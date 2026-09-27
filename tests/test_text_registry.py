@@ -502,9 +502,13 @@ def test_prefix_records_git_bytes_mismatch_without_changing_public_reference(wor
     assert call(registry, 'list')['records'][1]['references'][0]['evidence']['commit'] == 'week-2'
 
 
-def test_applicability_error_shows_the_accepted_shapes(workspace):
+def test_applicability_accepts_open_ended_start_and_explains_shapes(workspace):
     registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
-    # Both groups repeatedly sent an open-ended {"start_day": N} in the free runs.
-    with pytest.raises(ValueError, match=r'both ends required') as error:
-        call(registry, 'create', **declaration(applies_at={'start_day': 7}))
-    assert '{"day": 21}' in str(error.value) and '{"unknown": "reason"}' in str(error.value)
+    # Both groups repeatedly sent {"start_day": N} meaning "until revised" in the free runs.
+    call(registry, 'create', **declaration(applies_at={'start_day': 7}))
+    assert call(registry, 'list')['records'][0]['applies_at'] == {'start_day': 7}
+    for bad in ({'end_day': 7}, {'start_day': 9, 'end_day': 7}, {'day': 7, 'start_day': 7},
+                {'start_day': 7, 'unknown': 'until revised'}):
+        with pytest.raises(ValueError, match='until revised or retired') as error:
+            call(registry, 'create', **declaration(applies_at=bad))
+        assert '{"day": 21}' in str(error.value) and '{"unknown": "reason"}' in str(error.value)

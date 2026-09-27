@@ -30,10 +30,11 @@ class ContentTime(Input):
         elif self.day is not None:
             valid = self.start_day is self.end_day is None
         else:
-            valid = self.start_day is not None and self.end_day is not None and self.start_day <= self.end_day
+            # start_day alone is open-ended: from that day until the text is revised or retired.
+            valid = self.start_day is not None and (self.end_day is None or self.start_day <= self.end_day)
         if not valid:
-            raise ValueError('Use {"day": 21}, {"start_day": 21, "end_day": 27} (both ends required), '
-                             'or {"unknown": "reason"}')
+            raise ValueError('Use {"day": 21}, {"start_day": 21, "end_day": 27}, {"start_day": 21} '
+                             '(until revised or retired), or {"unknown": "reason"}')
         return self
 
 
@@ -169,7 +170,8 @@ def tool_definitions(pf=False):
                   'Predicates are only stored.')
     descriptions = {
         'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence in registrations.json. '
-                  'Supply explicit business objects and applicability time; use unknown with a reason when evidence '
+                  'Supply explicit business objects and applicability time (applies_at: day, start_day with end_day, or '
+                  'start_day alone for "until revised or retired"); use unknown with a reason when evidence '
                   'is unavailable. ' + evidence + ' purpose is current or historical_only. Optional select uses row '
                   'equality keys and col, or a JSON Pointer path. ' + predicates + ' Notes over 200 characters are '
                   'truncated. Returns rN and rN.M.',
