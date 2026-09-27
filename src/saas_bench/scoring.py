@@ -5,6 +5,20 @@ import math
 from .database import get_predictions
 
 
+# Ledger categories written only by the agent's own purchase tools (tools.py market and
+# group research, start_research_project). The agent acts on a week-start day only after
+# that day's advance, so on the target day these entries follow the dashboard it saw.
+WEEK_START_PURCHASES = ('market_research', 'group_research', 'research_project')
+
+
+def cash_at_advance(conn, day):
+    """Cash when the advance reaching `day` finished, before that day's new-week purchases."""
+    marks = ','.join('?' * len(WEEK_START_PURCHASES))
+    return conn.execute(f'SELECT COALESCE(SUM(amount), 0) FROM ledger WHERE day < ? '
+                        f'OR (day = ? AND category NOT IN ({marks}))',
+                        (day, day, *WEEK_START_PURCHASES)).fetchone()[0]
+
+
 def interval_score(lower, upper, actual):
     if not all(math.isfinite(v) for v in (lower, upper, actual)) or lower > upper:
         raise ValueError('Finite ordered interval and actual cash are required')
@@ -33,10 +47,13 @@ def score_predictions(conn, current_day, *, outcome='running', planned_end_day=N
                 row['status'] = 'unmatured_failure'
         else:
             if target not in actuals:
-                actuals[target] = conn.execute('SELECT COALESCE(SUM(amount), 0) FROM ledger WHERE day <= ?', (target,)).fetchone()[0]
-            actual = actuals[target]
+                actuals[target] = (cash_at_advance(conn, target), conn.execute(
+                    'SELECT COALESCE(SUM(amount), 0) FROM ledger WHERE day <= ?', (target,)).fetchone()[0])
+            actual, through_day = actuals[target]
             point, lower, upper = (row[k] for k in ('predicted_value', 'predicted_lower', 'predicted_upper'))
-            row['actual_cash'] = actual
+            # Scored against the dashboard cash at the target advance; the old end-of-day
+            # ledger total (including that day's purchases) is kept for comparison.
+            row.update(actual_cash=actual, ledger_cash_through_target_day=through_day)
             if any(v is None or not math.isfinite(v) for v in (point, lower, upper)) or not lower <= point <= upper:
                 row['status'] = 'invalid_prediction'
             else:

@@ -38,6 +38,20 @@ def test_zero_and_negative_cash(make_initialized_sim):
     assert score_predictions(conn, 28)['rows'][0]['interval_score'] == 42
 
 
+def test_actual_cash_is_the_target_advance_before_new_week_purchases(make_initialized_sim):
+    conn, _, _ = make_initialized_sim()
+    conn.execute('DELETE FROM ledger')
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (0,'initial_funding',100,'test')")
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (7,'market_research',-5,'week 0 purchase')")
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (28,'operations',-10,'day 28 of the advance')")
+    # Bought on day 28 after the advance: not part of the cash the forecast targets.
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (28,'research_project',-40,'new week')")
+    save_predictions(conn, 0, {28: {'cash': {'point': 85, 'lower': 80, 'upper': 90}}}, 0)
+    row = score_predictions(conn, 28)['rows'][0]
+    assert row['actual_cash'] == 85 and row['ledger_cash_through_target_day'] == 45
+    assert row['covered'] and row['interval_score'] == 10
+
+
 def test_prediction_failure_rolls_back_before_any_world_change(make_initialized_sim, tmp_path, monkeypatch):
     conn, simulator, _ = make_initialized_sim()
     initial_rng = simulator.rng.bit_generator.state
