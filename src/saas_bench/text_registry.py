@@ -7,7 +7,7 @@ import subprocess
 from pydantic import ValidationError
 
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
-from .registration_evidence import EvidenceResolver, git_reference
+from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
 from .registration_schema import MODELS
 from .run_state import write_json
 from .sql_evidence import encoded, now
@@ -105,7 +105,7 @@ class TextRegistry:
         evidence = ref['evidence']
         if 'unknown' in evidence:
             return dict(status='unknown', reason=evidence['unknown'])
-        full = None
+        full = label = None
         if 'record' in evidence:
             requested = evidence['record']
             history = records.get(requested.split('.')[0], [])
@@ -114,11 +114,17 @@ class TextRegistry:
             if target is None:
                 raise ValueError('Unknown registered text revision; use unknown with a reason')
             evidence['record'] = target['version']
+        elif self.mode in ('git', 'prefix') and 'path' in evidence and 'commit' not in evidence \
+                and '@' not in evidence['path']:
+            ref['evidence'] = weekly_reference(self.workspace, evidence['path'], week_label(self.sim_day()))
+            label = ref['evidence']['commit']
+            if (ref.get('select') or ref.get('predicate')) and not evidence['path'].endswith(('.json', '.csv')):
+                raise ValueError('Plain text supports whole-text equality only')
         elif self.mode in ('git', 'prefix') or (
                 'path' in evidence and ('commit' in evidence or '@' in evidence['path'])):
             # PF keeps the Git group's committed-file references (design 4.1).
             if 'path' not in evidence:
-                raise ValueError('Git references require a committed path, or unknown with a reason')
+                raise ValueError('Evidence must be a workspace file path or a registered text rN.M; otherwise use unknown with a reason')
             ref['evidence'], full = git_reference(self.workspace, evidence)
             if (ref.get('select') or ref.get('predicate')) and not ref['evidence']['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
@@ -126,7 +132,8 @@ class TextRegistry:
             path = Path(evidence['path'])
             if path.is_absolute() or '..' in path.parts or path.as_posix() != evidence['path']:
                 raise ValueError('Evidence path must be workspace-relative')
-        binding = dict(status='git', git_commit=full) if full else dict(status='registered_text', **evidence)
+        binding = (dict(status='git', git_commit=full) if full else
+                   dict(status='git', git_week=label) if label else dict(status='registered_text', **evidence))
         if self.mode == 'git':
             return binding
         accept = None

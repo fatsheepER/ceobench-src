@@ -10,6 +10,18 @@ import subprocess
 
 # Private state name of the lineage-wide vN handle table.
 HANDLES = 'registration_handles'
+WEEK_LABEL = re.compile('week-[1-9][0-9]*')
+
+
+def week_label(day):
+    """Label of the weekly harness commit that closes the week containing day."""
+    return f'week-{max(day or 0, 0) // 7 + 1}'
+
+
+def week_commit_subject(label):
+    # Must equal the runner's weekly commit message (`_commit_weeks_up_to`).
+    week = int(label.split('-')[1])
+    return f'Week {week} (day {week * 7}) [{label}]'
 
 
 def git_reference(workspace, evidence):
@@ -31,6 +43,12 @@ def git_reference(workspace, evidence):
         return result.stdout.decode().strip()
     if commit is None:
         full = git('rev-parse', '--verify', 'HEAD^{commit}')
+    elif WEEK_LABEL.fullmatch(commit):
+        subject = week_commit_subject(commit)
+        matches = [line[:40] for line in git('log', '--format=%H %s').splitlines() if line[41:] == subject]
+        if not matches:
+            raise ValueError('That weekly commit does not exist yet; a bare path cites this week\'s file')
+        full = matches[-1]
     else:
         if not re.fullmatch('[0-9a-fA-F]{1,40}', commit):
             raise ValueError('Commit must be a unique hexadecimal prefix')
@@ -44,7 +62,23 @@ def git_reference(workspace, evidence):
     if git('cat-file', '-t', full + ':' + path) != 'blob':
         raise ValueError('Reference must name a committed file')
     # No git show, checkout, snapshot, or commit: existence checking reads no cited contents.
-    return dict(path=path, commit=full[:7]), full
+    return dict(path=path, commit=commit if WEEK_LABEL.fullmatch(commit or '') else full[:7]), full
+
+
+def weekly_reference(workspace, path, label):
+    """Cite a working-tree file as the weekly harness commit labelled `label` will store it."""
+    p = PurePosixPath(path)
+    if not path or p.is_absolute() or '..' in p.parts or p.as_posix() != path or '\x00' in path:
+        raise ValueError('Evidence path must be a normalized workspace-relative file path')
+    target = workspace / path
+    if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(workspace):
+        raise ValueError('Reference must name an existing workspace file, or use unknown with a reason')
+    ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', '--', path],
+                             capture_output=True, timeout=10)
+    if ignored.returncode == 0:
+        raise ValueError('File is ignored by Git and never committed; use unknown with a reason')
+    # Bound silently to that week's closing commit; later edits in the week are included.
+    return dict(path=path, commit=label)
 
 
 def json_spans(text):

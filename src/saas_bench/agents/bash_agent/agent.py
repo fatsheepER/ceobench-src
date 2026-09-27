@@ -27,6 +27,8 @@ class Message:
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # DeepSeek thinking mode: returned reasoning must be sent back verbatim after tool calls.
+    reasoning_content: Optional[str] = None
 
 
 # Regex to detect dashboard in bash output (day advancement)
@@ -425,13 +427,16 @@ class BashAgent(BaseAgent):
         content = m.content
         if isinstance(content, list):
             content = [self._serialize_content_item(x) for x in content]
-        return {
+        data = {
             "role": m.role,
             "content": content,
             "tool_calls": m.tool_calls,
             "tool_call_id": m.tool_call_id,
             "name": m.name,
         }
+        if m.reasoning_content is not None:
+            data["reasoning_content"] = m.reasoning_content
+        return data
 
     def _save_conversation_snapshot(self, strict=False) -> None:
         """Atomically write self.conversation + minimal turn state to disk.
@@ -506,6 +511,7 @@ class BashAgent(BaseAgent):
                     tool_calls=m.get("tool_calls"),
                     tool_call_id=m.get("tool_call_id"),
                     name=m.get("name"),
+                    reasoning_content=m.get("reasoning_content"),
                 ))
 
             if payload.get('pending_tool_calls'):
@@ -564,6 +570,9 @@ class BashAgent(BaseAgent):
                     m['name'] = msg.name
                 if msg.tool_calls:
                     m['tool_calls'] = msg.tool_calls
+                # Omitting returned reasoning after a tool call makes DeepSeek answer 400.
+                if msg.reasoning_content is not None:
+                    m['reasoning_content'] = msg.reasoning_content
                 messages.append(m)
 
             tools = [
@@ -705,7 +714,9 @@ class BashAgent(BaseAgent):
                 self.conversation.append(Message(
                     role='assistant',
                     content=assistant_msg.content or '',
-                    tool_calls=tool_calls_data
+                    tool_calls=tool_calls_data,
+                    # DeepSeek-compatible thinking requires the field on every later assistant turn.
+                    reasoning_content=(reasoning_content or '') if (_is_deepseek_compat and self._wants_reasoning()) else None,
                 ))
 
                 if not assistant_msg.tool_calls:

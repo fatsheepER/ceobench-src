@@ -203,3 +203,61 @@ def test_legacy_snapshot_freezes_missing_system_once(tmp_path, anthropic):
     third = agent(tmp_path, anthropic)
     assert third.load_conversation_snapshot(first._snapshot_path)
     assert third.conversation[0].content == second.conversation[0].content
+
+
+class Rejected(BaseException):
+    pass
+
+
+@pytest.mark.parametrize('effort', ['high', 'none'])
+def test_deepseek_thinking_returns_reasoning_after_tool_calls_and_restore(tmp_path, monkeypatch, effort):
+    import httpx
+    from openai import OpenAI
+    from test_preflight_usage import reply
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    captured, rejected = [], []
+    def handle(request):
+        body = json.loads(request.content)
+        captured.append(body)
+        thinking = body['thinking']['type'] == 'enabled'
+        assistants = [m for m in body['messages'] if m['role'] == 'assistant']
+        # Official rule: after a tool-call turn every assistant turn must return its reasoning verbatim.
+        if thinking and any(m.get('reasoning_content') != f"think {i}" for i, m in enumerate(assistants)):
+            rejected.append(body)
+            if len(rejected) > 1:
+                # The agent feeds 400s back and retries forever; fail instead of hanging.
+                raise Rejected('reasoning_content was not passed back')
+            return httpx.Response(400, json={'error': {'message': 'The reasoning_content in the thinking mode '
+                                                       'must be passed back to the API.', 'type': 'invalid_request_error'}})
+        assert thinking or all('reasoning_content' not in m for m in assistants)
+        result = reply('chat')
+        message = result['choices'][0]['message']
+        if thinking:
+            message['reasoning_content'] = f"think {len(assistants)}"
+        message['tool_calls'] = [dict(id=f'call{len(assistants)}', type='function',
+                                      function=dict(name='read_file', arguments='{"path":"MEMORY.md"}'))]
+        return httpx.Response(200, json=result)
+    client = OpenAI(api_key='offline-only', base_url='https://api.deepseek.com', max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    def new_agent():
+        value = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='Original instructions',
+                          workspace_path=tmp_path, reasoning_effort=effort)
+        value._snapshot_path = tmp_path / 'context.json'
+        return value
+    first = new_agent()
+    for _ in range(2):
+        assert first.act('observation', 0, False, {'day': 0}).tool == 'read_file'
+        first.record_tool_result('contents')
+    first._save_conversation_snapshot(strict=True)
+    second = new_agent()
+    assert second.load_conversation_snapshot(second._snapshot_path)
+    first.act('contents', 0, False, {'day': 0})
+    second.act('contents', 0, False, {'day': 0})
+    assert not rejected and captured[-1] == captured[-2]
+    if effort == 'high':
+        assert [m['reasoning_content'] for m in captured[-1]['messages'] if m['role'] == 'assistant'] == ['think 0', 'think 1']
+        assert captured[-1]['reasoning_effort'] == 'high'
+    second.record_tool_result('contents')
+    second.act('new week', 0, False, {'day': 7})
+    assert not rejected and all(m['role'] != 'assistant' for m in captured[-1]['messages'])
+    client.close()

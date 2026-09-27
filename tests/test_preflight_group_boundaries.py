@@ -255,12 +255,18 @@ def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspa
     assert '{"n":7}' not in registry.path.read_text()
     assert not re.search(r'\b[0-9a-f]{8,64}\b', registry.path.read_text())
     original = registry.path.read_bytes()
-    (workspace / 'new.json').write_text('{"n":1}')
     for evidence in ({'path': 'new.json'}, {'sql': 'SELECT 1'}, {'version': 'v1'},
-                     {'path': 'evidence.json', 'commit': 'f' * 40}):
+                     {'path': 'evidence.json', 'commit': 'f' * 40}, {'path': 'new.json@week-1'}):
         with pytest.raises(ValueError):
             registry.execute('create', declaration(evidence))
         assert registry.path.read_bytes() == original
+    # An uncommitted file binds the weekly commit label without committing or copying it.
+    (workspace / 'new.json').write_text('{"n":1}')
+    registry.execute('create', declaration({'path': 'new.json'}))
+    assert json.loads(registry.execute('list', {}))['records'][-1]['references'][0]['evidence'] == dict(
+        path='new.json', commit='week-1')
+    assert (workspace / '.git/index').read_bytes() == index and git(workspace, 'rev-parse', 'HEAD') == head
+    assert '{"n":1}' not in registry.path.read_text()
     executor = BashAgentToolExecutor(workspace, text_registry=registry)
     error = executor.execute('text_create', declaration({'version': 'a' * 64}))
     assert error.startswith('Error:') and 'a' * 64 not in error

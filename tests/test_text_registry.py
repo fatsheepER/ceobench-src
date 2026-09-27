@@ -64,7 +64,8 @@ def test_git_lifecycle_pins_references_preserves_history_and_never_copies(worksp
     created = call(registry, 'create', **declaration({'path': 'evidence.json'}))
     assert created == dict(id='r1', version='r1.1', status='active')
     original = json.loads(registry.path.read_text())['records']['r1'][0]
-    assert original['references'][0]['evidence'] == dict(path='evidence.json', commit=head[:7])
+    # A bare path waits for the weekly commit that closes day 7's week.
+    assert original['references'][0]['evidence'] == dict(path='evidence.json', commit='week-2')
     assert head not in registry.path.read_text() and '"n":7' not in registry.path.read_text()
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert git(workspace, 'diff', '--cached', '--name-only') == ''
@@ -81,6 +82,31 @@ def test_git_lifecycle_pins_references_preserves_history_and_never_copies(worksp
     assert len(json.loads(registry.path.read_text())['records']['r1']) == 3
     with pytest.raises(ValueError, match='retired'):
         call(registry, 'revise', record='r1', reason='retry')
+
+
+def test_bare_path_binds_the_weekly_commit_and_week_labels_resolve_after_it(workspace):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from saas_bench.registration_evidence import week_commit_subject
+    registry = TextRegistry(workspace, 'git', sim_day=lambda: 20)
+    (workspace / 'plan.json').write_text('{"v":1}')
+    (workspace / '.gitignore').write_text('*.db\n')
+    (workspace / 'cache.db').write_text('x')
+    call(registry, 'create', **declaration({'path': 'plan.json'}))
+    assert call(registry, 'list')['records'][0]['references'][0]['evidence'] == dict(path='plan.json', commit='week-3')
+    for evidence in ({'path': 'cache.db'}, {'path': 'missing.json'}, {'path': 'plan.json@week-3'}):
+        with pytest.raises(ValueError):
+            call(registry, 'create', **declaration(evidence))
+    (workspace / 'plan.json').write_text('{"v":2}')  # later edits in the week belong to the binding
+    runner = BashAgentRunner.__new__(BashAgentRunner)
+    runner.agent_workspace = workspace
+    runner._commit_weeks_up_to(21)
+    subjects = git(workspace, 'log', '--format=%s').splitlines()
+    assert week_commit_subject('week-3') in subjects
+    assert git(workspace, 'show', 'HEAD:plan.json') == '{"v":2}'
+    call(registry, 'create', **declaration({'path': 'plan.json@week-3'}))
+    call(registry, 'create', **declaration({'path': 'plan.json', 'commit': 'week-2'}))
+    refs = [r['references'][0]['evidence'] for r in call(registry, 'list')['records']]
+    assert refs[1] == dict(path='plan.json', commit='week-3') and refs[2]['commit'] == 'week-2'
 
 
 def test_direct_registered_text_reference_before_commit_and_pagination(workspace):
@@ -426,9 +452,16 @@ def test_prefix_records_git_bytes_mismatch_without_changing_public_reference(wor
     store, registry, executor = captured(workspace, tmp_path, 'prefix')
     (workspace / 'evidence.json').write_text('{"n":99}')
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
-    result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    head = git(workspace, 'rev-parse', 'HEAD')[:7]
+    result = call(registry, 'create', **declaration({'path': 'evidence.json@' + head}))
     assert 'evidence' not in result
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert not binding['git_content_matches']
     assert store.get_content(binding['version_id'])[1] == b'{"n":99}'
-    assert call(registry, 'list')['records'][0]['references'][0]['evidence']['commit'] == git(workspace, 'rev-parse', 'HEAD')[:7]
+    assert call(registry, 'list')['records'][0]['references'][0]['evidence']['commit'] == head
+    # A bare path waits for the weekly commit; privately it binds the last delivered version.
+    assert 'evidence' not in call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    binding = store.load_state('declaration:r2.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['git_week'] == 'week-2' and 'git_content_matches' not in binding
+    assert store.get_content(binding['version_id'])[1] == b'{"n":99}'
+    assert call(registry, 'list')['records'][1]['references'][0]['evidence']['commit'] == 'week-2'

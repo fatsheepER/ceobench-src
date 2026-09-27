@@ -157,8 +157,9 @@ def tool_definitions(pf=False):
     evidence = ('Evidence uses a workspace path (a bare path binds the version last sent to you; path@commit binds '
                 'that committed file), exact SQL of a query you ran, a vN handle, or a registered text rN / rN.M.'
                 if pf else
-                'Evidence uses a committed file path (a bare path binds HEAD; path@commit or commit selects a commit) '
-                'or a registered text rN / rN.M.')
+                'Evidence uses a workspace file path (a bare path binds the commit closing this week, shown as '
+                'week-N; path@commit or commit selects an earlier commit by hex prefix or week-N) or a registered '
+                'text rN / rN.M.')
     predicates = ('Optional predicates: tolerance amount around the cited value, threshold op/value, or compare '
                   'left/op/right within one query result. Predicates on current-purpose references are checked '
                   'when you run pf_dependencies.' if pf else
@@ -183,9 +184,13 @@ REGISTRATION_COMMON = '''
 
 You may use text_create, text_revise, text_retire and text_list to preserve useful
 hypotheses, forecasts, plans, conclusions and counterevidence across weeks.
-Choose what to register; missing registration never blocks business actions.
-Registrations are saved in registrations.json. MEMORY.md remains your free-form
-weekly memory; registrations are not automatically injected into your context.
+Registrations are saved in registrations.json, which also persists across weeks
+in addition to the items listed under Memory & Persistence. When you save what
+matters in the weekly workflow, you can register or revise the items you expect
+to rely on later, and keep the weekly summary and useful rN IDs in MEMORY.md.
+Registrations are not automatically injected into your context; use text_list
+to review them. Choose what to register; missing registration never blocks
+business actions.
 Distinguish acquisition time, the day/interval described by evidence, and when
 you read it. Use an explicit unknown reason when applicability is unclear.
 Dashboard normally reflects the previous weekly advance. After changing settings
@@ -196,14 +201,15 @@ reference. Revise with omitted references to preserve the original bindings.
 An unknown reference with a reason is always allowed.
 '''
 
-GIT_EVIDENCE_RULES = '''File references require a path present in a commit. A path alone binds HEAD;
-path@commit accepts a unique commit prefix. Commit new files yourself or wait for
-the weekly commit. Registration never commits or copies cited file contents.
+GIT_EVIDENCE_RULES = '''File references cite committed files. A bare path cites the file as the weekly
+commit closing the current week stores it (shown as week-N), so edits later this
+week are included. path@commit cites an earlier commit by a unique commit prefix
+or week-N. Registration never commits or copies cited file contents.
 '''
 
 PF_EVIDENCE_RULES = '''A bare file path binds the version of that file last sent to your model, not the
-latest version or HEAD. path@commit (a unique commit prefix) binds that committed
-file as in Git and also records whether those exact bytes were sent to you. Exact
+latest version or HEAD. path@commit (a unique commit prefix or week-N) binds that
+committed file and also records whether those exact bytes were sent to you. Exact
 SQL binds the last delivered result of that query; optional vN handles identify
 exact versions, and a path works when a handle is unavailable. Only already
 delivered evidence and selected ranges can be cited as versions.
