@@ -1309,6 +1309,10 @@ __pycache__/
                 # Check server for timeout (via game-status)
                 status = self._get_game_status()
                 last_status = status
+                # Shell pipelines can trim the dashboard header; the server day
+                # still ends the week and must trigger checkpoint/stop handling.
+                if status.get('day', sim_day) > sim_day:
+                    day_ended = True
                 sim_day = status.get('day', sim_day)  # Update sim_day after potential next-week
                 self._commit_weeks_up_to(sim_day)  # Commit any sim-week boundary just crossed
 

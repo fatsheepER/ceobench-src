@@ -69,14 +69,14 @@ def test_stop_day_is_harness_only_and_validated(offline_runner):
             offline_runner(stop_after_day=day)
 
 
-def fake_weeks(runner, monkeypatch):
+def fake_weeks(runner, monkeypatch, suffix=''):
     from openai import OpenAI
     from test_preflight_usage import reply
     requests = []
     def handle(request):
         requests.append(json.loads(request.content))
         body = reply('chat')
-        command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+        command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4 + suffix
         body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
             function=dict(name='bash', arguments=json.dumps({'command': command})))]
         return httpx.Response(200, json=body)
@@ -86,6 +86,22 @@ def fake_weeks(runner, monkeypatch):
     runner.agent.client = runner.agent.usage_recorder.attach(runner.client)
     monkeypatch.setattr(runner, 'setup', lambda: None)
     return requests
+
+
+@pytest.mark.parametrize('mode', ['off', 'prefix', 'pf'])
+def test_trimmed_week_output_still_checkpoints_and_stops(offline_runner, monkeypatch, mode):
+    runner = offline_runner(text_registration=mode, stop_after_day=7)
+    requests = fake_weeks(runner, monkeypatch, suffix=' | tail -1')
+    act = runner.agent.act
+    def before_stop(observation, reward, done, info):
+        assert info['day'] < 7, 'Agent called again after the requested stop day'
+        return act(observation, reward, done, info)
+    monkeypatch.setattr(runner.agent, 'act', before_stop)
+    result = runner.run(verbose=False)
+    assert result['outcome'] == 'stopped' and result['days_run'] == 7
+    assert len(requests) == 1
+    assert runner._load_checkpoint()['day'] == 7
+    assert runner._load_checkpoint()['context_boundary'] == 'new_week'
 
 
 def test_prefix_stops_at_fork_day_then_git_and_pf_branches_continue(offline_runner, monkeypatch, tmp_path):
