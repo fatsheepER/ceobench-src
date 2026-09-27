@@ -193,13 +193,13 @@ TOOL_DOCS = {
         },
         "impact": {
             "operations": "CRITICAL: (1) REDUCES OUTAGE PROBABILITY - At $0: ~3% daily outage risk (~1/month). At $500: ~1.1% daily (~3/year). (2) Speeds up issue resolution. The global issue-resolution pool is partitioned by customer group: each group g draws Poisson((base_rate + scale_g × spend) × n_g / total_open_issues), where scale_g = 0.3 for individual groups (S*, D_S*) and 0.05 for enterprise groups (E*, D_E*). So $1 of ops spend resolves ~0.3 individual issues/day vs ~0.05 enterprise issues/day. WARNING: Without ops spending, frequent outages damage reputation and cause churn!",
-            "development": "Dev spending improves product quality (amplified by model tier). Global improvement = 0.006 × ln(1 + global_spend/5000) per day (applies to all groups). Targeted per-group improvement = 0.030 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier."
+            "development": "Dev spending improves product quality (amplified by model tier). Global improvement = 0.0045 × ln(1 + global_spend/5000) per day plus small random noise (applies to all groups). Targeted per-group improvement = 0.0225 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier."
         },
         "example_call": {
             "tool": "set_daily_spend",
             "arguments": {"operations": 1200, "development": 600}
         },
-        "internal_notes": "Ops: outage_prob = 0.03 * exp(-0.002 * ops_spend). Issue resolution (global pool, partitioned by group): for each group g with n_g open issues, mean_g = (base_rate + scale_g * spend) * (n_g / total_open_issues); scale_g = 0.3 for individual groups (S*, D_S*), 0.05 for enterprise groups (E*, D_E*). Dev (global): quality_improvement = 0.006 * ln(1 + spend/5000). Dev (targeted per-group): group_improvement = 0.030 * ln(1 + spend/5000). Advertising is NOT a valid key here — use set_targeted_ad_spend.",
+        "internal_notes": "Ops: outage_prob = 0.03 * exp(-0.002 * ops_spend). Issue resolution (global pool, partitioned by group): for each group g with n_g open issues, mean_g = (base_rate + scale_g * spend) * (n_g / total_open_issues); scale_g = 0.3 for individual groups (S*, D_S*), 0.05 for enterprise groups (E*, D_E*). Dev (global): quality_improvement = 0.0045 * ln(1 + spend/5000) + N(0, quality_shared_noise_scale). Dev (targeted per-group): group_improvement = 0.0225 * ln(1 + spend/5000). Advertising is NOT a valid key here — use set_targeted_ad_spend.",
         "sample_io": {
             "success": [
                 {"label": "Set both budgets", "input": {"operations": 1200, "development": 600}, "output": "Daily spend updated: operations=$1200, development=$600"},

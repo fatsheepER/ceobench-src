@@ -22,6 +22,12 @@ def original_prompt(days):
     # Frozen inputs from the design's original source baseline, not the current
     # prompt generator. Keep the fixture independent of shallow Git checkouts.
     sim = ORIGINAL['simulator_instructions'].replace('{tool_list}\n', '').replace('{tool_list}', '')
+    # User-approved common repair (2026-09-27): the original sentence contradicted the
+    # simulator, where ads_strength defaults to 0 and never scales lead generation.
+    sim = sim.replace('- `ads_strength` is a multiplier on ad effectiveness (default 1.0) — increase it to amplify '
+                      'lead generation from all ad spend',
+                      '- `ads_strength` (0–1, default 0) controls in-app ads only; it does not change how many '
+                      'leads ad spend generates')
     years = days / 365
     return (ORIGINAL['system_template'].replace('{simulator_instructions}', sim)
             .replace('{total_days}', str(days))

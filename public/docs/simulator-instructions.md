@@ -27,7 +27,7 @@ New customers join through several channels:
 **Advertising & Marketing:**
 - 5 ad channels: social_media, search_ads, linkedin, content_marketing, referral_program
 - Each channel has different effectiveness per customer group — effectiveness values determine how many leads you get per dollar spent in that channel for each group
-- `ads_strength` is a multiplier on ad effectiveness (default 1.0) — increase it to amplify lead generation from all ad spend
+- `ads_strength` (0–1, default 0) controls in-app ads only; it does not change how many leads ad spend generates
 - In-app ads generate daily revenue per subscriber (proportional to ads strength × seat count), but degrade perceived quality — this is a revenue-vs-quality trade-off. Set via `set_ads_strength`
 - All ad spend is per-(channel, group) via `set_targeted_ad_spend({channel: {group: $/day}})`. There is no aggregate ad budget — every dollar must be allocated to a specific channel and group.
 - `set_daily_spend` only handles `operations` and `development` (not advertising).
