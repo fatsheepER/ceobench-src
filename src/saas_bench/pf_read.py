@@ -62,9 +62,14 @@ def _compact(full, mode, handle, edits):
     return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
 
 
-def _compact_tool(mode, target_handle, edits):
-    """Compact form of a repeated identical tool call; the base is its previous result."""
-    header = dict(delivery=mode, base='previous_same_call', target=target_handle)
+def tool_base(key):
+    """How the model finds the base: the previous same call, or the same script's last output."""
+    return 'previous_same_call' if key[0] == 'tool_call' else 'previous_output_of:' + key[1]
+
+
+def _compact_tool(mode, target_handle, edits, base='previous_same_call'):
+    """Compact form of a repeated tool read; the base is its previous result in this request."""
+    header = dict(delivery=mode, base=base, target=target_handle)
     if mode == 'DELTA':
         header['patch_format'] = 'unicode-replacements-v1'
     return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
@@ -72,7 +77,7 @@ def _compact_tool(mode, target_handle, edits):
 
 def _payload(meta, full, mode, delivery):
     if meta.get('read_kind') == 'tool_call':
-        return _compact_tool(mode, delivery['target_handle'], delivery['edits'])
+        return _compact_tool(mode, delivery['target_handle'], delivery['edits'], delivery['base_handle'])
     return _compact(full, mode, delivery['base_handle'], delivery['edits'])
 
 
@@ -194,7 +199,7 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     named = meta['target'] if tool else base
     handle = next((k for k, v in handles.items() if v == named), 'v' + str(len(handles) + 1))
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
-    labels = (dict(base_handle='previous_same_call', target_handle=handle) if tool else dict(base_handle=handle))
+    labels = (dict(base_handle=tool_base(meta['key']), target_handle=handle) if tool else dict(base_handle=handle))
     payload = _payload(meta, full, mode, dict(labels, edits=edits))
     tokens = _count(counter, payload)
     choice['candidate_tokens'][mode] = tokens

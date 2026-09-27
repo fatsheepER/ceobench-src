@@ -169,6 +169,35 @@ BASH_AGENT_TOOL_DEFS = [
 DELTA_READ_TOOLS = ('bash', 'read_file', 'search_files')
 
 
+def read_identity(store, event, workspace, tool_name, args):
+    """The content object a repeated read is compared against (design 3.5).
+
+    A Bash command that ran exactly one Python script file is identified by that
+    script, so rerunning a report script compares with its previous output even when
+    the surrounding command differs. Other calls are identified by tool and arguments,
+    ignoring a leading `cd` into the workspace itself.
+    """
+    from contextlib import closing
+    from pathlib import PurePosixPath
+    if tool_name == 'bash':
+        with closing(store.connect()) as conn:
+            sources = [row[0] for row in conn.execute(
+                "SELECT json_extract(request, '$.request.source') FROM requests "
+                "WHERE json_extract(request, '$.parent_event_id') = ? "
+                "AND json_extract(request, '$.kind') = 'cli_python'", (event,))]
+        if len(sources) == 1 and sources[0] and sources[0] != 'inline':
+            source = PurePosixPath(sources[0])
+            root = PurePosixPath(str(Path(workspace).resolve()))
+            if source.is_absolute() and source.is_relative_to(root):
+                source = source.relative_to(root)
+            return ['script_output', source.as_posix()]
+        command = args.get('command', '')
+        match = re.match(r'\s*cd\s+(\S+)\s*(?:&&|;|\n)\s*', command)
+        if match and match.group(1).strip('\'"') in (str(workspace), str(Path(workspace).resolve())):
+            args = dict(args, command=command[match.end():])
+    return ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
+
+
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
@@ -316,8 +345,8 @@ class BashAgentToolExecutor:
                 if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                     if tool_name in DELTA_READ_TOOLS:
-                        # Same tool and same arguments identify one repeatable read (design 3.5).
-                        read_key = ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
+                        read_key = capture.safe(read_identity, capture.store, capture.event,
+                                                self.workspace_path, tool_name, args)
                 result = capture.finish(result, status, read_key=read_key,
                                         read_complete=not capture.facts.get('output_truncated'))
                 if status == 'result_unknown':

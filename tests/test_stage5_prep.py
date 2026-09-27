@@ -223,3 +223,29 @@ def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
     # Git and prefix groups never produce compact tool reads.
     store2, _, prefix = captured(workspace, tmp_path / 'prefix', 'prefix')
     assert prefix.execute('read_file', {'path': 'facts.txt'}).pf_read is None
+
+
+def test_same_content_object_reads_compare_with_the_previous_output(offline_runner, workspace, tmp_path):
+    # A leading cd into the workspace itself does not make a different read.
+    store, registry, executor = pf_executor(workspace, tmp_path)
+    (workspace / 'data.txt').write_text(sample())
+    plain = executor.execute('bash', {'command': 'cat data.txt'})
+    moved = executor.execute('bash', {'command': f'cd {workspace} && cat data.txt'})
+    _, ledger = deliver(store, [plain, moved])
+    assert [r['mode'] for r in ledger] == ['FULL', 'UNCHANGED']
+    # Rerunning the same script is compared with its last output, whatever surrounds it.
+    runner = offline_runner(text_registration='pf')
+    runner.agent.current_day = 0
+    body = ''.join(f"print('row {i:03d}: a stable report line about this business')\n" for i in range(60))
+    first = runner._execute_tool('bash', {'command': "cat > report.py <<'EOF'\n" + body + "EOF\n./novamind-operation python report.py"})
+    second = runner._execute_tool('bash', {'command': 'echo rerun; ./novamind-operation python ./report.py'})
+    event, ledger = deliver(runner.evidence_store, [first, second])
+    assert ledger[1]['mode'] in ('DELTA', 'UNCHANGED') and ledger[1]['base_handle'] == 'previous_output_of:report.py'
+    if ledger[1]['mode'] == 'DELTA':
+        assert apply_delta(str(first), ledger[1]['edits']) == str(second)
+    wire = json.loads(runner.evidence_store.get_content(event + ':wire')[1])
+    assert json.loads(wire['messages'][1]['content'].split('\n', 1)[0])['base'] == 'previous_output_of:report.py'
+    # Inline Python and ordinary commands keep the same-call identity.
+    other = runner._execute_tool('bash', {'command': './novamind-operation python -c "print(1)"'})
+    _, ledger = deliver(runner.evidence_store, [first, other])
+    assert ledger[1]['mode'] == 'FULL'
