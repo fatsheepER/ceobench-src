@@ -32,7 +32,8 @@ class ContentTime(Input):
         else:
             valid = self.start_day is not None and self.end_day is not None and self.start_day <= self.end_day
         if not valid:
-            raise ValueError('Use day, start_day/end_day, or unknown with a reason')
+            raise ValueError('Use {"day": 21}, {"start_day": 21, "end_day": 27} (both ends required), '
+                             'or {"unknown": "reason"}')
         return self
 
 

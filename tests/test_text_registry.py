@@ -500,3 +500,11 @@ def test_prefix_records_git_bytes_mismatch_without_changing_public_reference(wor
     assert binding['status'] == 'resolved' and binding['git_week'] == 'week-2' and 'git_content_matches' not in binding
     assert store.get_content(binding['version_id'])[1] == b'{"n":99}'
     assert call(registry, 'list')['records'][1]['references'][0]['evidence']['commit'] == 'week-2'
+
+
+def test_applicability_error_shows_the_accepted_shapes(workspace):
+    registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
+    # Both groups repeatedly sent an open-ended {"start_day": N} in the free runs.
+    with pytest.raises(ValueError, match=r'both ends required') as error:
+        call(registry, 'create', **declaration(applies_at={'start_day': 7}))
+    assert '{"day": 21}' in str(error.value) and '{"unknown": "reason"}' in str(error.value)
