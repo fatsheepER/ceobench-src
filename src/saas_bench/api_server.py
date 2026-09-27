@@ -1009,8 +1009,9 @@ class NovaMindAPIServer:
         executor = BashAgentToolExecutor(workspace, bash_timeout=300,
             evidence_store=self.sql_evidence if self.sql_evidence and self.sql_evidence.execution_capture else None,
             require_sandbox=self.require_sandbox,
-            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0',
-                 'PYTHONPATH': os.pathsep.join((str(workspace / 'docs'), str(workspace)))})
+            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0'})
+        root = executor.guest_root
+        executor.extra_env['PYTHONPATH'] = os.pathsep.join((root + '/docs', root))
         results = {}
         self.last_script_results = []
         for name, code in self.get_daily_scripts().items():
@@ -1023,7 +1024,7 @@ class NovaMindAPIServer:
                 capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
                 token = CURRENT_EVENT.set(capture.event)
             try:
-                output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+                output = executor.execute('bash', {'command': shlex.quote(executor.python) + ' -c ' + shlex.quote(code)})
             except BaseException as exc:
                 if capture and capture.event:
                     capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)

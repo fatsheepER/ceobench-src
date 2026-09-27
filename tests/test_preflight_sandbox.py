@@ -54,3 +54,89 @@ def test_linux_isolation_blocks_sibling_clone_and_source(tmp_path):
     assert 'private sibling' not in result
     assert 'No such file' in result and 'saas_bench' in result
     assert (workspace / 'local-file').exists()
+
+
+linux_only = pytest.mark.skipif(sys.platform != 'linux', reason='Linux bubblewrap acceptance runs on sheep-rog')
+
+
+def sandboxed_workspace(tmp_path):
+    workspace = tmp_path / 'branches' / 'pf-42' / 'agent_workspace'
+    (workspace / 'sessions' / 'abc').mkdir(parents=True)
+    (workspace / 'sessions' / 'abc' / 'session.json').write_text('{"benchmark_config": {"secret": 1}}')
+    (workspace / 'note.txt').write_text('marker-7c1f\n')
+    executor = BashAgentToolExecutor(workspace, bash_timeout=300, require_sandbox=True)
+    executor.verify_sandbox()
+    return workspace, executor
+
+
+def test_sandbox_requires_built_agent_runtime(tmp_path, monkeypatch):
+    if sys.platform != 'linux' or not __import__('shutil').which('bwrap'):
+        pytest.skip('Linux bubblewrap only')
+    monkeypatch.setenv('CEOBENCH_AGENT_RUNTIME', str(tmp_path / 'missing'))
+    with pytest.raises(RuntimeError, match='build_agent_runtime'):
+        BashAgentToolExecutor(tmp_path, require_sandbox=True).verify_sandbox()
+
+
+@linux_only
+def test_sandbox_shows_only_fixed_workspace_and_agent_runtime(tmp_path):
+    workspace, executor = sandboxed_workspace(tmp_path)
+    result = executor.execute('bash', {'command': (
+        'pwd; echo "root: $(ls / | tr "\\n" " ")"; echo "sessions: $(ls -A sessions)"; env; '
+        'python -c "import sys, numpy, pandas, sklearn; print(sys.executable); print(sys.path)"; '
+        'test -e /proc && echo proc-visible; python -c "import saas_bench" 2>&1 | tail -1')})
+    assert result.startswith('/workspace\n')
+    assert 'root: bin dev etc lib lib64 opt sbin tmp usr workspace ' in result
+    assert 'sessions: \n' in result
+    assert '/opt/python/bin/python' in result and 'blocked inside the bash_agent sandbox' in result
+    assert 'proc-visible' not in result
+    for host in (str(tmp_path), str(Path.home()), sys.prefix, 'pf-42'):
+        assert host not in result
+
+
+@linux_only
+def test_recursive_root_search_finishes_inside_sandbox(tmp_path):
+    workspace, executor = sandboxed_workspace(tmp_path)
+    result = executor.execute('bash', {'command': 'grep -rl marker-7c1f / 2>/dev/null; echo done'})
+    assert result == '/workspace/note.txt\ndone\n'
+
+
+@linux_only
+def test_file_tools_follow_sandbox_paths_and_hide_sessions(tmp_path):
+    workspace, executor = sandboxed_workspace(tmp_path)
+    assert 'marker-7c1f' in executor.execute('read_file', {'path': '/workspace/note.txt'})
+    assert 'escapes workspace' in executor.execute('read_file', {'path': str(workspace / 'note.txt')})
+    assert 'not found' in executor.execute('read_file', {'path': 'sessions/abc/session.json'})
+    assert 'not found' in executor.execute('write_file', {'path': '/workspace/sessions/x', 'content': 'x'})
+    assert executor.execute('search_files', {'pattern': 'secret|marker'}) == 'note.txt:1: marker-7c1f'
+    assert executor.execute('glob_files', {'pattern': '**/*'}) == 'note.txt'
+
+
+@linux_only
+def test_absolute_workspace_paths_survive_a_fork(tmp_path):
+    from saas_bench.run_state import copy_workspace
+    workspace, executor = sandboxed_workspace(tmp_path)
+    executor.execute('write_file', {'path': 'report.py', 'content':
+                                    'print(open("/workspace/note.txt").read().strip())\n'})
+    command = {'command': 'cd /workspace && python /workspace/report.py'}
+    before = executor.execute('bash', command)
+    fork = tmp_path / 'branches' / 'git-42' / 'agent_workspace'
+    copy_workspace(workspace, fork)
+    after = BashAgentToolExecutor(fork, require_sandbox=True).execute('bash', command)
+    assert before == after == 'marker-7c1f\n'
+
+
+@linux_only
+def test_repeated_read_identity_ignores_cd_into_sandbox_workspace(tmp_path):
+    import sqlite3
+    from saas_bench.agents.bash_agent.tools import read_identity
+
+    class Store:
+        def connect(self):
+            conn = sqlite3.connect(':memory:')
+            conn.execute('CREATE TABLE requests (request TEXT)')
+            return conn
+
+    workspace, executor = sandboxed_workspace(tmp_path)
+    identity = [read_identity(Store(), 'e', workspace, 'bash', {'command': c}, executor.guest_root)
+                for c in ('cd /workspace && cat note.txt', 'cat note.txt')]
+    assert identity[0] == identity[1]

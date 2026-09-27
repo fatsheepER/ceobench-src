@@ -230,7 +230,7 @@ def test_same_content_object_reads_compare_with_the_previous_output(offline_runn
     store, registry, executor = pf_executor(workspace, tmp_path)
     (workspace / 'data.txt').write_text(sample())
     plain = executor.execute('bash', {'command': 'cat data.txt'})
-    moved = executor.execute('bash', {'command': f'cd {workspace} && cat data.txt'})
+    moved = executor.execute('bash', {'command': f'cd {executor.guest_root} && cat data.txt'})
     _, ledger = deliver(store, [plain, moved])
     assert [r['mode'] for r in ledger] == ['FULL', 'UNCHANGED']
     # Rerunning the same script is compared with its last output, whatever surrounds it.

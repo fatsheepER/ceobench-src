@@ -7,7 +7,9 @@ and file manipulation (read, write, edit, search, glob).
 import fnmatch
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -165,11 +167,42 @@ BASH_AGENT_TOOL_DEFS = [
 ]
 
 
+# Inside the sandbox the workspace and the agent Python runtime appear at fixed paths,
+# independent of the host directory layout, the run and the experiment group.
+GUEST_WORKSPACE = '/workspace'
+GUEST_PYTHON_ROOT = '/opt/python'
+GUEST_PYTHON = GUEST_PYTHON_ROOT + '/bin/python3'
+# Harness-owned files kept under the workspace (world database, session metadata with
+# the full benchmark configuration, conversation snapshots). The agent never sees them.
+HIDDEN_WORKSPACE_DIRS = ('sessions',)
+
+
+def agent_runtime_dir() -> Path:
+    configured = os.environ.get('CEOBENCH_AGENT_RUNTIME')
+    return Path(configured) if configured else Path(sys.prefix).parent / 'agent-runtime'
+
+
+def agent_runtime(verify=False) -> Dict[str, Any]:
+    """The runtime built by scripts/build_agent_runtime.py, optionally checked byte for byte."""
+    directory = agent_runtime_dir()
+    try:
+        record = json.loads((directory / 'runtime.json').read_text())
+    except FileNotFoundError:
+        raise RuntimeError(f'Agent runtime missing at {directory}; run scripts/build_agent_runtime.py') from None
+    if record.get('python') != platform.python_version():
+        raise RuntimeError('Agent runtime Python differs from the host interpreter; rebuild the agent runtime')
+    if verify:
+        from saas_bench.run_state import tree_hash
+        if tree_hash(directory / 'python') != record['sha256']:
+            raise RuntimeError('Agent runtime differs from its runtime.json; rebuild the agent runtime')
+    return record
+
+
 # PF groups deliver repeated identical reads of these tools as FULL, DELTA or UNCHANGED.
 DELTA_READ_TOOLS = ('bash', 'read_file', 'search_files')
 
 
-def read_identity(store, event, workspace, tool_name, args):
+def read_identity(store, event, workspace, tool_name, args, guest_root=None):
     """The content object a repeated read is compared against (design 3.5).
 
     A Bash command that ran exactly one Python script file is identified by that
@@ -185,15 +218,16 @@ def read_identity(store, event, workspace, tool_name, args):
                 "SELECT json_extract(request, '$.request.source') FROM requests "
                 "WHERE json_extract(request, '$.parent_event_id') = ? "
                 "AND json_extract(request, '$.kind') = 'cli_python'", (event,))]
+        roots = {str(workspace), str(Path(workspace).resolve()), guest_root or str(workspace)}
         if len(sources) == 1 and sources[0] and sources[0] != 'inline':
             source = PurePosixPath(sources[0])
-            root = PurePosixPath(str(Path(workspace).resolve()))
-            if source.is_absolute() and source.is_relative_to(root):
-                source = source.relative_to(root)
+            for root in map(PurePosixPath, roots):
+                if source.is_absolute() and source.is_relative_to(root):
+                    source = source.relative_to(root)
             return ['script_output', source.as_posix()]
         command = args.get('command', '')
         match = re.match(r'\s*cd\s+(\S+)\s*(?:&&|;|\n)\s*', command)
-        if match and match.group(1).strip('\'"') in (str(workspace), str(Path(workspace).resolve())):
+        if match and match.group(1).strip('\'"') in roots:
             args = dict(args, command=command[match.end():])
     return ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
 
@@ -265,13 +299,30 @@ class BashAgentToolExecutor:
         if sys.platform != 'linux':
             raise RuntimeError('Formal runs require Linux and bubblewrap')
         self.workspace_path.mkdir(parents=True, exist_ok=True)
-        env = {'PATH': os.path.join(sys.prefix, 'bin') + os.pathsep + os.defpath}
-        command = self._build_bwrap_cmd('true', str(self.workspace_path), env)
-        if command is None:
+        if self._bwrap() is None:
             raise RuntimeError('Formal runs require bubblewrap')
+        agent_runtime()
+        env = {'PATH': GUEST_PYTHON_ROOT + '/bin' + os.pathsep + os.defpath}
+        command = self._build_bwrap_cmd(GUEST_PYTHON + ' -c pass', str(self.workspace_path), env)
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
         if result.returncode:
             raise RuntimeError('Bubblewrap startup failed: ' + result.stderr)
+
+    def _bwrap(self):
+        bwrap = shutil.which('bwrap')
+        if not bwrap and self.require_sandbox:
+            raise RuntimeError('Formal runs require bubblewrap')
+        return bwrap
+
+    @property
+    def guest_root(self) -> str:
+        """The workspace path as the agent sees it."""
+        return GUEST_WORKSPACE if self._bwrap() else str(self.workspace_path)
+
+    @property
+    def python(self) -> str:
+        """The interpreter path valid inside the agent's command environment."""
+        return GUEST_PYTHON if self._bwrap() else sys.executable
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Execute a tool and return the result string."""
@@ -346,7 +397,7 @@ class BashAgentToolExecutor:
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                     if tool_name in DELTA_READ_TOOLS:
                         read_key = capture.safe(read_identity, capture.store, capture.event,
-                                                self.workspace_path, tool_name, args)
+                                                self.workspace_path, tool_name, args, self.guest_root)
                 result = capture.finish(result, status, read_key=read_key,
                                         read_complete=not capture.facts.get('output_truncated'))
                 if status == 'result_unknown':
@@ -382,17 +433,48 @@ class BashAgentToolExecutor:
             self.capture.origins.append(origin(version, text, start, end, target))
 
     def _resolve_path(self, path_str: str) -> Path:
-        """Resolve a path relative to the workspace, preventing escape."""
+        """Resolve a workspace-relative or agent-visible absolute path, preventing escape."""
+        return self._contained(self._host_path(path_str), path_str)
+
+    def _host_path(self, path_str: str) -> Path:
+        """Map an agent-visible path onto the host workspace."""
         p = Path(path_str)
         if p.is_absolute():
-            resolved = p.resolve()
-        else:
-            resolved = (self.workspace_path / p).resolve()
+            p = Path(os.path.normpath(p))
+            roots = [Path(self.guest_root)] + ([] if self._bwrap() else [self.workspace_path.resolve()])
+            root = next((r for r in roots if p.is_relative_to(r)), None)
+            if root is None:
+                raise ValueError(f"Path escapes workspace: {path_str}")
+            p = p.relative_to(root)
+        return self.workspace_path / p
+
+    def _contained(self, path: Path, shown: str) -> Path:
+        """Resolve a host path, rejecting anything outside the agent-visible workspace."""
+        resolved = path.resolve()
         # Ensure it's within workspace
         ws_resolved = self.workspace_path.resolve()
         if not resolved.is_relative_to(ws_resolved):
-            raise ValueError(f"Path escapes workspace: {path_str}")
+            raise ValueError(f"Path escapes workspace: {shown}")
+        if self._hidden(resolved):
+            raise ValueError(f"Path not found in workspace: {shown}")
         return resolved
+
+    def _guest_paths(self, value: str) -> str:
+        """Rewrite host workspace paths in a path-list value to their sandbox location."""
+        hosts = {str(self.workspace_path), str(self.workspace_path.resolve())}
+        parts = value.split(os.pathsep)
+        for i, part in enumerate(parts):
+            for host in hosts:
+                if part == host or part.startswith(host + '/'):
+                    parts[i] = GUEST_WORKSPACE + part[len(host):]
+        return os.pathsep.join(parts)
+
+    def _hidden(self, path: Path) -> bool:
+        for root in (self.workspace_path, self.workspace_path.resolve()):
+            if path.is_relative_to(root):
+                parts = path.relative_to(root).parts
+                return bool(parts) and parts[0] in HIDDEN_WORKSPACE_DIRS
+        return False
 
     # Env vars that MUST never be passed into the agent sandbox. The DB key
     # in particular is a hard secret — if the agent saw it, the .nmdb
@@ -416,17 +498,17 @@ class BashAgentToolExecutor:
         """Build a bwrap command that sandboxes bash to the workspace.
 
         Uses bubblewrap (bwrap) to create a filesystem namespace where:
-        - The agent workspace is the ONLY writable directory
-        - System binaries, Python venv, and libraries are read-only
-        - No access to source code, home directory, or other paths
+        - The agent workspace, mounted at /workspace, is the ONLY writable
+          directory; harness-owned `sessions/` under it appears empty
+        - System binaries and libraries are read-only; the agent Python
+          runtime (scripts/build_agent_runtime.py) is read-only at /opt/python
+        - No host home, source, development environment, run or group paths
+        - No /proc: a recursive search of / reaches only ordinary files
         - `import saas_bench` is blocked at the Python meta_path level via
           a `sitecustomize.py` ro-bound at `/opt/_sandbox_init/`
         """
-        import shutil
-        bwrap = shutil.which('bwrap')
+        bwrap = self._bwrap()
         if not bwrap:
-            if self.require_sandbox:
-                raise RuntimeError('Formal runs require bubblewrap')
             return None  # Fall back to unsandboxed execution
 
         env = self._scrub_sandbox_env(env)
@@ -439,39 +521,15 @@ class BashAgentToolExecutor:
             if os.path.exists(sys_path):
                 cmd.extend(['--ro-bind', sys_path, sys_path])
 
-        # /proc and /dev are needed for basic operation
-        cmd.extend(['--proc', '/proc'])
         cmd.extend(['--dev', '/dev'])
 
         # Writable /tmp (separate from workspace, for temp files)
         cmd.extend(['--tmpfs', '/tmp'])
 
-        # Read-only Python venv (for novamind-operation, python, pip, etc.)
-        venv_bin = env.get('PATH', '').split(':')[0] if ':' in env.get('PATH', '') else ''
-        if venv_bin and os.path.isdir(venv_bin):
-            venv_root = os.path.dirname(venv_bin)  # e.g., .venv/
-            if os.path.isdir(venv_root):
-                cmd.extend(['--ro-bind', venv_root, venv_root])
-
-        # Read-only Python site-packages (for imports like novamind_api)
-        import sysconfig
-        site_packages = sysconfig.get_paths()['purelib']
-        if os.path.isdir(site_packages):
-            cmd.extend(['--ro-bind', site_packages, site_packages])
-        # Also bind the stdlib
-        stdlib = sysconfig.get_paths()['stdlib']
-        if os.path.isdir(stdlib):
-            cmd.extend(['--ro-bind', stdlib, stdlib])
-        # Python binary itself — bind both the venv prefix and the base
-        # install it symlinks to (sys.base_prefix). In a uv venv the venv's
-        # python3 is a symlink chain into the underlying miniconda install;
-        # without binding base_prefix the symlink dangles inside the sandbox
-        # and PATH lookup silently falls through to /usr/bin/python3 (the
-        # system 3.9, which can't load 3.13-compiled .pyc files from the
-        # novamind-operation zipapp).
-        for py_root in {sys.prefix, sys.base_prefix}:
-            if py_root and os.path.isdir(py_root):
-                cmd.extend(['--ro-bind', py_root, py_root])
+        # The agent's own interpreter and analysis packages. The zipapps are
+        # compiled for this exact Python version (checked by agent_runtime()).
+        agent_runtime()
+        cmd.extend(['--ro-bind', str(agent_runtime_dir() / 'python'), GUEST_PYTHON_ROOT])
 
         # Sandbox init dir — contains sitecustomize.py that blocks
         # `import saas_bench` at the Python meta_path level. Mounted at a
@@ -515,10 +573,13 @@ class BashAgentToolExecutor:
                 )
 
         # The agent workspace — ONLY writable directory
-        cmd.extend(['--bind', ws, ws])
+        cmd.extend(['--bind', ws, GUEST_WORKSPACE])
+        for name in HIDDEN_WORKSPACE_DIRS:
+            if os.path.isdir(os.path.join(ws, name)):
+                cmd.extend(['--tmpfs', GUEST_WORKSPACE + '/' + name])
 
         # Set working directory
-        cmd.extend(['--chdir', ws])
+        cmd.extend(['--chdir', GUEST_WORKSPACE])
 
         # Unshare namespaces for isolation
         cmd.extend(['--unshare-all', '--share-net'])  # Keep network for API calls
@@ -544,7 +605,7 @@ class BashAgentToolExecutor:
             return "Error: No command provided"
 
         from saas_bench.process_boundary import Boundary
-        boundary = Boundary(command)
+        boundary = Boundary(command, self.python)
         try:
             return self._run_bash(command, boundary)
         finally:
@@ -558,18 +619,21 @@ class BashAgentToolExecutor:
         # Build a minimal, sandboxed environment.
         # Start from scratch — do NOT inherit os.environ (which contains
         # simulator source paths, home directory, etc.)
-        venv_bin_dir = os.path.join(sys.prefix, 'bin')
-        path_parts = [venv_bin_dir] if os.path.isdir(venv_bin_dir) else []
+        sandboxed = self._bwrap() is not None
+        python_bin_dir = GUEST_PYTHON_ROOT + '/bin' if sandboxed else os.path.join(sys.prefix, 'bin')
+        path_parts = [python_bin_dir] if sandboxed or os.path.isdir(python_bin_dir) else []
         path_parts += ['/usr/local/bin', '/usr/bin', '/bin']
         env = {
             'PATH': ':'.join(path_parts),
-            'HOME': ws,
-            'TMPDIR': ws,
+            'HOME': self.guest_root,
+            'TMPDIR': self.guest_root,
             'LANG': os.environ.get('LANG', 'en_US.UTF-8'),
             'TERM': os.environ.get('TERM', 'xterm'),
         }
         env.update(self.extra_env)
         env = self._scrub_sandbox_env(env)
+        if sandboxed:
+            env = {k: self._guest_paths(v) for k, v in env.items()}
 
         # Try bwrap sandbox; fall back to basic Popen if unavailable
         bwrap_cmd = self._build_bwrap_cmd(supervised_command, ws, env)
@@ -812,13 +876,13 @@ class BashAgentToolExecutor:
         if resolved.is_file():
             files = [resolved]
         else:
-            files = sorted(resolved.rglob(glob_filter))
+            files = sorted(f for f in resolved.rglob(glob_filter) if not self._hidden(f))
 
         target = 0
         scanned, skipped = [], []
         for fpath in files[:100]:  # Limit file count
             try:
-                self._resolve_path(str(fpath))
+                self._contained(fpath, str(fpath))
             except ValueError:
                 skipped.append(str(fpath))
                 continue
@@ -860,13 +924,13 @@ class BashAgentToolExecutor:
         pattern = args['pattern']
         if Path(pattern).is_absolute() or '..' in Path(pattern).parts:
             return 'Error: Glob must stay within workspace'
-        matches = sorted(self.workspace_path.glob(pattern))
+        matches = sorted(m for m in self.workspace_path.glob(pattern) if not self._hidden(m))
         if not matches:
             return "No matching files."
         result = []
         for m in matches[:200]:
             try:
-                self._resolve_path(str(m))
+                self._contained(m, str(m))
                 rel = m.relative_to(self.workspace_path)
                 result.append(str(rel))
             except ValueError:

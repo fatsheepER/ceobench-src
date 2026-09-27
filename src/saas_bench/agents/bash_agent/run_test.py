@@ -676,6 +676,8 @@ __pycache__/
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
+        from .tools import agent_runtime_dir
+        env['CEOBENCH_AGENT_RUNTIME'] = str(agent_runtime_dir())
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
         env['CEOBENCH_CHECKPOINT_TOKEN'] = self._checkpoint_token
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
@@ -715,6 +717,10 @@ __pycache__/
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
+        from .tools import GUEST_WORKSPACE, agent_runtime
+        # Layout 2: fixed guest paths, dedicated agent runtime, no /proc, sessions/ hidden.
+        manifest['agent_sandbox'] = dict(layout=2, workspace=GUEST_WORKSPACE,
+                                         runtime=agent_runtime(verify=True) if shutil.which('bwrap') else None)
         if self.sql_evidence_config:
             manifest['sql_evidence'] = self.sql_evidence_config
         if self.fork_source:
@@ -1278,7 +1284,7 @@ __pycache__/
                     result = self._execute_tool(action.tool, action.arguments or {})
                 except self._NextDayTimeoutError as e:
                     _tool_elapsed = _time.monotonic() - _t0
-                    print(f"\n⚠️  next_week timed out on sim day {sim_day} ({e})")
+                    print(f"\n⚠️  {tool_name} timed out on sim day {sim_day} ({e})")
                     raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
                 _tool_elapsed = _time.monotonic() - _t0
                 _day_tool_total += _tool_elapsed

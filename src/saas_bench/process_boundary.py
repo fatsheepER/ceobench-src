@@ -24,22 +24,18 @@ unknown = None
 children = []
 try:
     if linux:
-        tree = {}
-        for item in os.listdir('/proc'):
-            if not item.isdigit():
-                continue
-            try:
-                fields = open('/proc/' + item + '/stat').read().rsplit(')', 1)[1].split()
-                tree[int(item)] = (int(fields[1]), fields[0])
-            except FileNotFoundError:
-                continue
-        parents = {os.getpid()}
+        # The sandbox has no /proc. As subreaper this process adopts every orphaned
+        # descendant, so a live descendant exists exactly when a child of ours has
+        # not exited. Finished ones are reaped; the first live child is reported.
         while True:
-            found = {pid for pid, (ppid, state) in tree.items() if ppid in parents and state != 'Z'}
-            if found <= parents:
+            try:
+                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
                 break
-            parents |= found
-        children = sorted(parents - {os.getpid()})
+            if info is None:
+                children = ['running']
+                break
+            os.waitpid(info.si_pid, 0)
     else:
         probe = subprocess.Popen(['ps', '-axo', 'pid=,ppid=,pgid=,stat='], stdout=subprocess.PIPE, text=True)
         rows = probe.communicate()[0]
@@ -49,7 +45,7 @@ try:
 except Exception as exc:
     unknown = type(exc).__name__ + ': ' + str(exc)
 channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
-                                coverage='subreaper' if linux else 'process_group')) + '\n').encode())
+                                coverage='subreaper_wait' if linux else 'process_group')) + '\n').encode())
 channel.close()
 if children or unknown:
     while True:
@@ -68,12 +64,12 @@ class BoundaryOpen(RuntimeError):
 
 
 class Boundary:
-    def __init__(self, command):
+    def __init__(self, command, python=sys.executable):
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.listener.listen(1)
         self.key = uuid.uuid4().hex
-        self.command = shlex.join([sys.executable, '-c', SUPERVISOR,
+        self.command = shlex.join([python, '-c', SUPERVISOR,
                                   str(self.listener.getsockname()[1]), self.key, command])
         self.channel = None
         self.record = None
