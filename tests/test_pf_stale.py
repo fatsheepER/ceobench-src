@@ -371,6 +371,9 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
             continue
         result = json.loads(output)
         assert result['stale_check'] == ('performed' if enabled else 'not_performed')
+        # The packed host runtime must contain the refresh module (it was once left out).
+        assert all(item.get('check', {}).get('reason') not in ('refresh_failed', 'refresh_unavailable')
+                   for item in result['items'])
         child._save_checkpoint(7)
         assert business_state(child) == before
         cursor = result['next_cursor']

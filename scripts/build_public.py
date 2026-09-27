@@ -46,6 +46,7 @@ _ENGINE_MODULES = [
     "public_sql",
     "sql_evidence",
     "execution_capture",
+    "pf_refresh",
     "process_boundary",
     "config",
     "customer_llm",
