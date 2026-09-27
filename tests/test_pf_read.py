@@ -40,6 +40,13 @@ def captured_file(executor, content, path='facts.txt'):
     return read(executor, target={'path': path})[2]
 
 
+def external_file(executor, content, path='facts.txt'):
+    """A version the model never wrote: bytes appear via another program, then a Bash boundary."""
+    (executor.workspace_path / path).write_bytes(content.encode())
+    executor.execute('bash', {'command': 'true'})
+    return read(executor, target={'path': path})[2]
+
+
 def sample():
     return ''.join(f'记录 {i:03d}: a useful observation about this business 🙂\r\n' for i in range(100))
 
@@ -173,7 +180,7 @@ def test_missing_base_diff_failed_delivery_and_truncation(workspace, tmp_path):
     first = captured_file(executor, sample())
     old = json.loads(first.split('\n')[0])['target']['version']
     deliver(store, [first])
-    second = captured_file(executor, sample().replace('记录 007', '修改 007'))
+    second = external_file(executor, sample().replace('记录 007', '修改 007'))
     diff = read(executor, target={'path': 'facts.txt'}, baseline={'version': old}, mode='diff')[2]
     _, ledger = deliver(store, [diff])
     assert ledger[0]['mode'] == 'DIFF'

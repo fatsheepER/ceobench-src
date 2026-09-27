@@ -344,10 +344,10 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert set(MODELS) <= {t['name'] for t in child.agent.tool_descriptions}
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        assert re.search(r'\n\[q: v\d+ \| 写: query\.json v\d+\]$', output), output
+        assert re.search(r'\n\[输出: v\d+ \| q: v\d+ \| 写: query\.json v\d+\]$', output), output
         # A non-zero exit still delivered the SQL result and wrote the file.
         failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
-        assert re.search(r'\n\[q: v\d+ \| 写: failed\.json v\d+\]$', failed), failed
+        assert re.search(r'\n\[输出: v\d+ \| q: v\d+ \| 写: failed\.json v\d+\]$', failed), failed
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
         traced = json.loads(child._execute_tool('pf_dependencies', dict(
@@ -366,7 +366,7 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
 def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     output = executor.execute('bash', {'command': 'printf 1 > one.txt; printf 2 > two.txt; exit 1'})
-    assert re.search(r'\n\[写: one\.txt v\d+ two\.txt v\d+\]$', output), output
+    assert re.search(r'\n\[输出: v\d+ \| 写: one\.txt v\d+ two\.txt v\d+\]$', output), output
     many = ' '.join(f'printf {i} > f{i}.txt;' for i in range(10))
     output = executor.execute('bash', {'command': many})
     assert output.endswith(' | 另有 2 项]') and output.count('.txt v') == 8, output
@@ -414,3 +414,31 @@ def test_path_dependents_survive_boundary_snapshots_of_unchanged_bytes(workspace
     (workspace / 'evidence.json').write_text('{"n":8}')
     executor.execute('bash', {'command': 'true'})
     assert query(executor, 'pf_dependents', target={'path': 'evidence.json'})['items'] == []
+
+
+def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offline_runner):
+    """Agents run SDK scripts and read printed summaries, never the raw query response."""
+    runner = offline_runner(text_registration='pf')
+    runner.agent.current_day = 0
+    script = ("cat > calc.py <<'EOF'\nimport novamind_api as nm\n"
+              "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
+    runner._execute_tool('bash', {'command': script})
+    output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
+    footer = re.search(r'\n\[输出: (v\d+) \| q: (v\d+)\]$', output)
+    assert footer and 'ledger rows:' in output, output
+    store = runner.evidence_store
+    settled_request = send(store, output)
+    assert settled_request
+    # The raw query result never reached the model, so SQL alone is still refused, with a pointer.
+    refused = runner._execute_tool('text_create', declaration({'sql': 'SELECT COUNT(*) AS n FROM ledger'}))
+    assert refused.startswith('Error:') and '输出 vN' in refused, refused
+    created = json.loads(runner._execute_tool('text_create', declaration({'version': footer.group(1)})))
+    assert created['evidence'][0]['version'] == footer.group(1)
+    traced = json.loads(runner._execute_tool('pf_dependencies', dict(target={'record': 'r1'}, purpose='current', depth=4)))
+    assert traced['stale_check'] == 'performed'
+    upstream = [i for i in traced['items'] if (i['target'] or {}).get('sql') == 'SELECT COUNT(*) AS n FROM ledger']
+    assert upstream and upstream[0]['kind'] == 'same_execution' and upstream[0]['path'][1] == footer.group(1)
+    assert upstream[0]['check']['version_changed'] is False, json.dumps(upstream[0]['check'])
+    assert upstream[0]['check']['current_version'] != footer.group(2)  # rerun, not reused
+    # The script itself is traced too; interpreter caches and session logs get no handles.
+    assert '__pycache__' not in output and 'sessions/' not in output

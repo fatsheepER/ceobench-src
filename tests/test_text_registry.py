@@ -157,7 +157,9 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     with pytest.raises(ValueError, match='not been delivered'):
         call(registry, 'create', **declaration({'path': 'evidence.json'}))
     request = send(store, text)
-    executor.execute('write_file', {'path': 'evidence.json', 'content': '{"n":8}'})
+    # Bytes from another program: captured at the next Bash boundary but never sent.
+    (workspace / 'evidence.json').write_text('{"n":8}')
+    executor.execute('bash', {'command': 'true'})
     result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
     assert result['evidence'][0] == dict(version='v1', latest='v2', differs=True)
     binding = store.load_state('declaration:r1.1')['references'][0]
@@ -193,17 +195,50 @@ def test_pf_partial_read_selectors_and_latest_delivery_not_latest_capture(worksp
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
 
 
-def test_pf_registered_text_must_be_read_and_retirement_keeps_old_reference(workspace, tmp_path):
+def test_pf_registered_text_cites_directly_like_git_and_retirement_keeps_old_reference(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     call(registry, 'create', **declaration())
-    with pytest.raises(ValueError, match='not been delivered'):
-        call(registry, 'create', **declaration({'record': 'r1.1'}))
-    page = executor.execute('text_list', {})
-    send(store, page)
+    # Design 3.2: registered texts cite each other directly in both groups, unread.
+    result = call(registry, 'create', **declaration({'record': 'r1'}))
+    binding = store.load_state('declaration:r2.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['basis'] == 'registered_text'
+    assert json.loads(store.get_content(binding['version_id'])[1])['version'] == 'r1.1'
+    assert result['evidence'][0]['version'].startswith('v')
+    with pytest.raises(ValueError, match='whole-text'):
+        call(registry, 'create', **declaration(references=[dict(evidence={'record': 'r1.1'}, purpose='current',
+                                                                select={'path': '/text'})]))
+    with pytest.raises(ValueError, match='Unknown registered text'):
+        call(registry, 'create', **declaration({'record': 'r1.9'}))
     call(registry, 'create', **declaration({'record': 'r1.1'}))
     call(registry, 'retire', record='r1', reason='Superseded')
     assert call(registry, 'list')['records'][0]['references'][0]['evidence'] == {'record': 'r1.1'}
     assert len(json.loads(registry.path.read_text())['records']['r1']) == 2
+
+
+def test_pf_files_the_model_wrote_count_as_known_but_script_outputs_do_not(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', {'path': 'plan.json', 'content': '{"price": 99}'})
+    ref = dict(evidence={'path': 'plan.json'}, purpose='current', select={'path': '/price'},
+               predicate=dict(type='threshold', op='>=', value=90))
+    call(registry, 'create', **declaration(references=[ref]))
+    binding = store.load_state('declaration:r1.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['authored_by'] and binding['delivered_in'] == []
+    assert store.get_content(binding['version_id'])[1] == b'{"price": 99}'
+    # A quoted heredoc writes exactly the text in the model's command.
+    executor.execute('bash', {'command': "cat > setup.py <<'EOF'\nPRICE = 9\nEOF"})
+    call(registry, 'create', **declaration({'path': 'setup.py'}))
+    assert store.load_state('declaration:r2.1')['references'][0]['authored_by']
+    # A file computed by a program was neither read nor written by the model.
+    executor.execute('bash', {'command': 'python3 -c "open(\'out.txt\', \'w\').write(str(6 * 7))"'})
+    with pytest.raises(ValueError, match='neither read nor wrote'):
+        call(registry, 'create', **declaration({'path': 'out.txt'}))
+    # A later write by another program: the model's own earlier version stays the binding.
+    (workspace / 'plan.json').write_text('{"price": 79}')
+    executor.execute('bash', {'command': 'true'})
+    call(registry, 'create', **declaration({'path': 'plan.json'}))
+    binding = store.load_state('declaration:r3.1')['references'][0]
+    assert store.get_content(binding['version_id'])[1] == b'{"price": 99}'
+    assert binding['version_id'] != binding['latest_version_id']
 
 
 @pytest.mark.parametrize('delivered', [False, True])

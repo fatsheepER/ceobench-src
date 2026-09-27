@@ -199,13 +199,17 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
     monkeypatch.setattr('saas_bench.text_registry.now', lambda: '2026-09-25T00:00:00Z')
     from saas_bench.text_registry import TextRegistry
     store, prefix, executor = captured(workspace, tmp_path, 'prefix')
+    # Bytes written by another program (not by the model's own tool call) followed by a
+    # Bash boundary, so only reads establish delivery.
     if delivery == 'partial':
-        executor.execute('write_file', {'path': 'evidence.json', 'content': '{\n"n":7,\n"other":8\n}'})
+        (workspace / 'evidence.json').write_text('{\n"n":7,\n"other":8\n}')
+        executor.execute('bash', {'command': 'true'})
         send(store, executor.execute('read_file', {'path': 'evidence.json', 'limit': 2}))
     elif delivery != 'missing':
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))
         if delivery == 'changed':
-            executor.execute('write_file', {'path': 'evidence.json', 'content': '{"n":9}'})
+            (workspace / 'evidence.json').write_text('{"n":9}')
+            executor.execute('bash', {'command': 'true'})
     twin = tmp_path / 'git-twin'
     shutil.copytree(workspace, twin)
     control = TextRegistry(twin, 'git', sim_day=lambda: 7)

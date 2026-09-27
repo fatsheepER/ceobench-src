@@ -296,13 +296,44 @@ class EvidenceResolver:
                 continue
             candidates.append(version)
         if not candidates:
+            if kind == 'query':
+                raise ValueError('No captured query has exactly this SQL text; cite the vN handle shown '
+                                 'after your command instead, or use unknown with a reason')
             raise ValueError('No captured evidence exists; use unknown with a reason')
         latest = candidates[0]
         if accept is not None:
             candidates = [c for c in candidates if accept(c)]
             if not candidates:
                 raise ValueError('The committed bytes were never captured')
+        predicate = reference.get('predicate', {})
+        if kind == 'record':
+            # Registered texts cite each other directly, exactly as in the Git group
+            # (design 3.2); the text is the agent's own declaration, not captured evidence.
+            if reference.get('select') or predicate:
+                raise ValueError('Registered text supports whole-text equality only')
+            wanted_record = evidence.get('record', '')
+            for candidate in candidates:
+                if explicit and candidate != explicit:
+                    continue
+                if '.' in wanted_record and json.loads(self.content(candidate)[1])['version'] != wanted_record:
+                    continue
+                return dict(version_id=candidate, latest_version_id=latest, source_truncated=False,
+                            delivered_in=[], basis='registered_text')
+            raise ValueError('Unknown registered text revision; use unknown with a reason')
+        authored = {c for c in candidates if kind == 'file' and self.authored(c)}
         for occurrence_version, meta in versions:
+            if occurrence_version in authored and not (explicit and occurrence_version != explicit):
+                # The model wrote these exact bytes itself, so it knows the whole file.
+                if predicate.get('type') == 'compare':
+                    raise ValueError('compare requires one query view')
+                text = self.content(occurrence_version)[1].decode('utf-8')
+                content_kind = 'csv' if str(object_id).endswith('.csv') else 'json'
+                selector = reference.get('select')
+                if selector and not str(object_id).endswith(('.csv', '.json')):
+                    raise ValueError('Plain text supports whole-text equality only')
+                return dict(version_id=occurrence_version, latest_version_id=latest, source_truncated=False,
+                            delivered_in=[], authored_by=meta['created_by_event'],
+                            selected_ranges=selected_ranges(text, selector, content_kind))
             if meta['layer'] != 'model_source_occurrences':
                 continue
             event = self.store.read_event(meta['created_by_event'])
@@ -324,14 +355,6 @@ class EvidenceResolver:
                         matches.append((item, content, source_kind))
                 if not matches:
                     continue
-                wanted_record = evidence.get('record', '')
-                if '.' in wanted_record:
-                    record = json.loads(self.content(candidate)[1])
-                    if record['version'] != wanted_record:
-                        continue
-                predicate = reference.get('predicate', {})
-                if kind == 'record' and (reference.get('select') or predicate):
-                    raise ValueError('Registered text supports whole-text equality only')
                 if predicate.get('type') == 'compare' and kind != 'query':
                     raise ValueError('compare requires one query view')
                 selectors = ([predicate['left'], predicate['right']] if predicate.get('type') == 'compare'
@@ -340,7 +363,7 @@ class EvidenceResolver:
                     group = [(item, content) for item, content, _ in matches if item['version_id'] == source_version]
                     text = group[0][1]
                     content_kind = ('csv' if str(object_id).endswith('.csv') else 'json')
-                    if kind == 'file' and not str(object_id).endswith(('.csv', '.json')) and any(selectors):
+                    if kind in ('file', 'other') and not str(object_id).endswith(('.csv', '.json')) and any(selectors):
                         raise ValueError('Plain text supports whole-text equality only')
                     ranges = [r for select in selectors for r in selected_ranges(text, select, content_kind)]
                     if covered(ranges, [item for item, _ in group]):
@@ -351,4 +374,32 @@ class EvidenceResolver:
                                                   for item, _ in group], selected_ranges=ranges)
                 # Never silently fall back to an older, more fully read version.
                 raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
+        if kind == 'query':
+            raise ValueError('Evidence has not been delivered to the model: you saw only what your command '
+                             'printed, not this raw query result. Cite that output by its 输出 vN handle '
+                             '(its queries are traced upstream), or use unknown with a reason')
+        if kind == 'file':
+            raise ValueError('Evidence has not been delivered to the model: you neither read nor wrote this '
+                             'file version. Read it first, cite the 输出 vN handle of the command output '
+                             'you saw, or use unknown with a reason')
         raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
+
+    def authored(self, version):
+        """Whether the model's own tool call contained these exact file bytes.
+
+        write_file writes its content argument verbatim; a Bash command counts only when
+        the complete decoded file text appears in the command the model wrote (for
+        example a quoted heredoc). Script outputs and edits remain unassigned.
+        """
+        meta, raw = self.content(version)
+        if meta['layer'] != 'file_bytes':
+            return False
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+        request = self.store.read_event(meta['created_by_event'])['request']
+        args = request.get('request') or {}
+        if request['kind'] == 'write_file':
+            return args.get('content') == text
+        return request['kind'] == 'bash' and bool(text) and text in (args.get('command') or '')

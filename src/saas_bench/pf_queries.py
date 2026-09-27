@@ -123,6 +123,12 @@ def evidence_key(version, meta, query, result, request):
     return (meta['layer'], meta.get('object_id') or version)
 
 
+def noise(path):
+    """Interpreter caches and CLI session logs are captured but never shown as handles."""
+    parts = path.split('/')
+    return '__pycache__' in parts or parts[0] == 'sessions'
+
+
 class PFQueries:
     def __init__(self, registry, *, stale_checks=True, refresh=None):
         if registry.mode != 'pf':
@@ -150,11 +156,13 @@ class PFQueries:
                 ORDER BY v.rowid''', (capture.event,)).fetchall()
         entries = [('q', None, row[0]) for row in queries]
         entries += [('写', path, after[path]['version']) for path in capture.facts.get('changed_paths', [])
-                    if after and after.get(path, {}).get('version')]
+                    if after and after.get(path, {}).get('version') and not noise(path)]
         if not entries:
             return text
-        # Only displayed entries receive handles: [q: v40 v41 | 写: forecast.json v42].
-        groups = {}
+        # Only displayed entries receive handles: [输出: v43 | q: v40 v41 | 写: forecast.json v42].
+        # 输出 names this exact tool return (saved by capture.finish under a fixed id), so the
+        # printed result of a script can be cited with its queries traced as upstream.
+        groups = {'输出': [self.resolver.handle(capture.event + ':tool_return')]}
         for group, path, version in entries[:8]:
             groups.setdefault(group, []).append((path + ' ' if path else '') + self.resolver.handle(version))
         displayed = [group + ': ' + ' '.join(items) for group, items in groups.items()]
@@ -334,6 +342,10 @@ class PFQueries:
                     item = value.get(path, {})
                     if item.get('version') in self.nodes:
                         execution_outputs[event_id].append(item['version'])
+        for version, row in self.nodes.items():
+            # A command's printed result depends on whatever its execution queried.
+            if row['meta']['layer'] in ('tool_return', 'stdout', 'stderr'):
+                execution_outputs[row['event_id']].append(version)
         for event, outputs in execution_outputs.items():
             for output in outputs:
                 for source in execution_inputs[event]:
