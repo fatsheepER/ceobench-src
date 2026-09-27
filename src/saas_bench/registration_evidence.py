@@ -227,7 +227,7 @@ class EvidenceResolver:
             self.store.save_state(name, handles)
         return next(k for k, v in handles.items() if v == version)
 
-    def resolve(self, evidence, reference):
+    def resolve(self, evidence, reference, accept=None):
         versions = self.versions()
         explicit = None
         if 'version' in evidence:
@@ -264,6 +264,10 @@ class EvidenceResolver:
         if not candidates:
             raise ValueError('No captured evidence exists; use unknown with a reason')
         latest = candidates[0]
+        if accept is not None:
+            candidates = [c for c in candidates if accept(c)]
+            if not candidates:
+                raise ValueError('The committed bytes were never captured')
         for occurrence_version, meta in versions:
             if meta['layer'] != 'model_source_occurrences':
                 continue

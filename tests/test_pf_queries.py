@@ -13,7 +13,7 @@ from saas_bench.sql_evidence import SQLEvidenceStore, encoded
 from test_sql_evidence import identity, request, settled
 from test_text_registry import workspace, captured, call, declaration, send
 from test_public_sql import server
-from test_preflight_integration import offline_runner, packed_public
+from test_preflight_integration import offline_runner, packed_public, advance
 
 
 def query(executor, name, **args):
@@ -330,13 +330,15 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
     prefix.agent.current_day = 0
     prefix._execute_tool('write_file', dict(path='facts.txt', content='prefix evidence'))
     prefix._execute_tool('read_file', dict(path='facts.txt'))
-    prefix._save_checkpoint(0)
+    assert advance(prefix)['success']
+    prefix._save_checkpoint(7)
     prefix._stop_server()
     for mode in ('git', 'pf'):
         child = offline_runner(clone_sql_run(prefix.workspace_dir, tmp_path / mode, mode, text_registration=mode))
         result = child._execute_tool('pf_read', dict(target={'path': 'facts.txt'}))
         if mode == 'git':
             assert result.startswith('Error: Unknown tool')
+            assert child.evidence_store is None and not list(child.workspace_dir.rglob('sql-evidence*'))
             continue
         assert result.split('\n', 1)[1] == 'prefix evidence'
         assert set(MODELS) <= {t['name'] for t in child.agent.tool_descriptions}
@@ -353,7 +355,7 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert any(item['target'].get('sql') == 'SELECT COUNT(*) AS n FROM ledger' for item in traced['items'])
         with closing(child.evidence_store.connect()) as conn:
             assert conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0] == count
-        child._save_checkpoint(0)
+        child._save_checkpoint(7)
         child._stop_server()
         restored = offline_runner(child.workspace_dir)
         header = json.loads(result.split('\n', 1)[0])

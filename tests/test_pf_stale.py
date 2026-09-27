@@ -16,7 +16,7 @@ from saas_bench.sql_evidence import encoded
 from test_text_registry import workspace, captured, call, declaration, send
 from test_pf_queries import query, read
 from test_public_sql import server
-from test_preflight_integration import offline_runner, packed_public, business_state
+from test_preflight_integration import offline_runner, packed_public, business_state, advance
 
 
 def record_sql(store, sql, body, *, parent=None, execution=None):
@@ -348,7 +348,8 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
     prefix = offline_runner(text_registration='prefix')
     prefix.agent.current_day = 0
     prefix._execute_tool('bash', {'command': './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'})
-    prefix._save_checkpoint(0)
+    assert advance(prefix)['success']
+    prefix._save_checkpoint(7)
     prefix._stop_server()
     for mode, enabled in (('pf', True), ('pf', False), ('git', None)):
         branch = 'pf-on' if enabled else 'pf-off' if mode == 'pf' else 'git'
@@ -361,7 +362,7 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
                  "except urllib.error.HTTPError as e: print(e.code)\n")
         child._execute_tool('write_file', dict(path='probe.py', content=probe))
         assert child._execute_tool('bash', dict(command='python -S probe.py')).strip() == '403'
-        child._save_checkpoint(0)
+        child._save_checkpoint(7)
         before = business_state(child)
         args = dict(target={'path': 'query.json'}, include_execution=True, depth=4, limit=1)
         output = child._execute_tool('pf_dependencies', args)
@@ -370,7 +371,7 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
             continue
         result = json.loads(output)
         assert result['stale_check'] == ('performed' if enabled else 'not_performed')
-        child._save_checkpoint(0)
+        child._save_checkpoint(7)
         assert business_state(child) == before
         cursor = result['next_cursor']
         child._stop_server()

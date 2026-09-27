@@ -5,6 +5,7 @@ and file manipulation (read, write, edit, search, glob).
 """
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -164,12 +165,16 @@ BASH_AGENT_TOOL_DEFS = [
 ]
 
 
+# PF groups deliver repeated identical reads of these tools as FULL, DELTA or UNCHANGED.
+DELTA_READ_TOOLS = ('bash', 'read_file', 'search_files')
+
+
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
-        definitions = definitions + tool_definitions()
+        definitions = definitions + tool_definitions(pf=pf_queries)
     if pf_queries:
         from saas_bench.pf_queries import tool_definitions
         definitions = definitions + tool_definitions()
@@ -307,9 +312,14 @@ class BashAgentToolExecutor:
                                {x:v for x,v in after.get(k, {}).items() if x != 'version'})
                 # A failed or timed-out Bash command may still have delivered SQL output or
                 # written files; decorate whatever this execution actually captured.
+                read_key = None
                 if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
-                result = capture.finish(result, status)
+                    if tool_name in DELTA_READ_TOOLS:
+                        # Same tool and same arguments identify one repeatable read (design 3.5).
+                        read_key = ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
+                result = capture.finish(result, status, read_key=read_key,
+                                        read_complete=not capture.facts.get('output_truncated'))
                 if status == 'result_unknown':
                     capture.store.fail('Execution outcome unknown; branch paused')
             if token is not None:
@@ -318,10 +328,21 @@ class BashAgentToolExecutor:
             self.capture = None
         return result
 
-    def _read_text(self, path):
+    def _read_text(self, path, reuse=False):
         from saas_bench.execution_capture import decoded
+        from saas_bench.sql_evidence import digest
         raw = path.read_bytes()
-        raw_version = self.capture.file(str(path.relative_to(self.workspace_path)), raw) if self.capture else None
+        raw_version = None
+        if self.capture and reuse and self.capture.event:
+            # Plain reads of unchanged bytes observe the existing version (same vN handle);
+            # edits keep their own read version as the observed edit input.
+            latest, sha = self.capture.safe(self.capture.store.latest_version,
+                                            str(path.relative_to(self.workspace_path)), 'file_bytes') or (None, None)
+            if latest and sha == digest(raw):
+                self.capture.slots += 1
+                raw_version = latest
+        if self.capture and raw_version is None:
+            raw_version = self.capture.file(str(path.relative_to(self.workspace_path)), raw)
         text = decoded(raw)
         version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version) if self.capture else None
         return text, version
@@ -581,6 +602,7 @@ class BashAgentToolExecutor:
                 self.capture.origins = self._stream_origins(stdout, stderr)
             if len(output) > 30000:
                 if self.capture:
+                    self.capture.facts['output_truncated'] = True
                     from saas_bench.execution_capture import slice_origins
                     marker = '\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n'
                     self.capture.origins = (slice_origins(self.capture.origins, 0, 15000) +
@@ -684,7 +706,7 @@ class BashAgentToolExecutor:
         if not path.is_file():
             return f"Error: Not a file: {args['path']}"
 
-        content, version = self._read_text(path)
+        content, version = self._read_text(path, reuse=True)
         lines = content.split('\n')
 
         offset = args.get('offset', 1)
@@ -774,7 +796,7 @@ class BashAgentToolExecutor:
             if not fpath.is_file():
                 continue
             try:
-                content, version = self._read_text(fpath)
+                content, version = self._read_text(fpath, reuse=True)
                 scanned.append(str(fpath))
             except (UnicodeDecodeError, PermissionError):
                 skipped.append(str(fpath))

@@ -1,4 +1,4 @@
-"""Shared declaration input shapes. Predicates are stored, never evaluated here."""
+"""Declaration input shapes per group. Predicates are stored, never evaluated here."""
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -71,61 +71,69 @@ class Compare(Input):
     right: Selector
 
 
-class Evidence(Input):
-    path: Text | None = None
-    commit: Text | None = None
-    sql: Text | None = None
-    record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
-    version: Annotated[str, Field(pattern=r'^v[1-9][0-9]*$')] | None = None
-    unknown: Text | None = None
-
-    @model_validator(mode='after')
-    def shape(self):
-        if sum(x is not None for x in (self.path, self.sql, self.record, self.version, self.unknown)) != 1:
-            raise ValueError('Specify exactly one of path, sql, record, version, unknown')
-        if self.commit is not None and self.path is None:
-            raise ValueError('commit requires a path')
-        return self
+def _reference_shape(self):
+    if self.predicate is not None and self.predicate.type == 'compare':
+        if self.select is not None:
+            raise ValueError('compare uses left/right selectors, not select')
+        if self.predicate.left.path is not None or self.predicate.right.path is not None:
+            raise ValueError('compare requires two cells of one query result')
+        if self.evidence.path or self.evidence.record:
+            raise ValueError('compare requires a query view')
+    elif self.predicate is not None and self.select is None:
+        raise ValueError('A numeric predicate requires a selector')
+    if self.evidence.record and (self.select or self.predicate):
+        raise ValueError('Registered text supports whole-text equality only')
+    return self
 
 
-class Reference(Input):
-    evidence: Evidence
-    purpose: Literal['current', 'historical_only']
-    select: Selector | None = None
-    predicate: Annotated[Tolerance | Threshold | Compare, Field(discriminator='type')] | None = None
-    note: str | None = None
+def _declaration_models(pf):
+    """Git/prefix inputs expose only Git evidence; PF adds SQL, handles and compare."""
+    class Evidence(Input):
+        path: Text | None = None
+        commit: Text | None = None
+        if pf:
+            sql: Text | None = None
+        record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
+        if pf:
+            version: Annotated[str, Field(pattern=r'^v[1-9][0-9]*$')] | None = None
+        unknown: Text | None = None
 
-    @model_validator(mode='after')
-    def shape(self):
-        if isinstance(self.predicate, Compare):
-            if self.select is not None:
-                raise ValueError('compare uses left/right selectors, not select')
-            if self.predicate.left.path is not None or self.predicate.right.path is not None:
-                raise ValueError('compare requires two cells of one query result')
-            if self.evidence.path or self.evidence.record:
-                raise ValueError('compare requires a query view')
-        elif self.predicate is not None and self.select is None:
-            raise ValueError('A numeric predicate requires a selector')
-        if self.evidence.record and (self.select or self.predicate):
-            raise ValueError('Registered text supports whole-text equality only')
-        return self
+        @model_validator(mode='after')
+        def shape(self):
+            given = [getattr(self, k, None) for k in ('path', 'sql', 'record', 'version', 'unknown')]
+            if sum(x is not None for x in given) != 1:
+                raise ValueError('Specify exactly one of ' + ('path, sql, record, version, unknown' if pf
+                                                               else 'path, record, unknown'))
+            if self.commit is not None and self.path is None:
+                raise ValueError('commit requires a path')
+            return self
 
+    Predicate = Tolerance | Threshold | Compare if pf else Tolerance | Threshold
 
-class Create(Input):
-    text: Text
-    objects: Annotated[list[BusinessObject], Field(min_length=1)]
-    references: list[Reference]
-    applies_at: ContentTime
-    reason: Text
+    class Reference(Input):
+        evidence: Evidence
+        purpose: Literal['current', 'historical_only']
+        select: Selector | None = None
+        predicate: Annotated[Predicate, Field(discriminator='type')] | None = None
+        note: str | None = None
+        shape = model_validator(mode='after')(_reference_shape)
 
+    class Create(Input):
+        text: Text
+        objects: Annotated[list[BusinessObject], Field(min_length=1)]
+        references: list[Reference]
+        applies_at: ContentTime
+        reason: Text
 
-class Revise(Input):
-    record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*$')]
-    reason: Text
-    text: Text | None = None
-    objects: Annotated[list[BusinessObject], Field(min_length=1)] | None = None
-    references: list[Reference] | None = None
-    applies_at: ContentTime | None = None
+    class Revise(Input):
+        record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*$')]
+        reason: Text
+        text: Text | None = None
+        objects: Annotated[list[BusinessObject], Field(min_length=1)] | None = None
+        references: list[Reference] | None = None
+        applies_at: ContentTime | None = None
+
+    return Create, Revise
 
 
 class Retire(Input):
@@ -138,21 +146,40 @@ class ListTexts(Input):
     limit: Annotated[int, Field(ge=1, le=100)] = 20
 
 
-MODELS = dict(create=Create, revise=Revise, retire=Retire, list=ListTexts)
+GIT_CREATE, GIT_REVISE = _declaration_models(pf=False)
+PF_CREATE, PF_REVISE = _declaration_models(pf=True)
+MODELS = dict(git=dict(create=GIT_CREATE, revise=GIT_REVISE, retire=Retire, list=ListTexts),
+              pf=dict(create=PF_CREATE, revise=PF_REVISE, retire=Retire, list=ListTexts))
+MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word for word.
 
 
-def tool_definitions():
+def tool_definitions(pf=False):
+    evidence = ('Evidence uses a workspace path (a bare path binds the version last sent to you; path@commit binds '
+                'that committed file), exact SQL of a query you ran, a vN handle, or a registered text rN / rN.M.'
+                if pf else
+                'Evidence uses a committed file path (a bare path binds HEAD; path@commit or commit selects a commit) '
+                'or a registered text rN / rN.M.')
+    predicates = ('Optional predicates: tolerance amount around the cited value, threshold op/value, or compare '
+                  'left/op/right within one query result. Predicates on current-purpose references are checked '
+                  'when you run pf_dependencies.' if pf else
+                  'Optional predicates: tolerance amount around the cited value, or threshold op/value. '
+                  'Predicates are only stored.')
     descriptions = {
-        'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence in registrations.json. Supply explicit business objects and applicability time; use unknown with a reason when evidence is unavailable. Evidence uses path (optionally path@commit or commit), record, or in PF only sql/version. purpose is current or historical_only. Optional select uses row equality keys and col, or a JSON Pointer path. Optional predicates: tolerance amount around the cited value, threshold op/value, or compare left/op/right within one query result. Predicates are only stored. Notes over 200 characters are truncated. Returns rN and rN.M.',
+        'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence in registrations.json. '
+                  'Supply explicit business objects and applicability time; use unknown with a reason when evidence '
+                  'is unavailable. ' + evidence + ' purpose is current or historical_only. Optional select uses row '
+                  'equality keys and col, or a JSON Pointer path. ' + predicates + ' Notes over 200 characters are '
+                  'truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including existing evidence bindings, stay unchanged. Supplied references replace the entire reference list and are validated anew. Old revisions remain in registrations.json.',
         'retire': 'Stop using a registered text. Append a retired revision with a reason and preserve all history.',
         'list': 'Page through current, active registered texts in creation order. Includes text and reference notes; does not expand references, find reverse links, or check staleness. Pass next_after as after for the next page.',
     }
+    models = MODELS['pf' if pf else 'git']
     return [dict(name='text_' + name, description=descriptions[name], parameters=model.model_json_schema())
-            for name, model in MODELS.items()]
+            for name, model in models.items()]
 
 
-REGISTRATION_PROMPT = '''
+REGISTRATION_COMMON = '''
 
 You may use text_create, text_revise, text_retire and text_list to preserve useful
 hypotheses, forecasts, plans, conclusions and counterevidence across weeks.
@@ -163,14 +190,25 @@ Distinguish acquisition time, the day/interval described by evidence, and when
 you read it. Use an explicit unknown reason when applicability is unclear.
 Dashboard normally reflects the previous weekly advance. After changing settings
 within a week, use the corresponding public query to obtain current settings.
-Git file references require a path present in a commit. A path alone binds HEAD;
-path@commit accepts a unique commit prefix. Commit new files yourself or wait for
-the weekly commit. Registration never commits or copies cited file contents.
 Registered texts can cite each other directly using rN.M, including before a Git
 commit. A bare rN binds its current revision; later revisions do not change that
 reference. Revise with omitted references to preserve the original bindings.
-In PF, a path or SQL defaults to the last version actually sent to your model,
-not the latest captured version. Only already delivered evidence and selected
-ranges can be cited. Optional vN handles identify versions; use a path if a handle
-is unavailable. An unknown reference with a reason is always allowed.
+An unknown reference with a reason is always allowed.
 '''
+
+GIT_EVIDENCE_RULES = '''File references require a path present in a commit. A path alone binds HEAD;
+path@commit accepts a unique commit prefix. Commit new files yourself or wait for
+the weekly commit. Registration never commits or copies cited file contents.
+'''
+
+PF_EVIDENCE_RULES = '''A bare file path binds the version of that file last sent to your model, not the
+latest version or HEAD. path@commit (a unique commit prefix) binds that committed
+file as in Git and also records whether those exact bytes were sent to you. Exact
+SQL binds the last delivered result of that query; optional vN handles identify
+exact versions, and a path works when a handle is unavailable. Only already
+delivered evidence and selected ranges can be cited as versions.
+'''
+
+
+def registration_prompt(pf=False):
+    return REGISTRATION_COMMON + (PF_EVIDENCE_RULES if pf else GIT_EVIDENCE_RULES)

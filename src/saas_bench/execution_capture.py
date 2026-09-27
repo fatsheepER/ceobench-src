@@ -1,6 +1,7 @@
 """Host-only execution capture. Public clients never import this module."""
 from contextvars import ContextVar
 from contextlib import closing
+import fnmatch
 import io
 import json
 import os
@@ -20,6 +21,15 @@ OBJECT_FIELDS = dict(project_id='research_project', customer_id='customer', grou
                      plan='plan', channel='ad_channel')
 READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
                         'get_market_overview', 'get_group_insights'})
+_EXCLUSION_PARTS = [tuple(pattern.split('/')) for pattern in EXCLUSIONS]
+
+
+def excluded(rel):
+    """Right-anchored, per-segment glob, exactly as PurePosixPath(rel).match(pattern)."""
+    parts = rel.split('/')
+    return any(len(parts) >= len(pattern) and
+               all(fnmatch.fnmatchcase(part, glob) for part, glob in zip(parts[-len(pattern):], pattern))
+               for pattern in _EXCLUSION_PARTS)
 
 
 class CapturedText(str):
@@ -78,17 +88,26 @@ class ExecutionCapture:
 
     def snapshot(self, workspace, phase):
         started = time.monotonic()
+        with self.store.batch():
+            items = self._snapshot(workspace, phase)
+        self.facts[phase + '_scan_seconds'] = time.monotonic() - started
+        return items
+
+    def _snapshot(self, workspace, phase):
         items = {}
-        root = Path(workspace).resolve()
-        # ponytail: full boundary walk; replace with an index only after measuring scan cost.
+        reused = 0
+        root = str(Path(workspace).resolve())
+        # Every file is read and hashed on each boundary (no mtime shortcut); only bytes
+        # that differ from the newest visible version of the path get a new version.
         for directory, dirs, files in os.walk(root, followlinks=False):
+            prefix = '' if directory == root else directory[len(root) + 1:] + '/'
             for name in sorted(dirs + files):
-                path = Path(directory) / name
-                rel = path.relative_to(root).as_posix()
-                if any(Path(rel).match(pattern) for pattern in EXCLUSIONS):
+                path = directory + '/' + name
+                rel = prefix + name
+                if excluded(rel):
                     items[rel] = {'type': 'excluded', 'reason': 'simulator_private_state'}
                     continue
-                info = path.lstat()
+                info = os.lstat(path)
                 item = dict(mode=info.st_mode, size=info.st_size)
                 if stat.S_ISLNK(info.st_mode):
                     item.update(type='symlink', target=os.readlink(path))
@@ -102,21 +121,35 @@ class ExecutionCapture:
                         after = os.fstat(stream.fileno())
                     if (info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
                         raise RuntimeError('File changed during boundary capture: ' + rel)
-                    item.update(type='file', sha256=digest(raw), version=self.file(rel, raw, phase=phase))
+                    sha = digest(raw)
+                    version, latest_sha = self.store.latest_version(rel, 'file_bytes') if self.event else (None, None)
+                    if version and latest_sha == sha:
+                        reused += 1
+                    else:
+                        version = self.file(rel, raw, phase=phase)
+                    item.update(type='file', sha256=sha, version=version)
                 else:
                     item['type'] = 'directory' if stat.S_ISDIR(info.st_mode) else 'special'
                 items[rel] = item
-        self.blob('workspace_' + phase, encoded(items), 'workspace_boundary', exclusions=EXCLUSIONS)
-        self.facts[phase + '_scan_seconds'] = time.monotonic() - started
+        self.blob('workspace_' + phase, encoded(items), 'workspace_boundary', exclusions=EXCLUSIONS,
+                  reused_file_versions=reused)
         return items
 
-    def finish(self, text, status='succeeded', **facts):
+    def finish(self, text, status='succeeded', read_key=None, read_complete=True, **facts):
         version = self.blob('tool_return', text, 'tool_return', segments=self.origins) if text is not None else None
+        pf_read = getattr(text, 'pf_read', None)
+        if read_key and version:
+            # The exact tool return is the read target; repeated identical calls in one
+            # request context can then be delivered as DELTA or UNCHANGED.
+            read = self.blob('read_full', text, 'pf_read_full', target=version, key=read_key, mode='content',
+                             read_range=[0, len(text)], complete=read_complete, force_full=False,
+                             read_kind='tool_call')
+            pf_read = {'id': read} if read else pf_read
         self.facts.update(facts)
         if self.event:
             self.safe(self.store.complete, self.event, status, **self.facts)
         origins = [origin(version, text)] if version else []
-        return CapturedText(text, origins + self.origins, getattr(text, 'pf_read', None)) if text is not None else None
+        return CapturedText(text, origins + self.origins, pf_read) if text is not None else None
 
 
 def capture_http(handler, raw):
@@ -408,6 +441,13 @@ def restore_sources(value, records):
 
 def model_request(store, raw, sources, call_id, attempt_id, context_id):
     event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id))
+    # One transaction for the wire, occurrences and every read of this request.
+    with store.batch():
+        _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id)
+    return event
+
+
+def _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id):
     store.version(event, 'wire', raw, layer='model_request_wire')
     body = json.loads(raw)
     occurrences = []
@@ -431,7 +471,6 @@ def model_request(store, raw, sources, call_id, attempt_id, context_id):
     if any(source.get('pf_read') for source in sources):
         from .pf_read import record_request
         record_request(store, event, body, sources, context_id)
-    return event
 
 
 def registered_scripts(api, scripts, before, registration=None):

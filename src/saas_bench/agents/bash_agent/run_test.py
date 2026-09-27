@@ -94,6 +94,7 @@ class BashAgentRunner:
         execution_capture: Optional[bool] = None,
         text_registration: Optional[str] = None,
         pf_stale_checks: Optional[bool] = None,
+        stop_after_day: Optional[int] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -158,7 +159,7 @@ class BashAgentRunner:
             raise ValueError('Invalid run kind')
         seed = 42 if seed is None else seed
         scenario = 'default' if scenario is None else scenario
-        total_days = 3650 if total_days is None else total_days
+        total_days = default_config.total_days if total_days is None else total_days
         initial_cash = 1_000_000.0 if initial_cash is None else initial_cash
         self.model = model or default_config.agent_llm_model
         self.provider = provider or default_config.agent_llm_provider
@@ -168,6 +169,12 @@ class BashAgentRunner:
         # week boundary (no partial trailing week). e.g. 500 -> 497.
         self.total_days = (total_days // 7) * 7
         self.initial_cash = initial_cash
+        # Harness-only stop at a completed week: never shown to the Agent and not part of
+        # the effective configuration, so a stopped prefix can be forked and continued.
+        if stop_after_day is not None and (stop_after_day <= 0 or stop_after_day % 7 or
+                                           stop_after_day >= self.total_days):
+            raise ValueError('stop_after_day must be a whole week before the configured end')
+        self.stop_after_day = stop_after_day
         self.reasoning_effort = reasoning_effort or default_config.agent_llm_reasoning_effort
         self.continue_from = continue_from
         self.label = label  # Optional human-readable variant tag — surfaced on the dashboard
@@ -202,6 +209,7 @@ class BashAgentRunner:
         # Agent working directory (inside the run directory)
         self.agent_workspace = self.workspace_dir / "agent_workspace"
         from saas_bench.sql_evidence import FORMAT
+        self.fork_source = saved_manifest.get('fork_source') if continue_from else None
         self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
             dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
                  data_source_id=uuid.uuid4().hex) if sql_capture else None)
@@ -709,6 +717,8 @@ __pycache__/
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
         if self.sql_evidence_config:
             manifest['sql_evidence'] = self.sql_evidence_config
+        if self.fork_source:
+            manifest['fork_source'] = self.fork_source
         if self.text_registration != 'off':
             manifest['text_registration'] = self.text_registration
         if self.text_registration == 'pf':
@@ -901,6 +911,13 @@ __pycache__/
                 expected_manifest['text_registration'] = 'prefix'
                 expected_manifest.pop('pf_stale_checks', None)
                 expected_manifest.pop('pf_read_tokenizer', None)
+        if self.fork_source and saved_manifest.get('text_registration') == 'prefix':
+            from saas_bench.run_state import file_hash
+            if file_hash(directory / 'manifest.json') != self.fork_source['source_manifest_sha256']:
+                raise ValueError('Clone source manifest mismatch')
+            expected_manifest.pop('fork_source')
+            expected_manifest['sql_evidence'] = saved_manifest.get('sql_evidence')
+            expected_manifest['text_registration'] = 'prefix'
         if saved_manifest != expected_manifest:
             raise ValueError('Checkpoint configuration differs from run manifest')
         if self.sql_evidence_config:
@@ -1413,6 +1430,15 @@ __pycache__/
 
             # Save checkpoint (use actual sim day, not harness loop counter)
             self._save_checkpoint(sim_day)
+            if self.stop_after_day is not None and sim_day >= self.stop_after_day and _cash >= 0:
+                checkpoint = self._load_checkpoint()
+                if sim_day != self.stop_after_day or checkpoint['context_boundary'] != 'new_week':
+                    raise RuntimeError('Harness stop did not land on the requested week boundary')
+                game_ended = True
+                game_outcome = 'stopped'
+                if verbose:
+                    print(f"\n⏸ Harness stop at sim day {sim_day} (configured end: {self.total_days})")
+                break
 
             # Check bankruptcy
             if _cash < 0:
@@ -1487,7 +1513,9 @@ def main():
     parser.add_argument("--base-url", help="Custom API base URL")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (new run: 42)")
     parser.add_argument("--scenario", default=None, help="Scenario name (new run: default)")
-    parser.add_argument("--days", type=int, default=None, help="Total simulation days (new run: 3650)")
+    parser.add_argument("--days", type=int, default=None, help="Total simulation days shown to the agent (new run: 500)")
+    parser.add_argument('--stop-after-day', type=int, default=None,
+                        help='Harness-only stop after this completed week; the agent still sees --days')
     parser.add_argument("--workspace", type=Path, help="Workspace base directory")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     parser.add_argument("--reasoning-effort",
@@ -1528,6 +1556,7 @@ def main():
         pricing_file=args.pricing_file,
         sql_capture=args.sql_capture, execution_capture=args.execution_capture, text_registration=args.text_registration,
         pf_stale_checks=args.pf_stale_checks,
+        stop_after_day=args.stop_after_day,
     )
 
     result = runner.run(verbose=not args.quiet)

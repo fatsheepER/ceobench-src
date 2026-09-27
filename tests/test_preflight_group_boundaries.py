@@ -78,7 +78,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     import httpx
     from openai import OpenAI
     from anthropic import Anthropic
-    from saas_bench.registration_schema import REGISTRATION_PROMPT
+    from saas_bench.registration_schema import registration_prompt
     from saas_bench.pf_queries import PF_PROMPT, MODELS
     from saas_bench.model_usage import ModelUsage
     store, registry, executor = captured(workspace, tmp_path, mode if mode != 'off' else 'git')
@@ -104,7 +104,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             return value
         first = new_agent()
         assert first.act('dashboard', 0, False, {'day': 0}).tool == 'read_file'
-        base = original_prompt(42) + (REGISTRATION_PROMPT if mode != 'off' else '')
+        base = original_prompt(42) + (registration_prompt(pf=mode == 'pf') if mode != 'off' else '')
         if mode == 'pf':
             base += PF_PROMPT
         expected = (base + '\n\n## Your MEMORY.md (auto-loaded)\n\n'
@@ -295,14 +295,17 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
         assert not list(child.agent_workspace.rglob('*.sqlite'))
         assert not re.search(r'(?i)(evidence|provenance|bindings).*\.sqlite', child._git('ls-tree', '-r', '--name-only', 'HEAD').stdout)
         probes = {}
-        private_paths = [child.evidence_store.path, prefix.evidence_store.path,
-                         snapshot / 'sql-evidence.sqlite', child.workspace_dir / 'manifest.json']
+        if mode == 'git':
+            # The Git branch neither captures nor receives the prefix evidence database.
+            assert child.evidence_store is None and not list(child.workspace_dir.rglob('sql-evidence*'))
+        private_paths = [path for path in (child.evidence_store and child.evidence_store.path, prefix.evidence_store.path,
+                         snapshot / 'sql-evidence.sqlite', child.workspace_dir / 'manifest.json') if path]
         for i, path in enumerate(private_paths):
             probes[f'bash_read_{i}'] = child._execute_tool('bash', {'command': 'cat ' + shlex.quote(str(path))})
             assert '[exit code:' in probes[f'bash_read_{i}']
             assert binding['version_id'] not in probes[f'bash_read_{i}']
             assert child._execute_tool('read_file', {'path': str(path)}).startswith('Error: Path escapes workspace')
-        child._execute_tool('bash', {'command': 'ln -s ' + shlex.quote(str(child.evidence_store.path)) + ' private-link'})
+        child._execute_tool('bash', {'command': 'ln -s ' + shlex.quote(str(private_paths[0])) + ' private-link'})
         assert child._execute_tool('read_file', {'path': 'private-link'}).startswith('Error: Path escapes workspace')
         assert 'private-link:' not in child._execute_tool('search_files', {'pattern': '.', 'glob': 'private-link'})
         child._execute_tool('bash', {'command': 'rm private-link'})

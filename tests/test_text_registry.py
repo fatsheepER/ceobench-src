@@ -12,7 +12,7 @@ from saas_bench.sql_evidence import SQLEvidenceStore
 from saas_bench.text_registry import TextRegistry
 from test_sql_evidence import identity
 from test_public_sql import server
-from test_preflight_integration import offline_runner, packed_public
+from test_preflight_integration import offline_runner, packed_public, advance
 
 
 def git(ws, *args):
@@ -278,7 +278,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
     from openai import OpenAI
     from anthropic import Anthropic
     from saas_bench.agents.bash_agent.agent import BashAgent
-    from saas_bench.registration_schema import REGISTRATION_PROMPT
+    from saas_bench.registration_schema import registration_prompt
     from test_preflight_usage import reply
     requests = []
     def handle(request):
@@ -304,7 +304,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         original = BashAgent(get_bash_agent_tool_descriptions(), client, workspace_path=workspace)
         enhanced = BashAgent(get_bash_agent_tool_descriptions(True), client, workspace_path=workspace,
                              text_registration=True, reasoning_effort='low' if api == 'responses' else None)
-        assert enhanced.system_prompt == original.system_prompt + REGISTRATION_PROMPT
+        assert enhanced.system_prompt == original.system_prompt + registration_prompt(pf=False)
         assert enhanced.act('dashboard', 0, False, {'day': 0}).tool == 'text_list'
         request = requests[-1]
         tools = [t.get('function', t) for t in request['tools']]
@@ -349,7 +349,10 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     restored = offline_runner(runner.workspace_dir)
     assert restored.text_registration == 'prefix'
     assert restored._execute_tool('text_list', {}) == page
-    restored._save_checkpoint(0)
+    # Group forks start at a completed week boundary (design 4.3).
+    assert advance(restored)['success']
+    restored._commit_weeks_up_to(7)
+    restored._save_checkpoint(7)
     children = [offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / mode, mode,
                                            text_registration=mode)) for mode in ('git', 'pf')]
     for child in children:
@@ -361,11 +364,14 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
             assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
         else:
             assert history.startswith('Error: Unknown tool')
-        # The only copy of resolved evidence identities is outside the workspace.
+        # The only copy of resolved evidence identities is outside the workspace; a Git
+        # branch neither captures nor receives the prefix evidence.
         assert not list(child.agent_workspace.rglob('*evidence.sqlite'))
-        private = child.workspace_dir / 'sql-evidence.sqlite'
+        if child.text_registration == 'git':
+            assert child.evidence_store is None and not list(child.workspace_dir.rglob('sql-evidence*'))
+        private = restored.workspace_dir / 'sql-evidence.sqlite'
         assert '[exit code:' in child._execute_tool('bash', {'command': 'cat ' + str(private)})
-        child._save_checkpoint(0)
+        child._save_checkpoint(7)
     assert json.loads(restored._execute_tool('text_list', {}))['records'][0]['id'] == 'r1'
     import os
     if destination := os.environ.get('CEOBENCH_REGISTRATION_ARTIFACTS'):
@@ -374,7 +380,8 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
             target = output / branch.text_registration
             target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(branch.agent_workspace / 'registrations.json', target / 'registrations.json')
-            branch.evidence_store.snapshot(target / 'evidence.sqlite')
+            if branch.evidence_store:
+                branch.evidence_store.snapshot(target / 'evidence.sqlite')
         (output / 'validation.json').write_text(json.dumps(dict(
             evidence_kind='constructed_offline_integration', external_model_calls=0,
             stages=['packed CLI', 'captured file read', 'model send', 'declaration',

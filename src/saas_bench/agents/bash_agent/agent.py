@@ -97,10 +97,11 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
+        pf_tools = any(t['name'] == 'pf_dependencies' for t in tool_descriptions)
         if text_registration:
-            from saas_bench.registration_schema import REGISTRATION_PROMPT
-            self.system_prompt += REGISTRATION_PROMPT
-        if any(t['name'] == 'pf_dependencies' for t in tool_descriptions):
+            from saas_bench.registration_schema import registration_prompt
+            self.system_prompt += registration_prompt(pf=pf_tools)
+        if pf_tools:
             from saas_bench.pf_queries import PF_PROMPT
             self.system_prompt += PF_PROMPT
 

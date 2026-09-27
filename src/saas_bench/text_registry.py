@@ -38,7 +38,7 @@ class TextRegistry:
 
     def execute(self, operation, args):
         try:
-            values = MODELS[operation].model_validate(args).model_dump(exclude_none=True)
+            values = MODELS[self.mode][operation].model_validate(args).model_dump(exclude_none=True)
         except ValidationError as exc:
             # Do not echo the submitted value: it can contain long private identifiers.
             errors = ['.'.join(map(str, e['loc'])) + ': ' + e['msg'] for e in exc.errors(include_input=False)]
@@ -114,7 +114,9 @@ class TextRegistry:
             if target is None:
                 raise ValueError('Unknown registered text revision; use unknown with a reason')
             evidence['record'] = target['version']
-        elif self.mode in ('git', 'prefix'):
+        elif self.mode in ('git', 'prefix') or (
+                'path' in evidence and ('commit' in evidence or '@' in evidence['path'])):
+            # PF keeps the Git group's committed-file references (design 4.1).
             if 'path' not in evidence:
                 raise ValueError('Git references require a committed path, or unknown with a reason')
             ref['evidence'], full = git_reference(self.workspace, evidence)
@@ -124,32 +126,50 @@ class TextRegistry:
             path = Path(evidence['path'])
             if path.is_absolute() or '..' in path.parts or path.as_posix() != evidence['path']:
                 raise ValueError('Evidence path must be workspace-relative')
-            if 'commit' in evidence or '@' in evidence['path']:
-                raise ValueError('PF paths use delivered captured versions; omit commit or use a version handle')
         binding = dict(status='git', git_commit=full) if full else dict(status='registered_text', **evidence)
         if self.mode == 'git':
             return binding
+        accept = None
+        if full:
+            # Keep the Git identity distinct from the delivered PF version. Bind only a
+            # delivered capture whose bytes hash to that committed blob.
+            blob = subprocess.check_output(['git', '-C', str(self.workspace), 'rev-parse',
+                full + ':' + ref['evidence']['path']], text=True).strip()
+            def accept(version):
+                raw = self.store.get_content(version)[1]
+                return blob == subprocess.check_output(['git', '-C', str(self.workspace), 'hash-object', '--stdin'],
+                                                       input=raw).decode().strip()
         try:
-            binding.update(self.resolver.resolve(ref['evidence'], ref), status='resolved')
-            if full:
-                # Keep the Git identity distinct from the delivered PF version. Establish
-                # an exact correspondence only if the captured bytes hash to that blob.
-                blob = subprocess.check_output(['git', '-C', str(self.workspace), 'rev-parse',
-                    full + ':' + ref['evidence']['path']], text=True).strip()
-                raw = self.store.get_content(binding['version_id'])[1]
-                captured_blob = subprocess.check_output(['git', '-C', str(self.workspace), 'hash-object', '--stdin'], input=raw).decode().strip()
-                binding['git_content_matches'] = blob == captured_blob
+            try:
+                binding.update(self.resolver.resolve(ref['evidence'], ref, accept=accept), status='resolved')
+                if full:
+                    binding['git_content_matches'] = True
+            except ValueError:
+                if not full:
+                    raise
+                # No delivered capture has the committed bytes: record the last delivered
+                # version and the mismatch, which traversal reports as a missing edge.
+                binding.update(self.resolver.resolve(ref['evidence'], ref), status='resolved',
+                               git_content_matches=False)
         except ValueError as exc:
-            if self.mode == 'pf':
+            if self.mode == 'pf' and not full:
                 raise
-            # Prefix results never disclose whether the private match succeeded.
+            # A committed-file reference stays valid as in Git; prefix results never
+            # disclose whether the private match succeeded.
             binding.update(status='unknown', reason=str(exc))
         return binding
 
     def _display_binding(self, binding):
+        shown = dict(commit=binding['git_commit'][:7]) if binding.get('git_commit') else {}
+        if binding.get('status') == 'registered_text':
+            return dict(record=binding['record'])
+        if binding.get('git_content_matches') is False:
+            return dict(shown, status='commit_only', reason='The committed bytes were not sent to your model',
+                        delivered=self.resolver.handle(binding['version_id']))
         if binding.get('status') != 'resolved':
-            return dict(status='unknown', reason=binding.get('reason', 'not_captured_in_prefix'))
-        return dict(version=self.resolver.handle(binding['version_id']),
+            status = 'commit_only' if binding.get('git_commit') else 'unknown'
+            return dict(shown, status=status, reason=binding.get('reason', 'not_captured_in_prefix'))
+        return dict(shown, version=self.resolver.handle(binding['version_id']),
                     latest=self.resolver.handle(binding['latest_version_id']),
                     differs=binding['version_id'] != binding['latest_version_id'])
 

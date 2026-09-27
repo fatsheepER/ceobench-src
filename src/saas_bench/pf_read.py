@@ -2,6 +2,7 @@
 from collections import Counter
 from contextlib import closing
 import difflib
+import hashlib
 from itertools import accumulate
 import json
 
@@ -61,14 +62,39 @@ def _compact(full, mode, handle, edits):
     return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
 
 
+def _compact_tool(mode, target_handle, edits):
+    """Compact form of a repeated identical tool call; the base is its previous result."""
+    header = dict(delivery=mode, base='previous_same_call', target=target_handle)
+    if mode == 'DELTA':
+        header['patch_format'] = 'unicode-replacements-v1'
+    return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
+
+
+def _payload(meta, full, mode, delivery):
+    if meta.get('read_kind') == 'tool_call':
+        return _compact_tool(mode, delivery['target_handle'], delivery['edits'])
+    return _compact(full, mode, delivery['base_handle'], delivery['edits'])
+
+
+_COUNTS = {}
+
+
 def _count(counter, text):
     if counter is None:
         return None
+    # Every tool return in the context is counted per request; cache successful counts.
+    key = (id(counter), json.dumps(counter.metadata, sort_keys=True, default=str),
+           hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest())
+    if key in _COUNTS:
+        return _COUNTS[key]
     try:
         value = counter.count(text)
-        return value if type(value) is int and value >= 0 else None
     except Exception:
         return None
+    if type(value) is not int or value < 0:
+        return None
+    _COUNTS[key] = value
+    return value
 
 
 def _literal_bases(store, source, available):
@@ -122,9 +148,16 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     previous, last_seq, prior_seq = recent
     spent_key = 'pf_read_recovered:' + store.identity['branch_id'] + ':' + context
     spent = store.load_state(spent_key) or []
+    tool = meta.get('read_kind') == 'tool_call'
+    # A tool call is identified by tool and arguments; a PF read by target and range.
+    mark = json.dumps(meta['key']) if tool else meta['target']
+    target_sha = store.get_content(meta['target'])[0]['blob_sha256'] if tool else None
     for item in reversed(previous):
-        if (item['mode'] not in ('DELTA', 'UNCHANGED') or item['target'] != meta['target']
-                or item['range'] != meta['read_range'] or item['read_id'] == read_id):
+        # A repeated tool call only recovers the compact result if it returns the same text;
+        # a rerun whose output changed is an ordinary new read.
+        same = (item.get('key') == meta['key'] and store.get_content(item['target'])[0]['blob_sha256'] == target_sha
+                if tool else item['target'] == meta['target'] and item['range'] == meta['read_range'])
+        if item['mode'] not in ('DELTA', 'UNCHANGED') or not same or item['read_id'] == read_id:
             continue
         old_meta, _ = store.get_content(item['read_id'])
         old = store.read_event(old_meta['created_by_event'])['request']
@@ -133,9 +166,9 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         adjacent = adjacent and prior_seq < old['seq'] < last_seq < current['seq']
         # Only a compact read delivered in the immediately preceding request is recovered;
         # an explicit full read elsewhere is an ordinary FULL read without pairing.
-        if adjacent and (meta['force_full'] or meta['target'] not in spent):
+        if adjacent and (meta['force_full'] or mark not in spent):
             if item['read_id'] not in spent:
-                store.save_state(spent_key, [*spent, item['read_id'], meta['target']])
+                store.save_state(spent_key, [*spent, item['read_id'], mark])
                 return dict(choice, reason='requested_full' if meta['force_full'] else 'adjacent_recovery',
                             recovery_of=item['read_id'])
     if meta['force_full']:
@@ -157,9 +190,12 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     if not valid:
         return dict(choice, reason='delta_verification_failed')
     handles = store.load_state(HANDLES) or {}
-    handle = next((k for k, v in handles.items() if v == base), 'v' + str(len(handles) + 1))
+    # Tool-call reads name their own target (for pf_read full text); PF reads name the base.
+    named = meta['target'] if tool else base
+    handle = next((k for k, v in handles.items() if v == named), 'v' + str(len(handles) + 1))
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
-    payload = _compact(full, mode, handle, edits)
+    labels = (dict(base_handle='previous_same_call', target_handle=handle) if tool else dict(base_handle=handle))
+    payload = _payload(meta, full, mode, dict(labels, edits=edits))
     tokens = _count(counter, payload)
     choice['candidate_tokens'][mode] = tokens
     if tokens is None:
@@ -167,10 +203,10 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     if tokens >= full_tokens:
         return dict(choice, reason='compact_not_smaller')
     from .registration_evidence import EvidenceResolver
-    if EvidenceResolver(store).handle(base) != handle:
+    if EvidenceResolver(store).handle(named) != handle:
         raise RuntimeError('Read baseline handle changed')
     return dict(choice, mode=mode, reason='unchanged' if mode == 'UNCHANGED' else 'delta_smaller',
-                payload=payload, base=base, base_handle=handle, edits=edits)
+                payload=payload, base=base, edits=edits, **labels)
 
 
 def _replace(request, pointer, value):
@@ -219,14 +255,25 @@ def prepare_request(store, request, context_id, counter):
             else:
                 chain = base['chain']
         actual = delivery.pop('payload')
+        tool = meta.get('read_kind') == 'tool_call'
         delivery.update(read_id=read_id, target=meta['target'], range=meta['read_range'],
                         full_version=read_id, complete=meta['complete'], context_id=context_id,
                         actual_tokens=_count(counter, actual), full_tokens=_count(counter, full),
-                        tokenizer=counter.metadata if counter else None, chain=chain)
-        prefix = actual.index('\n') + 1
-        origins = ([origin(meta['target'], target, *meta['read_range'], prefix)]
-                   if delivery['mode'] == 'FULL' else [])
-        value = CapturedText(actual, origins, dict(id=read_id, delivery=delivery))
+                        tokenizer=counter.metadata if counter else None, chain=chain,
+                        key=meta['key'], read_kind=meta.get('read_kind', 'pf_read'))
+        pf = dict(id=read_id, delivery=delivery)
+        if tool:
+            # Keep the tool return's own evidence origins (files, SQL, streams): they are
+            # delivered literally when FULL and by exact reconstruction otherwise.
+            origins = list(source['origins']) if delivery['mode'] == 'FULL' else []
+            pf['source_origins'] = source['origins']
+            if delivery['mode'] == 'FULL':
+                _literal_bases(store, source, available)
+        else:
+            prefix = actual.index('\n') + 1
+            origins = ([origin(meta['target'], target, *meta['read_range'], prefix)]
+                       if delivery['mode'] == 'FULL' else [])
+        value = CapturedText(actual, origins, pf)
         replacements.append((source['pointer'], at_pointer(request, source['pointer']), value))
         if meta['complete']:
             available[meta['target']] = dict(text=target, key=meta['key'], chain=[
@@ -264,26 +311,36 @@ def record_request(store, event, body, sources, context):
         meta, full = store.get_content(read_id)
         full = full.decode('utf-8')
         actual = at_pointer(body, source['pointer'])
+        tool = meta.get('read_kind') == 'tool_call'
         delivery = source['pf_read'].get('delivery') or dict(
             read_id=read_id, target=meta['target'], range=meta['read_range'], full_version=read_id,
             mode='FULL' if meta['mode'] == 'content' else 'DIFF', reason='not_prepared',
-            actual_tokens=None, full_tokens=None, tokenizer=None, recovery_of=None, materialization=False)
+            actual_tokens=None, full_tokens=None, tokenizer=None, recovery_of=None, materialization=False,
+            key=meta['key'], read_kind=meta.get('read_kind', 'pf_read'))
         target = store.get_content(meta['target'])[1].decode('utf-8')
         chain = []
         if delivery['mode'] in ('DELTA', 'UNCHANGED'):
             base = available.get(delivery['base'])
             if (not meta['complete'] or base is None or
                     apply_delta(base['text'], delivery['edits']) != target or
-                    actual != _compact(full, delivery['mode'], delivery['base_handle'], delivery['edits'])):
+                    actual != _payload(meta, full, delivery['mode'], delivery)):
                 raise ValueError('Compact PF read cannot be reconstructed from the final request')
             chain = base['chain']
-            reconstructed.append(dict(version_id=meta['target'], source_range=[0, len(target)],
-                request_range=[0, len(actual)], full_source=False, reconstructible=True,
+            common = dict(request_range=[0, len(actual)], reconstructible=True,
                 representation=delivery['mode'], reconstructed_from=chain, read_id=read_id,
                 reader='ceo', context_id=context, json_pointer=source['pointer'],
-                send_state_event_id=event))
+                send_state_event_id=event)
+            if tool:
+                reconstructed.extend(dict(common, version_id=item['version_id'], source_range=item['source_range'],
+                                          full_source=item['full_source'])
+                                     for item in source['pf_read'].get('source_origins', []))
+            else:
+                reconstructed.append(dict(common, version_id=meta['target'], source_range=[0, len(target)],
+                                          full_source=False))
         elif actual != full:
             raise ValueError('PF full response differs from saved evidence')
+        elif tool:
+            _literal_bases(store, source, available)
         read = dict(delivery, context_id=context, json_pointer=source['pointer'],
                     message_id=_message_id(body, source['pointer'], event), chain=chain)
         read['actual_version'] = store.version(event, 'pf_payload_' + str(len(reads)), actual, layer='pf_read_payload')
@@ -336,6 +393,7 @@ def accounting(store):
             materialized += actual
     first = {item['read_id']: item for item in reversed(reads)}
     return dict(reads=len(first), occurrences=len(reads), excluded_occurrences=dict(excluded),
+        read_kinds=dict(Counter(v.get('read_kind', 'pf_read') for v in first.values())),
         read_modes=dict(Counter(v['mode'] for v in first.values())),
         occurrence_modes=dict(Counter(v['mode'] for v in reads)),
         reasons=dict(Counter(v['reason'] for v in reads)), recovery_pairs=len(paired),

@@ -114,7 +114,12 @@ def checkpoint_directory(run, checkpoint):
         raise ValueError('Checkpoint workspace checksum mismatch')
     evidence = checkpoint.get('sql_evidence')
     manifest = json.loads((directory / 'manifest.json').read_text())
-    if bool(evidence) != bool(manifest.get('sql_evidence')):
+    dropped = checkpoint.get('dropped_sql_evidence')
+    if dropped:
+        # A Git fork of a captured prefix: the evidence was deliberately not copied.
+        if evidence or dropped['identity'] != manifest.get('sql_evidence'):
+            raise ValueError('Invalid dropped SQL evidence record')
+    elif bool(evidence) != bool(manifest.get('sql_evidence')):
         raise ValueError('Checkpoint SQL evidence is missing or unexpected')
     if evidence and (evidence['identity'] != manifest['sql_evidence'] or
                      file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']):
@@ -156,6 +161,9 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
     directory = checkpoint_directory(source, checkpoint)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', branch_id):
         raise ValueError('Invalid evidence branch ID')
+    if checkpoint.get('context_boundary') != 'new_week':
+        # Design 4.3: fork only after a completed week, before the next Agent call.
+        raise ValueError('Fork snapshots must be taken at a completed week boundary')
     manifest = json.loads((directory / 'manifest.json').read_text())
     parent = manifest['sql_evidence']
     if pf_stale_checks is not None and text_registration != 'pf':
@@ -177,11 +185,27 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
     destination.mkdir(parents=True, exist_ok=False)
     target = destination / 'checkpoints' / checkpoint['snapshot_id']
     target.parent.mkdir()
-    shutil.copytree(directory, target)
+    source_manifest = file_hash(directory / 'manifest.json')
+    if text_registration == 'git':
+        # A Git branch never uses PF: it neither captures nor receives the prefix
+        # evidence database. The dropped evidence stays recorded for provenance.
+        private = ('sql-evidence.sqlite', 'sql-evidence.controls.jsonl')
+        # Also skip SQLite sidecars (-wal/-shm) that a read-only open may leave behind.
+        shutil.copytree(directory, target, ignore=lambda d, names: {n for n in names if n.startswith('sql-evidence')}
+                        if Path(d) == directory else set())
+        del manifest['sql_evidence']
+        manifest['fork_source'] = dict(source_manifest_sha256=source_manifest, branch_id=branch_id,
+                                       parent_branch=parent['branch_id'], capture='off')
+        checkpoint = dict(checkpoint, files={k: v for k, v in checkpoint['files'].items() if k not in private},
+                          dropped_sql_evidence=dict(checkpoint['sql_evidence'],
+                                                    files={k: v for k, v in checkpoint['files'].items() if k in private}))
+        del checkpoint['sql_evidence']
+    else:
+        shutil.copytree(directory, target)
+        manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
+                                        fork_seq=checkpoint['sql_evidence']['cutoff'],
+                                        source_manifest_sha256=source_manifest)
     shutil.copy2(source / 'config.json', destination / 'config.json')
-    manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
-                                    fork_seq=checkpoint['sql_evidence']['cutoff'],
-                                    source_manifest_sha256=file_hash(directory / 'manifest.json'))
     write_json(destination / 'manifest.json', manifest)
     write_json(destination / 'checkpoint.json', checkpoint)
     return destination

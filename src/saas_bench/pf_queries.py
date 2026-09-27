@@ -93,6 +93,11 @@ apply all replacements together. UNCHANGED reuses the named baseline exactly.
 Only complete baselines and verified difference chains in this request qualify.
 Use pf_read with full=true for full text. Repeating the same target immediately
 after a compact read also returns full text once per target and context.
+Repeated identical bash, read_file and search_files calls (same tool and arguments)
+may likewise return DELTA or UNCHANGED against the previous result of that same
+call in this request, named previous_same_call; the header's vN is the full result,
+readable with pf_read. Repeating the call immediately after a compact result returns
+full text once (for bash this reruns the command).
 Execution associations are observed facts, not claims of semantic support.
 Use vN handles, workspace-relative paths, exact SQL, or rN.M. A path, SQL or bare
 rN in a PF query selects the latest captured version, whereas text registration
