@@ -66,10 +66,16 @@ MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Depe
 
 def tool_definitions():
     descriptions = {
-        'pf_search': 'Find captured evidence and registered text revisions by exact business object kind/id. Returns an index, not evidence contents. Object IDs come only from public fields or explicit declarations.',
-        'pf_dependencies': 'Trace dependencies of a captured file or registered text. Explicit references first; purpose=current always also follows observed execution associations, so upstream SQL of derived files is included; for purpose=historical_only, include_execution=true adds them. With the runner stale check enabled, purpose=current refreshes all expanded SQL views and approved public reads, compares current files and evaluates reference predicates. Historical-only paths are skipped. A passing predicate stops downstream propagation; failures and unknown checks retain paths. Scripts never rerun. Results are advisory. purpose=historical_only retrieves saved history without checks.',
-        'pf_dependents': 'Find references to an exact captured version, with paths and reference purposes. Defaults to current active registered texts, traversing old revisions to reach them; current_only=false also returns superseded and retired endpoints. Historical-only paths are labeled, never marked invalid. A file path or version also matches references to any captured observation of the same bytes. include_execution also returns observed execution associations.',
-        'pf_read': 'Read immutable evidence (mode=content), list versions of its object (history), or compare baseline to target (diff). Content automatically uses FULL, DELTA or UNCHANGED when the current request contains a complete recoverable baseline and compact output costs fewer tokens. Set full=true with mode=content to request full text. Paths, SQL and bare rN select the latest captured version; rN.M and vN select an exact version. Diff requires the same file, query view, or registered object. SQL comparison preserves types and duplicate rows and separately reports raw order. Content/diff are paged at 30000 characters. A diff does not count as reading the target.',
+        'pf_search': 'List saved evidence and registered texts about one business object, e.g. '
+                     'kind=research_project id=t10_2 or kind=customer_group id=S2. Returns an index; read contents with pf_read.',
+        'pf_dependencies': 'Show what a registered text or file relies on. With purpose=current (default) the cited '
+                           'queries are rerun and files compared, and each row says whether it changed or a predicate '
+                           'now fails. Use before acting on an earlier plan or conclusion. purpose=historical_only '
+                           'only lists history. Results are advisory.',
+        'pf_dependents': 'Show which registered texts cite a version, e.g. forecasts and plans that still rely on an '
+                         'assumption you just corrected.',
+        'pf_read': 'Read a saved version (mode=content), list its versions (history), or diff two versions of the '
+                   'same object (diff), including results you never saved as files. full=true returns full text.',
     }
     return [dict(name=name, description=descriptions[name] +
                  ' Continue a page with only its cursor; pagination uses a fixed snapshot.',
@@ -78,31 +84,21 @@ def tool_definitions():
 
 PF_PROMPT = '''
 
-PF tools are available: pf_search finds business objects,
-pf_dependencies follows references, pf_dependents finds referrers, and pf_read
-reads or compares saved versions. Index results do not deliver evidence contents;
-read a version before registering a reference to it. Current-purpose pf_dependencies
-automatically checks expanded dependencies when enabled by the runner. Historical-only
-references and purpose=historical_only do not trigger checks. All expanded SQL views
-rerun on one read-only snapshot; approved SDK reads rerun, scripts never do. A passing
-predicate stops changes propagating to referrers. The checks report observations,
-not whether your conclusions are correct. Other tools do not run stale checks.
-Content reads may return FULL, DELTA or UNCHANGED. DELTA lists [start,end,text]
-replacements using zero-based Unicode character offsets in the original baseline;
-apply all replacements together. UNCHANGED reuses the named baseline exactly.
-Only complete baselines and verified difference chains in this request qualify.
-Use pf_read with full=true for full text. Repeating the same target immediately
-after a compact read also returns full text once per target and context.
-Repeated identical bash, read_file and search_files calls (same tool and arguments)
-may likewise return DELTA or UNCHANGED against the previous result of that same
-call in this request, named previous_same_call; the header's vN is the full result,
-readable with pf_read. Repeating the call immediately after a compact result returns
-full text once (for bash this reruns the command).
-Execution associations are observed facts, not claims of semantic support.
-Use vN handles, workspace-relative paths, exact SQL, or rN.M. A path, SQL or bare
-rN in a PF query selects the latest captured version, whereas text registration
-still defaults to the most recently delivered evidence. Use mode=history to find
-older versions. Keep next_cursor to continue the same snapshot using only cursor.
+PF saves the query results, command outputs and workspace file versions from your
+tool calls, and answers questions about them across weeks:
+- pf_dependencies: before acting on an earlier plan or conclusion, check whether
+  what it cites has changed. Example: r4 "keep B at $99 while S2 new B
+  subscriptions stay >= 770" cites a query with that threshold; the check reruns
+  the query and reports whether the threshold still holds.
+- pf_dependents: after correcting an assumption, find the texts that cite it.
+- pf_search: everything saved about one business object, e.g. project t10_2.
+- pf_read: read or diff saved versions, including outputs you never saved.
+Checks are advisory; you decide what to do.
+Repeated reads may come back compact. UNCHANGED means identical to the named base;
+DELTA lists [start,end,text] replacements (zero-based character offsets into the
+base, applied together). The base is the previous result of the same call, or of
+the same script (previous_output_of:<script>). Use pf_read with full=true, or repeat
+the call once, for full text.
 '''
 
 

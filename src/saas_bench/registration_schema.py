@@ -154,8 +154,9 @@ MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word fo
 
 
 def tool_definitions(pf=False):
-    evidence = ('Evidence uses a workspace path (a bare path binds the version last sent to you; path@commit binds '
-                'that committed file), exact SQL of a query you ran, a vN handle, or a registered text rN / rN.M.'
+    evidence = ('Evidence uses a workspace path you read or wrote (a bare path binds the version last sent to you; '
+                'path@commit binds that committed file), a vN handle (for a script\'s printed numbers, its 输出 vN), '
+                'exact SQL of raw query output you saw, or a registered text rN / rN.M.'
                 if pf else
                 'Evidence uses a workspace file path (a bare path binds the commit closing this week, shown as '
                 'week-N; path@commit or commit selects an earlier commit by hex prefix or week-N) or a registered '
@@ -201,18 +202,19 @@ reference. Revise with omitted references to preserve the original bindings.
 An unknown reference with a reason is always allowed.
 '''
 
-GIT_EVIDENCE_RULES = '''File references cite committed files. A bare path cites the file as the weekly
-commit closing the current week stores it (shown as week-N), so edits later this
-week are included. path@commit cites an earlier commit by a unique commit prefix
-or week-N. Registration never commits or copies cited file contents.
+GIT_EVIDENCE_RULES = '''File references cite committed files. A bare path cites the file as this week's
+closing commit stores it (shown as week-N), so edits later this week are included;
+path@commit cites an earlier commit by a unique prefix or week-N.
+Example: before reusing last week's plan, git log -p on the files it cites shows
+whether they changed since you registered it.
 '''
 
-PF_EVIDENCE_RULES = '''A bare file path binds the version of that file last sent to your model, not the
-latest version or HEAD. path@commit (a unique commit prefix or week-N) binds that
-committed file and also records whether those exact bytes were sent to you. Exact
-SQL binds the last delivered result of that query; optional vN handles identify
-exact versions, and a path works when a handle is unavailable. Only already
-delivered evidence and selected ranges can be cited as versions.
+PF_EVIDENCE_RULES = '''Cite what you actually saw or wrote. A bare file path binds the version
+last sent to you or written by you; path@commit binds that committed file. After a command,
+a footer such as [输出: v12 | q: v10 v11 | 写: plan.json v13] names its printed
+output, the queries it ran and the files it wrote. To cite numbers a script printed,
+cite its output (v12); the queries behind it are traced for you. Exact SQL works
+only for raw query output you saw.
 '''
 
 
