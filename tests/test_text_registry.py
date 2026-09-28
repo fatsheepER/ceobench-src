@@ -265,8 +265,7 @@ def test_pf_frozen_old_memory_does_not_hide_a_new_authored_version(workspace, tm
 
 
 @pytest.mark.parametrize('delivered', [False, True])
-def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, monkeypatch, delivered):
-    monkeypatch.setattr('saas_bench.text_registry.now', lambda: 'fixed-time')
+def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, delivered):
     store, prefix, executor = captured(workspace, tmp_path, 'prefix')
     if delivered:
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))

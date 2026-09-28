@@ -66,6 +66,16 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 ANTHROPIC_FABLE_FALLBACK_MODEL = "claude-opus-4-8"
 
 
+def _joined(first, separator, second):
+    """Concatenate texts, keeping the evidence source ranges of both parts."""
+    from saas_bench.execution_capture import CapturedText, slice_origins
+    text = first + separator + second
+    origins = list(getattr(first, 'origins', []))
+    if getattr(second, 'origins', None):
+        origins += slice_origins(second.origins, 0, len(second), target=len(first) + len(separator))
+    return CapturedText(text, origins) if origins else text
+
+
 class BashAgentRunner:
     """Runner for bash_agent with SaaS Bench.
 
@@ -1215,9 +1225,16 @@ __pycache__/
             self._log_timing("dashboard", sim_day, elapsed_s=round(_dashboard_elapsed, 3))
 
             # Agent loop for this day
-            observation = (self.agent._last_observation
-                           if getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
-                           else dashboard)
+            resumed = getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
+            observation = self.agent._last_observation if resumed else dashboard
+            if not resumed:
+                # A new week's context: registered texts whose cited evidence changed follow the dashboard.
+                _t0 = _time.monotonic()
+                check = self.tool_executor.weekly_check(sim_day)
+                if check:
+                    self._log_tool_result(0, sim_day, '_weekly_check', {}, check)
+                    self._log_timing("weekly_check", sim_day, elapsed_s=round(_time.monotonic() - _t0, 3))
+                    observation = _joined(dashboard, '\n\n', check)
             info = {'day': sim_day, 'cash': status['cash']}
             turns_today = 0
             day_ended = False

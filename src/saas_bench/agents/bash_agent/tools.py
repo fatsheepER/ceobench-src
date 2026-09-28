@@ -295,6 +295,14 @@ class BashAgentToolExecutor:
         self.capture = None
         self.preserved_process = None
 
+    def weekly_check(self, day):
+        """Week-start check of active registered texts, or None when nothing is registered."""
+        if self.pf_queries:
+            return self.pf_queries.weekly_check(day)
+        if self.text_registry and self.text_registry.mode in ('git', 'prefix'):
+            return self.text_registry.weekly_check(day)
+        return None
+
     def verify_sandbox(self):
         if sys.platform != 'linux':
             raise RuntimeError('Formal runs require Linux and bubblewrap')

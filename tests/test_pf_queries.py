@@ -17,11 +17,12 @@ from test_preflight_integration import offline_runner, packed_public, advance
 
 
 def query(executor, name, **args):
-    if name == 'pf_dependencies' and 'cursor' not in args:
-        args.setdefault('purpose', 'historical_only')
-    text = executor.execute(name, args)
-    assert not text.startswith('Error:'), text
-    return json.loads(text)
+    """Structured page behind a PF tool; dependency queries default to every traced row."""
+    if name in ('pf_dependencies', 'pf_dependents') and 'cursor' not in args:
+        args.setdefault('detail', True)
+        if name == 'pf_dependencies':
+            args.setdefault('purpose', 'historical_only')
+    return executor.pf_queries.answer(name, args)
 
 
 def read(executor, **args):
@@ -68,8 +69,8 @@ def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_p
     all_refs = query(executor, 'pf_dependents', target={'record': 'r1.1'}, current_only=False)
     assert {i['source']['record'] for i in all_refs['items']} == {'r2.1', 'r2.2', 'r3.1'}
     history = query(executor, 'pf_read', mode='history', target={'record': 'r1'})
-    assert [i['record'] for i in history['items']] == ['r1.1', 'r1.2']
-    assert history['items'][-1]['reason'] == 'Changed interpretation'
+    assert [i['record'] for i in history['items']] == ['r1.2', 'r1.1']  # newest first
+    assert history['items'][0]['reason'] == 'Changed interpretation'
     assert not re.search(r'\b[0-9a-f]{8,64}\b', json.dumps(page))
     assert store.identity['run_id'] not in json.dumps(page)
     # The graph is reconstructible without mutable declaration lookup state.
@@ -129,7 +130,7 @@ def test_pagination_freezes_snapshot_survives_restore_and_delivers_only_read_chu
     assert page2['items'][0]['record'] == 'r2.1' and page2['remaining'] == 1
     assert query(executor, 'pf_search', cursor=first_cursor) == page2
     last = query(executor, 'pf_search', cursor=page2['next_cursor'])
-    assert last['items'][0]['record'] == 'r3.1' and last['next_cursor'] is None
+    assert last['items'][0]['record'] == 'r1.1' and last['next_cursor'] is None
     assert len(query(executor, 'pf_search', object={'kind': 'plan', 'id': 'B'})['items']) == 4
     (workspace / 'long.txt').write_text('a' * 30000 + 'tail🙂')
     executor.execute('read_file', {'path': 'long.txt', 'limit': 1})
@@ -181,7 +182,7 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
     request(server, sql)
     settled(server)
     head, diff, _ = read(executor, mode='diff', baseline={'version': original}, target={'sql': sql})
-    assert head['row_comparison']['equal'] is False and diff
+    assert head['rows_equal'] is False and diff
     with closing(store.connect()) as conn:
         cutoff = store.sequence(conn)
     fork = SQLEvidenceStore(store.path, identity('pf', parent_branch='prefix', fork_seq=cutoff, capture_scope='execution'))
@@ -190,10 +191,10 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
     server.sql_evidence = fork
     request(server, sql)
     settled(server)
-    history = json.loads(branch.execute('pf_read', dict(target={'sql': sql}, mode='history')))
+    history = branch.answer('pf_read', dict(target={'sql': sql}, mode='history'))
     assert len(history['items']) == 3
     assert all(i['sql'] == sql for i in history['items'])
-    old_handle = history['items'][0]['version']
+    old_handle = history['items'][-1]['version']  # oldest: the prefix result
     send(fork, branch.execute('pf_read', dict(target={'version': old_handle})))
     bound = branch.resolver.resolve({'version': old_handle}, {})
     assert bound['version_id'].startswith('test-run/prefix/')
@@ -203,11 +204,11 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
         event = store.begin(encoded({'sql': 'SELECT x'}), 'test')
         store.finish(event, 200, '', encoded(dict(success=True, columns=['x'], rows=rows, row_count=len(rows))), {})
         store.delivered(event, 'sent')
-    hist = query(executor, 'pf_read', mode='history', target={'sql': 'SELECT x'})['items']
+    hist = query(executor, 'pf_read', mode='history', target={'sql': 'SELECT x'})['items'][::-1]
     head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[1]['version']})
-    assert head['raw_equal'] is False and head['row_comparison']['equal'] is True
+    assert head['raw_equal'] is False and head['rows_equal'] is True
     head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[2]['version']})
-    assert head['row_comparison']['equal'] is False
+    assert head['rows_equal'] is False
 
 
 def test_public_objects_are_exact_typed_and_not_inferred_from_prose(workspace, tmp_path):
@@ -225,7 +226,7 @@ def test_public_objects_are_exact_typed_and_not_inferred_from_prose(workspace, t
     store.finish(event, 200, '', encoded(dict(success=True, columns=['project_id'], rows=[{'project_id': 't10_2'}], row_count=1)), {})
     store.delivered(event, 'sent')
     results = query(executor, 'pf_search', object=dict(kind='research_project', id='t10_2'))['items']
-    assert len(results) == 2 and results[-1]['objects'][0]['basis'] == 'public_result_column'
+    assert len(results) == 2 and results[0]['objects'][0]['basis'] == 'public_result_column'  # newest first
     assert query(executor, 'pf_search', object=dict(kind='custom', id='t10_2'))['items'] == []
 
 
@@ -313,9 +314,9 @@ def test_empty_failed_truncated_and_binary_history_are_distinct(workspace, tmp_p
     items = query(executor, 'pf_read', target={'sql': 'SELECT x'}, mode='history')['items']
     assert [i['status'] for i in items] == ['succeeded', 'rejected', 'succeeded']
     head, _, _ = read(executor, mode='diff', baseline={'version': items[0]['version']}, target={'version': items[2]['version']})
-    assert head['row_comparison'] == dict(status='compared', equal=True, scope='returned_subset', order_compared=False)
+    assert head['rows_equal'] is True and head['rows_scope'] == 'returned_subset'
     head, _, _ = read(executor, mode='diff', baseline={'version': items[1]['version']}, target={'version': items[2]['version']})
-    assert head['row_comparison']['status'] == 'unknown'
+    assert head['rows_equal'] is None
     event = store.begin_event('fixture')
     store.version(event, 'binary', b'\xff', layer='file_bytes', object_id='binary.bin')
     store.complete(event)
@@ -350,8 +351,8 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert re.search(r'\n\[输出: v\d+ \| q: v\d+ \| 写: failed\.json v\d+\]$', failed), failed
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
-        traced = json.loads(child._execute_tool('pf_dependencies', dict(
-            target={'path': 'query.json'}, include_execution=True, depth=4, purpose='historical_only')))
+        traced = query(child.tool_executor, 'pf_dependencies', target={'path': 'query.json'},
+                       include_execution=True, depth=4, purpose='historical_only')
         assert any(item['target'].get('sql') == 'SELECT COUNT(*) AS n FROM ledger' for item in traced['items'])
         with closing(child.evidence_store.connect()) as conn:
             assert conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0] == count
@@ -434,7 +435,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     assert refused.startswith('Error:') and '输出 vN' in refused, refused
     created = json.loads(runner._execute_tool('text_create', declaration({'version': footer.group(1)})))
     assert created['evidence'][0]['version'] == footer.group(1)
-    traced = json.loads(runner._execute_tool('pf_dependencies', dict(target={'record': 'r1'}, purpose='current', depth=4)))
+    traced = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'}, purpose='current', depth=4)
     assert traced['stale_check'] == 'performed'
     upstream = [i for i in traced['items'] if (i['target'] or {}).get('sql') == 'SELECT COUNT(*) AS n FROM ledger']
     assert upstream and upstream[0]['kind'] == 'same_execution' and upstream[0]['path'][1] == footer.group(1)

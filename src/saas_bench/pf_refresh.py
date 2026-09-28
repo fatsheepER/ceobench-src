@@ -21,8 +21,8 @@ def refresh(server, versions, parent):
     store = server.sql_evidence
     if not store or server.oracle_mode:
         raise ValueError('Public evidence capture is required')
-    if store.read_event(parent)['request']['kind'] != 'pf_dependencies':
-        raise ValueError('Refresh requires a forward query event')
+    if store.read_event(parent)['request']['kind'] not in ('pf_dependencies', 'pf_weekly_check'):
+        raise ValueError('Refresh requires a forward query or weekly check event')
     sources = {}
     for version in dict.fromkeys(versions):
         meta, _ = store.get_content(version)

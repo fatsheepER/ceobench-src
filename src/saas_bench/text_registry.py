@@ -2,15 +2,23 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 import subprocess
 
 from pydantic import ValidationError
 
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
+from . import pf_render
 from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
 from .registration_schema import MODELS
 from .run_state import write_json
-from .sql_evidence import encoded, now
+from .sql_evidence import encoded
+
+
+# A stated numeric condition such as "< 45%", ">= 770" or "falls below 50". Arrows like
+# "15 -> 18" are not conditions.
+CONDITION = re.compile(r'(?:(?<![-=<>])(?:[<>]=?|[≥≤])|\b(?:at least|at most|below|above|under|over|exceeds?|'
+                       r'less than|more than|greater than|fewer than)\b)\s*\$?-?\d[\d,.]*\s*%?', re.I)
 
 
 class TextRegistry:
@@ -61,8 +69,8 @@ class TextRegistry:
             record = dict(deepcopy(previous), **values, revision=previous['revision'] + 1)
             if operation == 'retire':
                 record['status'] = 'retired'
-        record.update(version=f"{record_id}.{record['revision']}",
-                      registered_at=now(), sim_day=self.sim_day(), author='ceo')
+        # Agents reason in simulated days; clock time stays in the private event record.
+        record.update(version=f"{record_id}.{record['revision']}", sim_day=self.sim_day(), author='ceo')
         warnings, bindings = [], []
         if operation == 'create' or 'references' in values:
             for ref in record['references']:
@@ -99,7 +107,64 @@ class TextRegistry:
             result['warnings'] = list(dict.fromkeys(warnings))
         if self.mode == 'pf':
             result['evidence'] = [self._display_binding(b) for b in bindings]
+            if operation in ('create', 'revise') and (tip := self._threshold_tip(record)):
+                result['tip'] = tip
         return encoded(result).decode()
+
+    def _threshold_tip(self, record):
+        """At most once a week: a text states a numeric condition but no reference checks it."""
+        match = CONDITION.search(record['text'])
+        checkable = [r for r in record['references'] if r['purpose'] == 'current' and (
+            'sql' in r['evidence'] or 'version' in r['evidence'] or
+            str(r['evidence'].get('path', '')).split('@')[0].endswith(('.json', '.csv')))]
+        week = week_label(self.sim_day())
+        if (not match or not checkable or any(r.get('predicate') for r in record['references'])
+                or self.store.load_state('threshold_tip_week') == week):
+            return None
+        self.store.save_state('threshold_tip_week', week)
+        condition = ' '.join(match.group(0).split())
+        return (f'The text states a condition ("{condition}"). To have the weekly check and pf_dependencies '
+                'test it instead of reporting any change, revise the reference it depends on with select and a '
+                'threshold predicate, e.g. "select": {"row": {"group_id": "S1"}, "col": "rate"}, "predicate": '
+                '{"type": "threshold", "op": ">=", "value": 50}. Optional; shown at most once a week.')
+
+    def weekly_check(self, day):
+        """Git/prefix week-start digest: cited committed files and texts compared with current ones."""
+        records = self._load()['records']
+        entries = []
+        for key in sorted(records, key=lambda k: int(k[1:]), reverse=True):
+            record = records[key][-1]
+            refs = [r for r in record['references'] if r['purpose'] == 'current' and 'unknown' not in r['evidence']]
+            if record['status'] != 'active' or not refs:
+                continue
+            changed = [line for line in (self._git_change(r['evidence'], records) for r in refs) if line]
+            entries.append(dict(text=dict(record=record['version'], day=record.get('sim_day'), text=record['text']),
+                                total=len(refs), changed=changed))
+        return pf_render.render_weekly(entries, day, pf=False) if entries else None
+
+    def _git_change(self, evidence, records):
+        if 'record' in evidence:
+            latest = records[evidence['record'].split('.')[0]][-1]
+            if latest['version'] == evidence['record']:
+                return None
+            return f"text {evidence['record']}: " + ('retired' if latest['status'] == 'retired' else
+                                                      'revised to ' + latest['version'])
+        cited = evidence['path'] + '@' + evidence['commit']
+        try:
+            _, full = git_reference(self.workspace, evidence)
+            old = subprocess.run(['git', '-C', str(self.workspace), 'show', f"{full}:{evidence['path']}"],
+                                 capture_output=True, timeout=10, check=True).stdout
+        except (ValueError, subprocess.SubprocessError) as exc:
+            return f'{cited}: cannot check ({exc})'
+        current = self.workspace / evidence['path']
+        if current.is_symlink() or not current.is_file():
+            return f'{cited}: the file no longer exists'
+        new = current.read_bytes()
+        if new == old:
+            return None
+        kind = 'json' if evidence['path'].endswith('.json') else 'text'
+        return (f"{cited}: the current file differs ({pf_render.change(kind, old, new)}); "
+                f"git diff {full[:7]} -- {evidence['path']}")
 
     def _bind(self, ref, records):
         evidence = ref['evidence']

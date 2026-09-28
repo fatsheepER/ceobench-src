@@ -54,7 +54,12 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         return output
 
     def query(name, **args):
-        return json.loads(tool(name, **args))
+        if not name.startswith('pf_'):
+            return json.loads(tool(name, **args))
+        if name in ('pf_dependencies', 'pf_dependents') and 'cursor' not in args:
+            args['detail'] = True
+        tool(name, **args)  # the agent-facing text goes into the request
+        return executor.pf_queries.last_answer
 
     def read(**args):
         return tool('pf_read', **args)
@@ -208,7 +213,7 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         assert missing['check']['reason'] == 'No saved evidence'
         query('text_revise', record='r1', text='A revised', reason='Constructed correction')
         history = query('pf_read', target={'record': 'r1'}, mode='history')
-        assert [r['record'] for r in history['items']] == ['r1.1', 'r1.2']
+        assert [r['record'] for r in history['items']] == ['r1.2', 'r1.1']
         reverse = query('pf_dependents', target={'version': reference['evidence']['version']})
         assert {'r2.1', 'r5.1'} <= {r['source']['record'] for r in reverse['items']}
         assert next(r for r in reverse['items'] if r['source']['record'] == 'r5.1')['historical_only']

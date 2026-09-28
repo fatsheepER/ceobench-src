@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 
 import pytest
 
@@ -364,24 +365,22 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
         assert child._execute_tool('bash', dict(command='python -S probe.py')).strip() == '403'
         child._save_checkpoint(7)
         before = business_state(child)
-        args = dict(target={'path': 'query.json'}, include_execution=True, depth=4, limit=1)
+        args = dict(target={'path': 'query.json'}, include_execution=True, depth=4, limit=1, detail=True)
         output = child._execute_tool('pf_dependencies', args)
         if mode == 'git':
             assert output.startswith('Error: Unknown tool')
             continue
-        result = json.loads(output)
-        assert result['stale_check'] == ('performed' if enabled else 'not_performed')
+        assert ('Checked against the current world' in output) is enabled, output
         # The packed host runtime must contain the refresh module (it was once left out).
-        assert all(item.get('check', {}).get('reason') not in ('refresh_failed', 'refresh_unavailable')
-                   for item in result['items'])
+        assert 'refresh_failed' not in output and 'refresh_unavailable' not in output, output
         child._save_checkpoint(7)
         assert business_state(child) == before
-        cursor = result['next_cursor']
+        cursor = (re.search(r'\{"cursor": "(c\d+)"\}', output) or [None, None])[1]
         child._stop_server()
         restored = offline_runner(child.workspace_dir)
         assert restored.pf_stale_checks is enabled
         if cursor:
             restored.tool_executor.pf_queries.refresh = lambda *_: pytest.fail('Restored page reran reads')
-            json.loads(restored._execute_tool('pf_dependencies', {'cursor': cursor}))
+            assert not restored._execute_tool('pf_dependencies', {'cursor': cursor}).startswith('Error:')
         with pytest.raises(ValueError, match='stale check configuration mismatch'):
             BashAgentRunner(continue_from=child.workspace_dir, pf_stale_checks=not enabled)

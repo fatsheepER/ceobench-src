@@ -165,7 +165,7 @@ def tool_definitions(pf=False):
                 'text rN / rN.M.')
     predicates = ('Optional predicates: tolerance amount around the cited value, threshold op/value, or compare '
                   'left/op/right within one query result. Predicates on current-purpose references are checked '
-                  'when you run pf_dependencies.' if pf else
+                  'by pf_dependencies and the weekly check.' if pf else
                   'Optional predicates: tolerance amount around the cited value, or threshold op/value. '
                   'Predicates are only stored.')
     descriptions = {
@@ -193,8 +193,9 @@ in addition to the items listed under Memory & Persistence. When you save what
 matters in the weekly workflow, you can register or revise the items you expect
 to rely on later, and keep the weekly summary and useful rN IDs in MEMORY.md.
 Registrations are not automatically injected into your context; use text_list
-to review them. Choose what to register; missing registration never blocks
-business actions.
+to review them. Each week begins with a check, shown after the dashboard, that
+lists the active texts whose cited evidence changed. Choose what to register;
+missing registration never blocks business actions.
 Distinguish acquisition time, the day/interval described by evidence, and when
 you read it. Use an explicit unknown reason when applicability is unclear.
 Dashboard normally reflects the previous weekly advance. After changing settings
@@ -208,7 +209,8 @@ An unknown reference with a reason is always allowed.
 GIT_EVIDENCE_RULES = '''File references cite committed files. A bare path cites the file as this week's
 closing commit stores it (shown as week-N), so edits later this week are included;
 path@commit cites an earlier commit by a unique prefix or week-N.
-Example: before reusing last week's plan, git log -p on the files it cites shows
+The weekly check lists cited committed files and texts that differ from their
+current versions. Example: before reusing last week's plan, git log -p on the files it cites shows
 whether they changed since you registered it.
 '''
 
