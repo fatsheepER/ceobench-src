@@ -241,6 +241,29 @@ def test_pf_files_the_model_wrote_count_as_known_but_script_outputs_do_not(works
     assert binding['version_id'] != binding['latest_version_id']
 
 
+def test_pf_frozen_old_memory_does_not_hide_a_new_authored_version(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    (workspace / 'MEMORY.md').write_text('Old plan\nOld detail\n')
+    frozen = executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1})
+    send(store, frozen)
+    current = 'New plan\nNew detail\n'
+    executor.execute('write_file', {'path': 'MEMORY.md', 'content': current})
+    # Every subsequent request repeats the frozen week-start MEMORY.
+    send(store, frozen)
+    call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    binding = store.load_state('declaration:r1.1')['references'][0]
+    assert binding['authored_by'] and store.get_content(binding['version_id'])[1] == current.encode()
+    # A partial reread of these same authored bytes cannot erase that knowledge.
+    send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
+    call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    assert store.load_state('declaration:r2.1')['references'][0]['version_id'] == binding['version_id']
+    # A genuinely newer, externally changed version must still be read in full.
+    (workspace / 'MEMORY.md').write_text('External plan\nUnread detail\n')
+    send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
+    with pytest.raises(ValueError, match='not fully delivered'):
+        call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+
+
 @pytest.mark.parametrize('delivered', [False, True])
 def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, monkeypatch, delivered):
     monkeypatch.setattr('saas_bench.text_registry.now', lambda: 'fixed-time')

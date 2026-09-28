@@ -354,6 +354,8 @@ class EvidenceResolver:
                     if source == candidate:
                         matches.append((item, content, source_kind))
                 if not matches:
+                    if candidate in authored:
+                        break  # Repeated old messages cannot supersede a newer full write.
                     continue
                 if predicate.get('type') == 'compare' and kind != 'query':
                     raise ValueError('compare requires one query view')
@@ -372,6 +374,8 @@ class EvidenceResolver:
                                     source_truncated=candidate_meta['source_truncated'],
                                     delivered_in=[dict(request_event=meta['created_by_event'], occurrence=item)
                                                   for item, _ in group], selected_ranges=ranges)
+                if candidate in authored:
+                    break  # The outer loop will use the model's complete authored bytes.
                 # Never silently fall back to an older, more fully read version.
                 raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
         if kind == 'query':
