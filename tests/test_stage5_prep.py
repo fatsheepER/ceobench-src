@@ -191,7 +191,8 @@ def test_repeated_tool_calls_are_delivered_compactly_and_reconstruct(workspace, 
     assert apply_delta(str(second), ledger[2]['edits']) == str(third)
     wire = json.loads(store.get_content(event + ':wire')[1])
     header = json.loads(wire['messages'][2]['content'].split('\n', 1)[0])
-    assert header['base'] == 'previous_same_call' and re.fullmatch(r'v\d+', header['target'])
+    # The target names this command's return: cmdN, version 2 after the file changed.
+    assert header['base'] == 'previous_same_call' and re.fullmatch(r'cmd\d+@v2', header['target'])
     # The named full result is readable with pf_read.
     full = executor.execute('pf_read', {'target': {'version': header['target']}})
     assert full.split('\n', 1)[1] == str(third)
@@ -208,7 +209,7 @@ def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
     assert ledger[1]['mode'] == 'UNCHANGED'
     # A compact file read still counts as delivering that file version (reconstruction).
     result = call(registry, 'create', **declaration({'path': 'facts.txt'}))
-    assert result['evidence'][0]['version'].startswith('v')
+    assert result['evidence'][0]['version'] == 'facts.txt@v1'
     # Repeating the call right after a compact result returns full text once.
     c = executor.execute('read_file', {'path': 'facts.txt'})
     _, ledger = deliver(store, [a, b, c])

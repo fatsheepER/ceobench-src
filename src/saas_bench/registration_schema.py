@@ -3,6 +3,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence_handles import HANDLE_PATTERN
+
 
 class Input(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -97,7 +99,7 @@ def _declaration_models(pf):
             sql: Text | None = None
         record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
         if pf:
-            version: Annotated[str, Field(pattern=r'^v[1-9][0-9]*$')] | None = None
+            version: Annotated[str, Field(pattern=HANDLE_PATTERN)] | None = None
         unknown: Text | None = None
 
         @model_validator(mode='after')
@@ -157,7 +159,8 @@ MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word fo
 
 def tool_definitions(pf=False):
     evidence = ('Evidence uses a workspace path you read or wrote (a bare path binds the version last sent to you; '
-                'path@commit binds that committed file), a vN handle (for a script\'s printed numbers, its 输出 vN), '
+                'path@commit binds that committed file), a handle shown in results such as forecast.json@v3, '
+                'query7@v2 or analyze.py.out@v4 (for a script\'s printed numbers, the 输出 handle after the command), '
                 'exact SQL of raw query output you saw, or a registered text rN / rN.M.'
                 if pf else
                 'Evidence uses a workspace file path (a bare path binds the commit closing this week, shown as '

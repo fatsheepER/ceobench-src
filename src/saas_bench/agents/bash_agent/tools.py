@@ -202,6 +202,18 @@ def agent_runtime(verify=False) -> Dict[str, Any]:
 DELTA_READ_TOOLS = ('bash', 'read_file', 'search_files')
 
 
+def call_identity(workspace, tool_name, args, guest_root=None):
+    """One tool call's identity: the tool and its arguments, ignoring a leading `cd` into
+    the workspace itself. Repeated returns of one call are versions of one object."""
+    if tool_name == 'bash':
+        roots = {str(workspace), str(Path(workspace).resolve()), guest_root or str(workspace)}
+        command = args.get('command', '')
+        match = re.match(r'\s*cd\s+(\S+)\s*(?:&&|;|\n)\s*', command)
+        if match and match.group(1).strip('\'"') in roots:
+            args = dict(args, command=command[match.end():])
+    return ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
+
+
 def read_identity(store, event, workspace, tool_name, args, guest_root=None):
     """The content object a repeated read is compared against (design 3.5).
 
@@ -225,11 +237,7 @@ def read_identity(store, event, workspace, tool_name, args, guest_root=None):
                 if source.is_absolute() and source.is_relative_to(root):
                     source = source.relative_to(root)
             return ['script_output', source.as_posix()]
-        command = args.get('command', '')
-        match = re.match(r'\s*cd\s+(\S+)\s*(?:&&|;|\n)\s*', command)
-        if match and match.group(1).strip('\'"') in roots:
-            args = dict(args, command=command[match.end():])
-    return ['tool_call', tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)]
+    return call_identity(workspace, tool_name, args, guest_root)
 
 
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
@@ -362,7 +370,7 @@ class BashAgentToolExecutor:
         result, status = '', 'succeeded'
         try:
             if capture:
-                capture.begin(tool_name, args)
+                capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root))
                 token = CURRENT_EVENT.set(capture.event)
                 if capture.event:
                     context = capture.safe(capture.store.context, capture.event)
@@ -401,12 +409,13 @@ class BashAgentToolExecutor:
                 # A failed or timed-out Bash command may still have delivered SQL output or
                 # written files; decorate whatever this execution actually captured.
                 read_key = None
+                body = result
                 if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                     if tool_name in DELTA_READ_TOOLS:
                         read_key = capture.safe(read_identity, capture.store, capture.event,
                                                 self.workspace_path, tool_name, args, self.guest_root)
-                result = capture.finish(result, status, read_key=read_key,
+                result = capture.finish(result, status, read_key=read_key, body=body,
                                         read_complete=not capture.facts.get('output_truncated'))
                 if status == 'result_unknown':
                     capture.store.fail('Execution outcome unknown; branch paused')
@@ -422,7 +431,7 @@ class BashAgentToolExecutor:
         raw = path.read_bytes()
         raw_version = None
         if self.capture and reuse and self.capture.event:
-            # Plain reads of unchanged bytes observe the existing version (same vN handle);
+            # Plain reads of unchanged bytes observe the existing version (same path@vK handle);
             # edits keep their own read version as the observed edit input.
             latest, sha = self.capture.safe(self.capture.store.latest_version,
                                             str(path.relative_to(self.workspace_path)), 'file_bytes') or (None, None)
@@ -792,8 +801,9 @@ class BashAgentToolExecutor:
         result = []
         if stdout:
             result.append(origin(self.capture.event + ':stdout', stdout))
-            from saas_bench.execution_capture import query_projection
+            from saas_bench.execution_capture import query_projection, script_projection
             result.extend(self.capture.safe(query_projection, self.capture, stdout) or [])
+            result.extend(self.capture.safe(script_projection, self.capture, stdout) or [])
         if stderr:
             result.append(origin(self.capture.event + ':stderr', stderr,
                                  target=(len(stdout) + 1 if stdout else 0) + len('[stderr]\n')))

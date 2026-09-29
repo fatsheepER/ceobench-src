@@ -9,8 +9,8 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError, model_validator
 
 from .execution_capture import CapturedText, CURRENT_EVENT, OBJECT_FIELDS, origin
-from . import pf_render
-from .registration_evidence import HANDLES
+from . import evidence_handles, pf_render
+from .registration_evidence import covered
 from .registration_schema import BusinessObject, Input, Text
 from .sql_evidence import encoded
 
@@ -19,7 +19,7 @@ class Target(Input):
     path: Text | None = None
     sql: Text | None = None
     record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
-    version: Annotated[str, Field(pattern=r'^v[1-9][0-9]*$')] | None = None
+    version: Annotated[str, Field(pattern=evidence_handles.HANDLE_PATTERN)] | None = None
 
     @model_validator(mode='after')
     def captured_target(self):
@@ -101,6 +101,11 @@ instead of reporting any change. Checks are advisory; you decide what to do.
 - pf_search: saved items about one business object, newest first.
 - pf_read: read or diff saved versions, including outputs you never saved.
 Results give one line per item; "detail": true adds the underlying sources.
+Saved items carry handles NAME@vK: version K of that object, e.g. forecast.json@v3,
+query7@v2 (a query; its SQL is shown the first time it appears each week),
+analyze.py.out@v4 (what that script printed) or cmd5@v1 (a command's return). K
+rises only when the content changes; "同第 N 天" / "unchanged since day N" marks the
+same content acquired again. Use a handle to read, diff or cite that version.
 Repeated reads may come back compact. UNCHANGED means identical to the named base;
 DELTA lists [start,end,text] replacements (zero-based character offsets into the
 base, applied together). The base is the previous result of the same call, or of
@@ -146,7 +151,15 @@ PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registere
                  'query_model_projection', 'tool_return'}
 
 
-def evidence_key(version, meta, query, result, request):
+def evidence_key(version, meta, query, result, request, record=None):
+    """The object whose versions are listed, diffed and checked together."""
+    record = record or {}
+    if meta['layer'] in ('stdout', 'stderr', 'executed_code') and record.get('kind') == 'cli_python' \
+            and (record.get('request') or {}).get('script'):
+        # Every run of one script file: its outputs are versions of one object.
+        return ('script_' + meta['layer'], record['request']['script'])
+    if meta['layer'] in ('tool_return', 'stdout', 'stderr') and record.get('call'):
+        return ('command_' + meta['layer'], encoded(record['call']).decode())
     if meta['layer'] == 'server_public_response' and query:
         return ('query', encoded([query[1], *query[3:]]).decode())
     if meta['layer'] == 'server_public_response' and result.get('classification') == 'read':
@@ -171,37 +184,70 @@ class PFQueries:
         self.stale_checks, self.refresh = stale_checks, refresh
 
     def decorate(self, capture, text, after):
-        kind = self.store.read_event(capture.event)['request']['kind']
-        if kind == 'read_file':
+        record = self.store.read_event(capture.event)['request']
+        handles = evidence_handles.index(self.store)
+        if record['kind'] == 'read_file':
             for item in capture.origins:
                 meta, _ = self.resolver.content(item['version_id'])
                 if meta['layer'] == 'file_text':
                     return str(text) + '\n[' + self.resolver.handle(meta['derived_from']) + ']'
-        if kind != 'bash':
+        if record['kind'] != 'bash':
             return text
         with closing(self.store.connect()) as conn:
             queries = conn.execute('''WITH RECURSIVE children(event_id) AS (
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
                 ON json_extract(r.request, '$.parent_event_id')=c.event_id)
-                SELECT v.version_id FROM versions v JOIN requests r USING(event_id)
-                WHERE r.event_id IN children AND r.query_id IS NOT NULL
-                AND json_extract(v.metadata, '$.layer')='server_public_response'
+                SELECT v.version_id, q.definition FROM versions v JOIN requests r USING(event_id)
+                JOIN queries q ON r.query_id=q.id
+                WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
                 ORDER BY v.rowid''', (capture.event,)).fetchall()
+            scripts = conn.execute('''SELECT r.event_id || ':stdout' FROM requests r
+                WHERE json_extract(r.request, '$.parent_event_id')=? AND json_extract(r.request, '$.kind')='cli_python'
+                AND json_extract(r.request, '$.request.script') IS NOT NULL ORDER BY r.rowid''',
+                (capture.event,)).fetchall()
+        body = str(text)
+        printed = []
+        for (version,) in scripts:
+            try:
+                output = self.resolver.content(version)[1].decode('utf-8')
+            except (RuntimeError, UnicodeDecodeError):
+                continue
+            if output:
+                shown = [o for o in capture.origins if o['version_id'] == version]
+                printed.append((version, covered([(0, len(output))], shown) if shown else False, output == body))
         entries = [('q', None, row[0]) for row in queries]
         entries += [('写', path, after[path]['version']) for path in capture.facts.get('changed_paths', [])
                     if after and after.get(path, {}).get('version') and not noise(path)]
-        if not entries:
+        if not entries and not printed:
             return text
-        # Only displayed entries receive handles: [输出: v43 | q: v40 v41 | 写: forecast.json v42].
-        # 输出 names this exact tool return (saved by capture.finish under a fixed id), so the
-        # printed result of a script can be cited with its queries traced as upstream.
-        groups = {'输出': [self.resolver.handle(capture.event + ':tool_return')]}
+        again = lambda day: '' if day is None else f'（同第 {day} 天）'
+        # Only displayed entries receive numbers: [输出: analyze.py.out@v3 | q: query7@v2 | 写: f.json@v4].
+        # 输出 names the script's stdout when this return is exactly that output; otherwise this
+        # command return (saved by capture.finish) is named too, so what was seen is always citable.
+        outputs = []
+        if not (len(printed) == 1 and printed[0][2]):
+            name, day = handles.pending('cmd', record.get('call'), evidence_handles.body_digest(body))
+            outputs.append(name + again(day))
+        outputs += [self.resolver.handle(v) + again(handles.repeated(v)) + ('' if full else '（部分）')
+                    for v, full, _ in printed]
+        groups = {'输出': outputs}
+        sql, week, shown_sql = [], handles.day, self.store.load_state('pf_sql_shown') or {}
         for group, path, version in entries[:8]:
-            groups.setdefault(group, []).append((path + ' ' if path else '') + self.resolver.handle(version))
+            handle = self.resolver.handle(version)
+            groups.setdefault(group, []).append(handle + again(handles.repeated(version)))
+            if group == 'q':
+                # The full SQL accompanies a query name the first time it appears each week.
+                name = handle.rsplit('@', 1)[0]
+                definition = json.loads(next(row[1] for row in queries if row[0] == version))
+                if shown_sql.get(name) != week:
+                    shown_sql[name] = week
+                    sql.append(f'{name}: {evidence_handles.one_line(definition[5])}')
+        if sql:
+            self.store.save_state('pf_sql_shown', shown_sql)
         displayed = [group + ': ' + ' '.join(items) for group, items in groups.items()]
         if len(entries) > 8:
             displayed.append(f'另有 {len(entries) - 8} 项')
-        return str(text) + '\n[' + ' | '.join(displayed) + ']'
+        return body + '\n[' + ' | '.join(displayed) + ']' + ''.join('\n' + line for line in dict.fromkeys(sql))
 
     def execute(self, operation, args):
         """Agent-facing result: compact text, one line per item."""
@@ -499,7 +545,8 @@ class PFQueries:
     def _key(self, version):
         row = self.nodes[version]
         meta, event = row['meta'], self.events[row['event_id']]
-        return evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'))
+        return evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'),
+                            event['request'])
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
         if target not in self.nodes and origin != 'agent_declaration':
@@ -517,12 +564,16 @@ class PFQueries:
                 for o in self.nodes[version]['meta'].get('objects', [])]
 
     def _target(self, target):
+        if 'path' in target and evidence_handles.VERSIONED.fullmatch(target['path']) and not any(
+                row['meta'].get('object_id') == target['path'] for row in self.nodes.values()):
+            target = {'version': target['path']}  # forecast.json@v3 written as a path
+        if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
+            target = {'record': target['version']}
         if 'version' in target:
-            handles = self.store.load_state(HANDLES) or {}
-            version = handles.get(target['version'])
-            if version not in self.nodes:
+            members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
+            if not members:
                 raise ValueError('Unknown or unavailable version handle; use a path or SQL instead')
-            return version
+            return members[-1]
         matches = []
         for version, row in self.nodes.items():
             meta, event = row['meta'], self.events[row['event_id']]
@@ -577,8 +628,13 @@ class PFQueries:
             result.update(record=record['version'], text=record['text'], text_status=record['status'],
                           reason=record['reason'], applies_at=record['applies_at'],
                           current_revision=self.latest[self._key(version)] == version)
-        if row['previous_version'] in self.nodes:
-            result['previous_version'] = self.resolver.handle(row['previous_version'])
+        handles = evidence_handles.index(self.store)
+        if previous := handles.previous(version):
+            result['previous_version'] = previous
+        if (day := handles.repeated(version)) is not None:
+            result['unchanged_since_day'] = day
+        if same := handles.same_as(version):
+            result['same_content_as'] = same
         reads = self.reads[version]
         result['model_reads'] = dict(count=len(reads), full=any(r['full_source'] for r in reads),
                                      last_day=reads[-1]['day'] if reads else None)
@@ -720,7 +776,8 @@ class PFQueries:
         if self.values['mode'] == 'diff':
             baseline = self._target(self.values['baseline'])
             key = self._key(target)
-            if key != self._key(baseline) or key[0] not in ('query', 'file_bytes', 'registered_text', 'registered_script', 'dashboard'):
+            if key != self._key(baseline) or not (key[0] in ('query', 'file_bytes', 'registered_text', 'registered_script',
+                                                              'dashboard') or key[0].startswith(('script_', 'command_'))):
                 raise ValueError('Diff requires two versions of the same captured object')
             old_meta, old = self.resolver.content(baseline)
             try:

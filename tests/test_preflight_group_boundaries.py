@@ -354,7 +354,7 @@ print(json.dumps(results))'''
             assert history.startswith('Error: Unknown tool')
         result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
         if mode == 'pf':
-            assert json.loads(result)['evidence'][0]['version'].startswith('v')
+            assert json.loads(result)['evidence'][0]['version'] == 'facts.json@v1'
         else:
             assert 'evidence' not in json.loads(result)
         assert not re.search(r'\b[0-9a-f]{8,64}\b', result)

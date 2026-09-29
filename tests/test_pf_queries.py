@@ -205,10 +205,11 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
         store.finish(event, 200, '', encoded(dict(success=True, columns=['x'], rows=rows, row_count=len(rows))), {})
         store.delivered(event, 'sent')
     hist = query(executor, 'pf_read', mode='history', target={'sql': 'SELECT x'})['items'][::-1]
-    head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[1]['version']})
-    assert head['raw_equal'] is False and head['rows_equal'] is True
+    # Reordered but equal rows are the same content: one handle, marked as acquired again.
+    assert hist[0]['version'] == hist[1]['version'] and hist[1]['unchanged_since_day'] == 0
+    assert hist[2]['version'].endswith('@v2') and hist[2]['previous_version'] == hist[0]['version']
     head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[2]['version']})
-    assert head['rows_equal'] is False
+    assert head['raw_equal'] is False and head['rows_equal'] is False
 
 
 def test_public_objects_are_exact_typed_and_not_inferred_from_prose(workspace, tmp_path):
@@ -345,10 +346,17 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert set(MODELS) <= {t['name'] for t in child.agent.tool_descriptions}
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        assert re.search(r'\n\[输出: v\d+ \| q: v\d+ \| 写: query\.json v\d+\]$', output), output
+        # The SQL accompanies a query name the first time it appears in the week.
+        assert re.search(r'\n\[输出: cmd\d+@v1 \| q: (query\d+)@v1 \| 写: query\.json@v1\]\n'
+                         r'\1: SELECT COUNT\(\*\) AS n FROM ledger$', output), output
         # A non-zero exit still delivered the SQL result and wrote the file.
         failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
-        assert re.search(r'\n\[输出: v\d+ \| q: v\d+ \| 写: failed\.json v\d+\]$', failed), failed
+        assert re.search(r'\n\[输出: cmd\d+@v1 \| q: query\d+@v1（同第 \d+ 天） \| 写: failed\.json@v1\]$', failed), failed
+        # A new week shows the SQL again with the query name.
+        event = child.evidence_store.begin_event('dashboard_generation', {'day': 14})
+        child.evidence_store.complete(event)
+        again = child._execute_tool('bash', {'command': command.replace('query.json', 'again.json')})
+        assert re.search(r'\]\nquery\d+: SELECT COUNT\(\*\) AS n FROM ledger$', again), again
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
         traced = query(child.tool_executor, 'pf_dependencies', target={'path': 'query.json'},
@@ -367,35 +375,50 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
 def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     output = executor.execute('bash', {'command': 'printf 1 > one.txt; printf 2 > two.txt; exit 1'})
-    assert re.search(r'\n\[输出: v\d+ \| 写: one\.txt v\d+ two\.txt v\d+\]$', output), output
+    assert re.search(r'\n\[输出: cmd1@v1 \| 写: one\.txt@v1 two\.txt@v1\]$', output), output
     many = ' '.join(f'printf {i} > f{i}.txt;' for i in range(10))
     output = executor.execute('bash', {'command': many})
-    assert output.endswith(' | 另有 2 项]') and output.count('.txt v') == 8, output
+    assert output.endswith(' | 另有 2 项]') and output.count('.txt@v1') == 8, output
+    # A changed file gets the next version; the same command returning the same text keeps its handle.
+    again = executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'})
+    assert again.endswith('[输出: cmd3@v1 | 写: one.txt@v2]'), again
+    (workspace / 'one.txt').write_text('1')
+    assert executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'}).endswith(
+        '[输出: cmd3@v1（同第 0 天） | 写: one.txt@v4]')
+    history = query(executor, 'pf_read', mode='history', target={'path': 'one.txt'})['items']
+    assert history[0]['same_content_as'] == 'one.txt@v2'
 
 
-def test_forks_keep_lineage_handles_and_continue_numbering(workspace, tmp_path):
+def test_handles_name_the_object_and_its_version_in_each_branch(workspace, tmp_path):
     from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
     from saas_bench.text_registry import TextRegistry
     store, registry, executor = captured(workspace, tmp_path)
     for name, content in (('a.txt', 'A'), ('b.txt', 'B')):
         (workspace / name).write_text(content)
-    assert executor.execute('read_file', {'path': 'a.txt'}).endswith('[v1]')
-    assert executor.execute('read_file', {'path': 'b.txt'}).endswith('[v2]')
+    assert executor.execute('read_file', {'path': 'a.txt'}).endswith('[a.txt@v1]')
+    assert executor.execute('read_file', {'path': 'b.txt'}).endswith('[b.txt@v1]')
+    (workspace / 'a.txt').write_text('A2')
+    assert executor.execute('read_file', {'path': 'a.txt'}).endswith('[a.txt@v2]')
     receipt = store.snapshot(tmp_path / 'child.sqlite')
     child_store = SQLEvidenceStore(tmp_path / 'child.sqlite', identity(
         'child', capture_scope='execution', parent_branch='prefix', fork_seq=receipt['cutoff']))
     child = BashAgentToolExecutor(workspace, evidence_store=child_store,
                                   text_registry=TextRegistry(workspace, 'pf', child_store))
-    (workspace / 'c.txt').write_text('C')
-    # The first handle shown after the fork continues the parent's numbering.
-    assert child.execute('read_file', {'path': 'c.txt'}).endswith('[v3]')
-    assert read(child, target={'version': 'v1'})[1] == 'A'
-    assert read(child, target={'version': 'v2'})[1] == 'B'
-    # The parent keeps its own table; a handle never denotes two versions in one lineage.
-    (workspace / 'd.txt').write_text('D')
-    assert executor.execute('read_file', {'path': 'd.txt'}).endswith('[v3]')
+    # Handles shown before the fork keep their meaning in the copied branch.
+    assert read(child, target={'version': 'a.txt@v1'})[1] == 'A'
+    assert read(child, target={'version': 'a.txt@v2'})[1] == 'A2'
+    # Each branch numbers its own later versions; nothing is shared between branches.
+    (workspace / 'a.txt').write_text('A3')
+    assert child.execute('read_file', {'path': 'a.txt'}).endswith('[a.txt@v3]')
+    assert executor.execute('read_file', {'path': 'a.txt'}).endswith('[a.txt@v3]')
     with pytest.raises(AssertionError, match='unavailable version handle'):
-        read(child, target={'version': 'v9'})
+        read(child, target={'version': 'a.txt@v9'})
+    # A handle written as a path is accepted too.
+    assert read(child, target={'path': 'b.txt@v1'})[1] == 'B'
+    send(store, executor.execute('read_file', {'path': 'b.txt'}))
+    created = call(registry, 'create', **declaration({'path': 'b.txt@v1'}))
+    assert created['evidence'][0]['version'] == 'b.txt@v1'
+    assert store.load_state('declaration:r1.1')['references'][0]['status'] == 'resolved'
 
 
 def test_path_dependents_survive_boundary_snapshots_of_unchanged_bytes(workspace, tmp_path):
@@ -425,14 +448,14 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
               "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
     runner._execute_tool('bash', {'command': script})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
-    footer = re.search(r'\n\[输出: (v\d+) \| q: (v\d+)\]$', output)
+    footer = re.search(r'\n\[输出: (calc\.py\.out@v1) \| q: (query\d+@v1)\]\nquery\d+: SELECT COUNT', output)
     assert footer and 'ledger rows:' in output, output
     store = runner.evidence_store
     settled_request = send(store, output)
     assert settled_request
     # The raw query result never reached the model, so SQL alone is still refused, with a pointer.
     refused = runner._execute_tool('text_create', declaration({'sql': 'SELECT COUNT(*) AS n FROM ledger'}))
-    assert refused.startswith('Error:') and '输出 vN' in refused, refused
+    assert refused.startswith('Error:') and '输出 handle' in refused, refused
     created = json.loads(runner._execute_tool('text_create', declaration({'version': footer.group(1)})))
     assert created['evidence'][0]['version'] == footer.group(1)
     traced = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'}, purpose='current', depth=4)
@@ -440,6 +463,22 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     upstream = [i for i in traced['items'] if (i['target'] or {}).get('sql') == 'SELECT COUNT(*) AS n FROM ledger']
     assert upstream and upstream[0]['kind'] == 'same_execution' and upstream[0]['path'][1] == footer.group(1)
     assert upstream[0]['check']['version_changed'] is False, json.dumps(upstream[0]['check'])
-    assert upstream[0]['check']['current_version'] != footer.group(2)  # rerun, not reused
+    # Rerun, not reused: an equal result is a new acquisition of the same content, so one handle.
+    assert upstream[0]['check']['current_version'] == footer.group(2)
+    rerun = query(runner.tool_executor, 'pf_read', mode='history', target={'version': footer.group(2)})['items']
+    assert len(rerun) == 1 and rerun[0]['version'] == footer.group(2)  # PF reruns are not listed as history
+    # Running the same script again with the same printed output keeps the handle; a
+    # different output is its next version, whatever the surrounding command looks like.
+    output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py 2>&1 | head -5'})
+    assert re.search(r'\[输出: calc\.py\.out@v1（同第 0 天） \| q: query\d+@v1（同第 0 天）\]$', output), output
+    runner._execute_tool('bash', {'command': "printf 'print(2)\\nprint(3)\\n' > calc.py"})
+    output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py | head -1'})
+    assert re.search(r'\[输出: cmd\d+@v1 calc\.py\.out@v2（部分）\]$', output), output
+    assert send(store, output)
+    # Only the first line reached the model: the whole stdout is not citable, the return is.
+    refused = runner._execute_tool('text_create', declaration({'version': 'calc.py.out@v2'}))
+    assert refused.startswith('Error:') and 'Only part of this output' in refused, refused
+    shown = re.search(r'\[输出: (cmd\d+@v1) ', output).group(1)
+    assert json.loads(runner._execute_tool('text_create', declaration({'version': shown})))['id'] == 'r2'
     # The script itself is traced too; interpreter caches and session logs get no handles.
     assert '__pycache__' not in output and 'sessions/' not in output

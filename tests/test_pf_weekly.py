@@ -23,13 +23,13 @@ def test_compact_lines_carry_day_what_and_value_without_clock_time(workspace, tm
     server.conn.commit()
     compact = executor.execute('pf_dependencies', {'target': {'record': 'r2'}})
     lines = compact.splitlines()
-    assert lines[0].startswith('v') and '· day 7 · text r2.1 (active): "Keep the plan"' in lines[0]
+    assert lines[0].startswith('r2.1 · day 7 · text r2.1 (active): "Keep the plan"')
     # One line per declared reference; the failed threshold shows the value then and now.
     assert len([l for l in lines if re.match(r'\d+\. ', l)]) == 1
     assert 'cites' in lines[2] and 'text r1.1' in lines[2]
     assert '1 of 1 underlying sources PREDICATE FAILS on SQL: SELECT amount FROM ledger: >= 40: now 39 (was 42)' in lines[2]
     detail = executor.execute('pf_dependencies', {'target': {'record': 'r2'}, 'detail': True})
-    assert re.search(r'PREDICATE FAILS \(now v\d+\): >= 40: now 39', detail) and 'note: Keep at least forty' in detail
+    assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39', detail) and 'note: Keep at least forty' in detail
     assert 'SQL (1 rows): SELECT amount FROM ledger' in detail
     for text in (compact, detail, executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True}),
                  executor.execute('pf_read', {'target': {'record': 'r1'}, 'mode': 'history', 'detail': True}),
@@ -62,7 +62,9 @@ def test_query_changes_name_the_rows_that_differ(workspace, tmp_path, server):
     server.conn.execute("UPDATE ledger SET amount=amount+5")
     server.conn.commit()
     text = executor.execute('pf_dependencies', {'target': {'record': 'r1'}})
-    assert re.search(r'changed \(now v\d+\): 1 of 1 rows differ; category="operations": total \d+→\d+', text), text
+    assert re.search(r'cites (query\d+)@v1 · .* changed \(now \1@v2\): 1 of 1 rows differ; category="operations": total \d+→\d+', text), text
+    # The diff hint names the two versions just compared.
+    assert re.search(r'"baseline": \{"version": "(query\d+)@v1"\}, "target": \{"version": "\1@v2"\}', text), text
     # The rerun is a diff target, not part of the agent's own history listing.
     history = executor.execute('pf_read', {'target': {'sql': sql}, 'mode': 'history'})
     assert history.startswith('Versions of SQL: ') and ': 1 saved' in history and 'rerun' not in history
@@ -83,7 +85,7 @@ def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, t
     server.conn.commit()
     loud = executor.weekly_check(21)
     assert 'r1.1 (day 7): "Keep the plan" — 1 of 1 cited sources flagged' in loud
-    assert re.search(r'PREDICATE FAILS \(now v\d+\): >= 40: now 39 \(was 42\)', loud), loud
+    assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39 \(was 42\)', loud), loud
     assert 'r2.1 (day 7)' in loud and 'Details: pf_dependencies {"target": {"record": "rN"}}.' in loud
     assert not CLOCK.search(loud)
     # The digest is saved with its own origin so request source mappings stay complete.
@@ -148,7 +150,7 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
         if mode == 'pf':  # A cited query output is rerun through the host's refresh endpoint.
             output = runner._execute_tool('bash', {'command': './novamind-operation query "SELECT COUNT(*) AS n FROM ledger"'})
             send(runner.evidence_store, output)
-            handle = re.search(r'\[输出: (v\d+)', output).group(1)
+            handle = re.search(r'\[输出: (cmd\d+@v\d+)', output).group(1)
             runner._execute_tool('text_create', declaration({'version': handle}, text='Ledger size'))
         runner.agent.current_day = -1
     requests = fake_weeks(runner, monkeypatch)

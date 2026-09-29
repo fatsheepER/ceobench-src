@@ -1,5 +1,6 @@
 """Shared declaration behavior using real Git, captured reads, and model requests."""
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -161,7 +162,7 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     (workspace / 'evidence.json').write_text('{"n":8}')
     executor.execute('bash', {'command': 'true'})
     result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
-    assert result['evidence'][0] == dict(version='v1', latest='v2', differs=True)
+    assert result['evidence'][0] == dict(version='evidence.json@v1', latest='evidence.json@v2', differs=True)
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert binding['delivered_in'][0]['request_event'] == request
     assert store.get_content(binding['version_id'])[1] == b'{"n":7}'
@@ -203,7 +204,7 @@ def test_pf_registered_text_cites_directly_like_git_and_retirement_keeps_old_ref
     binding = store.load_state('declaration:r2.1')['references'][0]
     assert binding['status'] == 'resolved' and binding['basis'] == 'registered_text'
     assert json.loads(store.get_content(binding['version_id'])[1])['version'] == 'r1.1'
-    assert result['evidence'][0]['version'].startswith('v')
+    assert result['evidence'][0]['version'] == 'r1.1'  # a registered text's handle is its revision
     with pytest.raises(ValueError, match='whole-text'):
         call(registry, 'create', **declaration(references=[dict(evidence={'record': 'r1.1'}, purpose='current',
                                                                 select={'path': '/text'})]))
@@ -334,7 +335,7 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
                left={'row': {'channel': 'search'}, 'col': 'cost'}, op='<',
                right={'row': {'channel': 'social'}, 'col': 'cost'}))
     registered = call(registry, 'create', **declaration(references=[ref]))
-    assert registered['evidence'][0]['version'].startswith('v')
+    assert re.fullmatch(r'query\d+@v1', registered['evidence'][0]['version'])
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert binding['version_id'].endswith(':public_response')
     assert store.read_event(binding['version_id'].rsplit(':', 1)[0])['request']['candidate_sql'] == sql

@@ -7,7 +7,7 @@ from itertools import accumulate
 import json
 
 from .execution_capture import CapturedText, CURRENT_EVENT, at_pointer, origin, text_sources
-from .registration_evidence import HANDLES
+from . import evidence_handles
 from .sql_evidence import encoded
 
 
@@ -121,7 +121,8 @@ def _literal_bases(store, source, available):
             if original != raw:
                 continue  # Universal-newline projections cannot recover original bytes.
         event = store.read_event(meta['created_by_event'])
-        key = evidence_key(version, meta, event['query_definition'], event['result'], event['request'].get('request'))
+        key = evidence_key(version, meta, event['query_definition'], event['result'], event['request'].get('request'),
+                           event['request'])
         available[version] = dict(text=text, key=list(key),
             chain=[dict(version=version, pointer=source['pointer'], range=[a, b])])
 
@@ -194,10 +195,11 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         valid = False
     if not valid:
         return dict(choice, reason='delta_verification_failed')
-    handles = store.load_state(HANDLES) or {}
     # Tool-call reads name their own target (for pf_read full text); PF reads name the base.
+    # A number is only allocated once the compact form is actually used.
     named = meta['target'] if tool else base
-    handle = next((k for k, v in handles.items() if v == named), 'v' + str(len(handles) + 1))
+    handles = evidence_handles.index(store)
+    handle = handles.name(named, allocate=False)
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
     labels = (dict(base_handle=tool_base(meta['key']), target_handle=handle) if tool else dict(base_handle=handle))
     payload = _payload(meta, full, mode, dict(labels, edits=edits))
@@ -207,8 +209,7 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         return dict(choice, reason='token_count_failed')
     if tokens >= full_tokens:
         return dict(choice, reason='compact_not_smaller')
-    from .registration_evidence import EvidenceResolver
-    if EvidenceResolver(store).handle(named) != handle:
+    if handles.name(named) != handle:
         raise RuntimeError('Read baseline handle changed')
     return dict(choice, mode=mode, reason='unchanged' if mode == 'UNCHANGED' else 'delta_smaller',
                 payload=payload, base=base, edits=edits, **labels)

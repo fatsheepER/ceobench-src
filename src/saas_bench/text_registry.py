@@ -8,7 +8,7 @@ import subprocess
 from pydantic import ValidationError
 
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
-from . import pf_render
+from . import evidence_handles, pf_render
 from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
 from .registration_schema import MODELS
 from .run_state import write_json
@@ -171,6 +171,11 @@ class TextRegistry:
         if 'unknown' in evidence:
             return dict(status='unknown', reason=evidence['unknown'])
         full = label = None
+        if self.mode == 'pf' and 'path' in evidence and 'commit' not in evidence \
+                and evidence_handles.VERSIONED.fullmatch(evidence['path']):
+            evidence = ref['evidence'] = {'version': evidence['path']}  # forecast.json@v3 written as a path
+        if self.mode == 'pf' and evidence_handles.RECORD.fullmatch(evidence.get('version', '')):
+            evidence = ref['evidence'] = {'record': evidence['version']}
         if 'record' in evidence:
             requested = evidence['record']
             history = records.get(requested.split('.')[0], [])
@@ -241,9 +246,8 @@ class TextRegistry:
         if binding.get('status') != 'resolved':
             status = 'commit_only' if binding.get('git_commit') else 'unknown'
             return dict(shown, status=status, reason=binding.get('reason', 'not_captured_in_prefix'))
-        return dict(shown, version=self.resolver.handle(binding['version_id']),
-                    latest=self.resolver.handle(binding['latest_version_id']),
-                    differs=binding['version_id'] != binding['latest_version_id'])
+        version, latest = (self.resolver.handle(binding[k]) for k in ('version_id', 'latest_version_id'))
+        return dict(shown, version=version, latest=latest, differs=version != latest)
 
     def _list(self, state, after, limit):
         active = [versions[-1] for key, versions in sorted(state['records'].items(), key=lambda kv: int(kv[0][1:]))

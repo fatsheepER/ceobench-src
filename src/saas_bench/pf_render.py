@@ -161,7 +161,7 @@ def change(kind, old_raw, new_raw):
 # --- page rendering --------------------------------------------------------------
 
 def item_line(item):
-    """v12 · day 7 · what (flags)."""
+    """query7@v2 · day 7 · what (flags)."""
     day = f"day {item['day']}" if item.get('day') is not None else 'day ?'
     if item.get('record'):
         state = item['text_status'] + ('' if item.get('current_revision', True) else ', superseded')
@@ -173,6 +173,8 @@ def item_line(item):
     flags = [item['status']] if item.get('status') not in (None, 'succeeded') else []
     flags += ['truncated'] if item.get('truncated') else []
     flags += ['partial capture'] if item.get('extent', 'full') != 'full' else []
+    flags += [f"unchanged since day {item['unchanged_since_day']}"] if item.get('unchanged_since_day') is not None else []
+    flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
     return f"{item['version']} · {day} · {what}" + (f" ({', '.join(flags)})" if flags else '')
 
 
@@ -217,7 +219,8 @@ def render_list(page, title, wanted=None):
         lines.append(item_line(item))
         if detail:
             lines.append(item_detail(item, wanted))
-    tail = ' '.join(filter(None, [_more(page, 'older'), 'Read one: pf_read {"target": {"version": "vN"}}.',
+    example = items[0]['version'] if items else 'forecast.json@v3'
+    tail = ' '.join(filter(None, [_more(page, 'older'), 'Read one: pf_read {"target": {"version": "%s"}}.' % example,
                                   '' if detail else 'Add "detail": true for times, reads and matches.']))
     return '\n'.join(lines + [tail])
 
@@ -274,7 +277,12 @@ def render_dependencies(page):
     tail = [_more(page, 'items')]
     if not detail:
         tail.append('Add "detail": true for every underlying query, read and file.')
-    tail.append('Compare versions: pf_read {"mode": "diff", "baseline": {"version": "vA"}, "target": {"version": "vB"}}.')
+    # Name a pair that was just compared, so the example is directly usable.
+    pair = next(((row['target']['version'], row['check']['current_version']) for row in page['items']
+                 if row.get('target') and (row.get('check') or {}).get('current_version') not in
+                 (None, row['target']['version'])), ('forecast.json@v1', 'forecast.json@v2'))
+    tail.append('Compare two versions of one object: pf_read {"mode": "diff", "baseline": {"version": "%s"}, '
+                '"target": {"version": "%s"}}.' % pair)
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 

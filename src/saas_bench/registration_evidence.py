@@ -7,9 +7,10 @@ from pathlib import PurePosixPath
 import re
 import subprocess
 
+from . import evidence_handles
+from .evidence_handles import HANDLES  # noqa: F401  (re-exported for callers)
 
-# Private state name of the lineage-wide vN handle table.
-HANDLES = 'registration_handles'
+
 WEEK_LABEL = re.compile('week-[1-9][0-9]*')
 
 
@@ -251,25 +252,24 @@ class EvidenceResolver:
         # observations. They can be cited by handle without inventing an update chain.
         return version, meta.get('object_id') or version, body.decode(), 'other'
 
-    def handle(self, version):
-        # One lineage-wide table: forks copy the evidence database and keep numbering,
-        # so a handle an agent saw or wrote down never changes meaning.
-        name = HANDLES
-        handles = self.store.load_state(name) or {}
-        if version not in handles.values():
-            handles['v' + str(len(handles) + 1)] = version
-            self.store.save_state(name, handles)
-        return next(k for k, v in handles.items() if v == version)
+    def handle(self, version, allocate=True):
+        """Agent-facing handle, e.g. forecast.json@v3; see evidence_handles."""
+        return evidence_handles.index(self.store).name(version, allocate)
+
+    def lookup(self, handle):
+        return evidence_handles.index(self.store).lookup(handle)
 
     def resolve(self, evidence, reference, accept=None):
         versions = self.versions()
-        explicit = None
+        explicit = members = None
         if 'version' in evidence:
-            handles = self.store.load_state(HANDLES) or {}
-            explicit = handles.get(evidence['version'])
-            if explicit is None:
+            named = self.lookup(evidence['version'])
+            if not named:
                 raise ValueError('Unknown version handle; use a path or SQL instead')
-            explicit, object_id, _, kind = self.identity(explicit)
+            # One handle denotes every acquisition of the same content; bind the newest delivered.
+            members = {self.identity(v)[0] for v in named}
+            explicit, object_id, _, kind = self.identity(named[-1])
+            handle_object = evidence_handles.index(self.store).key(explicit)
         elif 'path' in evidence:
             object_id, kind = evidence['path'], 'file'
         elif 'record' in evidence:
@@ -279,26 +279,24 @@ class EvidenceResolver:
         else:
             raise ValueError('Unsupported PF evidence reference')
         candidates = []
-        query_definition = (self.store.read_event(self.content(explicit)[0]['created_by_event'])['query_definition']
-                            if explicit and kind == 'query' else None)
         for version, meta in versions:
             if kind != 'other' and meta['layer'] not in ('file_bytes', 'server_public_response', 'registered_text'):
+                continue
+            if members is not None:
+                if evidence_handles.index(self.store).key(version) == handle_object:
+                    candidates.append(version)
                 continue
             if kind == 'query' and 'sql' in evidence:
                 event = self.store.read_event(meta['created_by_event'])
                 if event['request'].get('candidate_sql') != evidence['sql']:
-                    continue
-            elif query_definition:
-                definition = self.store.read_event(meta['created_by_event'])['query_definition']
-                if not definition or [definition[1], *definition[3:]] != [query_definition[1], *query_definition[3:]]:
                     continue
             elif (meta.get('object_id') or version) != object_id:
                 continue
             candidates.append(version)
         if not candidates:
             if kind == 'query':
-                raise ValueError('No captured query has exactly this SQL text; cite the vN handle shown '
-                                 'after your command instead, or use unknown with a reason')
+                raise ValueError('No captured query has exactly this SQL text; cite the handle shown after '
+                                 'your command instead (e.g. query7@v2), or use unknown with a reason')
             raise ValueError('No captured evidence exists; use unknown with a reason')
         latest = candidates[0]
         if accept is not None:
@@ -313,7 +311,7 @@ class EvidenceResolver:
                 raise ValueError('Registered text supports whole-text equality only')
             wanted_record = evidence.get('record', '')
             for candidate in candidates:
-                if explicit and candidate != explicit:
+                if members is not None and candidate not in members:
                     continue
                 if '.' in wanted_record and json.loads(self.content(candidate)[1])['version'] != wanted_record:
                     continue
@@ -322,7 +320,7 @@ class EvidenceResolver:
             raise ValueError('Unknown registered text revision; use unknown with a reason')
         authored = {c for c in candidates if kind == 'file' and self.authored(c)}
         for occurrence_version, meta in versions:
-            if occurrence_version in authored and not (explicit and occurrence_version != explicit):
+            if occurrence_version in authored and not (members is not None and occurrence_version not in members):
                 # The model wrote these exact bytes itself, so it knows the whole file.
                 if predicate.get('type') == 'compare':
                     raise ValueError('compare requires one query view')
@@ -346,7 +344,7 @@ class EvidenceResolver:
             # Newest acquired evidence in the last actual request wins, regardless of
             # message field ordering (old tool messages often recur in the same request).
             for candidate in candidates:
-                if explicit and candidate != explicit:
+                if members is not None and candidate not in members:
                     continue
                 matches = []
                 for item in occurrences:
@@ -377,14 +375,17 @@ class EvidenceResolver:
                 if candidate in authored:
                     break  # The outer loop will use the model's complete authored bytes.
                 # Never silently fall back to an older, more fully read version.
+                if kind == 'other':
+                    raise ValueError('Only part of this output reached you; cite the command return handle '
+                                     '(cmdN@vK) shown after your command, or use unknown with a reason')
                 raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
         if kind == 'query':
             raise ValueError('Evidence has not been delivered to the model: you saw only what your command '
-                             'printed, not this raw query result. Cite that output by its 输出 vN handle '
+                             'printed, not this raw query result. Cite that output by its 输出 handle '
                              '(its queries are traced upstream), or use unknown with a reason')
         if kind == 'file':
             raise ValueError('Evidence has not been delivered to the model: you neither read nor wrote this '
-                             'file version. Read it first, cite the 输出 vN handle of the command output '
+                             'file version. Read it first, cite the 输出 handle of the command output '
                              'you saw, or use unknown with a reason')
         raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
 

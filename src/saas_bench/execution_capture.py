@@ -135,8 +135,11 @@ class ExecutionCapture:
                   reused_file_versions=reused)
         return items
 
-    def finish(self, text, status='succeeded', read_key=None, read_complete=True, **facts):
-        version = self.blob('tool_return', text, 'tool_return', segments=self.origins) if text is not None else None
+    def finish(self, text, status='succeeded', read_key=None, read_complete=True, body=None, **facts):
+        # body is the return before PF appended handles; equal bodies keep one version number.
+        from .evidence_handles import body_digest
+        extra = dict(body_sha256=body_digest(body)) if body is not None else {}
+        version = self.blob('tool_return', text, 'tool_return', segments=self.origins, **extra) if text is not None else None
         pf_read = getattr(text, 'pf_read', None)
         if read_key and version:
             # The exact tool return is the read target; repeated identical calls in one
@@ -314,7 +317,10 @@ def receive_client(handler):
         if record.get('kind') == 'python_start':
             if set(record) != {'kind', 'code', 'source'} or not all(isinstance(record[k], str) for k in ('code', 'source')):
                 raise ValueError('Invalid Python start record')
-            child = store.begin_event('cli_python', {'source': record['source']}, parent=parent)
+            args = {'source': record['source']}
+            if script := script_name(record['source'], getattr(handler.server._api_server, 'script_workspace', None)):
+                args['script'] = script
+            child = store.begin_event('cli_python', args, parent=parent)
             store.version(child, 'code', record['code'], layer='executed_code')
             store.context(child, body['call'])
             handler._send_json({'accepted': True})
@@ -403,6 +409,53 @@ def query_projection(capture, stdout):
                            object_id=meta['object_id'], derived_from=public,
                            source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection')
     return [origin(version, stdout)] if version else []
+
+
+def script_name(source, workspace=None):
+    """A script path as the agent would write it from the workspace, e.g. analyze.py."""
+    from pathlib import PurePosixPath
+    if not source or source == 'inline':
+        return None
+    path = PurePosixPath(source)
+    roots = ['/workspace'] + ([str(workspace), str(Path(workspace).resolve())] if workspace else [])
+    for root in roots:
+        if path.is_absolute() and path.is_relative_to(root):
+            return path.relative_to(root).as_posix()
+    return path.as_posix()
+
+
+def script_projection(capture, stdout):
+    """Lines of this command's stdout that are lines of a script it ran, in order.
+
+    Only scripts run by this very execution are considered; their full stdout was
+    reported by the client wrapper. Filters such as head, tail or grep keep whole lines,
+    so the part of a script's output that reached the model stays citable.
+    """
+    import difflib
+    from itertools import accumulate
+    store = capture.store
+    with closing(store.connect()) as conn:
+        children = [row[0] for row in conn.execute(
+            "SELECT event_id FROM requests WHERE json_extract(request, '$.parent_event_id') = ? "
+            "AND json_extract(request, '$.kind') = 'cli_python' ORDER BY rowid", (capture.event,))]
+    lines = stdout.splitlines(keepends=True)
+    offsets = [0, *accumulate(map(len, lines))]
+    result = []
+    for child in children:
+        try:
+            raw = store.get_content(child + ':stdout')[1]
+        except KeyError:
+            continue
+        text = raw.decode('utf-8')
+        source = text.splitlines(keepends=True)
+        starts = [0, *accumulate(map(len, source))]
+        matcher = difflib.SequenceMatcher(None, source, lines, autojunk=False)
+        for a, b, size in matcher.get_matching_blocks():
+            if size:
+                start, end = starts[a], starts[a + size]
+                result.append(dict(origin(child + ':stdout', text, start, end, offsets[b]),
+                                   match='same_execution_lines'))
+    return result
 
 
 def text_sources(value, pointer=''):
