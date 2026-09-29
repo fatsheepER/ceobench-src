@@ -205,6 +205,8 @@ DELTA_READ_TOOLS = ('bash', 'read_file', 'search_files')
 def call_identity(workspace, tool_name, args, guest_root=None):
     """One tool call's identity: the tool and its arguments, ignoring a leading `cd` into
     the workspace itself. Repeated returns of one call are versions of one object."""
+    # A note explains the call; it is not part of what the call is.
+    args = {k: v for k, v in args.items() if k != 'note'}
     if tool_name == 'bash':
         roots = {str(workspace), str(Path(workspace).resolve()), guest_root or str(workspace)}
         command = args.get('command', '')
@@ -240,15 +242,27 @@ def read_identity(store, event, workspace, tool_name, args, guest_root=None):
     return call_identity(workspace, tool_name, args, guest_root)
 
 
+# PF groups may attach a note to the calls that produce outputs and files (design 3.2).
+NOTE_TOOLS = ('bash', 'write_file', 'edit_file')
+NOTE_LIMIT = 200
+NOTE_PARAMETER = {
+    'type': 'string',
+    'description': ('Optional. Why you ran this or what the change is for. PF keeps the note with the outputs '
+                    'and files of this call and shows it when you see them again. Up to 200 characters.'),
+}
+
+
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
+    if pf_queries:
+        # PF queries run as the `pf` command inside bash; the function tools stay those of Git.
+        definitions = [dict(t, parameters=dict(t['parameters'], properties=dict(
+            t['parameters']['properties'], note=NOTE_PARAMETER))) if t['name'] in NOTE_TOOLS else t
+            for t in definitions]
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
         definitions = definitions + tool_definitions(pf=pf_queries)
-    if pf_queries:
-        from saas_bench.pf_queries import tool_definitions
-        definitions = definitions + tool_definitions()
     return [
         {
             'type': 'function',
@@ -353,9 +367,29 @@ class BashAgentToolExecutor:
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
+        facts, view = {}, None
         if self.pf_queries:
+            from saas_bench import pf_cli
             from saas_bench.pf_queries import MODELS
             dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
+            dispatch['pf_usage'] = lambda args: args['message']
+            if tool_name == 'bash':
+                # `pf ...` typed in bash is answered here, outside the sandbox (design 3.4).
+                try:
+                    parsed = pf_cli.parse(args.get('command', ''), self._roots())
+                except pf_cli.Usage as exc:
+                    parsed = ('pf_usage', {'message': str(exc)}, None)
+                if parsed:
+                    facts['command'] = args.get('command', '')
+                    tool_name, args, view = parsed
+            if tool_name in NOTE_TOOLS and 'note' in args:
+                if not isinstance(args['note'], str):
+                    return 'Error: note must be a string'
+                if len(args['note']) > NOTE_LIMIT:
+                    args = dict(args, note=args['note'][:NOTE_LIMIT])
+                    facts['note_truncated'] = True
+        elif tool_name in NOTE_TOOLS and 'note' in args:
+            args = {k: v for k, v in args.items() if k != 'note'}  # Not offered outside PF.
         handler = dispatch.get(tool_name)
         if handler is None:
             return f"Error: Unknown tool '{tool_name}'"
@@ -370,7 +404,9 @@ class BashAgentToolExecutor:
         result, status = '', 'succeeded'
         try:
             if capture:
-                capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root))
+                capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root),
+                              **{k: v for k, v in facts.items() if k == 'command'})
+                capture.facts.update(facts)
                 token = CURRENT_EVENT.set(capture.event)
                 if capture.event:
                     context = capture.safe(capture.store.context, capture.event)
@@ -383,6 +419,9 @@ class BashAgentToolExecutor:
                         'unobserved_internal_file_reads', 'unobserved_intermediate_file_versions',
                         'unobserved_pipe_streams', 'unobserved_program_data_dependencies']
             result = handler(args)
+            if view and getattr(result, 'pf_read', None) is None:
+                from saas_bench.pf_cli import apply_view
+                result = apply_view(result, view)
             if capture:
                 capture.origins.extend(getattr(result, 'origins', []))
             if tool_name != 'bash' and result.startswith('Error:'):
@@ -424,6 +463,10 @@ class BashAgentToolExecutor:
             self.extra_env = previous_env
             self.capture = None
         return result
+
+    def _roots(self):
+        """Paths by which the agent may name its workspace, e.g. in a leading cd."""
+        return {str(self.workspace_path), str(self.workspace_path.resolve()), self.guest_root}
 
     def _read_text(self, path, reuse=False):
         from saas_bench.execution_capture import decoded

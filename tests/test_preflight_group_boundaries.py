@@ -10,7 +10,7 @@ import pytest
 from saas_bench.agents.bash_agent.agent import BashAgent
 from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
 from saas_bench.registration_evidence import HANDLES
-from test_text_registry import captured, declaration, git, send, workspace
+from test_text_registry import captured, declaration, git, receipt, send, workspace
 from test_public_sql import server
 from test_preflight_integration import offline_runner, packed_public, advance
 
@@ -84,8 +84,8 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     import httpx
     from openai import OpenAI
     from anthropic import Anthropic
-    from saas_bench.registration_schema import registration_prompt
-    from saas_bench.pf_queries import PF_PROMPT, MODELS
+    from saas_bench.registration_prompt import MEMORY_HEADER, integrate
+    from saas_bench.agents.bash_agent.tools import NOTE_TOOLS
     from saas_bench.model_usage import ModelUsage
     store, registry, executor = captured(workspace, tmp_path, mode if mode != 'off' else 'git')
     registry.execute('create', declaration(text='DO_NOT_AUTOLOAD_REGISTRATIONS'))
@@ -103,19 +103,23 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             http_client=httpx.Client(transport=httpx.MockTransport(handle))) as client:
         def new_agent():
             value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off', mode == 'pf'), client,
-                workspace_path=workspace, total_days=42, text_registration=mode != 'off',
+                workspace_path=workspace, total_days=42, text_registration=mode != 'off', pf=mode == 'pf',
                 reasoning_effort='low' if api == 'responses' else None,
                 usage_recorder=ModelUsage(None, 'agent', evidence_store=store))
             value._snapshot_path = workspace / 'conversation.json'
             return value
         first = new_agent()
         assert first.act('dashboard', 0, False, {'day': 0}).tool == 'read_file'
-        base = original_prompt(42) + (registration_prompt(pf=mode == 'pf') if mode != 'off' else '')
-        if mode == 'pf':
-            base += PF_PROMPT
-        expected = (base + '\n\n## Your MEMORY.md (auto-loaded)\n\n'
-            'The following is the contents of your MEMORY.md file. '
-            'This is automatically loaded into your context at the start of every day.\n\n' + memory[:40000] +
+        if mode == 'off':
+            header = ('\n\n## Your MEMORY.md (auto-loaded)\n\nThe following is the contents of your MEMORY.md '
+                      'file. This is automatically loaded into your context at the start of every day.\n\n')
+            base = original_prompt(42)
+        else:
+            # Registration groups: sections integrated in place, weekly wording, one history line.
+            history = '[pf: MEMORY.md@v1, written day 0 | 1 version: pf log MEMORY.md]\n' if mode == 'pf' else ''
+            header = MEMORY_HEADER + history + '\n'
+            base = integrate(original_prompt(42), pf=mode == 'pf')
+        expected = (base + header + memory[:40000] +
             '\n\n--- MEMORY.md TRUNCATED ---\n' + f'Showing first 40,000 of {len(memory):,} characters. '
             'Use the read_file tool to see the full contents if needed.')
         assert system(requests[0]).encode() == expected.encode()
@@ -125,9 +129,14 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             item.pop('type', None)
             if 'input_schema' in item:
                 item['parameters'] = item.pop('input_schema')
+        if mode == 'pf':
+            # PF adds only the optional note to the three tools that produce outputs and files.
+            for item in definitions[:6]:
+                assert ('note' in item['parameters']['properties']) == (item['name'] in NOTE_TOOLS)
+                item['parameters']['properties'].pop('note', None)
         assert definitions[:6] == ORIGINAL['tools']
         assert [t['name'] for t in definitions[6:]] == ([] if mode == 'off' else
-            ['text_create', 'text_revise', 'text_retire', 'text_list'] + (list(MODELS) if mode == 'pf' else []))
+            ['text_create', 'text_revise', 'text_retire', 'text_list'])
         assert 'DO_NOT_AUTOLOAD_REGISTRATIONS' not in json.dumps(requests[0])
         first.record_tool_result('completed read')
         first._save_conversation_snapshot(strict=True)
@@ -290,7 +299,7 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
     prefix._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":7}'})
     prefix._git_commit_workspace('saved facts')
     send(prefix.evidence_store, prefix._execute_tool('read_file', {'path': 'facts.json'}))
-    assert json.loads(prefix._execute_tool('text_create', declaration({'path': 'facts.json'})))['id'] == 'r1'
+    assert receipt(prefix._execute_tool('text_create', declaration({'path': 'facts.json'})))['id'] == 'r1'
     prefix._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":8}'})
     # Reach the specified fork boundary: completed week, before the next model call.
     assert advance(prefix)['success']
@@ -353,10 +362,12 @@ print(json.dumps(results))'''
         else:
             assert history.startswith('Error: Unknown tool')
         result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
+        structured = child.tool_executor.text_registry.last_result
+        assert result == 'Revised r1.2 (active).'
         if mode == 'pf':
-            assert json.loads(result)['evidence'][0]['version'] == 'facts.json@v1'
+            assert structured['evidence'][0]['version'] == 'facts.json@v1'
         else:
-            assert 'evidence' not in json.loads(result)
+            assert 'evidence' not in structured
         assert not re.search(r'\b[0-9a-f]{8,64}\b', result)
         assert child._checkpoint_token not in json.dumps(probes)
         child._save_checkpoint(7)

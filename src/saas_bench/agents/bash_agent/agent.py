@@ -62,6 +62,7 @@ class BashAgent(BaseAgent):
         anthropic_fallback_model: Optional[str] = None,
         usage_recorder: Optional[ModelUsage] = None,
         text_registration: bool = False,
+        pf: bool = False,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -99,13 +100,13 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
-        pf_tools = any(t['name'] == 'pf_dependencies' for t in tool_descriptions)
+        if pf and not text_registration:
+            raise ValueError('PF requires text registration')
+        self.text_registration, self.pf = text_registration, pf
         if text_registration:
-            from saas_bench.registration_schema import registration_prompt
-            self.system_prompt += registration_prompt(pf=pf_tools)
-        if pf_tools:
-            from saas_bench.pf_queries import PF_PROMPT
-            self.system_prompt += PF_PROMPT
+            # Registration groups integrate their sections into the original prompt.
+            from saas_bench.registration_prompt import integrate
+            self.system_prompt = integrate(self.system_prompt, pf)
 
         # Agent state
         self.conversation: List[Message] = []
@@ -203,7 +204,7 @@ class BashAgent(BaseAgent):
                 from saas_bench.execution_capture import ExecutionCapture, CapturedText, decoded, origin
                 memory_text = decoded(original_memory)
                 memory_content = memory_text.strip()
-                memory_origin = None
+                memory_origin = memory_version = None
                 if self.evidence_store:
                     capture = ExecutionCapture(self.evidence_store)
                     capture.begin('memory_read', {'path': 'MEMORY.md'})
@@ -221,12 +222,17 @@ class BashAgent(BaseAgent):
                             f"Showing first {max_memory_chars:,} of {len(memory_content):,} characters. "
                             "Use the read_file tool to see the full contents if needed."
                         )
-                    prompt += (
-                        "\n\n## Your MEMORY.md (auto-loaded)\n\n"
-                        "The following is the contents of your MEMORY.md file. "
-                        "This is automatically loaded into your context at the start of every day.\n\n"
-                        f"{memory_content}"
-                    )
+                    if getattr(self, 'text_registration', False):
+                        from saas_bench.registration_prompt import MEMORY_HEADER
+                        history = self._memory_history(memory_version)
+                        prompt += MEMORY_HEADER + (history + '\n' if history else '') + '\n' + memory_content
+                    else:
+                        prompt += (
+                            "\n\n## Your MEMORY.md (auto-loaded)\n\n"
+                            "The following is the contents of your MEMORY.md file. "
+                            "This is automatically loaded into your context at the start of every day.\n\n"
+                            f"{memory_content}"
+                        )
                     if memory_origin:
                         length = memory_origin['request_range'][1]
                         offset = len(prompt) - len(memory_content)
@@ -236,6 +242,14 @@ class BashAgent(BaseAgent):
                 if self.evidence_store:
                     self.evidence_store.fail(exc)
         return prompt
+
+    def _memory_history(self, version):
+        """The registration groups' line on MEMORY.md's history: PF names the loaded version,
+        Git the last weekly commit that changed the file."""
+        from saas_bench import registration_prompt
+        if self.pf:
+            return registration_prompt.pf_memory_line(self.evidence_store, version) if version else None
+        return registration_prompt.git_memory_line(self.workspace_path)
 
     def _context_system_prompt(self) -> str:
         """Reuse the frozen prompt, including its private source ranges."""

@@ -1,9 +1,10 @@
 """Declaration input shapes per group. Predicates are stored, never evaluated here."""
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .evidence_handles import HANDLE_PATTERN
+from .evidence_handles import VERSIONED
 
 
 class Input(BaseModel):
@@ -17,27 +18,6 @@ Number = Annotated[float, Field(allow_inf_nan=False)]
 class BusinessObject(Input):
     kind: Text
     id: Text
-
-
-class ContentTime(Input):
-    day: Annotated[int, Field(ge=0)] | None = None
-    start_day: Annotated[int, Field(ge=0)] | None = None
-    end_day: Annotated[int, Field(ge=0)] | None = None
-    unknown: Text | None = None
-
-    @model_validator(mode='after')
-    def shape(self):
-        if self.unknown is not None:
-            valid = self.day is self.start_day is self.end_day is None
-        elif self.day is not None:
-            valid = self.start_day is self.end_day is None
-        else:
-            # start_day alone is open-ended: from that day until the text is revised or retired.
-            valid = self.start_day is not None and (self.end_day is None or self.start_day <= self.end_day)
-        if not valid:
-            raise ValueError('Use {"day": 21}, {"start_day": 21, "end_day": 27}, {"start_day": 21} '
-                             '(until revised or retired), or {"unknown": "reason"}')
-        return self
 
 
 class Selector(Input):
@@ -75,59 +55,159 @@ class Compare(Input):
     right: Selector
 
 
-def _reference_shape(self):
-    if self.predicate is not None and self.predicate.type == 'compare':
-        if self.select is not None:
-            raise ValueError('compare uses left/right selectors, not select')
-        if self.predicate.left.path is not None or self.predicate.right.path is not None:
-            raise ValueError('compare requires two cells of one query result')
-        if self.evidence.path or self.evidence.record:
-            raise ValueError('compare requires a query view')
-    elif self.predicate is not None and self.select is None:
-        raise ValueError('A numeric predicate requires a selector')
-    if self.evidence.record and (self.select or self.predicate):
-        raise ValueError('Registered text supports whole-text equality only')
-    return self
+CITE_FORMS = dict(
+    git='a workspace file path (the version this week\'s closing commit week-N will store), path@week-N or '
+        'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>"',
+    pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
+       'version you last saw or wrote), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
+       'or "unknown: <reason>"')
+_RECORD = re.compile(r'r[1-9][0-9]*(\.[1-9][0-9]*)?')
+_SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')
+_COMMIT = re.compile(r'week-[1-9][0-9]*|[0-9a-fA-F]{1,40}')
+_UNKNOWN = re.compile(r'unknown(?:(?:\s*:|\s)(.*))?', re.I | re.S)
+
+
+def parse_cite(cite, pf):
+    """The evidence object a cite string names, e.g. "a.py@week-3" -> {"path": "a.py", "commit": "week-3"}."""
+    cite = cite.strip()
+    if m := _UNKNOWN.fullmatch(cite):
+        if not (m.group(1) or '').strip():
+            raise ValueError('Write "unknown: <reason>"')
+        return dict(unknown=m.group(1).strip())
+    if _RECORD.fullmatch(cite):
+        return dict(record=cite)
+    if pf and (VERSIONED.fullmatch(cite) or ('/' not in cite and '.' not in cite and _SINGLE.fullmatch(cite))):
+        return dict(version=cite)
+    if '@' in cite:
+        path, commit = cite.rsplit('@', 1)
+        if path and _COMMIT.fullmatch(commit):
+            return dict(path=path, commit=commit)
+        raise ValueError('Cite a committed file as path@week-N or path@<commit prefix>' +
+                         ('; a handle is NAME@vK' if pf else ''))
+    return dict(path=cite)
+
+
+def parse_applies(value):
+    """"21", "21-27", "21-" (until revised or retired) or "unknown: reason" -> applies_at."""
+    text = value.strip()
+    if m := _UNKNOWN.fullmatch(text):
+        if (m.group(1) or '').strip():
+            return dict(unknown=m.group(1).strip())
+    elif m := re.fullmatch(r'([0-9]+)(?:\s*-\s*([0-9]*))?', text):
+        start = int(m.group(1))
+        if m.group(2) is None:
+            return dict(day=start)
+        if not m.group(2):
+            return dict(start_day=start)
+        if start <= int(m.group(2)):
+            return dict(start_day=start, end_day=int(m.group(2)))
+    raise ValueError(APPLIES_ERROR)
+
+
+def cite_text(evidence):
+    """The cite string of a stored evidence object; the inverse of parse_cite."""
+    if 'unknown' in evidence:
+        return 'unknown: ' + evidence['unknown']
+    if 'sql' in evidence:
+        return 'SQL: ' + evidence['sql']
+    if 'path' in evidence:
+        return evidence['path'] + ('@' + evidence['commit'] if evidence.get('commit') else '')
+    return evidence.get('record') or evidence.get('version')
+
+
+APPLIES_ERROR = 'applies must be "21", "21-27", "21-" (until revised or retired) or "unknown: <reason>"'
+
+
+def applies_text(applies_at):
+    """The applies string of a stored applies_at object; rejects shapes it never had."""
+    day = lambda k: type(applies_at.get(k)) is int and applies_at[k] >= 0
+    keys = set(applies_at)
+    if keys == {'unknown'} and isinstance(applies_at['unknown'], str) and applies_at['unknown'].strip():
+        return 'unknown: ' + applies_at['unknown']
+    if keys == {'day'} and day('day'):
+        return str(applies_at['day'])
+    if keys == {'start_day'} and day('start_day'):
+        return f"{applies_at['start_day']}-"
+    if keys == {'start_day', 'end_day'} and day('start_day') and day('end_day') and \
+            applies_at['start_day'] <= applies_at['end_day']:
+        return f"{applies_at['start_day']}-{applies_at['end_day']}"
+    raise ValueError(APPLIES_ERROR)
+
+
+def _legacy(data, field, flat, convert):
+    """Accept the earlier nested input shape without advertising it in the schema."""
+    if isinstance(data, dict) and field in data and flat not in data and isinstance(data[field], dict):
+        data = dict(data)
+        value = data.pop(field)
+        data[flat] = convert(value)
+    return data
 
 
 def _declaration_models(pf):
-    """Git/prefix inputs expose only Git evidence; PF adds SQL, handles and compare."""
-    class Evidence(Input):
-        path: Text | None = None
-        commit: Text | None = None
-        if pf:
-            sql: Text | None = None
-        record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
-        if pf:
-            version: Annotated[str, Field(pattern=HANDLE_PATTERN)] | None = None
-        unknown: Text | None = None
-
-        @model_validator(mode='after')
-        def shape(self):
-            given = [getattr(self, k, None) for k in ('path', 'sql', 'record', 'version', 'unknown')]
-            if sum(x is not None for x in given) != 1:
-                raise ValueError('Specify exactly one of ' + ('path, sql, record, version, unknown' if pf
-                                                               else 'path, record, unknown'))
-            if self.commit is not None and self.path is None:
-                raise ValueError('commit requires a path')
-            return self
-
+    """Git/prefix inputs expose only Git evidence; PF adds handles and compare."""
     Predicate = Tolerance | Threshold | Compare if pf else Tolerance | Threshold
 
     class Reference(Input):
-        evidence: Evidence
-        purpose: Literal['current', 'historical_only']
+        cite: Text
+        purpose: Literal['current', 'historical_only'] = 'current'
         select: Selector | None = None
         predicate: Annotated[Predicate, Field(discriminator='type')] | None = None
         note: str | None = None
-        shape = model_validator(mode='after')(_reference_shape)
+
+        @model_validator(mode='before')
+        @classmethod
+        def legacy(cls, data):
+            if isinstance(data, dict) and isinstance(data.get('evidence'), dict):
+                given = [k for k in ('path', 'sql', 'record', 'version', 'unknown') if data['evidence'].get(k) is not None]
+                if len(given) != 1 or ('sql' in given and not pf) or ('version' in given and not pf) or \
+                        set(data['evidence']) - {'path', 'commit', 'sql', 'record', 'version', 'unknown'} or \
+                        ('commit' in data['evidence'] and 'path' not in given) or \
+                        not all(isinstance(v, str) and v for v in data['evidence'].values()):
+                    raise ValueError('Specify exactly one of ' + ('path, sql, record, version, unknown' if pf
+                                                                   else 'path, record, unknown'))
+            return _legacy(data, 'evidence', 'cite', cite_text)
+
+        @model_validator(mode='after')
+        def shape(self):
+            evidence = self.evidence
+            if self.predicate is not None and self.predicate.type == 'compare':
+                if self.select is not None:
+                    raise ValueError('compare uses left/right selectors, not select')
+                if self.predicate.left.path is not None or self.predicate.right.path is not None:
+                    raise ValueError('compare requires two cells of one query result')
+                if 'path' in evidence or 'record' in evidence:
+                    raise ValueError('compare requires a query view')
+            elif self.predicate is not None and self.select is None:
+                raise ValueError('A numeric predicate requires a selector')
+            if 'record' in evidence and (self.select or self.predicate):
+                raise ValueError('Registered text supports whole-text equality only')
+            return self
+
+        @property
+        def evidence(self):
+            if self.cite.startswith('SQL: ') and pf:
+                return dict(sql=self.cite[len('SQL: '):])
+            return parse_cite(self.cite, pf)
+
+    Applies = Annotated[str, Field(min_length=1)]
+
+    def applies(data):
+        data = _legacy(data, 'applies_at', 'applies', applies_text)
+        if isinstance(data, dict) and isinstance(data.get('applies'), str):
+            parse_applies(data['applies'])
+        return data
 
     class Create(Input):
         text: Text
         objects: Annotated[list[BusinessObject], Field(min_length=1)]
         references: list[Reference]
-        applies_at: ContentTime
+        applies: Applies
         reason: Text
+
+        @model_validator(mode='before')
+        @classmethod
+        def flat_applies(cls, data):
+            return applies(data)
 
     class Revise(Input):
         record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*$')]
@@ -135,9 +215,30 @@ def _declaration_models(pf):
         text: Text | None = None
         objects: Annotated[list[BusinessObject], Field(min_length=1)] | None = None
         references: list[Reference] | None = None
-        applies_at: ContentTime | None = None
+        applies: Applies | None = None
+
+        @model_validator(mode='before')
+        @classmethod
+        def flat_applies(cls, data):
+            return applies(data)
 
     return Create, Revise
+
+
+def internal(values, pf):
+    """Validated flat input -> the stored declaration shape (evidence and applies_at objects)."""
+    values = dict(values)
+    if 'applies' in values:
+        values['applies_at'] = parse_applies(values.pop('applies'))
+    if 'references' in values:
+        references = []
+        for ref in values['references']:
+            ref = dict(ref)
+            cite = ref.pop('cite')
+            ref['evidence'] = dict(sql=cite[len('SQL: '):]) if pf and cite.startswith('SQL: ') else parse_cite(cite, pf)
+            references.append(ref)
+        values['references'] = references
+    return values
 
 
 class Retire(Input):
@@ -157,74 +258,53 @@ MODELS = dict(git=dict(create=GIT_CREATE, revise=GIT_REVISE, retire=Retire, list
 MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word for word.
 
 
+def compact_schema(node):
+    """Pydantic's JSON schema without titles or the null branch of optional fields.
+
+    Optional fields are simply not required; spelling out {"type": "null"} and a null
+    default for every one of them made the declaration schemas several times longer
+    than the fields they describe.
+    """
+    if isinstance(node, list):
+        return [compact_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    result = {}
+    for key, value in node.items():
+        if key == 'title' or (key == 'default' and value is None):
+            continue
+        if key in ('properties', '$defs'):
+            result[key] = {name: compact_schema(item) for name, item in value.items()}
+        else:
+            result[key] = compact_schema(value)
+    options = result.get('anyOf')
+    if options and len(options) == 2 and {'type': 'null'} in options:
+        other = next(o for o in options if o != {'type': 'null'})
+        result = {k: v for k, v in result.items() if k != 'anyOf'} | other
+    return result
+
+
 def tool_definitions(pf=False):
-    evidence = ('Evidence uses a workspace path you read or wrote (a bare path binds the version last sent to you; '
-                'path@commit binds that committed file), a handle shown in results such as forecast.json@v3, '
-                'query7@v2 or analyze.py.out@v4 (for a script\'s printed numbers, the 输出 handle after the command), '
-                'exact SQL of raw query output you saw, or a registered text rN / rN.M.'
-                if pf else
-                'Evidence uses a workspace file path (a bare path binds the commit closing this week, shown as '
-                'week-N; path@commit or commit selects an earlier commit by hex prefix or week-N) or a registered '
-                'text rN / rN.M.')
-    predicates = ('Optional predicates: tolerance amount around the cited value, threshold op/value, or compare '
-                  'left/op/right within one query result. Predicates on current-purpose references are checked '
-                  'by pf_dependencies and the weekly check.' if pf else
-                  'Optional predicates: tolerance amount around the cited value, or threshold op/value. '
-                  'Predicates are only stored.')
+    group = 'pf' if pf else 'git'
+    predicates = ('Optional select and predicate on a reference make the weekly check test a condition instead '
+                  'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
+                  'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
+                  'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}' +
+                  (', or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
+                   'result; query handles are listed by pf depend <output> --detail.' if pf else '.') +
+                  ' Script outputs and plain text support whole-content equality only.')
     descriptions = {
-        'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence in registrations.json. '
-                  'Supply explicit business objects and applicability time (applies_at: day, start_day with end_day, or '
-                  'start_day alone for "until revised or retired"); use unknown with a reason when evidence '
-                  'is unavailable. ' + evidence + ' purpose is current or historical_only. Optional select uses row '
-                  'equality keys and col, or a JSON Pointer path. ' + predicates + ' Notes over 200 characters are '
-                  'truncated. Returns rN and rN.M.',
-        'revise': 'Append a revision with a reason. Omitted fields, including existing evidence bindings, stay unchanged. Supplied references replace the entire reference list and are validated anew. Old revisions remain in registrations.json.',
-        'retire': 'Stop using a registered text. Append a retired revision with a reason and preserve all history.',
-        'list': 'Page through current, active registered texts in creation order. Includes text and reference notes; does not expand references, find reverse links, or check staleness. Pass next_after as after for the next page.',
+        'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence (see Registered Texts). '
+                  'Each reference is {"cite": ..., "purpose": "current" or "historical_only" (default current), '
+                  '"note": what you use it for}; cite is ' + CITE_FORMS[group] + '. applies is "49", "49-55", '
+                  '"49-" (until revised or retired) or "unknown: <reason>". ' + predicates +
+                  ' Notes over 200 characters are truncated. Returns rN and rN.M.',
+        'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
+                  'supplied references replace the whole list. Earlier revisions remain in registrations.json.',
+        'retire': 'Stop using a registered text. Appends a retired revision with a reason and keeps all history.',
+        'list': 'Page through your active registered texts in creation order, with their references and notes. '
+                'Does not check them. Pass next_after as after for the next page.',
     }
-    models = MODELS['pf' if pf else 'git']
-    return [dict(name='text_' + name, description=descriptions[name], parameters=model.model_json_schema())
+    models = MODELS[group]
+    return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
             for name, model in models.items()]
-
-
-REGISTRATION_COMMON = '''
-
-You may use text_create, text_revise, text_retire and text_list to preserve useful
-hypotheses, forecasts, plans, conclusions and counterevidence across weeks.
-Registrations are saved in registrations.json, which also persists across weeks
-in addition to the items listed under Memory & Persistence. When you save what
-matters in the weekly workflow, you can register or revise the items you expect
-to rely on later, and keep the weekly summary and useful rN IDs in MEMORY.md.
-Registrations are not automatically injected into your context; use text_list
-to review them. Each week begins with a check, shown after the dashboard, that
-lists the active texts whose cited evidence changed. Choose what to register;
-missing registration never blocks business actions.
-Distinguish acquisition time, the day/interval described by evidence, and when
-you read it. Use an explicit unknown reason when applicability is unclear.
-Dashboard normally reflects the previous weekly advance. After changing settings
-within a week, use the corresponding public query to obtain current settings.
-Registered texts can cite each other directly using rN.M, including before a Git
-commit. A bare rN binds its current revision; later revisions do not change that
-reference. Revise with omitted references to preserve the original bindings.
-An unknown reference with a reason is always allowed.
-'''
-
-GIT_EVIDENCE_RULES = '''File references cite committed files. A bare path cites the file as this week's
-closing commit stores it (shown as week-N), so edits later this week are included;
-path@commit cites an earlier commit by a unique prefix or week-N.
-The weekly check lists cited committed files and texts that differ from their
-current versions. Example: before reusing last week's plan, git log -p on the files it cites shows
-whether they changed since you registered it.
-'''
-
-PF_EVIDENCE_RULES = '''Cite what you actually saw or wrote. A bare file path binds the version
-last sent to you or written by you; path@commit binds that committed file. After a command,
-a footer such as [输出: v12 | q: v10 v11 | 写: plan.json v13] names its printed
-output, the queries it ran and the files it wrote. To cite numbers a script printed,
-cite its output (v12); the queries behind it are traced for you. Exact SQL works
-only for raw query output you saw.
-'''
-
-
-def registration_prompt(pf=False):
-    return REGISTRATION_COMMON + (PF_EVIDENCE_RULES if pf else GIT_EVIDENCE_RULES)

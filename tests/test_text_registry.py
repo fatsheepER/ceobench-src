@@ -35,14 +35,25 @@ def workspace(tmp_path):
 
 def declaration(evidence=None, **changes):
     data = dict(text='Keep the plan', objects=[dict(kind='plan', id='B')],
-                applies_at={'start_day': 7, 'end_day': 14}, reason='Initial observation',
+                applies_at={'start_day': 7}, reason='Initial observation',
                 references=[dict(evidence=evidence or {'unknown': 'No saved evidence'}, purpose='current')])
     data.update(changes)
     return data
 
 
 def call(registry, op, **args):
-    return json.loads(registry.execute(op, args))
+    text = registry.execute(op, args)
+    return json.loads(text) if op == 'list' else registry.last_result
+
+
+RECEIPT = re.compile(r'(Registered|Revised|Retired) (r[1-9][0-9]*)\.([1-9][0-9]*) \((active|retired)\)\.')
+
+
+def receipt(text):
+    """id, version and status of a text receipt, e.g. 'Registered r1.1 (active).'."""
+    match = RECEIPT.match(text)
+    assert match, text
+    return dict(id=match.group(2), version=f'{match.group(2)}.{match.group(3)}', status=match.group(4))
 
 
 def send(store, text, state='response_received'):
@@ -143,7 +154,7 @@ def test_notes_and_predicate_fields_are_saved_without_evaluation(workspace):
     ref = dict(evidence={'path': 'evidence.json'}, purpose='historical_only', select={'path': '/n'},
                predicate={'type': 'threshold', 'op': '>=', 'value': 99999}, note='中🙂' * 101)
     result = call(registry, 'create', **declaration(references=[ref]))
-    assert result['warnings'] == ['备注已截至 200 字']
+    assert result['warnings'] == ['Note truncated to 200 characters.']
     saved = call(registry, 'list')['records'][0]['references'][0]
     assert len(saved['note']) == 200 and saved['predicate']['value'] == 99999
     for changes in ({'select': {'row': 3, 'col': 'n'}}, {'predicate': {'type': 'eval', 'code': 'x'}},
@@ -173,7 +184,7 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     assert store.load_state('declaration:r1.2')['references'] == [binding]
     call(registry, 'revise', record='r1', reason='New evidence', references=declaration({'path': 'evidence.json'})['references'])
     assert store.load_state('declaration:r1.3')['references'][0]['version_id'] != binding['version_id']
-    with pytest.raises(ValueError, match='use a path'):
+    with pytest.raises(ValueError, match='or a file path'):
         call(registry, 'create', **declaration({'version': 'v999'}))
 
 
@@ -362,7 +373,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
     from openai import OpenAI
     from anthropic import Anthropic
     from saas_bench.agents.bash_agent.agent import BashAgent
-    from saas_bench.registration_schema import registration_prompt
+    from saas_bench.registration_prompt import integrate
     from test_preflight_usage import reply
     requests = []
     def handle(request):
@@ -388,7 +399,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         original = BashAgent(get_bash_agent_tool_descriptions(), client, workspace_path=workspace)
         enhanced = BashAgent(get_bash_agent_tool_descriptions(True), client, workspace_path=workspace,
                              text_registration=True, reasoning_effort='low' if api == 'responses' else None)
-        assert enhanced.system_prompt == original.system_prompt + registration_prompt(pf=False)
+        assert enhanced.system_prompt == integrate(original.system_prompt, pf=False)
         assert enhanced.act('dashboard', 0, False, {'day': 0}).tool == 'text_list'
         request = requests[-1]
         tools = [t.get('function', t) for t in request['tools']]
@@ -423,7 +434,7 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     result = runner._execute_tool('bash', {'command': 'git add facts.json && git -c maintenance.auto=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -m facts'})
     assert '[exit code:' not in result
     send(runner.evidence_store, runner._execute_tool('read_file', {'path': 'facts.json'}))
-    assert json.loads(runner._execute_tool('text_create', declaration({'path': 'facts.json'})))['version'] == 'r1.1'
+    assert receipt(runner._execute_tool('text_create', declaration({'path': 'facts.json'})))['version'] == 'r1.1'
     page = runner._execute_tool('text_list', {})
     send(runner.evidence_store, page)
     runner._save_checkpoint(0)
@@ -440,9 +451,9 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     children = [offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / mode, mode,
                                            text_registration=mode)) for mode in ('git', 'pf')]
     for child in children:
-        result = json.loads(child._execute_tool('text_create', declaration({'record': 'r1.1'})))
+        result = receipt(child._execute_tool('text_create', declaration({'record': 'r1.1'})))
         assert result['id'] == 'r2'
-        assert ('evidence' in result) == (child.text_registration == 'pf')
+        assert ('evidence' in child.tool_executor.text_registry.last_result) == (child.text_registration == 'pf')
         history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})
         if child.text_registration == 'pf':
             assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
@@ -534,4 +545,4 @@ def test_applicability_accepts_open_ended_start_and_explains_shapes(workspace):
                 {'start_day': 7, 'unknown': 'until revised'}):
         with pytest.raises(ValueError, match='until revised or retired') as error:
             call(registry, 'create', **declaration(applies_at=bad))
-        assert '{"day": 21}' in str(error.value) and '{"unknown": "reason"}' in str(error.value)
+        assert '"21-27"' in str(error.value) and '"unknown: <reason>"' in str(error.value)

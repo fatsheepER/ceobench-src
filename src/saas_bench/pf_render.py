@@ -22,7 +22,7 @@ def command_summary(command, limit=100):
     return short(' ; '.join(runs or parts) or command, limit)
 
 
-def _call(parsed, limit=80):
+def call_text(parsed, limit=80):
     args = json.dumps(parsed.get('args') or {}, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
     return parsed.get('tool', '?') + ('(' + short(args[1:-1], limit) + ')' if args != '{}' else '()')
 
@@ -41,7 +41,7 @@ def label(layer, kind, request, query_sql=None, object_id=None, classification=N
             return 'read current_day'
         parsed = request.get('parsed') or {}
         if parsed.get('tool'):
-            return ('write ' if classification == 'write_receipt' else 'read ') + _call(parsed)
+            return ('write ' if classification == 'write_receipt' else 'read ') + call_text(parsed)
         return (request.get('method', '') + ' ' + request.get('path', '')).strip() or 'public response'
     if layer == 'dashboard':
         return 'dashboard'
@@ -188,7 +188,7 @@ def item_detail(item, wanted=None):
                                         ('in full' if reads.get('full') else 'partly') +
                                         (f", last day {reads['last_day']}" if reads.get('last_day') is not None else '')))
     if wanted and item.get('objects'):
-        hit = next((o for o in item['objects'] if o['kind'] == wanted['kind'] and str(o['id']) == wanted['id']), {})
+        hit = next((o for o in item['objects'] if o['kind'] == wanted.get('kind', o['kind']) and str(o['id']) == wanted['id']), {})
         others = len({(o['kind'], str(o['id'])) for o in item['objects']}) - 1
         where = 'declared' if hit.get('basis') == 'agent_declaration' else 'at ' + str(hit.get('field') or hit.get('basis'))
         parts.append(f"{wanted['id']} {where}" + (f' (+{others} other objects)' if others > 0 else ''))
@@ -206,7 +206,7 @@ def item_detail(item, wanted=None):
 
 def _more(page, what):
     if page.get('next_cursor'):
-        return f"{page['remaining']} more {what}: {{\"cursor\": \"{page['next_cursor']}\"}}."
+        return f"{page['remaining']} more {what}: pf more {page['next_cursor']}."
     return ''
 
 
@@ -219,10 +219,57 @@ def render_list(page, title, wanted=None):
         lines.append(item_line(item))
         if detail:
             lines.append(item_detail(item, wanted))
-    example = items[0]['version'] if items else 'forecast.json@v3'
-    tail = ' '.join(filter(None, [_more(page, 'older'), 'Read one: pf_read {"target": {"version": "%s"}}.' % example,
-                                  '' if detail else 'Add "detail": true for times, reads and matches.']))
-    return '\n'.join(lines + [tail])
+    tail = ' '.join(filter(None, [_more(page, 'older'), f"Read one: pf show {items[0]['version']}." if items else '']))
+    return '\n'.join(lines + ([tail] if tail else []))
+
+
+def log_line(item):
+    """MEMORY.md@v9 · day 49 · +44 −48 lines · note (day 49): "..."."""
+    if item.get('record'):
+        return (f"{item['record']} · day {item['day']} · {item['text_status']}: \"{short(item.get('text', ''), 90)}\""
+                + (f" · reason: {short(item['reason'], 80)}" if item.get('reason') else ''))
+    parts = [item['version'], f"day {item['day']}"]
+    if item.get('rows') is not None:
+        parts.append(plural(item['rows'], 'row'))
+    if item.get('size'):
+        parts.append(item['size'])
+    flags = [item['status']] if item.get('status') not in (None, 'succeeded') else []
+    flags += ['truncated'] if item.get('truncated') else []
+    flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
+    if flags:
+        parts.append(', '.join(flags))
+    if item.get('note'):
+        parts.append(f"note: \"{short(item['note'][1], 150)}\"")
+    return ' · '.join(parts)
+
+
+def render_log(page):
+    items = page['items']
+    root = page['root']
+    what = f"text {root['record'].split('.')[0]}" if root.get('record') else root['what']
+    noun = 'revision' if page.get('kind') == 'record' else 'version'
+    lines = [f"{what}: {plural(page['total'], noun)}, newest first"]
+    lines += [log_line(item) for item in items]
+    tail = [_more(page, 'older')]
+    if not root.get('record') and items:
+        newest = items[0]['version']
+        tail.append(f'pf show {newest}' + (f" · pf diff {items[1]['version']} {newest}" if len(items) > 1 else '')
+                    + (f" · pf blame {newest.rsplit('@', 1)[0]}" if root.get('layer') == 'file_bytes' else ''))
+    return '\n'.join(lines + [' '.join(filter(None, tail))])
+
+
+def render_search(page):
+    wanted = page['object']
+    counts = ', '.join(plural(n, noun.lower().rstrip('s')) for noun, _, n in page['sections'])
+    lines = [f"{wanted['id']}: {counts}, newest first."]
+    for title, items, total in page['sections']:
+        if not items:
+            continue
+        lines.append(f'{title}:' + (f' (latest {len(items)} of {total})' if total > len(items) else ''))
+        for item in items:
+            lines.append('  ' + item_line(item))
+    lines.append(f"pf search {wanted['id']} --all lists all {plural(page['total'], 'saved item')}.")
+    return '\n'.join(lines)
 
 
 def status(check, row):
@@ -267,22 +314,22 @@ def render_dependencies(page):
     checked = page.get('stale_check') == 'performed'
     lines = [item_line(root),
              ('Checked against the current world; advisory.' if checked else
-              'Not checked (checks run only for purpose=current).')]
+              'Not checked (--history lists history only).')]
     if not page['items']:
         lines.append('No recorded dependencies.' if detail else
-                     'No declared references. Add "detail": true to trace what produced it.')
+                     f"No declared references. pf depend {root['version']} --detail traces what produced it.")
     for i, row in enumerate(page['items'], 1):
         indent = '  ' * (row['depth'] - 1) if detail else ''
         lines.append(f'{indent}{i}. ' + dependency_line(row))
     tail = [_more(page, 'items')]
     if not detail:
-        tail.append('Add "detail": true for every underlying query, read and file.')
+        tail.append(f"pf depend {root['version']} --detail lists every underlying query, read and file.")
     # Name a pair that was just compared, so the example is directly usable.
     pair = next(((row['target']['version'], row['check']['current_version']) for row in page['items']
                  if row.get('target') and (row.get('check') or {}).get('current_version') not in
-                 (None, row['target']['version'])), ('forecast.json@v1', 'forecast.json@v2'))
-    tail.append('Compare two versions of one object: pf_read {"mode": "diff", "baseline": {"version": "%s"}, '
-                '"target": {"version": "%s"}}.' % pair)
+                 (None, row['target']['version'])), None)
+    if pair:
+        tail.append('See what changed: pf diff %s %s.' % pair)
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -302,7 +349,7 @@ def render_dependents(page):
         lines.append(f'{i}. ' + item_line(source) + ' — ' + ' — '.join(extras))
     tail = [_more(page, 'referrers')]
     if not detail:
-        tail.append('Add "detail": true for scripts, files and outputs derived from it.')
+        tail.append(f"pf rdepend {root['version']} --detail adds scripts, files and outputs derived from it.")
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -310,29 +357,34 @@ def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
 
 
-def render_weekly(entries, day, pf):
-    """Week-start check: active texts whose cited evidence changed, each with its changed sources."""
-    affected = [e for e in entries if e['changed']]
-    unchanged = [e['text']['record'] for e in entries if not e['changed']]
-    lines = [f'=== Weekly check of your registered texts (day {day}) ===',
-             (f'Reran the queries and reads cited by {plural(len(entries), "active text")} and compared the files '
-              'they cite.' if pf else f'Compared the committed files and texts cited by {plural(len(entries), "active text")} '
-                                      'with their current versions.') + ' Advisory; you decide what to do.']
-    if not affected:
-        lines.append('None of the cited evidence changed.')
-    for entry in affected[:8]:
+def render_weekly(entries, day, pf, ended=(), underlying=()):
+    """Week-start check: texts whose directly cited evidence changed, then short summaries.
+
+    Only what the agent itself cited is itemized; changes in the queries behind a cited
+    output are normal week-to-week data changes and share one line.
+    """
+    flagged = [e for e in entries if e['changed']]
+    lines = [f'=== Check of your registered texts (day {day}) ===']
+    checked = plural(len(entries), 'active text') + ' checked'
+    if not flagged:
+        lines.append(checked + ': cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
+    else:
+        lines.append(f'{checked}; {len(flagged)} with changed evidence:')
+    for entry in flagged[:8]:
         text = entry['text']
-        lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\" — "
-                     f"{len(entry['changed'])} of {entry['total']} cited sources flagged")
+        lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\"")
         for row in entry['changed'][:3]:
             lines.append('  - ' + (row if isinstance(row, str) else short(dependency_line(row, relation=False), 320)))
         if len(entry['changed']) > 3:
             lines.append(f"  - and {len(entry['changed']) - 3} more")
-    if len(affected) > 8:
-        lines.append('Also changed: ' + ', '.join(e['text']['record'] for e in affected[8:]))
-    if unchanged:
-        lines.append('Unchanged: ' + ', '.join(unchanged[:15]) + (f' and {len(unchanged) - 15} more' if len(unchanged) > 15 else ''))
-    if affected:
-        lines.append('Details: pf_dependencies {"target": {"record": "rN"}}.' if pf else
-                     'Details: run the git diff shown on each line.')
+    if len(flagged) > 8:
+        lines.append('Also changed: ' + ', '.join(e['text']['record'] for e in flagged[8:]))
+    if underlying:
+        lines.append(f"The queries behind outputs cited by {', '.join(underlying)} now return different rows; "
+                     f"pf depend {underlying[0].split('.')[0]} shows which.")
+    if ended:
+        lines.append(f"Not checked because their applies window is over: {', '.join(ended)} "
+                     '(text_retire them if you no longer use them).')
+    if flagged:
+        lines.append('Details: pf depend rN.' if pf else 'Details: run the git diff shown on each line.')
     return '\n'.join(lines)

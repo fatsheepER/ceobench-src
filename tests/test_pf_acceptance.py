@@ -55,7 +55,8 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
 
     def query(name, **args):
         if not name.startswith('pf_'):
-            return json.loads(tool(name, **args))
+            output = tool(name, **args)
+            return json.loads(output) if name == 'text_list' else executor.text_registry.last_result
         if name in ('pf_dependencies', 'pf_dependents') and 'cursor' not in args:
             args['detail'] = True
         tool(name, **args)  # the agent-facing text goes into the request
@@ -217,7 +218,7 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         reverse = query('pf_dependents', target={'version': reference['evidence']['version']})
         assert {'r2.1', 'r5.1'} <= {r['source']['record'] for r in reverse['items']}
         assert next(r for r in reverse['items'] if r['source']['record'] == 'r5.1')['historical_only']
-        page = query('pf_search', object={'kind': 'plan', 'id': 'B'}, limit=1)
+        page = query('pf_search', object={'kind': 'plan', 'id': 'B'}, limit=1, all=True)
         records = [page['items'][0]['record']]
         while page['next_cursor']:
             page = query('pf_search', cursor=page['next_cursor'])

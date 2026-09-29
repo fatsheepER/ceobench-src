@@ -2,7 +2,6 @@
 from copy import deepcopy
 import json
 from pathlib import Path
-import re
 import subprocess
 
 from pydantic import ValidationError
@@ -10,15 +9,16 @@ from pydantic import ValidationError
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
 from . import evidence_handles, pf_render
 from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
-from .registration_schema import MODELS
+from .registration_schema import MODELS, cite_text, internal
 from .run_state import write_json
 from .sql_evidence import encoded
 
 
-# A stated numeric condition such as "< 45%", ">= 770" or "falls below 50". Arrows like
-# "15 -> 18" are not conditions.
-CONDITION = re.compile(r'(?:(?<![-=<>])(?:[<>]=?|[≥≤])|\b(?:at least|at most|below|above|under|over|exceeds?|'
-                       r'less than|more than|greater than|fewer than)\b)\s*\$?-?\d[\d,.]*\s*%?', re.I)
+def applies_ended(record, day):
+    """The text's stated applicability ended before this day, e.g. last week's plan for days 42-48."""
+    applies = record.get('applies_at') or {}
+    last = applies.get('end_day', applies.get('day'))
+    return type(last) is int and last < day
 
 
 class TextRegistry:
@@ -51,8 +51,11 @@ class TextRegistry:
             # Do not echo the submitted value: it can contain long private identifiers.
             errors = ['.'.join(map(str, e['loc'])) + ': ' + e['msg'] for e in exc.errors(include_input=False)]
             raise ValueError('; '.join(errors)) from exc
+        if operation in ('create', 'revise'):
+            values = internal(values, self.mode == 'pf')
         state = self._load()
         if operation == 'list':
+            self.last_result = None
             return self._list(state, **values)
         records = state['records']
         if operation == 'create':
@@ -76,7 +79,7 @@ class TextRegistry:
             for ref in record['references']:
                 if len(ref.get('note', '')) > 200:
                     ref['note'] = ref['note'][:200]
-                    warnings.append('备注已截至 200 字')
+                    warnings.append('Note truncated to 200 characters.')
                 bindings.append(self._bind(ref, records))
         elif self.store:
             binding = self.store.load_state('declaration:' + previous['version'])
@@ -102,45 +105,94 @@ class TextRegistry:
             except Exception as exc:
                 self.store.fail(exc)
                 raise RuntimeError('Text saved, but private capture failed; collection stopped') from exc
-        result = dict(id=record_id, version=record['version'], status=record['status'])
+        # Structured form for audits and tests; the agent receives the text receipt.
+        self.last_result = result = dict(id=record_id, version=record['version'], status=record['status'])
         if warnings:
             result['warnings'] = list(dict.fromkeys(warnings))
+        shown = operation == 'create' or 'references' in values
         if self.mode == 'pf':
             result['evidence'] = [self._display_binding(b) for b in bindings]
-            if operation in ('create', 'revise') and (tip := self._threshold_tip(record)):
-                result['tip'] = tip
-        return encoded(result).decode()
+            cited = [self._pf_cited(b, ref['evidence']) for b, ref in zip(bindings, record['references'])]
+        else:
+            # Git and prefix receipts show only what the Git group can know: the stored reference.
+            cited = [self._git_cited(ref['evidence']) for ref in record['references']]
+        verb = dict(create='Registered', revise='Revised', retire='Retired')[operation]
+        lines = [f"{verb} {record['version']} ({record['status']})."]
+        if shown and cited:
+            lines.append('Cited: ' + ' · '.join(cited))
+        if self.mode == 'pf' and operation != 'retire' and (writes := self._week_writes(record)):
+            lines.append('Business writes this week touching ' + ', '.join(writes[0]) + ': ' + ' · '.join(writes[1]))
+        lines += result.get('warnings', [])
+        return '\n'.join(lines)
 
-    def _threshold_tip(self, record):
-        """At most once a week: a text states a numeric condition but no reference checks it."""
-        match = CONDITION.search(record['text'])
-        checkable = [r for r in record['references'] if r['purpose'] == 'current' and (
-            'sql' in r['evidence'] or 'version' in r['evidence'] or
-            str(r['evidence'].get('path', '')).split('@')[0].endswith(('.json', '.csv')))]
-        week = week_label(self.sim_day())
-        if (not match or not checkable or any(r.get('predicate') for r in record['references'])
-                or self.store.load_state('threshold_tip_week') == week):
-            return None
-        self.store.save_state('threshold_tip_week', week)
-        condition = ' '.join(match.group(0).split())
-        return (f'The text states a condition ("{condition}"). To have the weekly check and pf_dependencies '
-                'test it instead of reporting any change, revise the reference it depends on with select and a '
-                'threshold predicate, e.g. "select": {"row": {"group_id": "S1"}, "col": "rate"}, "predicate": '
-                '{"type": "threshold", "op": ">=", "value": 50}. Optional; shown at most once a week.')
+    def _git_cited(self, evidence):
+        if 'unknown' in evidence:
+            return f"unknown ({evidence['unknown']})"
+        if 'record' in evidence:
+            return evidence['record']
+        text = cite_text(evidence)
+        return text + (" (this week's closing commit)" if evidence.get('commit') == week_label(self.sim_day()) else '')
+
+    def _pf_cited(self, binding, evidence):
+        shown = self._display_binding(binding)
+        if 'record' in shown:
+            return shown['record']
+        if shown.get('status') == 'unknown':
+            return f"unknown ({shown['reason']})"
+        if shown.get('status') == 'commit_only':
+            seen = f"; you saw {shown['delivered']}" if shown.get('delivered') else ''
+            return f"{cite_text(evidence)} (commit only: those bytes never reached you{seen})"
+        group = evidence_handles.index(self.store).group(binding['version_id'])
+        text = shown['version'] + (f" (day {group['day']})" if group else '')
+        if shown['differs']:
+            text += f" (as you last saw it; now {shown['latest']}, {self._change(binding)})"
+        return text
+
+    def _change(self, binding):
+        meta, old = self.resolver.content(binding['version_id'])
+        _, new = self.resolver.content(binding['latest_version_id'])
+        kind = ('query' if meta['layer'] == 'server_public_response' else
+                'json' if str(meta.get('object_id', '')).endswith('.json') else 'text')
+        return pf_render.change(kind, old, new)
+
+    def _week_writes(self, record):
+        """This week's successful business writes whose objects share an ID with the text's objects."""
+        wanted = {str(o['id']) for o in record['objects']}
+        handles = evidence_handles.index(self.store)
+        handles.refresh()
+        touched, calls = set(), []
+        for event_id, (kind, request, day) in list(handles.events.items()):
+            parsed = (request.get('request') or {}).get('parsed') or {}
+            if (kind != 'public_http' or day != handles.day or not parsed.get('tool') or
+                    (request.get('request') or {}).get('method') == 'GET' or parsed['tool'] in evidence_handles.READ_TOOLS):
+                continue
+            try:
+                meta = self.store.get_content(event_id + ':public_response')[0]
+                status = self.store.read_event(event_id)['result'].get('status')
+            except (KeyError, ValueError):
+                continue
+            ids = {str(o['value']) for o in meta.get('objects', [])} & wanted
+            if ids and status in ('succeeded', 'partially_succeeded'):
+                touched |= ids
+                calls.append(f"day {day} " + pf_render.call_text(parsed))
+        return (sorted(touched), calls[-6:]) if calls else None
 
     def weekly_check(self, day):
         """Git/prefix week-start digest: cited committed files and texts compared with current ones."""
         records = self._load()['records']
-        entries = []
+        entries, ended = [], []
         for key in sorted(records, key=lambda k: int(k[1:]), reverse=True):
             record = records[key][-1]
             refs = [r for r in record['references'] if r['purpose'] == 'current' and 'unknown' not in r['evidence']]
             if record['status'] != 'active' or not refs:
                 continue
+            if applies_ended(record, day):
+                ended.append(record['version'])
+                continue
             changed = [line for line in (self._git_change(r['evidence'], records) for r in refs) if line]
             entries.append(dict(text=dict(record=record['version'], day=record.get('sim_day'), text=record['text']),
                                 total=len(refs), changed=changed))
-        return pf_render.render_weekly(entries, day, pf=False) if entries else None
+        return pf_render.render_weekly(entries, day, pf=False, ended=ended) if entries or ended else None
 
     def _git_change(self, evidence, records):
         if 'record' in evidence:

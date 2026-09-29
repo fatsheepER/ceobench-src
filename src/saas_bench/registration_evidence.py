@@ -265,7 +265,7 @@ class EvidenceResolver:
         if 'version' in evidence:
             named = self.lookup(evidence['version'])
             if not named:
-                raise ValueError('Unknown version handle; use a path or SQL instead')
+                raise ValueError('Unknown version handle; cite the handle shown in a [pf: ...] line, or a file path')
             # One handle denotes every acquisition of the same content; bind the newest delivered.
             members = {self.identity(v)[0] for v in named}
             explicit, object_id, _, kind = self.identity(named[-1])
@@ -295,8 +295,8 @@ class EvidenceResolver:
             candidates.append(version)
         if not candidates:
             if kind == 'query':
-                raise ValueError('No captured query has exactly this SQL text; cite the handle shown after '
-                                 'your command instead (e.g. query7@v2), or use unknown with a reason')
+                raise ValueError('No captured query has exactly this SQL text; cite the handle in the [pf: ...] '
+                                 'line after your command instead, or use unknown with a reason')
             raise ValueError('No captured evidence exists; use unknown with a reason')
         latest = candidates[0]
         if accept is not None:
@@ -381,12 +381,12 @@ class EvidenceResolver:
                 raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
         if kind == 'query':
             raise ValueError('Evidence has not been delivered to the model: you saw only what your command '
-                             'printed, not this raw query result. Cite that output by its 输出 handle '
-                             '(its queries are traced upstream), or use unknown with a reason')
+                             'printed, not this raw query result. Cite that output by the first handle in its '
+                             '[pf: ...] line (its queries are traced upstream), or use unknown with a reason')
         if kind == 'file':
             raise ValueError('Evidence has not been delivered to the model: you neither read nor wrote this '
-                             'file version. Read it first, cite the 输出 handle of the command output '
-                             'you saw, or use unknown with a reason')
+                             'file version. Read it first, cite the handle in the [pf: ...] line of the command '
+                             'output you saw, or use unknown with a reason')
         raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
 
     def authored(self, version):

@@ -23,9 +23,11 @@ from .sql_evidence import digest, encoded
 # Private state name of the per-kind object number table, e.g. {"query": {key: 7}}.
 HANDLES = 'registration_handles'
 # Harness-generated reads; mirrors execution_capture.READ_TOOLS (kept here to avoid a cycle).
-_READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
-                         'get_market_overview', 'get_group_insights'})
+READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
+                        'get_market_overview', 'get_group_insights'})
 STREAMS = {'stdout': 'out', 'stderr': 'err', 'executed_code': 'code'}
+# Calls that may carry an agent note (design 3.2); mirrors bash_agent.tools.NOTE_TOOLS.
+NOTE_KINDS = frozenset({'bash', 'write_file', 'edit_file'})
 VERSIONED = re.compile(r'(.+)@v([1-9][0-9]*)')
 SINGLE = re.compile(r'([a-z_]+?)([1-9][0-9]*)')
 # Accepted wherever the agent may write a handle; registered texts keep rN / rN.M.
@@ -57,6 +59,7 @@ class HandleIndex:
         self.version_rowid = self.request_rowid = 0
         self.day = 0
         self.events = {}                    # visible event -> (kind, request record, day)
+        self.notes = {}                     # visible event -> (day, note) the agent attached to that call
         self.info = {}                      # version -> (object key, group)
         self.groups = defaultdict(list)     # object key -> [group], oldest first
         self.code = {}                      # cli_python event -> executed code hash
@@ -91,6 +94,11 @@ class HandleIndex:
                 self.events[row['event_id']] = (record['kind'], dict(
                     call=record.get('call'), request={k: args[k] for k in ('method', 'path', 'parsed', 'script', 'name')
                                                       if k in args}), self.day)
+                # A note on a call covers what it ran, e.g. the scripts of a bash command.
+                if record['kind'] in NOTE_KINDS and isinstance(args.get('note'), str) and args['note'].strip():
+                    self.notes[row['event_id']] = (self.day, args['note'].strip())
+                elif record.get('parent_event_id') in self.notes and record['kind'] == 'cli_python':
+                    self.notes[row['event_id']] = self.notes[record['parent_event_id']]
             rows = conn.execute('''SELECT v.rowid,v.version_id,v.event_id,v.content_hash,v.metadata,q.definition
                 FROM versions v JOIN requests r USING(event_id) LEFT JOIN queries q ON r.query_id=q.id
                 WHERE v.rowid>? ORDER BY v.rowid''', (self.version_rowid,)).fetchall()
@@ -125,6 +133,11 @@ class HandleIndex:
             group = dict(key=key, k=len(groups) + 1, signature=signature, members=[version], day=day)
             groups.append(group)
         self.info[version] = (key, group)
+        # The note of the call that produced this content: its outputs and the files it wrote,
+        # not versions it merely observed (a read, or the before-snapshot of a later command).
+        produced = layer != 'file_bytes' or version.endswith('_after')
+        if produced and event_id in self.notes:
+            group['note'] = self.notes[event_id]
 
     def _object(self, version, event_id, kind, record, layer, meta, definition):
         args = record.get('request') or {}
@@ -135,7 +148,7 @@ class HandleIndex:
                 query = json.loads(definition)
                 return ('query', encoded([query[1], *query[3:]]).decode())
             parsed = args.get('parsed') if isinstance(args.get('parsed'), dict) else {}
-            if args.get('method') == 'GET' or parsed.get('tool') in _READ_TOOLS:
+            if args.get('method') == 'GET' or parsed.get('tool') in READ_TOOLS:
                 return ('read', encoded([args.get('method'), args.get('path'), args.get('parsed')]).decode())
             return ('receipt', version)
         if layer == 'dashboard':
@@ -249,6 +262,23 @@ class HandleIndex:
         earlier = next((g for g in self.groups[group['key']][:group['k'] - 1]
                         if g['signature'] == group['signature']), None)
         return self.name(earlier['members'][0]) if earlier else None
+
+    def note(self, version):
+        """(day, text) of the latest note on a call that produced this version's content."""
+        group = self.group(version)
+        return group.get('note') if group else None
+
+    def latest(self, base):
+        """Versions (oldest first) of an object's newest version, named without @vK, or None."""
+        with self.lock:
+            self.refresh()
+            key = self._key_for(base)
+            return list(self.groups[key][-1]['members']) if key else None
+
+    def versions(self, version):
+        """Every version group of this version's object, oldest first."""
+        group = self.group(version)
+        return list(self.groups[group['key']]) if group else []
 
     def previous(self, version):
         group = self.group(version)

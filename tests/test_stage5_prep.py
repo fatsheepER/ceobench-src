@@ -9,7 +9,7 @@ import pytest
 from saas_bench.execution_capture import ExecutionCapture
 from saas_bench.pf_queries import PFQueries
 from saas_bench.pf_read import accounting, apply_delta
-from saas_bench.registration_schema import MODELS, registration_prompt, tool_definitions
+from saas_bench.registration_schema import MODELS
 from test_text_registry import workspace, captured, call, declaration, git, send
 from test_preflight_integration import offline_runner, packed_public, advance
 from test_pf_read import Counter, deliver
@@ -129,13 +129,22 @@ def test_prefix_stops_at_fork_day_then_git_and_pf_branches_continue(offline_runn
 
 
 def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
-    git_text = registration_prompt(pf=False) + json.dumps(tool_definitions(pf=False))
-    pf_text = registration_prompt(pf=True) + json.dumps(tool_definitions(pf=True))
-    for word in ('PF', 'pf_', 'vN', 'handle', '"sql"', 'compare', 'delivered', 'sent to'):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
+    from saas_bench.registration_prompt import integrate
+    agent = BashAgent.__new__(BashAgent)
+    agent.total_days = 497
+    base = agent._default_system_prompt()
+    git_text = integrate(base, pf=False) + json.dumps(get_bash_agent_tool_descriptions(True, False))
+    pf_text = integrate(base, pf=True) + json.dumps(get_bash_agent_tool_descriptions(True, True))
+    for word in ('PF', 'pf ', 'pf_', '@v1', '[pf:', '"compare"', 'delivered', 'last saw', 'keeps the note'):
         assert word not in git_text, word
-    for word in ('"sql"', '"version"', 'compare', 'pf_dependencies', 'path@commit', 'last sent to'):
+    for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'keeps the note',
+                 'path@week-N', 'last saw'):
         assert word in pf_text, word
-    assert 'Predicates are only stored' in git_text and 'Predicates are only stored' not in pf_text
+    # The function tools are those of Git; PF adds only the optional note on three of them.
+    names = lambda pf: [t['name'] for t in get_bash_agent_tool_descriptions(True, pf)]
+    assert names(True) == names(False)
     assert MODELS['prefix'] is MODELS['git']
     with pytest.raises(Exception):
         MODELS['git']['create'].model_validate(declaration({'sql': 'SELECT 1'}))

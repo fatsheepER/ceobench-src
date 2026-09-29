@@ -1085,6 +1085,7 @@ __pycache__/
             usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing,
                                       self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
+            pf=self.text_registration == 'pf',
         )
 
         # Wire the per-session conversation snapshot path. The agent writes

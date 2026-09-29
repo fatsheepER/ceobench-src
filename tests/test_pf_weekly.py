@@ -1,4 +1,4 @@
-"""Compact PF returns, the week-start check of registered texts, and the threshold tip."""
+"""Compact PF returns and the week-start check of registered texts."""
 import json
 import re
 
@@ -45,10 +45,10 @@ def test_search_and_history_are_newest_first_with_one_optional_detail_line(works
     store, registry, executor = captured(workspace, tmp_path)
     for i in range(3):
         call(registry, 'create', **declaration(text=f'plan {i}'))
-    lines = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'limit': 2}).splitlines()
-    assert lines[0] == 'pf_search plan=B: 3 saved, newest first; showing 1–2.'
-    assert '"plan 2"' in lines[1] and '"plan 1"' in lines[2] and '1 more older: {"cursor": "c1"}' in lines[3]
-    detail = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True}).splitlines()
+    lines = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'limit': 2, 'all': True}).splitlines()
+    assert lines[0] == 'pf search B: 3 saved, newest first; showing 1–2.'
+    assert '"plan 2"' in lines[1] and '"plan 1"' in lines[2] and '1 more older: pf more c1.' in lines[3]
+    detail = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True, 'all': True}).splitlines()
     assert len(detail) == 1 + 3 * 2 + 1 and detail[2].startswith('    B declared')
     assert executor.execute('pf_read', {'target': {'record': 'r1'}, 'detail': True}).startswith('Error:')
 
@@ -64,7 +64,7 @@ def test_query_changes_name_the_rows_that_differ(workspace, tmp_path, server):
     text = executor.execute('pf_dependencies', {'target': {'record': 'r1'}})
     assert re.search(r'cites (query\d+)@v1 · .* changed \(now \1@v2\): 1 of 1 rows differ; category="operations": total \d+→\d+', text), text
     # The diff hint names the two versions just compared.
-    assert re.search(r'"baseline": \{"version": "(query\d+)@v1"\}, "target": \{"version": "\1@v2"\}', text), text
+    assert re.search(r'See what changed: pf diff (query\d+)@v1 \1@v2\.', text), text
     # The rerun is a diff target, not part of the agent's own history listing.
     history = executor.execute('pf_read', {'target': {'sql': sql}, 'mode': 'history'})
     assert history.startswith('Versions of SQL: ') and ': 1 saved' in history and 'rerun' not in history
@@ -79,14 +79,15 @@ def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, t
     before = server.conn.serialize()
     quiet = executor.weekly_check(14)
     assert server.conn.serialize() == before
-    assert quiet.startswith('=== Weekly check of your registered texts (day 14) ===')
-    assert 'None of the cited evidence changed.' in quiet and 'Unchanged: r2.1, r1.1' in quiet
+    assert quiet == ('=== Check of your registered texts (day 14) ===\n'
+                     '2 active texts checked: cited files and texts are unchanged and no predicate fails.')
     server.conn.execute('UPDATE ledger SET amount=39')
     server.conn.commit()
     loud = executor.weekly_check(21)
-    assert 'r1.1 (day 7): "Keep the plan" — 1 of 1 cited sources flagged' in loud
+    assert '2 active texts checked; 2 with changed evidence:' in loud and 'r1.1 (day 7): "Keep the plan"' in loud
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39 \(was 42\)', loud), loud
-    assert 'r2.1 (day 7)' in loud and 'Details: pf_dependencies {"target": {"record": "rN"}}.' in loud
+    # r2 cites r1, whose predicate failed: the failure reaches it through the declared chain.
+    assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend rN.')
     assert not CLOCK.search(loud)
     # The digest is saved with its own origin so request source mappings stay complete.
     assert loud.origins and store.get_content(loud.origins[0]['version_id'])[1].decode() == str(loud)
@@ -104,7 +105,7 @@ def test_git_weekly_check_compares_cited_commits_with_current_files(workspace, t
     git(workspace, 'add', '.')
     git(workspace, 'commit', '-qm', 'Week 2 (day 14) [week-2]')
     first = registry.weekly_check(14)
-    assert 'None of the cited evidence changed.' in first and 'Unchanged: r2.1, r1.1' in first
+    assert first == '=== Check of your registered texts (day 14) ===\n2 active texts checked: cited files and texts are unchanged.'
     (workspace / 'evidence.json').write_text('{"n":9}')
     call(registry, 'revise', record='r1', reason='Updated')
     second = registry.weekly_check(21)
@@ -119,26 +120,6 @@ def test_git_weekly_check_compares_cited_commits_with_current_files(workspace, t
         assert baseline.weekly_check(21) == second
 
 
-def test_threshold_tip_is_pf_only_optional_and_once_a_week(workspace, tmp_path):
-    week = [7]
-    store, registry, executor = captured(workspace, tmp_path)
-    registry.sim_day = lambda: week[0]
-    send(store, executor.execute('read_file', {'path': 'evidence.json'}))
-    text = 'Keep B at $99 while S2 new B subscriptions stay >= 770; raise 15 -> 18 later'
-    first = call(registry, 'create', **declaration({'path': 'evidence.json'}, text=text))
-    assert '(">= 770")' in first['tip'] and 'Optional' in first['tip']
-    assert 'tip' not in call(registry, 'create', **declaration({'path': 'evidence.json'}, text=text))
-    week[0] = 14
-    ref = dict(evidence={'path': 'evidence.json'}, purpose='current', select={'path': '/n'},
-               predicate={'type': 'threshold', 'op': '>=', 'value': 5})
-    assert 'tip' not in call(registry, 'create', **declaration(references=[ref], text=text))
-    assert 'tip' not in call(registry, 'create', **declaration(text='Plain plan without a number'))
-    assert 'tip' in call(registry, 'create', **declaration({'path': 'evidence.json'}, text=text))
-    git_registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
-    git_registry.path = tmp_path / 'git-registrations.json'
-    assert 'tip' not in call(git_registry, 'create', **declaration({'path': 'evidence.json'}, text=text))
-
-
 @pytest.mark.parametrize('mode', ['off', 'prefix', 'pf'])
 def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runner, monkeypatch, mode):
     runner = offline_runner(text_registration=mode, stop_after_day=7)
@@ -150,7 +131,7 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
         if mode == 'pf':  # A cited query output is rerun through the host's refresh endpoint.
             output = runner._execute_tool('bash', {'command': './novamind-operation query "SELECT COUNT(*) AS n FROM ledger"'})
             send(runner.evidence_store, output)
-            handle = re.search(r'\[输出: (cmd\d+@v\d+)', output).group(1)
+            handle = re.search(r'\[pf: (cmd\d+@v\d+)', output).group(1)
             runner._execute_tool('text_create', declaration({'version': handle}, text='Ledger size'))
         runner.agent.current_day = -1
     requests = fake_weeks(runner, monkeypatch)
@@ -160,8 +141,8 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
     if mode == 'off':
         assert 'Weekly check' not in first
         return
-    head, check = first.split('\n\n=== Weekly check of your registered texts (day 0) ===\n')
-    assert 'r2.1 (day 0): "Depends on r1" — 1 of 1 cited sources flagged' in check
+    head, check = first.split('\n\n=== Check of your registered texts (day 0) ===\n')
+    assert 'r2.1 (day 0): "Depends on r1"' in check
     assert 'revised to r1.2' in check
-    if mode == 'pf':
-        assert 'Unchanged: r3.1' in check and 'refresh' not in check, check
+    if mode == 'pf':  # r3's cited query output is unchanged, so it is not listed.
+        assert 'r3.1' not in check and 'refresh' not in check, check

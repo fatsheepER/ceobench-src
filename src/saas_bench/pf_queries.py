@@ -11,7 +11,8 @@ from pydantic import Field, ValidationError, model_validator
 from .execution_capture import CapturedText, CURRENT_EVENT, OBJECT_FIELDS, origin
 from . import evidence_handles, pf_render
 from .registration_evidence import covered
-from .registration_schema import BusinessObject, Input, Text
+from .registration_schema import Input, Text
+from .text_registry import applies_ended
 from .sql_evidence import encoded
 
 
@@ -38,8 +39,26 @@ class Page(Input):
     detail: bool = False
 
 
+class SearchObject(Input):
+    id: Text
+    kind: Text | None = None
+
+
 class Search(Page):
-    object: BusinessObject | None = None
+    object: SearchObject | None = None
+    all: bool = False
+
+
+class Versions(Page):
+    target: Target | None = None
+
+
+class Single(Input):
+    target: Target | None = None
+
+
+class More(Input):
+    cursor: Annotated[str, Field(pattern=r'^c[1-9][0-9]*$')]
 
 
 class Trace(Page):
@@ -63,55 +82,8 @@ class Read(Page):
     full: bool = False
 
 
-MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Dependents, pf_read=Read)
-
-
-def tool_definitions():
-    descriptions = {
-        'pf_search': 'Saved evidence and registered texts about one business object, e.g. kind=research_project '
-                     'id=t10_2 or kind=customer_group id=S2, newest first, one line each. detail=true adds when '
-                     'you saw each item and where the object appears. Read contents with pf_read.',
-        'pf_dependencies': 'What a registered text or file relies on, one line per cited source. With purpose=current '
-                           '(default) cited queries and reads are rerun and files compared; each line says unchanged, '
-                           'changed (with the differing rows or values) or whether a predicate holds. Use before '
-                           'acting on an earlier plan or conclusion. detail=true lists every underlying query, read '
-                           'and file. purpose=historical_only only lists history. Advisory.',
-        'pf_dependents': 'Registered texts that cite a version, e.g. forecasts and plans that still rely on an '
-                         'assumption you just corrected. detail=true adds scripts, files and outputs derived from it.',
-        'pf_read': 'Read a saved version (mode=content), list its versions newest first (history), or diff two '
-                   'versions of the same object (diff), including results you never saved as files. full=true '
-                   'returns full text.',
-    }
-    return [dict(name=name, description=descriptions[name] + ' Continue a page with only its cursor.',
-                 parameters=model.model_json_schema()) for name, model in MODELS.items()]
-
-
-PF_PROMPT = '''
-
-PF saves the query results, command outputs and workspace file versions from your
-tool calls, and answers questions about them across weeks. The weekly check reruns
-the queries and reads your active texts cite and compares the files they cite; a
-reference with select and a threshold predicate is checked against that condition
-instead of reporting any change. Checks are advisory; you decide what to do.
-- pf_dependencies: before acting on an earlier plan or conclusion, see what it
-  cites and what changed. Example: r4 "keep B at $99 while S2 new B
-  subscriptions stay >= 770" cites a query with that threshold; the check reruns
-  the query and reports whether the threshold still holds.
-- pf_dependents: after correcting an assumption, find the texts that cite it.
-- pf_search: saved items about one business object, newest first.
-- pf_read: read or diff saved versions, including outputs you never saved.
-Results give one line per item; "detail": true adds the underlying sources.
-Saved items carry handles NAME@vK: version K of that object, e.g. forecast.json@v3,
-query7@v2 (a query; its SQL is shown the first time it appears each week),
-analyze.py.out@v4 (what that script printed) or cmd5@v1 (a command's return). K
-rises only when the content changes; "同第 N 天" / "unchanged since day N" marks the
-same content acquired again. Use a handle to read, diff or cite that version.
-Repeated reads may come back compact. UNCHANGED means identical to the named base;
-DELTA lists [start,end,text] replacements (zero-based character offsets into the
-base, applied together). The base is the previous result of the same call, or of
-the same script (previous_output_of:<script>). Use pf_read with full=true, or repeat
-the call once, for full text.
-'''
+MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Dependents, pf_read=Read,
+              pf_log=Versions, pf_diff=Single, pf_blame=Single, pf_more=More)
 
 
 RELATION = dict(reference='cites', same_execution='computed from', returned_range='printed from',
@@ -184,23 +156,36 @@ class PFQueries:
         self.stale_checks, self.refresh = stale_checks, refresh
 
     def decorate(self, capture, text, after):
+        """The [pf: ...] line after a tool return: what it can be cited as, what it wrote,
+        and notes on files whose full content it shows."""
         record = self.store.read_event(capture.event)['request']
         handles = evidence_handles.index(self.store)
+        note = (record.get('request') or {}).get('note')
+        noted = (['note saved' + (' (truncated to 200 characters)' if capture.facts.get('note_truncated') else '')]
+                 if note else [])
+        written = [after[path]['version'] for path in capture.facts.get('changed_paths', [])
+                   if after and after.get(path, {}).get('version') and not noise(path)]
+        wrote = ['wrote ' + ', '.join(self.resolver.handle(v) for v in written[:6]) +
+                 (f' and {len(written) - 6} more' if len(written) > 6 else '')] if written else []
         if record['kind'] == 'read_file':
             for item in capture.origins:
                 meta, _ = self.resolver.content(item['version_id'])
                 if meta['layer'] == 'file_text':
-                    return str(text) + '\n[' + self.resolver.handle(meta['derived_from']) + ']'
+                    return str(text) + '\n[pf: ' + self.resolver.handle(meta['derived_from']) + \
+                        self._noted(meta['derived_from']) + ']'
+            return text
+        if record['kind'] in ('write_file', 'edit_file'):
+            parts = wrote + noted
+            return str(text) + '\n[pf: ' + ' | '.join(parts) + ']' if parts else text
         if record['kind'] != 'bash':
             return text
         with closing(self.store.connect()) as conn:
-            queries = conn.execute('''WITH RECURSIVE children(event_id) AS (
+            observed = conn.execute('''WITH RECURSIVE children(event_id) AS (
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
                 ON json_extract(r.request, '$.parent_event_id')=c.event_id)
-                SELECT v.version_id, q.definition FROM versions v JOIN requests r USING(event_id)
-                JOIN queries q ON r.query_id=q.id
+                SELECT count(*) FROM versions v JOIN requests r USING(event_id)
                 WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
-                ORDER BY v.rowid''', (capture.event,)).fetchall()
+                ''', (capture.event,)).fetchone()[0]
             scripts = conn.execute('''SELECT r.event_id || ':stdout' FROM requests r
                 WHERE json_extract(r.request, '$.parent_event_id')=? AND json_extract(r.request, '$.kind')='cli_python'
                 AND json_extract(r.request, '$.request.script') IS NOT NULL ORDER BY r.rowid''',
@@ -215,48 +200,60 @@ class PFQueries:
             if output:
                 shown = [o for o in capture.origins if o['version_id'] == version]
                 printed.append((version, covered([(0, len(output))], shown) if shown else False, output == body))
-        entries = [('q', None, row[0]) for row in queries]
-        entries += [('写', path, after[path]['version']) for path in capture.facts.get('changed_paths', [])
-                    if after and after.get(path, {}).get('version') and not noise(path)]
-        if not entries and not printed:
-            return text
-        again = lambda day: '' if day is None else f'（同第 {day} 天）'
-        # Only displayed entries receive numbers: [输出: analyze.py.out@v3 | q: query7@v2 | 写: f.json@v4].
-        # 输出 names the script's stdout when this return is exactly that output; otherwise this
-        # command return (saved by capture.finish) is named too, so what was seen is always citable.
-        outputs = []
-        if not (len(printed) == 1 and printed[0][2]):
+        shown_files = self._shown_notes(after, written, body)
+        if not observed and not printed and not written:
+            return body + ''.join('\n' + line for line in shown_files) if shown_files else text
+        again = lambda day: '' if day is None else f' (same as day {day})'
+        # The first item names this return itself: a script's stdout when the return is exactly
+        # that output, otherwise the command return (saved by capture.finish), so what was seen
+        # is always citable. Scripts shown only in part are named as such.
+        if len(printed) == 1 and printed[0][2]:
+            version = printed[0][0]
+            output = self.resolver.handle(version) + again(handles.repeated(version))
+        else:
             name, day = handles.pending('cmd', record.get('call'), evidence_handles.body_digest(body))
-            outputs.append(name + again(day))
-        outputs += [self.resolver.handle(v) + again(handles.repeated(v)) + ('' if full else '（部分）')
-                    for v, full, _ in printed]
-        groups = {'输出': outputs}
-        sql, week, shown_sql = [], handles.day, self.store.load_state('pf_sql_shown') or {}
-        for group, path, version in entries[:8]:
-            handle = self.resolver.handle(version)
-            groups.setdefault(group, []).append(handle + again(handles.repeated(version)))
-            if group == 'q':
-                # The full SQL accompanies a query name the first time it appears each week.
-                name = handle.rsplit('@', 1)[0]
-                definition = json.loads(next(row[1] for row in queries if row[0] == version))
-                if shown_sql.get(name) != week:
-                    shown_sql[name] = week
-                    sql.append(f'{name}: {evidence_handles.one_line(definition[5])}')
-        if sql:
-            self.store.save_state('pf_sql_shown', shown_sql)
-        displayed = [group + ': ' + ' '.join(items) for group, items in groups.items()]
-        if len(entries) > 8:
-            displayed.append(f'另有 {len(entries) - 8} 项')
-        return body + '\n[' + ' | '.join(displayed) + ']' + ''.join('\n' + line for line in dict.fromkeys(sql))
+            output = name + again(day)
+            if printed:
+                output += ', with ' + ' and '.join(('' if full else 'part of ') + self.resolver.handle(v)
+                                                   for v, full, _ in printed)
+        line = '[pf: ' + ' | '.join([output] + wrote + noted) + ']'
+        return body + '\n' + line + ''.join('\n' + line for line in shown_files)
+
+    def _noted(self, version):
+        note = evidence_handles.index(self.store).note(version)
+        return f' note (day {note[0]}): "{pf_render.short(note[1], 200)}"' if note else ''
+
+    def _shown_notes(self, after, written, body):
+        """Notes on workspace files whose whole content this output shows, e.g. after cat."""
+        lines, handles = [], evidence_handles.index(self.store)
+        handles.refresh()
+        for path, item in (after or {}).items():
+            version = item.get('version')
+            group = handles.info.get(version, (None, None))[1] if version else None
+            if not group or not group.get('note') or version in written or noise(path):
+                continue
+            text = self._text(version)
+            if text and text.strip() and text.strip() in body:
+                lines.append('[pf: ' + self.resolver.handle(version) + self._noted(version) + ']')
+        return lines[:3]
 
     def execute(self, operation, args):
         """Agent-facing result: compact text, one line per item."""
+        if operation == 'pf_more':
+            saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
+            if not saved:
+                raise ValueError('Unknown cursor; run the pf command again')
+            operation = saved['operation']
         page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
         if isinstance(page, str):
             return page  # pf_read content and diff keep their header line and exact body
         if operation == 'pf_search':
+            if 'sections' in page:
+                return pf_render.render_search(page)
             wanted = self.values['object']
-            return pf_render.render_list(page, f"pf_search {wanted['kind']}={wanted['id']}", wanted)
+            return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
+        if operation == 'pf_log':
+            return pf_render.render_log(page)
         if operation == 'pf_read':
             return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
         if operation == 'pf_dependents':
@@ -288,12 +285,23 @@ class PFQueries:
             if 'object' not in values:
                 raise ValueError('object is required')
             wanted = values['object']
-            matches = [v for v in self.nodes if not self._rerun(v) and any(
-                       o['kind'] == wanted['kind'] and str(o['id']) == wanted['id'] for o in self._objects(v))]
-            return self._page(matches[::-1], offset, self._describe)
+            same = lambda o: str(o['id']) == wanted['id'] and wanted.get('kind', o['kind']) == o['kind']
+            matches = [v for v in self.nodes if not self._rerun(v) and any(same(o) for o in self._objects(v))]
+            if values['all'] or offset:
+                return self._page(matches[::-1], offset, self._describe)
+            return self._sections(matches, wanted)
         if 'target' not in values:
             raise ValueError('target is required')
         target = self._target(values['target'])
+        if operation == 'pf_log':
+            return self._log(target, offset)
+        if operation == 'pf_blame':
+            return self._blame(target)
+        if operation == 'pf_diff':
+            baseline, target = self._diff_pair(target, values['target'])
+            self.values = values = dict(target=values['target'], mode='diff', baseline={'version': 'implied'},
+                                        full=False, detail=False, limit=20)
+            return self._read(target, offset, baseline=baseline)
         if operation == 'pf_read':
             mode = values['mode']
             if (mode == 'diff') != ('baseline' in values):
@@ -357,23 +365,34 @@ class PFQueries:
         active = sorted((v for v, record in self.records.items()
                          if record['status'] == 'active' and self.latest[self._key(v)] == v),
                         key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
-        traced = {}
+        traced, ended = {}, []
         for version in active:
             rows = self._trace(version, False)
             if any(_weekly(r) for r in rows):
-                traced[version] = rows
-        if not traced:
+                if applies_ended(self.records[version], day):
+                    ended.append(self.records[version]['version'])
+                else:
+                    traced[version] = rows
+        if not traced and not ended:
             return None
         event = self.store.begin_event('pf_weekly_check', {'day': day})
         token = CURRENT_EVENT.set(event)
         try:
             self._check([row for rows in traced.values() for row in rows])
-            entries = []
+            entries, underlying = [], []
             for version, rows in traced.items():
                 tops = [self._top(r, rows) for r in rows if _weekly(r)]
-                entries.append(dict(text=self._describe(version), total=len(tops), changed=[
-                    t for t in tops if t['check']['affected'] or t['check']['predicate_result'] in ('fails', 'cannot_check')]))
-            text = pf_render.render_weekly(entries, day, pf=True)
+                # Itemize what the agent chose itself: a cited version that was superseded
+                # without a holding predicate, and any predicate on the declared chain that fails
+                # or cannot be checked (a failure propagates, design 3.4). Changes further upstream
+                # of a cited output are the normal week-to-week data changes and share one line.
+                direct = [t for t in tops if t['check'].get('below_failed')
+                          or t['check']['predicate_result'] in ('fails', 'cannot_check')
+                          or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds')]
+                entries.append(dict(text=self._describe(version), total=len(tops), changed=direct))
+                if not direct and any(t['check'].get('below_changed') for t in tops):
+                    underlying.append(self.records[version]['version'])
+            text = pf_render.render_weekly(entries, day, pf=True, ended=ended, underlying=underlying)
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
             self.store.complete(event)
         finally:
@@ -392,7 +411,8 @@ class PFQueries:
             return result
         below = [r for r in rows if _depth(r) > 1 and r['path'][:2] == row['path'] and r.get('check')
                  and r['edge']['target'] in self.nodes
-                 and self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS]
+                 and self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
+                 and not self._clock(r['edge']['target'])]
         failed = [r for r in below if r['check']['predicate_result'] == 'fails']
         changed = [r for r in below if r['check']['version_changed'] and r['check']['predicate_result'] in
                    ('not_declared', 'not_checked')]
@@ -408,7 +428,13 @@ class PFQueries:
             parts.append(f'{len(unknown)} could not be checked ({reasons})')
         if parts:
             result['check']['sources'] = '; '.join(parts)
+        result['check'].update(below_failed=len(failed) + len(unknown), below_changed=len(changed))
         return result
+
+    def _clock(self, version):
+        """The simulated-day read, which changes every week by definition."""
+        request = self.events[self.nodes[version]['event_id']]['request'].get('request') or {}
+        return request.get('path') == '/vars'
 
     def _index(self, cutoff):
         # ponytail: rebuild O(versions + edges) per query/page; persist an index if
@@ -567,12 +593,18 @@ class PFQueries:
         if 'path' in target and evidence_handles.VERSIONED.fullmatch(target['path']) and not any(
                 row['meta'].get('object_id') == target['path'] for row in self.nodes.values()):
             target = {'version': target['path']}  # forecast.json@v3 written as a path
+        if 'path' in target and not any(row['meta']['layer'] == 'file_bytes' and row['meta']['object_id'] == target['path']
+                                        for row in self.nodes.values()):
+            # An output or query named without its version, e.g. analyze.py.out or query7: the latest.
+            members = [v for v in evidence_handles.index(self.store).latest(target['path']) or [] if v in self.nodes]
+            if members:
+                return members[-1]
         if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
             target = {'record': target['version']}
         if 'version' in target:
             members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
             if not members:
-                raise ValueError('Unknown or unavailable version handle; use a path or SQL instead')
+                raise ValueError('Unknown version handle; pf log <file or output> lists its versions')
             return members[-1]
         matches = []
         for version, row in self.nodes.items():
@@ -749,6 +781,134 @@ class PFQueries:
             result['check'] = check
         return result
 
+    # --- pf log / diff / blame / search ---------------------------------------------
+
+    def _groups(self, version):
+        """Version groups of this version's object visible in this snapshot, oldest first."""
+        handles = evidence_handles.index(self.store)
+        return [g for g in handles.versions(version) if any(m in self.nodes for m in g['members'])]
+
+    def _text(self, version):
+        try:
+            return self.resolver.content(version)[1].decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+
+    def _log(self, target, offset):
+        """One line per version of the object, newest first; revisions for a registered text."""
+        if target in self.records:
+            key = self._key(target)
+            revisions = [v for v in self.nodes if v in self.records and self._key(v) == key][::-1]
+            return self._page(revisions, offset, self._describe, root=self._describe(target), kind='record')
+        groups = self._groups(target)
+        handles = evidence_handles.index(self.store)
+        before = dict(zip(map(id, groups[1:]), groups))
+        def describe(group):
+            member = next(m for m in group['members'] if m in self.nodes)
+            item = self._brief(member) | dict(version=handles.name(member), day=group['day'],
+                                              acquisitions=len(group['members']))
+            text, layer = self._text(member), self.nodes[member]['meta']['layer']
+            earlier = before.get(id(group))
+            if text is not None and layer == 'server_public_response':
+                try:
+                    item['rows'] = len(json.loads(text)['rows'])
+                except (ValueError, KeyError, TypeError):
+                    pass
+            elif text is not None:
+                previous = earlier and self._text(next(m for m in earlier['members'] if m in self.nodes))
+                item['size'] = (pf_render.text_change(previous, text) if previous is not None
+                                else pf_render.plural(len(text.splitlines()), 'line'))
+            if note := group.get('note'):
+                item['note'] = note
+            if same := handles.same_as(member):
+                item['same_content_as'] = same
+            if self._rerun(member):
+                item['what'] += ' [rerun by PF check]'
+            return item
+        return self._page(groups[::-1], offset, describe, root=self._describe(target))
+
+    def _diff_pair(self, version, requested):
+        """pf diff with one argument: that version against the latest, or the last two versions."""
+        if version in self.records:
+            key = self._key(version)
+            revisions = [v for v in self.nodes if v in self.records and self._key(v) == key]
+            if len(revisions) < 2:
+                raise ValueError(f"{self.records[version]['version']} has no other revision to compare")
+            if 'record' in requested and '.' in requested['record'] and version != revisions[-1]:
+                return version, revisions[-1]
+            return revisions[-2], revisions[-1]
+        groups = self._groups(version)
+        newest = lambda g: [m for m in g['members'] if m in self.nodes][-1]
+        if len(groups) < 2:
+            raise ValueError(f"{evidence_handles.index(self.store).name(version)} is the only version; nothing to compare")
+        group = evidence_handles.index(self.store).group(version)
+        if 'version' in requested and group['k'] < groups[-1]['k']:
+            return version, newest(groups[-1])
+        return newest(groups[-2]), newest(groups[-1])
+
+    def _blame(self, target):
+        """Each line of a text version with the version and day that introduced it."""
+        if target in self.records:
+            raise ValueError('pf blame works on files and outputs; pf log rN lists the revisions of a text')
+        handles = evidence_handles.index(self.store)
+        group = handles.group(target)
+        groups = [g for g in self._groups(target) if g['k'] <= group['k']]
+        origins, lines = [], []
+        for g in groups:
+            text = self._text(next(m for m in g['members'] if m in self.nodes))
+            if text is None:
+                raise ValueError('blame needs a text version')
+            new = text.splitlines()
+            fresh = []
+            for tag, a, b, c, d in difflib.SequenceMatcher(None, lines, new, autojunk=False).get_opcodes():
+                fresh += origins[a:b] if tag == 'equal' else [g] * (d - c)
+            origins, lines = fresh, new
+        name = handles.name(target)
+        out = [f"{name}: the version and day that introduced each line"]
+        previous = None
+        width = max((len(f"v{g['k']} d{g['day']}") for g in origins), default=0)
+        for origin_group, line in zip(origins, lines):
+            label = f"v{origin_group['k']} d{origin_group['day']}" if origin_group is not previous else ''
+            out.append(f'{label:<{width}} | {line}')
+            previous = origin_group
+        notes = [g for g in {id(g): g for g in origins}.values() if g.get('note')]
+        if notes:
+            out.append('Notes: ' + ' · '.join(f"v{g['k']} (day {g['note'][0]}): \"{pf_render.short(g['note'][1], 120)}\""
+                                              for g in sorted(notes, key=lambda g: g['k'])))
+        text = '\n'.join(out)
+        if len(text) > 30000:
+            text = text[:30000] + f'\n[truncated; pf show {name} for the whole file]'
+        return text
+
+    def _sections(self, matches, wanted):
+        """pf search: registered texts, business writes and latest outputs about one object."""
+        handles = evidence_handles.index(self.store)
+        texts = [v for v in matches if v in self.records and self.latest[self._key(v)] == v
+                 and self.records[v]['status'] == 'active']
+        writes = [v for v in matches if self.events[self.nodes[v]['event_id']]['result'].get('classification')
+                  == 'write_receipt']
+        outputs, seen = [], set()
+        for version in matches[::-1]:
+            for edge in self.incoming.get(version, []):
+                source = edge['source']
+                if edge['kind'] != 'same_execution' or source not in self.nodes:
+                    continue
+                # What the agent saw: a command's return, or the stdout of a script it ran by name.
+                event = self.events[self.nodes[source]['event_id']]
+                layer = self.nodes[source]['meta']['layer']
+                script = event['request']['kind'] == 'cli_python' and (event['request'].get('request') or {}).get('script')
+                if not (layer == 'tool_return' or (layer == 'stdout' and script)) or self._rerun(source):
+                    continue
+                key = handles.key(source)
+                if key not in seen:
+                    seen.add(key)
+                    outputs.append(source)
+        total = len(matches)
+        return dict(object=wanted, total=total, sections=[
+            ('Active texts', [self._describe(v) for v in texts[::-1][:5]], len(texts)),
+            ('Business writes', [self._describe(v) for v in writes[::-1][:5]], len(writes)),
+            ('Outputs', [self._describe(v) for v in outputs[:5]], len(outputs))])
+
     def _cursor(self, offset):
         value = dict(operation=self.operation, values=self.values, offset=offset, cutoff=self.cutoff)
         if self.check_state:
@@ -766,7 +926,7 @@ class PFQueries:
             next_cursor=self._cursor(end) if end < len(rows) else None,
             remaining=len(rows) - end, total=len(rows), detail=self.values['detail'], **extra)
 
-    def _read(self, target, offset):
+    def _read(self, target, offset, baseline=None):
         meta, raw = self.resolver.content(target)
         try:
             content = raw.decode('utf-8')
@@ -774,7 +934,7 @@ class PFQueries:
             raise ValueError('This captured version is not UTF-8 text') from exc
         header = {}
         if self.values['mode'] == 'diff':
-            baseline = self._target(self.values['baseline'])
+            baseline = baseline or self._target(self.values['baseline'])
             key = self._key(target)
             if key != self._key(baseline) or not (key[0] in ('query', 'file_bytes', 'registered_text', 'registered_script',
                                                               'dashboard') or key[0].startswith(('script_', 'command_'))):
@@ -807,6 +967,8 @@ class PFQueries:
         if end < len(content):
             header['truncated_reason'] = 'character_limit'
         prefix = encoded(header).decode() + '\n'
+        # The continuation command follows the body; the header keeps the delivery fields.
+        more = f"\n[{len(content) - end:,} more characters: pf more {header['next_cursor']}]" if header['next_cursor'] else ''
         from .pf_read import capture_read
-        return capture_read(self, target, prefix + content[offset:end],
+        return capture_read(self, target, prefix + content[offset:end] + more,
                             offset, end, len(content))
