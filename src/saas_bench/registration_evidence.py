@@ -390,11 +390,12 @@ class EvidenceResolver:
         raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
 
     def authored(self, version):
-        """Whether the model's own tool call contained these exact file bytes.
+        """Whether the model wrote or successfully edited this captured file version.
 
         write_file writes its content argument verbatim; a Bash command counts only when
         the complete decoded file text appears in the command the model wrote (for
-        example a quoted heredoc). Script outputs and edits remain unassigned.
+        example a quoted heredoc). Successful edit_file calls own their resulting
+        snapshot; their internal reads do not count as model delivery.
         """
         meta, raw = self.content(version)
         if meta['layer'] != 'file_bytes':
@@ -403,8 +404,12 @@ class EvidenceResolver:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
             return False
-        request = self.store.read_event(meta['created_by_event'])['request']
+        event = self.store.read_event(meta['created_by_event'])
+        request = event['request']
         args = request.get('request') or {}
+        if request['kind'] == 'edit_file':
+            return (version.endswith('_after') and event['result'].get('status') == 'succeeded'
+                    and meta['object_id'] in event['result'].get('written_paths', []))
         if request['kind'] == 'write_file':
             return args.get('content') == text
         return request['kind'] == 'bash' and bool(text) and text in (args.get('command') or '')

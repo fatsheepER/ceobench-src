@@ -40,7 +40,7 @@ def mentions_pf(command):
 def target(token):
     if RECORD.fullmatch(token):
         return {'record': token}
-    if VERSIONED.fullmatch(token) or ('/' not in token and '.' not in token and SINGLE.fullmatch(token)):
+    if VERSIONED.fullmatch(token) or (SINGLE.fullmatch(token) and not re.fullmatch(r'(cmd|query|read|call)[1-9][0-9]*', token)):
         return {'version': token}
     return {'path': token}
 
@@ -145,6 +145,6 @@ def parse(command, roots):
 def apply_view(text, view):
     if not view:
         return text
-    lines = str(text).split('\n')
+    lines = str(text).splitlines(keepends=True)
     kind, count = view
-    return '\n'.join(lines[:count] if kind == 'head' else lines[-count:])
+    return ''.join(lines[:count] if kind == 'head' else lines[-count:])

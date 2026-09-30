@@ -491,6 +491,8 @@ class BashAgentRunner:
             "arguments": arguments,
             "result": result,
         }
+        if getattr(result, 'pf_call', None):
+            entry['pf_call'] = result.pf_call
         with open(tool_results_file, 'a') as f:
             f.write(json.dumps(entry) + "\n")
 

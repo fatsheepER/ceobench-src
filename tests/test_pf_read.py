@@ -51,6 +51,34 @@ def sample():
     return ''.join(f'记录 {i:03d}: a useful observation about this business 🙂\r\n' for i in range(100))
 
 
+@pytest.mark.parametrize('command', ['pf show facts.txt', 'pf diff facts.txt'])
+@pytest.mark.parametrize('view', [('head', 2), ('tail', 2)])
+def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_path, command, view):
+    from saas_bench.pf_cli import apply_view
+    store, registry, executor = captured(workspace, tmp_path)
+    for text in ('a\nb\nc\n', 'A\nB\nC\n'):
+        (workspace / 'facts.txt').write_text(text)
+        executor.execute('bash', {'command': 'true'})
+    full = executor.execute('bash', {'command': command})
+    result = executor.execute('bash', {'command': f'{command} | {view[0]} -{view[1]}'})
+    assert result == apply_view(str(full), view)
+    if command == 'pf show facts.txt' and view[0] == 'tail':
+        assert result == 'B\nC\n'
+    event, reads = deliver(store, [result])
+    assert len(reads) == 1 and reads[0]['complete'] is False
+    assert reads[0]['mode'] == ('DIFF' if 'diff' in command else 'FULL')
+    assert reads[0]['actual_tokens'] == Counter().count(result)
+    for item in result.origins:
+        meta, raw = store.get_content(item['version_id'])
+        a, b = item['source_range']
+        c, d = item['request_range']
+        assert result[c:d] == raw.decode()[a:b]
+        if meta['layer'] == 'file_bytes':
+            assert not item['full_source']
+    with pytest.raises(ValueError, match='delivered|neither read nor wrote'):
+        call(registry, 'create', **declaration({'path': 'facts.txt'}))
+
+
 def test_official_model_tokenizer_is_pinned_and_validated(tmp_path, monkeypatch):
     from saas_bench.payload_tokens import load_counter, tokenizer_config
     config = tokenizer_config('deepseek', 'deepseek-flash')

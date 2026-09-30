@@ -299,7 +299,9 @@ class PFQueries:
             return self._blame(target)
         if operation == 'pf_diff':
             baseline, target = self._diff_pair(target, values['target'])
-            self.values = values = dict(target=values['target'], mode='diff', baseline={'version': 'implied'},
+            self.operation = 'pf_read'
+            self.values = values = dict(target={'version': self.resolver.handle(target)}, mode='diff',
+                                        baseline={'version': self.resolver.handle(baseline)},
                                         full=False, detail=False, limit=20)
             return self._read(target, offset, baseline=baseline)
         if operation == 'pf_read':
@@ -338,6 +340,8 @@ class PFQueries:
                         self.store.complete(event)
                 finally:
                     CURRENT_EVENT.reset(token)
+        unexpanded = list(dict.fromkeys(self.resolver.handle(r['edge']['target']) for r in rows
+                                       if r['stop'] == 'depth_limit'))
         describe = lambda r, all_rows=rows: self._top(r, all_rows) if _depth(r) == 1 else self._describe_edge(r)
         if not values['detail']:
             # Compact: one line per declared reference (or referrer); deeper rows only summarized.
@@ -352,7 +356,7 @@ class PFQueries:
                         endpoints.append(row)
                 rows = endpoints
         return self._page(rows, offset, describe, root=self._describe(target),
-                          stale_check='performed' if checking else 'not_performed')
+                          stale_check='performed' if checking else 'not_performed', unexpanded=unexpanded)
 
     def weekly_check(self, day):
         """Week-start digest: rerun what active registered texts cite, list only what changed."""
@@ -360,7 +364,8 @@ class PFQueries:
             return None
         self._index(None)
         self.operation = 'pf_dependencies'
-        self.values = dict(depth=3, purpose='current', include_execution=False, detail=False, limit=100)
+        # The digest covers every reachable dependency; explicit queries remain depth-limited.
+        self.values = dict(depth=len(self.nodes), purpose='current', include_execution=False, detail=False, limit=100)
         self.follow_execution = True
         active = sorted((v for v, record in self.records.items()
                          if record['status'] == 'active' and self.latest[self._key(v)] == v),
@@ -410,18 +415,27 @@ class PFQueries:
         if not check or row['historical_only']:
             return result
         below = [r for r in rows if _depth(r) > 1 and r['path'][:2] == row['path'] and r.get('check')
-                 and r['edge']['target'] in self.nodes
-                 and self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
-                 and not self._clock(r['edge']['target'])]
-        failed = [r for r in below if r['check']['predicate_result'] == 'fails']
+                 and not r['historical_only'] and (r['edge']['target'] is None or
+                 (self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
+                  and not self._clock(r['edge']['target'])))]
+        # Shared ancestors may have been expanded under another path. Use propagated
+        # causes, not just this branch's displayed traversal, for failed predicates.
+        causes = {tuple(path[-2:]) for path in check['affected_paths'] if len(path) > 2}
+        missing = {path[-1] for path in check['affected_paths'] if len(path) > 1}
+        problems = {encoded(r['edge']): r for r in rows if not r['historical_only']
+                    and r['check']['predicate_result'] in ('fails', 'cannot_check') and
+                    ((r['edge']['source'], r['edge']['target']) in causes or
+                     (r['edge']['target'] is None and r['edge']['source'] in missing))}
+        failed = [r for r in problems.values() if r['check']['predicate_result'] == 'fails']
         changed = [r for r in below if r['check']['version_changed'] and r['check']['predicate_result'] in
                    ('not_declared', 'not_checked')]
-        unknown = [r for r in below if r['check']['predicate_result'] == 'cannot_check']
+        unknown = [r for r in problems.values() if r['check']['predicate_result'] == 'cannot_check']
+        source_count = len({encoded(r['edge']) for r in below} | problems.keys())
         parts = []
         for rows_, head in ((failed, 'PREDICATE FAILS on'), (changed, 'changed:')):
             if rows_:
                 example = self._describe_edge(rows_[0])
-                parts.append(f"{len(rows_)} of {len(below)} underlying sources {head} "
+                parts.append(f"{len(rows_)} of {source_count} underlying sources {head} "
                              f"{example['target']['what']}: {example['check'].get('summary', 'changed')}")
         if unknown:
             reasons = ', '.join(sorted({str(r['check']['reason']) for r in unknown}))
@@ -832,18 +846,17 @@ class PFQueries:
         if version in self.records:
             key = self._key(version)
             revisions = [v for v in self.nodes if v in self.records and self._key(v) == key]
+            if '.' in requested.get('record', requested.get('version', '')):
+                return version, revisions[-1]
             if len(revisions) < 2:
                 raise ValueError(f"{self.records[version]['version']} has no other revision to compare")
-            if 'record' in requested and '.' in requested['record'] and version != revisions[-1]:
-                return version, revisions[-1]
             return revisions[-2], revisions[-1]
         groups = self._groups(version)
         newest = lambda g: [m for m in g['members'] if m in self.nodes][-1]
+        if 'version' in requested or evidence_handles.VERSIONED.fullmatch(requested.get('path', '')):
+            return version, newest(groups[-1])
         if len(groups) < 2:
             raise ValueError(f"{evidence_handles.index(self.store).name(version)} is the only version; nothing to compare")
-        group = evidence_handles.index(self.store).group(version)
-        if 'version' in requested and group['k'] < groups[-1]['k']:
-            return version, newest(groups[-1])
         return newest(groups[-2]), newest(groups[-1])
 
     def _blame(self, target):

@@ -220,9 +220,12 @@ class StaleCheck:
     def _propagate(self, rows):
         node = self.q._node
         outgoing = defaultdict(list)
+        seen = set()
         for row in rows:
-            if not row['historical_only']:
+            key = encoded(row['edge'])
+            if not row['historical_only'] and key not in seen:
                 outgoing[node(row['edge']['source'])].append(row)
+                seen.add(key)
 
         def causes(row, path):
             target, check = row['edge']['target'], row['check']

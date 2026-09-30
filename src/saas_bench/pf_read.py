@@ -6,7 +6,7 @@ import hashlib
 from itertools import accumulate
 import json
 
-from .execution_capture import CapturedText, CURRENT_EVENT, at_pointer, origin, text_sources
+from .execution_capture import CapturedText, CURRENT_EVENT, at_pointer, origin, slice_origins, text_sources
 from . import evidence_handles
 from .sql_evidence import encoded
 
@@ -31,6 +31,25 @@ def capture_read(query, target, text, start, end, total):
     if own_event:
         store.complete(event)
     return CapturedText(prefix + body, sources, {'id': read})
+
+
+def capture_view(store, text, view):
+    """Save exactly the piped response and only the source ranges it still contains."""
+    from .pf_cli import apply_view
+    shown = apply_view(text, view)
+    if shown == text:
+        return text
+    start = 0 if view[0] == 'head' else len(text) - len(shown)
+    end = start + len(shown)
+    sources = slice_origins(text.origins, start, end)
+    meta, _ = store.get_content(text.pf_read['id'])
+    a, b = meta['read_range']
+    prefix = str(text).index('\n') + 1
+    clip = lambda pos: a + max(0, min(b - a, pos - prefix))
+    read = store.version(meta['created_by_event'], 'read_view', shown, layer='pf_read_full',
+        target=meta['target'], key=meta['key'], mode=meta['mode'],
+        read_range=[clip(start), clip(end)], complete=False, force_full=True, view=list(view))
+    return CapturedText(shown, sources, {'id': read})
 
 
 def make_delta(before, after):
@@ -275,6 +294,8 @@ def prepare_request(store, request, context_id, counter):
             pf['source_origins'] = source['origins']
             if delivery['mode'] == 'FULL':
                 _literal_bases(store, source, available)
+        elif meta.get('view'):
+            origins = list(source['origins'])
         else:
             prefix = actual.index('\n') + 1
             origins = ([origin(meta['target'], target, *meta['read_range'], prefix)]

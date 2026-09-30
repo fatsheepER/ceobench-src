@@ -9,6 +9,7 @@ from saas_bench.registration_prompt import git_memory_line, integrate, pf_memory
 from saas_bench.text_registry import TextRegistry
 from test_text_registry import workspace, captured, call, declaration, git, send
 from test_preflight_integration import offline_runner, packed_public
+from test_public_sql import server
 
 ROOTS = {'/workspace'}
 
@@ -53,7 +54,7 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
     assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
     assert lines[3] == 'pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md'
-    assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2])
+    assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
     diff = executor.execute('bash', {'command': 'pf diff MEMORY.md'})
     assert '--- MEMORY.md@v1\n+++ MEMORY.md@v2' in diff and '-b\n+B\n+c' in diff
     assert executor.execute('bash', {'command': 'pf diff MEMORY.md@v1'}) == diff
@@ -168,3 +169,118 @@ def test_diff_of_a_text_compares_its_revisions(workspace, tmp_path):
     assert '"Keep B at $99"' in diff and '"Keep B at $89"' in diff and diff.index('-') < diff.index('+')
     assert executor.execute('bash', {'command': 'pf diff r1.1'}) == diff
     assert 'pf log rN' in executor.execute('bash', {'command': 'pf blame r1'})
+
+
+def test_single_diff_continues_the_same_pair_after_new_writes(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    for content in ('a' * 20000, 'b' * 20000):
+        executor.execute('write_file', dict(path='long.txt', content=content))
+    first = executor.execute('bash', {'command': 'pf diff long.txt'})
+    header, body = first.split('\n', 1)
+    header = json.loads(header)
+    assert header['next_cursor']
+    executor.execute('write_file', dict(path='long.txt', content='newer'))
+    more = executor.execute('bash', {'command': 'pf more ' + header['next_cursor']})
+    assert not more.startswith('Error:'), more
+    tail, rest = more.split('\n', 1)
+    tail = json.loads(tail)
+    assert tail['baseline']['version'] == header['baseline']['version'] == 'long.txt@v1'
+    assert tail['target']['version'] == header['target']['version'] == 'long.txt@v2'
+    assert tail['range'] == [30000, header['total_chars']] and tail['next_cursor'] is None
+    complete = body.rsplit('\n[', 1)[0] + rest
+    assert len(complete) == header['total_chars'] and 'newer' not in complete
+
+
+@pytest.mark.parametrize('kind', ['file', 'record'])
+def test_explicit_latest_diff_uses_itself_even_with_only_one_version(workspace, tmp_path, kind):
+    store, registry, executor = captured(workspace, tmp_path)
+    for i in (1, 2):
+        if kind == 'file':
+            executor.execute('write_file', dict(path='a.txt', content=str(i)))
+            target = f'a.txt@v{i}'
+        else:
+            call(registry, 'create', **declaration(text='one')) if i == 1 else call(
+                registry, 'revise', record='r1', reason='two', text='two')
+            target = f'r1.{i}'
+        result = executor.execute('bash', {'command': 'pf diff ' + target})
+        assert not result.startswith('Error:'), result
+        header, body = result.split('\n', 1)
+        assert json.loads(header)['raw_equal'] and body == ''
+
+
+def test_bare_command_query_and_read_names_resolve_latest(workspace, tmp_path, server):
+    from saas_bench.execution_capture import finish_http
+    from saas_bench.public_sql import execute_query
+    from test_pf_stale import record_sql
+    store, registry, executor = captured(workspace, tmp_path)
+    output = executor.execute('bash', {'command': 'echo x > out.txt'})
+    command = re.search(r'\[pf: (cmd\d+)@', output).group(1)
+    sql = 'SELECT amount FROM ledger'
+    version = record_sql(store, sql, execute_query(server, sql))
+    query = registry.resolver.handle(version).split('@')[0]
+    event = store.begin_event('public_http', dict(method='GET', path='/vars', parsed=None))
+    finish_http(store, event, 200, {}, b'{"day":7}', {})
+    read = registry.resolver.handle(event + ':public_response').split('@')[0]
+    for name in (command, query, read):
+        for verb in ('log', 'show', 'depend'):
+            result = executor.execute('bash', {'command': f'pf {verb} {name}'})
+            assert not result.startswith('Error:'), result
+            assert name + '@v1' in result
+
+
+def test_identical_writes_update_notes_but_reads_do_not(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    for note in ('first', 'second'):
+        executor.execute('write_file', dict(path='MEMORY.md', content='same', note=note))
+    result = executor.execute('read_file', {'path': 'MEMORY.md'})
+    assert 'MEMORY.md@v1' in result and 'second' in result and 'first' not in result
+    executor.execute('bash', dict(command='cat MEMORY.md', note='read only'))
+    executor.execute('write_file', dict(path='MEMORY.md', content='same'))
+    log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
+    assert '1 version,' in log and 'second' in log and 'read only' not in log
+    # A rebuilt index must agree with the incrementally refreshed one.
+    del store._handle_index
+    assert executor.execute('bash', {'command': 'pf log MEMORY.md'}) == log
+    executor.execute('bash', dict(command='printf same > MEMORY.md', note='third'))
+    log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
+    assert '1 version,' in log and 'third' in log and 'second' not in log
+
+
+def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from scripts.analyze_pf_run import analyze
+    store, registry, executor = captured(workspace, tmp_path)
+    run = tmp_path / 'run'
+    (run / 'logs').mkdir(parents=True)
+    logger = BashAgentRunner.__new__(BashAgentRunner)
+    logger.logs_dir, logger.run_id = run / 'logs', 'audit'
+    executor.execute('write_file', dict(path='MEMORY.md', content='a\nb\n'))
+    commands = ['pf log MEMORY.md', 'pf show missing | tail -1', 'pf log',
+                'ls && pf show MEMORY.md', 'pf help', "cat > data.py <<'EOF'\npf = 3\nEOF"]
+    for i, command in enumerate(commands):
+        args = dict(command=command, note='a purpose' if i == 0 else '')
+        logger._log_tool_result(i, 28, 'bash', args, executor.execute('bash', args))
+    store.snapshot(run / 'sql-evidence.sqlite')
+    request = dict(event='request', day=28, request=dict(messages=[dict(role='system', content=''),
+        dict(role='user', content='Dashboard\n\n=== Check of your registered texts (day 28) ===\n'
+                                  '1 active text checked; 1 with changed evidence:\nr1.1 (day 7): plan')]))
+    (run / 'logs/agent_requests.jsonl').write_text(json.dumps(request) + '\n')
+    (run / 'usage_summary.json').write_text('{}')
+    pointer = tmp_path / 'pointer.json'
+    pointer.write_text(json.dumps(dict(path=str(run), start_day=28, group='pf', run_id='audit', status='stopped')))
+    result = analyze(pointer)
+    week = result['weeks'][0]
+    assert week['digest_chars'] and week['flagged'] == ['r1.1']
+    assert len(week['pf_calls']) == 5  # The heredoc variable is not a command.
+    assert [c['outcome'] for c in week['pf_calls']] == [
+        'succeeded', 'execution_error', 'usage_error', 'usage_error', 'usage_error']
+    assert all(c['capture_match'] is True for c in week['pf_calls'])
+    assert week['note_calls'] == {'bash': 1}
+    # Older Bash logs have no metadata, but the same parser can recover their calls.
+    logfile = run / 'logs/tool_results_audit.jsonl'
+    entries = [json.loads(line) for line in logfile.read_text().splitlines()]
+    for entry in entries:
+        entry.pop('pf_call', None)
+    logfile.write_text(''.join(json.dumps(e) + '\n' for e in entries))
+    recovered = analyze(pointer)['weeks'][0]['pf_calls']
+    assert len(recovered) == 5 and all(c['capture_match'] is None for c in recovered)

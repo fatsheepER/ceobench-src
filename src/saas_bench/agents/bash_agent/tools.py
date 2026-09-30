@@ -419,14 +419,18 @@ class BashAgentToolExecutor:
                         'unobserved_internal_file_reads', 'unobserved_intermediate_file_versions',
                         'unobserved_pipe_streams', 'unobserved_program_data_dependencies']
             result = handler(args)
-            if view and getattr(result, 'pf_read', None) is None:
+            if tool_name == 'pf_usage' or (tool_name != 'bash' and result.startswith('Error:')):
+                status = 'failed'
+            if view:
                 from saas_bench.pf_cli import apply_view
-                result = apply_view(result, view)
+                if getattr(result, 'pf_read', None):
+                    from saas_bench.pf_read import capture_view
+                    result = capture_view(self.evidence_store, result, view)
+                else:
+                    result = apply_view(result, view)
             if capture:
                 capture.origins.extend(getattr(result, 'origins', []))
-            if tool_name != 'bash' and result.startswith('Error:'):
-                status = 'failed'
-            elif capture and capture.facts.get('timed_out'):
+            if capture and capture.facts.get('timed_out'):
                 status = 'timed_out'
             elif capture and capture.facts.get('exit_code', 0):
                 status = 'failed'
@@ -462,6 +466,10 @@ class BashAgentToolExecutor:
                 CURRENT_EVENT.reset(token)
             self.extra_env = previous_env
             self.capture = None
+        if capture and tool_name.startswith('pf_'):
+            result.pf_call = dict(operation=tool_name, arguments=args, event_id=capture.event,
+                                 outcome='usage_error' if tool_name == 'pf_usage' else
+                                         'succeeded' if status == 'succeeded' else 'execution_error')
         return result
 
     def _roots(self):
@@ -896,6 +904,8 @@ class BashAgentToolExecutor:
         path = self._resolve_path(args['path'])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(args['content'])
+        if self.capture:
+            self.capture.facts['written_paths'] = [str(path.relative_to(self.workspace_path))]
         return f"File written: {args['path']} ({path.stat().st_size} bytes)"
 
     def _exec_edit_file(self, args: Dict) -> str:
@@ -916,6 +926,8 @@ class BashAgentToolExecutor:
 
         new_content = content.replace(old_str, new_str, 1)
         path.write_text(new_content)
+        if self.capture:
+            self.capture.facts['written_paths'] = [str(path.relative_to(self.workspace_path))]
         return f"File edited: {args['path']}"
 
     def _exec_search_files(self, args: Dict) -> str:

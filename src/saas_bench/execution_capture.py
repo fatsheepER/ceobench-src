@@ -59,6 +59,7 @@ class ExecutionCapture:
         self.slots = 0
         self.origins = []
         self.facts = {}
+        self.before_stamps = {}
 
     def safe(self, fn, *args, **kwargs):
         try:
@@ -97,8 +98,8 @@ class ExecutionCapture:
         items = {}
         reused = 0
         root = str(Path(workspace).resolve())
-        # Every file is read and hashed on each boundary (no mtime shortcut); only bytes
-        # that differ from the newest visible version of the path get a new version.
+        # Read and hash every file (no mtime shortcut). Reuse unchanged observations,
+        # but retain a new acquisition for a write, even when its bytes are identical.
         for directory, dirs, files in os.walk(root, followlinks=False):
             prefix = '' if directory == root else directory[len(root) + 1:] + '/'
             for name in sorted(dirs + files):
@@ -123,7 +124,14 @@ class ExecutionCapture:
                         raise RuntimeError('File changed during boundary capture: ' + rel)
                     sha = digest(raw)
                     version, latest_sha = self.store.latest_version(rel, 'file_bytes') if self.event else (None, None)
-                    if version and latest_sha == sha:
+                    stamp = (info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+                    if phase == 'before':
+                        self.before_stamps[rel] = stamp
+                    # A repeated write may leave the bytes unchanged. Keep its acquisition
+                    # so the latest call note survives content-based handle deduplication.
+                    written = phase == 'after' and (rel in self.facts.get('written_paths', []) or
+                                                    self.before_stamps.get(rel) != stamp)
+                    if version and latest_sha == sha and not written:
                         reused += 1
                     else:
                         version = self.file(rel, raw, phase=phase)

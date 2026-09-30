@@ -306,6 +306,8 @@ def dependency_line(row, relation=True):
                                                  separators=(',', ':'), sort_keys=True))
     if row.get('note'):
         extras.append('note: ' + short(row['note'], 120))
+    if row.get('unexpanded') == 'depth_limit':
+        extras.append('depth limit; dependencies beyond this item were not expanded')
     return head + ' — ' + ' — '.join(extras)
 
 
@@ -313,8 +315,11 @@ def render_dependencies(page):
     root, detail = page['root'], page.get('detail')
     checked = page.get('stale_check') == 'performed'
     lines = [item_line(root),
-             ('Checked against the current world; advisory.' if checked else
+             ('Checked against the current world within the expanded dependencies; advisory.' if checked else
               'Not checked (--history lists history only).')]
+    if page.get('unexpanded'):
+        lines.append('Incomplete: depth limit reached at ' + ', '.join(page['unexpanded']) +
+                     '. Continue with ' + '; '.join('pf depend ' + v for v in page['unexpanded']) + '.')
     if not page['items']:
         lines.append('No recorded dependencies.' if detail else
                      f"No declared references. pf depend {root['version']} --detail traces what produced it.")
@@ -323,7 +328,7 @@ def render_dependencies(page):
         lines.append(f'{indent}{i}. ' + dependency_line(row))
     tail = [_more(page, 'items')]
     if not detail:
-        tail.append(f"pf depend {root['version']} --detail lists every underlying query, read and file.")
+        tail.append(f"pf depend {root['version']} --detail lists the expanded queries, reads and files.")
     # Name a pair that was just compared, so the example is directly usable.
     pair = next(((row['target']['version'], row['check']['current_version']) for row in page['items']
                  if row.get('target') and (row.get('check') or {}).get('current_version') not in

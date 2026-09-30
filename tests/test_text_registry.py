@@ -276,6 +276,25 @@ def test_pf_frozen_old_memory_does_not_hide_a_new_authored_version(workspace, tm
         call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
 
 
+def test_pf_local_edit_is_immediately_citable_by_path_and_handle(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', dict(path='plan.txt', content='budget 100\nprice 20\n'))
+    old = executor.execute('read_file', dict(path='plan.txt', limit=1))
+    edited = executor.execute('edit_file', dict(path='plan.txt', old_string='100', new_string='200'))
+    assert 'wrote plan.txt@v2' in edited
+    send(store, old)  # Repeated frozen context must not hide the edit.
+    for evidence in ({'path': 'plan.txt'}, {'version': 'plan.txt@v2'}):
+        created = call(registry, 'create', **declaration(evidence))
+        binding = store.load_state('declaration:' + created['version'])['references'][0]
+        assert binding['version_id'] == binding['latest_version_id']
+        assert store.get_content(binding['version_id'])[1] == b'budget 200\nprice 20\n'
+        assert store.read_event(binding['authored_by'])['request']['kind'] == 'edit_file'
+    (workspace / 'plan.txt').write_text('external 300\nprice 20\n')
+    assert executor.execute('edit_file', dict(path='plan.txt', old_string='absent', new_string='x')).startswith('Error:')
+    with pytest.raises(ValueError, match='neither read nor wrote'):
+        call(registry, 'create', **declaration({'version': 'plan.txt@v3'}))
+
+
 @pytest.mark.parametrize('delivered', [False, True])
 def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, delivered):
     store, prefix, executor = captured(workspace, tmp_path, 'prefix')
