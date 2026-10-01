@@ -25,8 +25,7 @@ def list_research_projects() -> Dict:
 
     Returns:
         Dict with tiers: costs, mean_days/std_days, mean_quality_boost/
-        std_quality_boost, in_progress/completed counts, total_quality_boost,
-        and projects (project_id, status, started_day, expected_completion_day,
-        expected_quality_boost, remaining_days). Completed remaining_days is None.
+        std_quality_boost, in_progress/completed counts and total_quality_boost.
+        Query the public research_projects table for individual projects and dates.
     """
     return _client.call('list_research_projects')

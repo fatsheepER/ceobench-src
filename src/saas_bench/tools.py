@@ -1407,21 +1407,21 @@ TOOL_DOCS = {
     "list_research_projects": {
         "name": "list_research_projects",
         "category": "R&D Research Projects",
-        "description": "List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, project dates, remaining days, and completion history for each tier. Tiers are repeatable.",
+        "description": "List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, in-progress and completed counts, and total quality boost for each tier. Tiers are repeatable. Query the public research_projects table for individual projects and their dates.",
         "inputSchema": {"type": "object", "properties": {}},
         "parameters": {},
         "returns": {
-            "output": "All 20 tiers with: cost, duration mean±std, quality mean±std, current status and public project details",
+            "output": "All 20 tiers with: cost, duration mean±std, quality mean±std, in-progress/completed counts and total quality boost",
             "data": {
                 "tiers": [{"tier": 1, "name": RESEARCH_TIERS[0].name, "cost": RESEARCH_TIERS[0].cost,
                     "mean_days": RESEARCH_TIERS[0].mean_days, "std_days": RESEARCH_TIERS[0].std_days,
                     "mean_quality_boost": RESEARCH_TIERS[0].mean_quality_boost,
                     "std_quality_boost": RESEARCH_TIERS[0].std_quality_boost,
-                    "in_progress": 0, "completed": 0, "total_quality_boost": 0, "projects": []}]
+                    "in_progress": 0, "completed": 0, "total_quality_boost": 0}]
             }
         },
         "output_schema": {
-            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float), projects (List[Dict]: project_id, status, started_day, expected_completion_day, expected_quality_boost, remaining_days). remaining_days is clamped to 0 for overdue projects and is None for completed projects.",
+            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float). Tier summaries only; query research_projects for individual projects and their dates.",
             "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
         },
         "total_tiers": 20,
@@ -4851,7 +4851,7 @@ os.chdir('{self.workspace_path}')
         )
 
     def list_research_projects(self) -> ToolResult:
-        """List all R&D research tiers with their status and public project details."""
+        """List all R&D research tiers with their aggregate status."""
         # Get all invocations from DB
         rows = self.conn.execute("SELECT * FROM research_projects ORDER BY tier, started_day").fetchall()
 
@@ -4908,11 +4908,6 @@ os.chdir('{self.workspace_path}')
                 'in_progress': len(in_prog),
                 'completed': len(done),
                 'total_quality_boost': round(total_q, 4),
-                'projects': [dict(project_id=r['project_id'], status=r['status'],
-                    started_day=r['started_day'], expected_completion_day=r['expected_completion_day'],
-                    expected_quality_boost=r['expected_quality_boost'],
-                    remaining_days=max(0, r['expected_completion_day'] - self.current_day)
-                        if r['status'] == 'in_progress' else None) for r in in_prog + done],
             })
 
         return ToolResult(True, output, {'tiers': tiers_data})

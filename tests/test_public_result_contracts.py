@@ -61,23 +61,22 @@ def test_sdk_survey_dates_and_referral_units(sdk):
     assert set(example) == set(result)
 
 
-def test_sdk_research_list_keeps_public_project_times_and_uncertainty(sdk):
+def test_sdk_research_list_returns_tier_summaries_without_project_dates(sdk):
+    from saas_bench.novamind_api import query
     start = research.start_research_project(1)
     tier = research.list_research_projects()['tiers'][0]
     assert tier['std_days'] == RESEARCH_TIERS_BY_ID[1].std_days
     assert tier['std_quality_boost'] == RESEARCH_TIERS_BY_ID[1].std_quality_boost
-    project = tier['projects'][0]
-    assert project['project_id'] == start['project_id']
-    assert project['expected_completion_day'] == start['expected_completion_day']
-    assert project['remaining_days'] == start['expected_duration_days']
-    assert 'actual_completion_day' not in project
-    sdk.current_day = start['expected_completion_day'] + 1
-    assert research.list_research_projects()['tiers'][0]['projects'][0]['remaining_days'] == 0
+    assert tier['in_progress'] == 1 and tier['completed'] == 0
+    assert 'projects' not in tier
+    assert 'expected_completion_day' not in json.dumps(tier)
+    project = query('SELECT project_id,expected_completion_day FROM research_projects')['rows'][0]
+    assert project == {k: start[k] for k in ('project_id', 'expected_completion_day')}
     sdk.conn.execute("UPDATE research_projects SET status='completed',quality_boost_applied=expected_quality_boost")
     sdk.conn.commit()
     completed = research.list_research_projects()['tiers'][0]
     assert completed['completed'] == 1 and completed['in_progress'] == 0
-    assert completed['projects'][0]['remaining_days'] is None
+    assert 'projects' not in completed
 
 
 def test_sdk_discovery_distinguishes_all_outcomes(sdk):
