@@ -210,7 +210,7 @@ def finish_http(store, event, status, headers, body, execution):
                         objects.append(dict(kind=outer, value=k, path=path + '/' + str(k), basis=basis + '_dictionary_key'))
                         if isinstance(children, dict):
                             objects.extend(dict(kind=inner, value=c, path=path + '/' + str(k) + '/' + str(c), basis=basis + '_dictionary_key') for c in children)
-                if key in ('day', 'current_day', 'start_day', 'started_day', 'end_day', 'expected_completion_day', 'snapshot_day', 'data_day', 'next_reply_day') and type(val) is int:
+                if key in ('day', 'current_day', 'start_day', 'started_day', 'end_day', 'expected_completion_day', 'snapshot_day', 'measurement_day', 'data_day', 'next_reply_day') and type(val) is int:
                     dates.append(dict(field=key, value=val, path=path, basis=basis))
                 if key == 'success' and type(val) is bool and pointer and basis == 'public_response_field':
                     outcomes.append(dict(path=path, success=val))

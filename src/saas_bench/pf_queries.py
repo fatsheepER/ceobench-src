@@ -414,8 +414,8 @@ class PFQueries:
                 continue
             eligible.add(version)
             if version in self.review_pending:
-                # Pending ordinary references stay dated. Only explicit conditions and
-                # their propagation paths need fresh checks until revision/manual review.
+                # Keep ordinary findings dated, but retry transient source failures
+                # alongside explicit conditions and their propagation paths.
                 rows = self.review_pending[version]['conditions']
                 if rows:
                     traced[version] = rows
@@ -439,7 +439,8 @@ class PFQueries:
             rendering = time.monotonic()
             entries, underlying = [], []
             for version, rows in traced.items():
-                tops = ([self._describe_edge(r) for r in rows if self._conditional(r) and not r['historical_only']]
+                tops = ([self._describe_edge(r) for r in rows
+                         if (self._conditional(r) or r.get('retry_refresh')) and not r['historical_only']]
                         if version in continuing else [self._top(r, rows) for r in rows if _weekly(r)])
                 # Itemize what the agent chose itself: a cited version that was superseded
                 # without a holding predicate, and any predicate on the declared chain that fails
@@ -465,11 +466,21 @@ class PFQueries:
                 else:
                     # Do not advance the ordinary problem's last verification date.
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
+            surveys = {}
+            for rows in traced.values():
+                for row in rows:
+                    target = row['edge']['target']
+                    if target and not row['historical_only'] and 'cached_check' not in row:
+                        request = self.events[self.nodes[target]['event_id']]['request'].get('request') or {}
+                        if (request.get('parsed') or {}).get('tool') == 'get_group_insights':
+                            item = self._describe(target)
+                            surveys[item['version']] = item
             text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
-                                          condition_only=len(continuing), pending=len(self.review_pending))
+                                          condition_only=len(continuing), pending=len(self.review_pending),
+                                          surveys=surveys.values())
             if self.review_pending:
                 old = [(v, p) for v, p in self.review_pending.items() if p['first_day'] != day]
-                text += f'\nPending review: {len(self.review_pending)} texts; ordinary references are not rechecked until revision or pf depend.'
+                text += f'\nPending review: {len(self.review_pending)} texts; ordinary findings remain dated until revision or pf depend; transient read failures retry with backoff.'
                 groups = defaultdict(list)
                 for v, p in old:
                     groups[(p['first_day'], p['last_day'])].append(self.records[v]['version'])
@@ -492,14 +503,22 @@ class PFQueries:
         return bool(ref.get('select') or ref.get('predicate'))
 
     def _continuing_rows(self, rows):
-        paths = [r['path'] for r in rows if self._conditional(r) and not r['historical_only']]
+        failures = self.store.load_state('pf_refresh_failures') or {}
+        def needs_retry(row):
+            target = row['edge']['target']
+            failure = failures.get(encoded(self._key(target)).decode(), {}) if target else {}
+            return bool(failure) and not failure.get('permanent') and not row['historical_only']
+        paths = [r['path'] for r in rows if not r['historical_only'] and (self._conditional(r) or needs_retry(r))]
         result = []
         for row in rows:
             if not any(path[:len(row['path'])] == row['path'] for path in paths):
                 continue
             item = dict(row)
-            if not self._conditional(row):
+            item['retry_refresh'] = needs_retry(row)
+            if not self._conditional(row) and not item['retry_refresh']:
                 item['cached_check'] = row['check']
+            else:
+                item.pop('cached_check', None)
             result.append(item)
         return result
 
@@ -844,7 +863,8 @@ class PFQueries:
 
     def _brief(self, version):
         full = self._describe(version)
-        return {k: full[k] for k in ('version', 'day', 'what', 'truncated', 'extent') if k in full} | (
+        return {k: full[k] for k in ('version', 'day', 'what', 'truncated', 'extent',
+                                    'snapshot_day', 'checked_day', 'refresh_hint') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
     def _change(self, before, after):

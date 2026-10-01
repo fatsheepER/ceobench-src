@@ -1130,19 +1130,23 @@ TOOL_DOCS = {
             "failure": "Market research complete ($25,000). No new segments discovered this time. Try again for another chance.",
             "no_funds": "Insufficient funds. Market research costs $25,000. Available: $12,000",
             "data_on_success": {
-                "discovered_group_id": "D_S01", "group_name": "Niche Creators", "segment": "Individual",
-                "info_level": 1, "cost": 25000
+                "discovered_group_id": "D_S01", "cost": 25000,
+                "status": "discovered", "remaining_undiscovered": 19
             },
-            "data_on_failure": {"cost": 25000}
+            "data_on_failure": {"cost": 25000, "status": "not_found", "remaining_undiscovered": 20},
+            "data_when_exhausted": {"cost": 25000, "status": "exhausted", "remaining_undiscovered": 0}
         },
         "what_happens": [
             "1. $25,000 deducted from cash",
             "2. 30% chance to discover one undiscovered group",
-            "3. If successful: group set to Info Level 1, initial parameter estimates returned",
+            "3. If successful: group set to Info Level 1; retrieve its estimates with get_group_insights()",
             "4. If unsuccessful: nothing discovered, money still spent"
         ],
         "output_schema": {
-            "discovered_group_id": "str|None — group ID if discovered (e.g., 'D_S01'), absent if no discovery",
+            "status": "str — 'discovered', 'not_found' (can retry), or 'exhausted' (all segments identified)",
+            "cost": "float — cost deducted for this attempt, including when exhausted",
+            "remaining_undiscovered": "int — segments still undiscovered after this attempt",
+            "discovered_group_id": "str — group ID if discovered (e.g., 'D_S01'), absent otherwise",
             "_access": "if 'discovered_group_id' in result: print('Found:', result['discovered_group_id'])"
         },
         "impact": "Costs $25,000 per attempt. On success, unlocks a new customer segment with initial parameter estimates.",
@@ -1245,13 +1249,15 @@ TOOL_DOCS = {
             "data": {
                 "known_groups": [{"group_id": "S1", "group_name": "Price-Sensitive Individuals", "segment": "Individual", "info_level": 1, "noise": "±65%"}],
                 "undiscovered_count": 14,
-                "macroeconomic": {"ism_pmi": 54.2, "change": 1.3, "phase": "expansion", "cycle": "recovering"}
+                "macroeconomic": {"measurement_day": 270, "publication_delay_days": 30,
+                    "pmi_value": 54.2, "pmi_trend": "expansion", "pmi_change": 1.3,
+                    "cycle_phase": "recovering", "description": "Period average"}
             }
         },
         "output_schema": {
             "known_groups": "List[Dict] — each: group_id (str), group_name (str), segment (str: 'Individual'|'Enterprise'), info_level (int 1-5), noise (str e.g. '±65%')",
             "undiscovered_count": "int — segments not yet discovered",
-            "macroeconomic": "Dict|None — keys: pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
+            "macroeconomic": "Dict|None — keys: measurement_day (int, when PMI was measured, not published), publication_delay_days (int, configured delay; not an exact publication timestamp), pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
             "_access": "for g in result['known_groups']: print(g['group_id'], g['group_name'])",
             "_warning": "Key is 'known_groups' NOT 'groups'"
         },
@@ -1290,14 +1296,13 @@ TOOL_DOCS = {
             "example": "=== Group Insights: Niche Creators (D_S01) ===\nSegment: Individual\nInfo Level: 2 (estimates accurate to \u00b140%)\n\nEstimated Parameters:\n  Willingness to pay:    ~$92/mo (max monthly budget)\n  Usage volume:          ~38 units/day\n  Quality floor (q_min): ~0.61 (minimum quality needed at $0)\n  Contract lock-in aversion: ~0.0072/month (satisfaction penalty per extra contract month)\n  Market cap:            ~185,000 (total addressable customers)\n  Market cap growth:     ~9.2%/year (annual market expansion)\n\n--- Network Influence (word-of-mouth referrals) ---\nUnit: leads per 1000 subscribers per day (at neutral reputation)\n  Self-referral rate: ~4.2 leads per 1000 subs/day\n\nOutgoing (this group's subs \u2192 leads in other groups):\n  \u2192 Music Producers (D_S10): ~1.8 leads per 1000 subs/day\n  \u2192 Indie Game Devs (D_S05): ~1.2 leads per 1000 subs/day\n  \u2192 S1: ~0.9 leads per 1000 subs/day\n\nIncoming (other groups' subs \u2192 leads in this group):\n  \u2190 S1: ~1.3 leads per 1000 subs/day\n  \u2190 Music Producers (D_S10): ~0.8 leads per 1000 subs/day\n\n--- Reputation Influence (cross-group sentiment spread) ---\nUnit: dimensionless weight (0-1, higher = stronger influence)\n\nOutgoing (this group's reputation events \u2192 other groups):\n  \u2192 S1: ~0.150\n  \u2192 Indie Game Devs (D_S05): ~0.120\n\nIncoming (other groups' events \u2192 this group):\n  \u2190 S1: ~0.150\n  \u2190 S3: ~0.120\n\nNote: All estimates have \u00b140% uncertainty at Level 2.\nUse research_group('D_S01') to upgrade to Level 3 (\u00b125%).",
             "data": {
                 "group_id": "S1", "group_name": "Price-Sensitive Individuals", "segment": "Individual",
-                "info_level": 1, "noise": "±65%",
+                "info_level": 1, "noise": "±65%", "snapshot_day": 0,
                 "estimates": {
                     "willingness_to_pay": 25.86, "usage_volume": 91.0, "quality_floor_q_min": 0.452,
                     "contract_lockin_aversion": 0.0045, "market_cap": 802000, "annual_market_cap_growth_rate": 0.035
                 },
-                "network_influence": {"self_referral": 0.0015, "outgoing": {"S3": 0.002}, "incoming": {"S2": 0.001}},
-                "reputation_influence": {"outgoing": {"E1": 0.36}, "incoming": {}},
-                "_enterprise_extra_fields": ["seat_range", "negotiation_rounds", "negotiation_pace_days"]
+                "network_influence": {"self_referral": 1.5, "outgoing": {"S3": 2.0}, "incoming": {"S2": 1.0}},
+                "reputation_influence": {"outgoing": {"E1": 0.36}, "incoming": {}}
             }
         },
         "parameter_explanations": {
@@ -1318,8 +1323,9 @@ TOOL_DOCS = {
         "output_schema": {
             "group_id": "str", "group_name": "str", "segment": "str ('Individual'|'Enterprise')",
             "info_level": "int (1-5)", "noise": "str (e.g. '±65%')",
+            "snapshot_day": "int — survey measurement day (0 is valid); only completed research_group updates it, not this read",
             "estimates": "Dict — keys: willingness_to_pay (float), usage_volume (float), quality_floor_q_min (float), contract_lockin_aversion (float), market_cap (int), annual_market_cap_growth_rate (float). Enterprise adds: seat_range (List[int]), decision_rounds (int), avg_response_days (float)",
-            "network_influence": "Dict — keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) — leads per 1000 subs/day",
+            "network_influence": "Dict — keys: self_referral (float), outgoing (Dict[str,float]), incoming (Dict[str,float]) — all rates in leads per 1000 subs/day",
             "reputation_influence": "Dict — keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) — influence weights 0-1",
             "_access": "result['estimates']['willingness_to_pay'] → group's WTP"
         },
@@ -1401,17 +1407,21 @@ TOOL_DOCS = {
     "list_research_projects": {
         "name": "list_research_projects",
         "category": "R&D Research Projects",
-        "description": "List all 10 R&D research tiers with their status. Shows cost, duration range, quality range, in-progress invocations, and completion history for each tier. Tiers are repeatable.",
+        "description": "List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, project dates, remaining days, and completion history for each tier. Tiers are repeatable.",
         "inputSchema": {"type": "object", "properties": {}},
         "parameters": {},
         "returns": {
-            "output": "All 10 tiers with: cost, duration mean±std, quality mean±std, current status (not started / in progress / completed Nx with total quality)",
+            "output": "All 20 tiers with: cost, duration mean±std, quality mean±std, current status and public project details",
             "data": {
-                "tiers": [{"tier": 1, "name": "Prompt Engineering Optimization", "cost": 100000, "mean_days": 35, "mean_quality_boost": 0.04, "in_progress": 0, "completed": 0, "total_quality_boost": 0}]
+                "tiers": [{"tier": 1, "name": RESEARCH_TIERS[0].name, "cost": RESEARCH_TIERS[0].cost,
+                    "mean_days": RESEARCH_TIERS[0].mean_days, "std_days": RESEARCH_TIERS[0].std_days,
+                    "mean_quality_boost": RESEARCH_TIERS[0].mean_quality_boost,
+                    "std_quality_boost": RESEARCH_TIERS[0].std_quality_boost,
+                    "in_progress": 0, "completed": 0, "total_quality_boost": 0, "projects": []}]
             }
         },
         "output_schema": {
-            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), mean_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float)",
+            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float), projects (List[Dict]: project_id, status, started_day, expected_completion_day, expected_quality_boost, remaining_days). remaining_days is clamped to 0 for overdue projects and is None for completed projects.",
             "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
         },
         "total_tiers": 20,
@@ -4180,7 +4190,7 @@ os.chdir('{self.workspace_path}')
             self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments to discover — all segments have been identified.",
-                data={'cost': cost})
+                data={'cost': cost, 'status': 'exhausted', 'remaining_undiscovered': 0})
 
         # Path-independent RNG: seeded by (global_seed, "market_research", attempt_number)
         # so discovery results depend only on how many times research_market was called, not on other RNG usage
@@ -4252,7 +4262,8 @@ os.chdir('{self.workspace_path}')
                 f"{preview_text}\n"
                 f"Use get_group_insights('{discovered_gid}') for full parameter estimates.\n"
                 f"Use research_group('{discovered_gid}') to improve accuracy.",
-                data={'discovered_group_id': discovered_gid}
+                data={'discovered_group_id': discovered_gid, 'cost': cost,
+                      'status': 'discovered', 'remaining_undiscovered': remaining}
             )
         else:
             remaining = len(undiscovered)
@@ -4264,7 +4275,7 @@ os.chdir('{self.workspace_path}')
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments discovered this time. "
                 f"Try again for another chance.",
-                data={'cost': cost}
+                data={'cost': cost, 'status': 'not_found', 'remaining_undiscovered': remaining}
             )
 
     def research_group(self, group_id: str, target_level: int = None) -> ToolResult:
@@ -4426,7 +4437,7 @@ os.chdir('{self.workspace_path}')
         macro_row = None
         try:
             macro_row = self.conn.execute(
-                "SELECT pmi_value, pmi_trend, pmi_change, cycle_phase, description "
+                "SELECT day, pmi_value, pmi_trend, pmi_change, cycle_phase, description "
                 "FROM macroeconomic_conditions ORDER BY day DESC LIMIT 1"
             ).fetchone()
             if macro_row:
@@ -4434,7 +4445,8 @@ os.chdir('{self.workspace_path}')
                 output += f"  ISM PMI: {macro_row['pmi_value']:.1f}  ({macro_row['pmi_trend'].replace('_', ' ')})\n"
                 output += f"  Change: {'+' if macro_row['pmi_change'] >= 0 else ''}{macro_row['pmi_change']:.1f}  |  Cycle: {macro_row['cycle_phase'].replace('_', ' ')}\n"
                 output += f"  {macro_row['description']}\n"
-                output += "NOTE: PMI data is published with ~30 day delay. This reading reflects past conditions.\n"
+                output += (f"Measurement day: {macro_row['day']}. PMI data is published with "
+                           f"~{self.config.macro_pmi_publication_delay_days} day delay. This reading reflects past conditions.\n")
                 output += "Query macroeconomic_conditions table for historical PMI data.\n"
         except Exception:
             pass  # Table may not exist in older databases
@@ -4460,6 +4472,8 @@ os.chdir('{self.workspace_path}')
         try:
             if macro_row:
                 macro_data = {
+                    'measurement_day': macro_row['day'],
+                    'publication_delay_days': self.config.macro_pmi_publication_delay_days,
                     'pmi_value': macro_row['pmi_value'],
                     'pmi_trend': macro_row['pmi_trend'],
                     'pmi_change': macro_row['pmi_change'],
@@ -4614,6 +4628,7 @@ os.chdir('{self.workspace_path}')
         incoming_net = []
         outgoing_rep = []
         incoming_rep = []
+        noised_self = 0.0
 
         if other_groups:
             output += "\n--- Network Influence (word-of-mouth referrals) ---\n"
@@ -4699,8 +4714,9 @@ os.chdir('{self.workspace_path}')
                 output += "  (negligible reputation influence from other groups)\n"
 
         data['network_influence'] = {
-            'outgoing': {gid: round(val, 4) for gid, _, val in outgoing_net},
-            'incoming': {gid: round(val, 4) for gid, _, val in incoming_net},
+            'self_referral': round(noised_self * 1000, 4),
+            'outgoing': {gid: round(val * 1000, 4) for gid, _, val in outgoing_net},
+            'incoming': {gid: round(val * 1000, 4) for gid, _, val in incoming_net},
         }
         data['reputation_influence'] = {
             'outgoing': {gid: round(val, 4) for gid, _, val in outgoing_rep},
@@ -4835,7 +4851,7 @@ os.chdir('{self.workspace_path}')
         )
 
     def list_research_projects(self) -> ToolResult:
-        """List all 10 R&D research tiers with their status."""
+        """List all R&D research tiers with their status and public project details."""
         # Get all invocations from DB
         rows = self.conn.execute("SELECT * FROM research_projects ORDER BY tier, started_day").fetchall()
 
@@ -4852,7 +4868,7 @@ os.chdir('{self.workspace_path}')
         output = "=== R&D Research Tiers ===\n"
         output += "Tiers are repeatable — same tier can be started again after completion.\n\n"
 
-        # Show all 10 tiers with their status
+        # Show all tiers with their status
         output += "ALL TIERS:\n"
         for rt in RESEARCH_TIERS:
             t = rt.tier
@@ -4886,10 +4902,17 @@ os.chdir('{self.workspace_path}')
                 'name': rt.name,
                 'cost': rt.cost,
                 'mean_days': rt.mean_days,
+                'std_days': rt.std_days,
                 'mean_quality_boost': rt.mean_quality_boost,
+                'std_quality_boost': rt.std_quality_boost,
                 'in_progress': len(in_prog),
                 'completed': len(done),
                 'total_quality_boost': round(total_q, 4),
+                'projects': [dict(project_id=r['project_id'], status=r['status'],
+                    started_day=r['started_day'], expected_completion_day=r['expected_completion_day'],
+                    expected_quality_boost=r['expected_quality_boost'],
+                    remaining_days=max(0, r['expected_completion_day'] - self.current_day)
+                        if r['status'] == 'in_progress' else None) for r in in_prog + done],
             })
 
         return ToolResult(True, output, {'tiers': tiers_data})

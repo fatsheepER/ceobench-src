@@ -242,12 +242,14 @@ def test_each_refresh_source_gets_its_own_timeout(workspace, tmp_path, server, m
     store.complete(parent)
 
 
-def test_retry_backoff_and_manual_retry_do_not_block_other_sources(workspace, tmp_path, server):
+@pytest.mark.parametrize('selection', [{}, {'select': {'col': 'amount'}}])
+def test_retry_backoff_and_manual_retry_do_not_block_other_sources(workspace, tmp_path, server, selection):
     from test_pf_stale import chain, forward
     from saas_bench.public_sql import PUBLIC_POLICY_VERSION
     from saas_bench.sql_evidence import encoded
-    store, registry, executor = chain(workspace, tmp_path, server, select={'col': 'amount'})
+    store, registry, executor = chain(workspace, tmp_path, server, **selection)
     query, attempts = executor.pf_queries, []
+    refresh = query.refresh
     day = [7]
     registry.sim_day = lambda: day[0]
     def timeout(versions, parent):
@@ -267,6 +269,72 @@ def test_retry_backoff_and_manual_retry_do_not_block_other_sources(workspace, tm
     assert attempts == [7, 14, 28]
     forward(executor, 'r1')
     assert attempts == [7, 14, 28, 35]
+    recovered_on = []
+    def successful(versions, parent):
+        recovered_on.append(day[0])
+        return refresh(versions, parent)
+    query.refresh = successful
+    for current in [42, 91, 98]:
+        day[0] = current
+        query.weekly_check(current)
+    assert recovered_on == ([91, 98] if selection else [91])
+    assert not store.load_state('pf_refresh_failures')
+    if not selection:
+        pending = store.load_state('pf_review')['pending']
+        assert pending and all(not p['conditions'] for p in pending.values())
+
+
+def test_recovery_before_first_fork_checkpoint_preserves_group(offline_runner, tmp_path):
+    from saas_bench.run_state import clone_sql_run, recover_run, tree_hash, write_json
+    from test_preflight_integration import advance
+    prefix = offline_runner(text_registration='prefix')
+    advance(prefix)
+    prefix._save_checkpoint(7)
+    for mode, stale in [('git', None), ('pf', True), ('pf', False)]:
+        name = f'{mode}-{stale}'
+        source = clone_sql_run(prefix.workspace_dir, tmp_path / name, name,
+                               text_registration=mode, pf_stale_checks=stale)
+        before = tree_hash(source)
+        recovered_path = recover_run(source, tmp_path / (name + '-recovery'))
+        recovered = offline_runner(recovered_path)
+        assert recovered.text_registration == mode
+        assert recovered.pf_stale_checks is bool(stale)
+        assert bool(recovered.evidence_store) is (mode == 'pf')
+        assert tree_hash(source) == before
+        # A second interruption before publication still inherits the prefix generation.
+        again = offline_runner(recover_run(recovered_path, tmp_path / (name + '-again')))
+        assert again.text_registration == mode and again.pf_stale_checks is bool(stale)
+        manifest = json.loads((source / 'manifest.json').read_text())
+        manifest['configuration']['seed'] += 1
+        write_json(source / 'manifest.json', manifest)
+        with pytest.raises(ValueError, match='configuration differs'):
+            recover_run(source, tmp_path / (name + '-invalid'))
+
+
+def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_path):
+    from saas_bench.execution_capture import finish_http
+    from saas_bench.sql_evidence import encoded
+    from test_pf_stale import cite
+    store, registry, executor = captured(workspace, tmp_path)
+    day = [7]
+    registry.sim_day = lambda: day[0]
+    def acquire(parent=None):
+        event = store.begin_event('public_http', dict(method='POST', path='/call',
+            parsed=dict(tool='get_group_insights', args={'group_id': 'S1'})), parent=parent)
+        finish_http(store, event, 200, '', encoded(dict(success=True,
+                    data=dict(group_id='S1', snapshot_day=0))), dict(day=day[0]))
+        return event + ':public_response'
+    version = acquire()
+    handle = registry.resolver.handle(version)
+    cite(store, registry, executor, version)
+    executor.pf_queries.refresh = lambda versions, parent: {v: acquire(parent) for v in versions}
+    day[0] = 308
+    for output in (executor.weekly_check(308),
+                   executor.execute('bash', dict(command=f'pf log {handle}'))):
+        assert 'survey day 0' in output and 'checked day 308' in output
+        assert 'acquired day' in output and 'research_group' in output
+    header = json.loads(executor.execute('pf_read', dict(target={'version': handle})).split('\n')[0])
+    assert header['target']['snapshot_day'] == 0
 
 
 def test_failed_background_checkpoint_keeps_the_previous_pointer(offline_runner, monkeypatch):

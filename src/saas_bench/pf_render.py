@@ -160,6 +160,13 @@ def change(kind, old_raw, new_raw):
 
 # --- page rendering --------------------------------------------------------------
 
+def survey_dates(item):
+    if 'snapshot_day' not in item:
+        return []
+    return [f"survey day {item['snapshot_day']}; acquired day {item.get('day')}; checked day {item['checked_day']}",
+            item['refresh_hint']]
+
+
 def item_line(item):
     """query7@v2 · day 7 · what (flags)."""
     day = f"day {item['day']}" if item.get('day') is not None else 'day ?'
@@ -173,9 +180,7 @@ def item_line(item):
     flags = [item['status']] if item.get('status') not in (None, 'succeeded') else []
     flags += ['truncated'] if item.get('truncated') else []
     flags += ['partial capture'] if item.get('extent', 'full') != 'full' else []
-    if 'snapshot_day' in item:
-        flags += [f"survey day {item['snapshot_day']}; acquired day {item.get('day')}; checked day {item['checked_day']}",
-                  item['refresh_hint']]
+    flags += survey_dates(item)
     flags += [f"unchanged since day {item['unchanged_since_day']}"] if item.get('unchanged_since_day') is not None else []
     flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
     return f"{item['version']} · {day} · {what}" + (f" ({', '.join(flags)})" if flags else '')
@@ -238,6 +243,7 @@ def log_line(item):
         parts.append(item['size'])
     flags = [item['status']] if item.get('status') not in (None, 'succeeded') else []
     flags += ['truncated'] if item.get('truncated') else []
+    flags += survey_dates(item)
     flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
     if flags:
         parts.append(', '.join(flags))
@@ -365,7 +371,7 @@ def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
 
 
-def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0):
+def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0, surveys=()):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Only what the agent itself cited is itemized; changes in the queries behind a cited
@@ -375,7 +381,7 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     lines = [f'=== Check of your registered texts (day {day}) ===']
     checked = plural(len(entries), 'active text') + ' checked'
     if not flagged and pending:
-        lines.append(f'{checked}; {condition_only} cover continuing conditions only. No new direct issues in these checks.')
+        lines.append(f'{checked}; {condition_only} cover continuing conditions or read retries. No new direct issues in these checks.')
     elif not flagged:
         lines.append(checked + ': cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
     else:
@@ -392,6 +398,9 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if underlying:
         lines.append(f"The queries behind outputs cited by {', '.join(underlying)} now return different rows; "
                      f"pf depend {underlying[0].split('.')[0]} shows which.")
+    if surveys:
+        lines.append('Survey dates (retrieving a survey does not update its measurement date):')
+        lines.extend('  - ' + item_line(item) for item in surveys)
     if ended:
         lines.append(f"Not checked because their applies window is over: {', '.join(ended)} "
                      '(text_retire them if you no longer use them).')

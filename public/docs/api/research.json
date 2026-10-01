@@ -50,31 +50,34 @@
     "name": "list_research_projects",
     "python_call": "novamind_api.research.list_research_projects(...)",
     "category": "R&D Research Projects",
-    "description": "List all 10 R&D research tiers with their status. Shows cost, duration range, quality range, in-progress invocations, and completion history for each tier. Tiers are repeatable.",
+    "description": "List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, project dates, remaining days, and completion history for each tier. Tiers are repeatable.",
     "parameters": {},
     "inputSchema": {
       "type": "object",
       "properties": {}
     },
     "returns": {
-      "output": "All 10 tiers with: cost, duration mean\u00b1std, quality mean\u00b1std, current status (not started / in progress / completed Nx with total quality)",
+      "output": "All 20 tiers with: cost, duration mean\u00b1std, quality mean\u00b1std, current status and public project details",
       "data": {
         "tiers": [
           {
             "tier": 1,
             "name": "Prompt Engineering Optimization",
-            "cost": 100000,
-            "mean_days": 35,
+            "cost": 166667,
+            "mean_days": 12,
+            "std_days": 12,
             "mean_quality_boost": 0.04,
+            "std_quality_boost": 0.02,
             "in_progress": 0,
             "completed": 0,
-            "total_quality_boost": 0
+            "total_quality_boost": 0,
+            "projects": []
           }
         ]
       }
     },
     "output_schema": {
-      "tiers": "List[Dict] \u2014 each tier: tier (int), name (str), cost (float), mean_days (int), mean_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float)",
+      "tiers": "List[Dict] \u2014 each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float), projects (List[Dict]: project_id, status, started_day, expected_completion_day, expected_quality_boost, remaining_days). remaining_days is clamped to 0 for overdue projects and is None for completed projects.",
       "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
     },
     "impact": "Read-only. No cost. Use to plan R&D investments.",

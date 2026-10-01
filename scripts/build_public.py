@@ -111,6 +111,8 @@ def build():
     # Add source to path for imports
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
     from saas_bench.docs_generator import render_api_docs, render_table_docs, render_cli_docs
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from generate_public_docs import render_tools_reference
 
     docs_dir = PUBLIC_DIR / "docs"
     api_dir = docs_dir / "api"
@@ -126,6 +128,7 @@ def build():
     render_api_docs(api_dir)
     render_table_docs(tables_dir)
     render_cli_docs(docs_dir)
+    render_tools_reference(docs_dir / "tools-reference.md")
 
     # Drop any stale empty JSON
     import json as _json

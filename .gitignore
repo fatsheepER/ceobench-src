@@ -139,6 +139,7 @@ tests/*
 !tests/test_pf_acceptance.py
 !tests/test_pf_cli.py
 !tests/test_round4.py
+!tests/test_public_result_contracts.py
 !tests/test_stage5_prep.py
 !tests/test_preflight_*.py
 !tests/preflight_*.py

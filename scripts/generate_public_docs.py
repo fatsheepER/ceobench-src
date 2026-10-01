@@ -87,6 +87,11 @@ def render_tools_reference(output_path: Path):
                 lines.append("```")
                 lines.append("")
 
+            # Structured SDK result
+            if schema := doc.get("output_schema"):
+                lines.extend(["**Output Schema:**", "", "```json",
+                              json.dumps(schema, indent=2, ensure_ascii=False), "```", ""])
+
             # Returns
             returns = doc.get("returns", {})
             if returns:

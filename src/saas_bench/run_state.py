@@ -137,6 +137,40 @@ def checkpoint_directory(run, checkpoint):
     return directory
 
 
+def checkpoint_manifest(run, directory):
+    """Validate the run's fork/recovery overrides against its frozen manifest."""
+    saved = json.loads((directory / 'manifest.json').read_text())
+    current = json.loads((Path(run) / 'manifest.json').read_text())
+    expected = dict(current)
+    source_hash = file_hash(directory / 'manifest.json')
+    recovery = current.get('recovery_source')
+    if recovery and recovery != saved.get('recovery_source'):
+        if source_hash != recovery['source_manifest_sha256']:
+            raise ValueError('Recovery source manifest mismatch')
+        expected.pop('recovery_source')
+        if 'recovery_source' in saved:
+            expected['recovery_source'] = saved['recovery_source']
+    evidence = current.get('sql_evidence')
+    if evidence != saved.get('sql_evidence') and evidence and evidence.get('source_manifest_sha256'):
+        if source_hash != evidence['source_manifest_sha256']:
+            raise ValueError('Clone source manifest mismatch')
+        expected['sql_evidence'] = saved['sql_evidence']
+        if saved.get('text_registration') == 'prefix' and expected.get('text_registration') == 'pf':
+            expected['text_registration'] = 'prefix'
+            expected.pop('pf_stale_checks', None)
+            expected.pop('pf_read_tokenizer', None)
+    fork = current.get('fork_source')
+    if fork and saved.get('text_registration') == 'prefix':
+        if source_hash != fork['source_manifest_sha256']:
+            raise ValueError('Clone source manifest mismatch')
+        expected.pop('fork_source')
+        expected['sql_evidence'] = saved.get('sql_evidence')
+        expected['text_registration'] = 'prefix'
+    if saved != expected:
+        raise ValueError('Checkpoint configuration differs from run manifest')
+    return current
+
+
 def restore_sql_evidence(run, directory, checkpoint, identity):
     from contextlib import closing
     from .sql_evidence import SQLEvidenceStore
@@ -229,12 +263,13 @@ def recover_run(source, destination):
         raise ValueError('Recovery destination must be outside the original run')
     checkpoint = json.loads((source / 'checkpoint.json').read_text())
     directory = checkpoint_directory(source, checkpoint)
-    manifest = json.loads((directory / 'manifest.json').read_text())
+    manifest = checkpoint_manifest(source, directory)
     attempt = 'recovery-' + uuid.uuid4().hex[:12]
     manifest['recovery_source'] = dict(directory=str(source), snapshot_id=checkpoint['snapshot_id'],
         source_manifest_sha256=file_hash(directory / 'manifest.json'), attempt_id=attempt,
         usage=dict(agent=checkpoint['usage'], simulator=json.loads((directory / 'server_state.json').read_text())['usage']))
-    if parent := manifest.get('sql_evidence'):
+    if manifest.get('sql_evidence'):
+        parent = checkpoint['sql_evidence']['identity']
         manifest['sql_evidence'] = dict(parent, branch_id=attempt, parent_branch=parent['branch_id'],
             fork_seq=checkpoint['sql_evidence']['cutoff'], source_manifest_sha256=file_hash(directory / 'manifest.json'))
     destination.mkdir(parents=True, exist_ok=False)

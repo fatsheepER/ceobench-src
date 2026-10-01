@@ -10,7 +10,8 @@ def research_market() -> Dict:
     Costs $25K per attempt, 30% chance of discovering a random hidden group.
 
     Returns:
-        Dict with discovery result.
+        Dict with status ('discovered', 'not_found', 'exhausted'), cost and
+        remaining_undiscovered. discovered_group_id is present only on discovery.
     """
     return _client.call('research_market')
 
@@ -37,7 +38,9 @@ def get_market_overview() -> Dict:
     """Get overview of all known customer segments.
 
     Returns:
-        Dict with market overview data.
+        Dict with known_groups, undiscovered_count and macroeconomic (or None).
+        Macroeconomic data includes measurement_day and publication_delay_days;
+        measurement_day is the date of the reading, not its publication date.
     """
     return _client.call('get_market_overview')
 
@@ -51,6 +54,9 @@ def get_group_insights(group_id: str) -> Dict:
         group_id: The group identifier.
 
     Returns:
-        Dict with group insight data.
+        Dict with group insight data and snapshot_day (survey date; 0 is valid).
+        Network self_referral, outgoing and incoming rates are all in leads per
+        1000 subscribers per day. A new read retrieves the same survey;
+        research_group must complete to update it.
     """
     return _client.call('get_group_insights', {'group_id': group_id})

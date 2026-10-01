@@ -978,38 +978,9 @@ __pycache__/
             self._wait_checkpoint()
 
     def _restore_checkpoint_files(self, checkpoint):
-        from saas_bench.run_state import checkpoint_directory, copy_workspace, restore_sql_evidence
+        from saas_bench.run_state import checkpoint_directory, checkpoint_manifest, copy_workspace, restore_sql_evidence
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
-        saved_manifest = json.loads((directory / 'manifest.json').read_text())
-        current_manifest = json.loads((self.workspace_dir / 'manifest.json').read_text())
-        expected_manifest = dict(current_manifest)
-        if self.recovery_source and current_manifest.get('recovery_source') != saved_manifest.get('recovery_source'):
-            from saas_bench.run_state import file_hash
-            if file_hash(directory / 'manifest.json') != self.recovery_source['source_manifest_sha256']:
-                raise ValueError('Recovery source manifest mismatch')
-            expected_manifest.pop('recovery_source')
-            if 'recovery_source' in saved_manifest:
-                expected_manifest['recovery_source'] = saved_manifest['recovery_source']
-        if (self.sql_evidence_config != saved_manifest.get('sql_evidence') and
-                self.sql_evidence_config and self.sql_evidence_config.get('source_manifest_sha256')):
-            from saas_bench.run_state import file_hash
-            if file_hash(directory / 'manifest.json') != self.sql_evidence_config['source_manifest_sha256']:
-                raise ValueError('Clone source manifest mismatch')
-            expected_manifest['sql_evidence'] = saved_manifest['sql_evidence']
-            if (saved_manifest.get('text_registration') == 'prefix' and
-                    expected_manifest.get('text_registration') in ('git', 'pf')):
-                expected_manifest['text_registration'] = 'prefix'
-                expected_manifest.pop('pf_stale_checks', None)
-                expected_manifest.pop('pf_read_tokenizer', None)
-        if self.fork_source and saved_manifest.get('text_registration') == 'prefix':
-            from saas_bench.run_state import file_hash
-            if file_hash(directory / 'manifest.json') != self.fork_source['source_manifest_sha256']:
-                raise ValueError('Clone source manifest mismatch')
-            expected_manifest.pop('fork_source')
-            expected_manifest['sql_evidence'] = saved_manifest.get('sql_evidence')
-            expected_manifest['text_registration'] = 'prefix'
-        if saved_manifest != expected_manifest:
-            raise ValueError('Checkpoint configuration differs from run manifest')
+        checkpoint_manifest(self.workspace_dir, directory)
         if self.sql_evidence_config:
             restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
             controls = directory / 'sql-evidence.controls.jsonl'
