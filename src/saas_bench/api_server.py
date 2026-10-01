@@ -768,6 +768,7 @@ class NovaMindAPIServer:
         if self._httpd:
             self._httpd.shutdown()
             self._httpd = None
+        self._query_snapshot = None
 
     def execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         """Execute a tool call with thread safety."""

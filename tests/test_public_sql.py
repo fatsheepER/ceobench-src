@@ -122,8 +122,11 @@ def test_fresh_snapshot_cleanup_and_readonly_independently(server):
             conn.execute('PRAGMA query_only=OFF')
             with pytest.raises(sqlite3.OperationalError, match='readonly'):
                 conn.execute('UPDATE main.ledger SET amount=99')
-        assert not path.exists()
+        assert path.exists()  # Same-world queries reuse this immutable snapshot.
+        with query_snapshot(server, time.monotonic()+5) as (_, again):
+            assert again['snapshot_reused'] and again['snapshot_ref'] == metadata['snapshot_ref']
     assert paths[0] != paths[1]
+    assert not paths[0].exists()
     # Authorizer independently rejects writes on an otherwise writable connection.
     conn = sqlite3.connect(':memory:')
     conn.execute('CREATE TABLE ledger(amount)')
@@ -258,12 +261,15 @@ def test_cleanup_on_query_and_backup_failure(server, monkeypatch, tmp_path):
     def failed_backup(target, **kwargs):
         target.execute('CREATE TABLE partial(x)')
         raise OSError('injected backup failure')
-    server.conn = SimpleNamespace(in_transaction=False, backup=failed_backup)
+    server.conn = SimpleNamespace(in_transaction=False, backup=failed_backup,
+                                  total_changes=source.total_changes, execute=source.execute)
     try:
         with pytest.raises(OSError, match='backup failure'): execute_query(server, 'SELECT 1')
     finally: server.conn = source
-    assert all(not d.exists() for d in directories)
+    assert directories[0].exists() and not directories[1].exists()
     assert execute_query(server, 'SELECT 1')['success']
+    server.stop()
+    assert all(not d.exists() for d in directories)
 
 
 def test_serialization_timeout_returns_504(server, monkeypatch):
