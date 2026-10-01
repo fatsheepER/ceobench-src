@@ -66,8 +66,8 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     shown = executor.execute('bash', {'command': 'cat MEMORY.md'})
     assert shown.endswith('[pf: MEMORY.md@v2 note (day 0): "' + 'x' * 200 + '"]'), shown
     refused = executor.execute('bash', {'command': 'pf log MEMORY.md; ls'})
-    assert refused.startswith('pf: run pf on its own') and not (workspace / 'ls').exists()
-    assert executor.execute('bash', {'command': 'pf show nothing.txt'}).startswith('Error:')
+    assert 'evidence.json' in refused and 'file MEMORY.md:' in refused
+    assert 'Error:' in executor.execute('bash', {'command': 'pf show nothing.txt'})
     call(registry, 'create', **declaration(objects=[dict(kind='segment', id='S1')], text='S1 plan'))
     search = executor.execute('bash', {'command': 'pf search S1'})
     assert search.splitlines()[:3] == ['S1: 1 active text, 0 business writes, 0 outputs, newest first.', 'Active texts:',
@@ -186,7 +186,7 @@ def test_single_diff_continues_the_same_pair_after_new_writes(workspace, tmp_pat
     tail = json.loads(tail)
     assert tail['baseline']['version'] == header['baseline']['version'] == 'long.txt@v1'
     assert tail['target']['version'] == header['target']['version'] == 'long.txt@v2'
-    assert tail['range'] == [30000, header['total_chars']] and tail['next_cursor'] is None
+    assert tail['range'] == [24000, header['total_chars']] and tail['next_cursor'] is None
     complete = body.rsplit('\n[', 1)[0] + rest
     assert len(complete) == header['total_chars'] and 'newer' not in complete
 
@@ -273,7 +273,7 @@ def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
     assert week['digest_chars'] and week['flagged'] == ['r1.1']
     assert len(week['pf_calls']) == 5  # The heredoc variable is not a command.
     assert [c['outcome'] for c in week['pf_calls']] == [
-        'succeeded', 'execution_error', 'usage_error', 'usage_error', 'usage_error']
+        'succeeded', 'execution_error', 'usage_error', 'succeeded', 'succeeded']
     assert all(c['capture_match'] is True for c in week['pf_calls'])
     assert week['note_calls'] == {'bash': 1}
     # Older Bash logs have no metadata, but the same parser can recover their calls.
@@ -281,6 +281,7 @@ def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
     entries = [json.loads(line) for line in logfile.read_text().splitlines()]
     for entry in entries:
         entry.pop('pf_call', None)
+        entry.pop('pf_calls', None)
     logfile.write_text(''.join(json.dumps(e) + '\n' for e in entries))
     recovered = analyze(pointer)['weeks'][0]['pf_calls']
     assert len(recovered) == 5 and all(c['capture_match'] is None for c in recovered)

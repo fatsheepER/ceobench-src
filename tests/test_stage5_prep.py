@@ -191,7 +191,7 @@ def test_repeated_tool_calls_are_delivered_compactly_and_reconstruct(workspace, 
     second = executor.execute('bash', {'command': 'cat data.txt'})
     _, ledger = deliver(store, [first, second])
     assert [r['mode'] for r in ledger] == ['FULL', 'UNCHANGED']
-    assert ledger[1]['read_kind'] == 'tool_call' and ledger[1]['base_handle'] == 'previous_same_call'
+    assert ledger[1]['read_kind'] == 'tool_call' and ledger[1]['base_handle'] == 'cmd1@v1'
     (workspace / 'data.txt').write_text(sample(' revised'))
     third = executor.execute('bash', {'command': 'cat data.txt'})
     other = executor.execute('bash', {'command': 'cat data.txt | head -n 100'})
@@ -201,7 +201,8 @@ def test_repeated_tool_calls_are_delivered_compactly_and_reconstruct(workspace, 
     wire = json.loads(store.get_content(event + ':wire')[1])
     header = json.loads(wire['messages'][2]['content'].split('\n', 1)[0])
     # The target names this command's return: cmdN, version 2 after the file changed.
-    assert header['base'] == 'previous_same_call' and re.fullmatch(r'cmd\d+@v2', header['target'])
+    assert header['base'] == 'cmd1@v1' and re.fullmatch(r'cmd\d+@v2', header['target'])
+    assert header['full_command'] == 'pf show ' + header['target'] + ' --full'
     # The named full result is readable with pf_read.
     full = executor.execute('pf_read', {'target': {'version': header['target']}})
     assert full.split('\n', 1)[1] == str(third)
@@ -250,11 +251,11 @@ def test_same_content_object_reads_compare_with_the_previous_output(offline_runn
     first = runner._execute_tool('bash', {'command': "cat > report.py <<'EOF'\n" + body + "EOF\n./novamind-operation python report.py"})
     second = runner._execute_tool('bash', {'command': 'echo rerun; ./novamind-operation python ./report.py'})
     event, ledger = deliver(runner.evidence_store, [first, second])
-    assert ledger[1]['mode'] in ('DELTA', 'UNCHANGED') and ledger[1]['base_handle'] == 'previous_output_of:report.py'
+    assert ledger[1]['mode'] in ('DELTA', 'UNCHANGED') and ledger[1]['base_handle'] == 'cmd2@v1'
     if ledger[1]['mode'] == 'DELTA':
         assert apply_delta(str(first), ledger[1]['edits']) == str(second)
     wire = json.loads(runner.evidence_store.get_content(event + ':wire')[1])
-    assert json.loads(wire['messages'][1]['content'].split('\n', 1)[0])['base'] == 'previous_output_of:report.py'
+    assert json.loads(wire['messages'][1]['content'].split('\n', 1)[0])['base'] == 'cmd2@v1'
     # Inline Python and ordinary commands keep the same-call identity.
     other = runner._execute_tool('bash', {'command': './novamind-operation python -c "print(1)"'})
     _, ledger = deliver(runner.evidence_store, [first, other])

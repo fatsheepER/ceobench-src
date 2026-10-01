@@ -243,7 +243,9 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert (workspace / '.git/index').read_bytes() == index
     binding = store.load_state('declaration:r1.1')['references'][0]
-    assert binding['status'] == ('unknown' if delivery in ('missing', 'partial') else 'resolved')
+    assert binding['status'] == ('unknown' if delivery == 'missing' else 'resolved')
+    if delivery == 'partial':
+        assert binding['reading_scope'] == 'partial'
     if delivery in ('same', 'changed'):
         assert (binding['version_id'] != binding['latest_version_id']) == (delivery == 'changed')
     for forbidden in ('delivered_in', 'version_id', 'git_content_matches', head):

@@ -4566,6 +4566,7 @@ os.chdir('{self.workspace_path}')
 
         data = {
             'group_id': group_id,
+            'snapshot_day': snapshot_day,
             'group_name': group_cfg.group_name,
             'segment': segment,
             'info_level': info_level,

@@ -360,6 +360,8 @@ class BashAgent(BaseAgent):
             self._observation_recorded = False
 
         # Call LLM
+        if self._pending_tool_calls:
+            raise RuntimeError('Finish the current tool batch before requesting another model response')
         self._llm_attempt = 0
         action = self._call_llm()
         self.turns_today += 1
@@ -383,37 +385,33 @@ class BashAgent(BaseAgent):
             setattr(self, 'last_' + field, value)
         return response
 
-    def record_tool_result(self, observation):
-        """Attach a completed result before making a resumable checkpoint."""
-        if self._pending_tool_calls:
-            if self.use_anthropic:
-                partial_results = self._pending_tool_calls[0].get('_partial_results', [])
-                tool_results = [{
-                    'type': 'tool_result',
-                    'tool_use_id': self._pending_tool_calls[0]['id'],
-                    'content': observation,
-                }]
-                tool_results.extend(partial_results)
-                self.conversation.append(Message(
-                    role='user',
-                    content=tool_results,
-                ))
-            else:
-                for tc in self._pending_tool_calls:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=observation,
-                        tool_call_id=tc['id'],
-                        name=tc['name']
-                    ))
-            self._pending_tool_calls = []
-        else:
-            # Add observation as user message (e.g., initial dashboard)
-            self.conversation.append(Message(
-                role='user',
-                content=observation
-            ))
+    def next_tool_action(self):
+        """Next call from the current response, in provider order; no new model request."""
+        if not self._pending_tool_calls:
+            return None
+        call = self._pending_tool_calls[0]
+        return Action(tool=call['name'], arguments=call.get('arguments', {}))
 
+    def record_tool_result(self, observation, call_id=None):
+        """Complete exactly one call; a batch must finish before checkpoint publication."""
+        if self._pending_tool_calls:
+            call = self._pending_tool_calls[0]
+            if call_id is not None and call_id != call['id']:
+                raise ValueError('Tool results must follow response order')
+            if self.use_anthropic:
+                result = dict(type='tool_result', tool_use_id=call['id'], content=observation)
+                if (self.conversation and self.conversation[-1].role == 'user'
+                        and isinstance(self.conversation[-1].content, list)
+                        and all(item.get('type') == 'tool_result' for item in self.conversation[-1].content)):
+                    self.conversation[-1].content.append(result)
+                else:
+                    self.conversation.append(Message(role='user', content=[result]))
+            else:
+                self.conversation.append(Message(role='tool', content=observation,
+                                                  tool_call_id=call['id'], name=call['name']))
+            self._pending_tool_calls.pop(0)
+        else:
+            self.conversation.append(Message(role='user', content=observation))
         self._last_observation = observation
         self._observation_recorded = True
 
@@ -745,22 +743,9 @@ class BashAgent(BaseAgent):
                     ))
                     continue
 
-                # Handle tool calls — execute first, skip rest
-                first_tc = assistant_msg.tool_calls[0]
-                # Safe to parse — we already validated above.
-                args = json.loads(first_tc.function.arguments) if first_tc.function.arguments else {}
-
-                # Skip extra parallel tool calls
-                for extra_tc in assistant_msg.tool_calls[1:]:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=f"[Skipped - only one tool per turn. Call {extra_tc.function.name} again if needed.]",
-                        tool_call_id=extra_tc.id,
-                        name=extra_tc.function.name
-                    ))
-
-                self._pending_tool_calls = [{'id': first_tc.id, 'name': first_tc.function.name}]
-                return Action(tool=first_tc.function.name, arguments=args)
+                self._pending_tool_calls = [dict(id=tc.id, name=tc.function.name,
+                    arguments=json.loads(tc.function.arguments or '{}')) for tc in assistant_msg.tool_calls]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:
@@ -949,22 +934,9 @@ class BashAgent(BaseAgent):
                     ))
                     continue
 
-                # Handle tool calls — execute first, skip rest
-                first_fc = function_calls[0]
-                # Safe to parse — we already validated above.
-                args = json.loads(first_fc.arguments) if first_fc.arguments else {}
-
-                # Skip extra parallel tool calls
-                for extra_fc in function_calls[1:]:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=f"[Skipped - only one tool per turn. Call {extra_fc.name} again if needed.]",
-                        tool_call_id=extra_fc.call_id,
-                        name=extra_fc.name
-                    ))
-
-                self._pending_tool_calls = [{'id': first_fc.call_id, 'name': first_fc.name}]
-                return Action(tool=first_fc.name, arguments=args)
+                self._pending_tool_calls = [dict(id=fc.call_id, name=fc.name,
+                    arguments=json.loads(fc.arguments or '{}')) for fc in function_calls]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:
@@ -1258,19 +1230,9 @@ class BashAgent(BaseAgent):
                     ))
                     continue
 
-                first_tool = tool_use_blocks[0]
-
-                # Skip extra parallel tool calls
-                partial_results = []
-                for extra in tool_use_blocks[1:]:
-                    partial_results.append({
-                        'type': 'tool_result',
-                        'tool_use_id': extra.id,
-                        'content': f"[Skipped - only one tool per turn. Call {extra.name} again if needed.]",
-                    })
-
-                self._pending_tool_calls = [{'id': first_tool.id, 'name': first_tool.name, '_partial_results': partial_results}]
-                return Action(tool=first_tool.name, arguments=first_tool.input or {})
+                self._pending_tool_calls = [dict(id=block.id, name=block.name,
+                    arguments=block.input or {}) for block in tool_use_blocks]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:

@@ -195,14 +195,15 @@ def test_pf_partial_read_selectors_and_latest_delivery_not_latest_capture(worksp
     send(store, text)
     ref = dict(evidence={'path': 'evidence.json'}, purpose='current', select={'path': '/n'})
     call(registry, 'create', **declaration(references=[ref]))
-    for selection in ({'path': '/hidden'}, None):
+    for selection in ({'path': '/hidden'},):
         with pytest.raises(ValueError, match='not fully delivered'):
             call(registry, 'create', **declaration(references=[dict(ref, select=selection)]))
     # An unconfirmed HTTP attempt does not establish delivery.
     full = executor.execute('read_file', {'path': 'evidence.json'})
     send(store, full, state='unknown')
-    with pytest.raises(ValueError, match='not fully delivered'):
-        call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    binding = store.load_state('declaration:' + result['version'])['references'][0]
+    assert binding['reading_scope'] == 'partial'
     send(store, full)
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
 
@@ -242,13 +243,13 @@ def test_pf_files_the_model_wrote_count_as_known_but_script_outputs_do_not(works
     assert store.load_state('declaration:r2.1')['references'][0]['authored_by']
     # A file computed by a program was neither read nor written by the model.
     executor.execute('bash', {'command': 'python3 -c "open(\'out.txt\', \'w\').write(str(6 * 7))"'})
-    with pytest.raises(ValueError, match='neither read nor wrote'):
-        call(registry, 'create', **declaration({'path': 'out.txt'}))
+    result = call(registry, 'create', **declaration({'path': 'out.txt'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_read'
     # A later write by another program: the model's own earlier version stays the binding.
     (workspace / 'plan.json').write_text('{"price": 79}')
     executor.execute('bash', {'command': 'true'})
     call(registry, 'create', **declaration({'path': 'plan.json'}))
-    binding = store.load_state('declaration:r3.1')['references'][0]
+    binding = store.load_state('declaration:r4.1')['references'][0]
     assert store.get_content(binding['version_id'])[1] == b'{"price": 99}'
     assert binding['version_id'] != binding['latest_version_id']
 
@@ -269,11 +270,11 @@ def test_pf_frozen_old_memory_does_not_hide_a_new_authored_version(workspace, tm
     send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
     call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
     assert store.load_state('declaration:r2.1')['references'][0]['version_id'] == binding['version_id']
-    # A genuinely newer, externally changed version must still be read in full.
+    # A newer partial read binds that version without claiming a complete read.
     (workspace / 'MEMORY.md').write_text('External plan\nUnread detail\n')
     send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
-    with pytest.raises(ValueError, match='not fully delivered'):
-        call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    result = call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'partial'
 
 
 def test_pf_local_edit_is_immediately_citable_by_path_and_handle(workspace, tmp_path):
@@ -291,8 +292,8 @@ def test_pf_local_edit_is_immediately_citable_by_path_and_handle(workspace, tmp_
         assert store.read_event(binding['authored_by'])['request']['kind'] == 'edit_file'
     (workspace / 'plan.txt').write_text('external 300\nprice 20\n')
     assert executor.execute('edit_file', dict(path='plan.txt', old_string='absent', new_string='x')).startswith('Error:')
-    with pytest.raises(ValueError, match='neither read nor wrote'):
-        call(registry, 'create', **declaration({'version': 'plan.txt@v3'}))
+    result = call(registry, 'create', **declaration({'version': 'plan.txt@v3'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_read'
 
 
 @pytest.mark.parametrize('delivered', [False, True])

@@ -212,8 +212,8 @@ def test_missing_base_diff_failed_delivery_and_truncation(workspace, tmp_path):
     diff = read(executor, target={'path': 'facts.txt'}, baseline={'version': old}, mode='diff')[2]
     _, ledger = deliver(store, [diff])
     assert ledger[0]['mode'] == 'DIFF'
-    with pytest.raises(ValueError, match='not been delivered'):
-        call(registry, 'create', **declaration({'version': json.loads(second.split('\n')[0])['target']['version']}))
+    # Explicit whole-object references pin the saved version independently of reading.
+    call(registry, 'create', **declaration({'version': json.loads(second.split('\n')[0])['target']['version']}))
     # Neither a failed response nor an absent prior request can supply a baseline.
     deliver(store, [second], status='failed')
     fresh = read(executor, target={'path': 'facts.txt'})[2]

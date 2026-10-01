@@ -1,7 +1,6 @@
 """Host-only execution capture. Public clients never import this module."""
 from contextvars import ContextVar
 from contextlib import closing
-import fnmatch
 import io
 import json
 import os
@@ -13,23 +12,19 @@ import uuid
 from .sql_evidence import digest, encoded, now
 
 CURRENT_EVENT = ContextVar('capture_event', default=None)
-EXCLUSIONS = ['sessions/*/world.nmdb', 'sessions/*/world.nmdb-*',
-              'sessions/*/*.plain.tmp*', 'sessions/*/*.nmdb.tmp*']
+EXCLUSIONS = ['sessions/']  # Reserved harness directory, hidden by the Bash sandbox.
 OBJECT_FIELDS = dict(project_id='research_project', customer_id='customer', group_id='customer_group',
                      thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
                      reply_to_post_id='social_post', discovered_group_id='customer_group',
                      plan='plan', channel='ad_channel')
 READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
                         'get_market_overview', 'get_group_insights'})
-_EXCLUSION_PARTS = [tuple(pattern.split('/')) for pattern in EXCLUSIONS]
 
 
 def excluded(rel):
-    """Right-anchored, per-segment glob, exactly as PurePosixPath(rel).match(pattern)."""
-    parts = rel.split('/')
-    return any(len(parts) >= len(pattern) and
-               all(fnmatch.fnmatchcase(part, glob) for part, glob in zip(parts[-len(pattern):], pattern))
-               for pattern in _EXCLUSION_PARTS)
+    """Only harness-owned paths at the workspace root; nested business names are legal."""
+    from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
+    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS
 
 
 class CapturedText(str):
@@ -102,6 +97,7 @@ class ExecutionCapture:
         # but retain a new acquisition for a write, even when its bytes are identical.
         for directory, dirs, files in os.walk(root, followlinks=False):
             prefix = '' if directory == root else directory[len(root) + 1:] + '/'
+            dirs[:] = [name for name in dirs if not excluded(prefix + name)]
             for name in sorted(dirs + files):
                 path = directory + '/' + name
                 rel = prefix + name
@@ -147,6 +143,8 @@ class ExecutionCapture:
         # body is the return before PF appended handles; equal bodies keep one version number.
         from .evidence_handles import body_digest
         extra = dict(body_sha256=body_digest(body)) if body is not None else {}
+        if self.facts.get('pf_calls'):
+            extra['pf_retrieval'] = True
         version = self.blob('tool_return', text, 'tool_return', segments=self.origins, **extra) if text is not None else None
         pf_read = getattr(text, 'pf_read', None)
         if read_key and version:
@@ -234,7 +232,8 @@ def finish_http(store, event, status, headers, body, execution):
     store.complete(event, outcome,
                    http_status=status, headers=headers, classification=classification,
                    public_success=value.get('success'), item_outcomes=outcomes, receive_state='unknown',
-                   **{k: execution[k] for k in ('refresh_of', 'day', 'snapshot_ref', 'refresh_error') if k in execution})
+                   **{k: execution[k] for k in ('refresh_of', 'day', 'snapshot_ref', 'refresh_error',
+                       'refresh_error_detail', 'attempted', 'permanent_error', 'refresh_seconds') if k in execution})
 
 
 def public_handler(method):
@@ -248,7 +247,7 @@ def public_handler(method):
             return receive_client(handler)
         if not store or not store.execution_capture:
             return method(handler)
-        if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh'):
+        if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh', '/run-metrics'):
             handler._control_capture = True
             try:
                 return method(handler)

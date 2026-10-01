@@ -173,6 +173,9 @@ def item_line(item):
     flags = [item['status']] if item.get('status') not in (None, 'succeeded') else []
     flags += ['truncated'] if item.get('truncated') else []
     flags += ['partial capture'] if item.get('extent', 'full') != 'full' else []
+    if 'snapshot_day' in item:
+        flags += [f"survey day {item['snapshot_day']}; acquired day {item.get('day')}; checked day {item['checked_day']}",
+                  item['refresh_hint']]
     flags += [f"unchanged since day {item['unchanged_since_day']}"] if item.get('unchanged_since_day') is not None else []
     flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
     return f"{item['version']} · {day} · {what}" + (f" ({', '.join(flags)})" if flags else '')
@@ -315,7 +318,7 @@ def render_dependencies(page):
     root, detail = page['root'], page.get('detail')
     checked = page.get('stale_check') == 'performed'
     lines = [item_line(root),
-             ('Checked against the current world within the expanded dependencies; advisory.' if checked else
+             (f"Checked day {page.get('checked_day')}, against the current world within the expanded dependencies; advisory." if checked else
               'Not checked (--history lists history only).')]
     if page.get('unexpanded'):
         lines.append('Incomplete: depth limit reached at ' + ', '.join(page['unexpanded']) +
@@ -362,7 +365,7 @@ def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
 
 
-def render_weekly(entries, day, pf, ended=(), underlying=()):
+def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Only what the agent itself cited is itemized; changes in the queries behind a cited
@@ -371,7 +374,9 @@ def render_weekly(entries, day, pf, ended=(), underlying=()):
     flagged = [e for e in entries if e['changed']]
     lines = [f'=== Check of your registered texts (day {day}) ===']
     checked = plural(len(entries), 'active text') + ' checked'
-    if not flagged:
+    if not flagged and pending:
+        lines.append(f'{checked}; {condition_only} cover continuing conditions only. No new direct issues in these checks.')
+    elif not flagged:
         lines.append(checked + ': cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
     else:
         lines.append(f'{checked}; {len(flagged)} with changed evidence:')

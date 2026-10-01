@@ -436,7 +436,7 @@ class SQLEvidenceStore:
             return dict(version_id=version, previous_version=row['previous_version'],
                         blob_sha256=row['content_hash'], **json.loads(row['metadata'])), bytes(blob[0])
 
-    def snapshot(self, target):
+    def snapshot(self, target, *, checksum=True):
         self.assert_healthy()
         with closing(self.connect()) as conn, closing(sqlite3.connect(target)) as backup:
             conn.backup(backup)
@@ -444,4 +444,6 @@ class SQLEvidenceStore:
             backup.execute("DELETE FROM private_state WHERE name='admission_paused'")
             backup.commit()
             cutoff = self.sequence(conn)
-        return dict(identity=self.identity, cutoff=cutoff, sha256=digest(Path(target).read_bytes()))
+        from .run_state import file_hash
+        return dict(identity=self.identity, cutoff=cutoff,
+                    sha256=file_hash(target) if checksum else None)

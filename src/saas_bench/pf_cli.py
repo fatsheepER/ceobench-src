@@ -1,11 +1,4 @@
-"""The `pf` command: PF history queries typed in bash and answered by the harness.
-
-`pf` is not a program inside the sandbox. A bash call whose whole command is one pf
-invocation (optionally after `cd` into the workspace, with `2>&1`, `| head -N` or
-`| tail -N`) becomes one PF query; any other command runs as ordinary bash. A pf
-invocation chained with other commands is refused with the usage text instead of
-reaching the shell, where it would only fail as an unknown command.
-"""
+"""PF argument parsing. The old command parser is retained only for historical logs."""
 import re
 import shlex
 
@@ -22,7 +15,7 @@ USAGE = '''usage: pf <command> ...
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about S1, t10_2, ...
   pf more <cursor>                     the next page of an earlier result
 Objects: a handle (MEMORY.md@v8, scripts/a.py.out@v2, query7@v1), a file path or output name
-(the latest version) or a text (r4, r4.2). Run pf on its own; | head -N and | tail -N work.'''
+(the latest version) or a text (r4, r4.2). Shell combinations, pipes and redirection work normally.'''
 
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS) + r')\b|\s*$)', re.M)
@@ -108,6 +101,13 @@ def parse(command, roots):
     words = segments[0][1:]
     if not words or words[0] in ('help', '--help', '-h'):
         raise Usage(USAGE)
+    return (*parse_argv(words), view)
+
+
+def parse_argv(words):
+    """Parse argv already expanded by Bash; never interpret shell syntax here."""
+    if not words or words[0] in ('help', '--help', '-h'):
+        return 'pf_help', {}
     verb, words = words[0], words[1:]
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}\n' + USAGE)
@@ -121,25 +121,25 @@ def parse(command, roots):
     if verb == 'more':
         if not re.fullmatch(r'c[1-9][0-9]*', first):
             raise Usage('pf more: give the cursor from a previous result, e.g. pf more c2\n' + USAGE)
-        return 'pf_more', {'cursor': first}, view
+        return 'pf_more', {'cursor': first}
     if verb == 'search':
         return 'pf_search', dict(object=dict(id=first, **({'kind': flags['kind']} if 'kind' in flags else {})),
-                                 all=bool(flags.get('all'))), view
+                                 all=bool(flags.get('all')))
     if verb == 'log':
-        return 'pf_log', {'target': target(first)}, view
+        return 'pf_log', {'target': target(first)}
     if verb == 'blame':
-        return 'pf_blame', {'target': target(first)}, view
+        return 'pf_blame', {'target': target(first)}
     if verb == 'show':
-        return 'pf_read', {'target': target(first), 'mode': 'content', 'full': bool(flags.get('full'))}, view
+        return 'pf_read', {'target': target(first), 'mode': 'content', 'full': bool(flags.get('full'))}
     if verb == 'diff':
         if len(rest) == 2:
-            return 'pf_read', {'target': target(rest[1]), 'mode': 'diff', 'baseline': target(first)}, view
-        return 'pf_diff', {'target': target(first)}, view
+            return 'pf_read', {'target': target(rest[1]), 'mode': 'diff', 'baseline': target(first)}
+        return 'pf_diff', {'target': target(first)}
     if verb == 'depend':
         return 'pf_dependencies', {'target': target(first), 'detail': bool(flags.get('detail')),
-                                   'purpose': 'historical_only' if flags.get('history') else 'current'}, view
+                                   'purpose': 'historical_only' if flags.get('history') else 'current'}
     return 'pf_dependents', {'target': target(first), 'detail': bool(flags.get('detail')),
-                             'current_only': not flags.get('all')}, view
+                             'current_only': not flags.get('all')}
 
 
 def apply_view(text, view):

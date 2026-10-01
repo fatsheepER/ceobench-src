@@ -146,6 +146,9 @@ class TextRegistry:
         text = shown['version'] + (f" (day {group['day']})" if group else '')
         if shown['differs']:
             text += f" (as you last saw it; now {shown['latest']}, {self._change(binding)})"
+        if binding.get('reading_scope') in ('partial', 'not_read'):
+            scope = 'part read' if binding['reading_scope'] == 'partial' else 'not read'
+            text += f" (whole captured object; {scope}; pf show {shown['version']} --full)"
         return text
 
     def _change(self, binding):

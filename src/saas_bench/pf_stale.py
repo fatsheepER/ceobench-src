@@ -7,6 +7,7 @@ import json
 import operator
 import os
 import stat
+import time
 
 from .execution_capture import CURRENT_EVENT
 from .pf_refresh import replayable
@@ -61,12 +62,16 @@ def number(value, kind):
     return result
 
 
-def compare(resolver, before, after, reference, kind):
+def compare(resolver, before, after, reference, kind, events=None):
     """Return whole-version change and whether this dependency still holds."""
     old_meta, old = resolver.content(before)
     new_meta, new = resolver.content(after)
-    events = [resolver.store.read_event(m['created_by_event']) for m in (old_meta, new_meta)]
-    for meta, event in zip((old_meta, new_meta), events):
+    cached = events if events is not None else {}
+    for meta in (old_meta, new_meta):
+        event_id = meta['created_by_event']
+        if event_id not in cached:
+            cached[event_id] = resolver.store.read_event(event_id)
+        event = cached[event_id]
         if event['result'].get('status') != 'succeeded':
             raise ValueError('read_' + event['result'].get('status', 'failed'))
         if meta['source_truncated']:
@@ -125,11 +130,14 @@ class StaleCheck:
         self.q = queries
         self.store, self.resolver = queries.store, queries.resolver
 
-    def run(self, rows):
+    def run(self, rows, day=None):
+        started = time.monotonic()
         current, failures, representatives = {}, {}, {}
+        retry = self.store.load_state('pf_refresh_failures') or {}
+        diagnostics, compared, events = {}, {}, dict(self.q.events)
         for row in rows:
             target = row['edge']['target']
-            if target and not row['historical_only']:
+            if target and not row['historical_only'] and 'cached_check' not in row:
                 representatives.setdefault(self.q._key(target), target)
         remote = {}
         for key, version in representatives.items():
@@ -138,9 +146,28 @@ class StaleCheck:
             if meta['layer'] == 'file_bytes':
                 current[key], failures[key] = self._file(meta['object_id'])
             elif meta['layer'] == 'server_public_response' and replayable(event):
-                remote[version] = key
+                retry_key = encoded(key).decode()
+                previous = retry.get(retry_key, {})
+                source = self.q._latest_agent.get(key, version)
+                if previous.get('source') != source:
+                    previous = {}
+                original = event['result']
+                permanent = original.get('permanent_error', False)
+                if key[0] == 'query' and original.get('http_status', 200) in (400, 403, 500):
+                    # Old ledgers predate the explicit SQL error classification.
+                    error = str(json.loads(self.resolver.content(version)[1]).get('error', '')).lower()
+                    permanent |= original['http_status'] in (400, 403) or any(
+                        hint in error for hint in ('syntax error', 'no such column', 'no such table', 'ambiguous column'))
+                if day is not None and (permanent or previous.get('permanent')):
+                    failures[key] = 'original_sql_error' if permanent else 'permanent_sql_error'
+                elif day is not None and previous.get('retry_day', 0) > day:
+                    failures[key] = f"retry_after_day_{previous['retry_day']}; last_verified_day_{previous['last_day']}"
+                else:
+                    remote[version] = key
+                diagnostics[key] = dict(previous, source=source)
             else:
                 current[key] = self.q.latest[key]
+        refreshing = time.monotonic()
         if remote:
             try:
                 if self.q.refresh is None:
@@ -148,16 +175,36 @@ class StaleCheck:
                 refreshed = self.q.refresh(list(remote), CURRENT_EVENT.get())
                 for version, key in remote.items():
                     current[key] = refreshed[version]
+                    meta, _ = self.resolver.content(current[key])
+                    receipt = self.store.read_event(meta['created_by_event'])
+                    events[meta['created_by_event']] = receipt
+                    result = receipt['result']
+                    self.q._check_day = max(self.q._check_day, result.get('day') or 0)
+                    mark = encoded(key).decode()
+                    if result.get('status') == 'succeeded':
+                        retry.pop(mark, None)
+                    else:
+                        previous = diagnostics[key]
+                        attempts = previous.get('attempts', 0) + 1
+                        checked_day = day if day is not None else self.q._check_day
+                        retry[mark] = dict(source=previous['source'], attempts=attempts,
+                            last_day=checked_day, retry_day=(checked_day or 0) + 7 * min(8, 2 ** min(attempts - 1, 3)),
+                            permanent=result.get('permanent_error', False), result=current[key])
             except Exception:
                 self.store.assert_healthy(quiescent=False)
                 for key in remote.values():
                     failures[key] = 'refresh_unavailable' if self.q.refresh is None else 'refresh_failed'
+        self.store.save_state('pf_refresh_failures', retry)
+        comparing = time.monotonic()
         for row in rows:
             edge, target = row['edge'], row['edge']['target']
             ref = edge.get('reference', {})
             check = dict(current_version=None, version_changed=None, predicate_result='not_checked',
                          notice=None, reason=None, affected=False, affected_paths=[])
             row['check'] = check
+            if 'cached_check' in row:
+                row['check'] = dict(row['cached_check'])
+                continue
             if row['historical_only']:
                 check['reason'] = 'historical_only'
                 continue
@@ -178,7 +225,16 @@ class StaleCheck:
             try:
                 if failures.get(key):
                     raise ValueError(failures[key])
-                changed, holds, reason = compare(self.resolver, target, current[key], ref, kind)
+                comparison_key = (target, current[key], encoded(ref), kind)
+                if comparison_key not in compared:
+                    try:
+                        compared[comparison_key] = compare(self.resolver, target, current[key], ref, kind, events)
+                    except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+                        compared[comparison_key] = exc
+                value = compared[comparison_key]
+                if isinstance(value, Exception):
+                    raise value
+                changed, holds, reason = value
                 check['version_changed'] = changed
                 if reason:
                     raise ValueError(reason)
@@ -190,7 +246,15 @@ class StaleCheck:
                     check['notice'] = 'strong_dependency_version_changed' if edge['origin'] == 'agent_declaration' else 'version_changed'
             except (ValueError, KeyError, TypeError, UnicodeError) as exc:
                 check.update(predicate_result='cannot_check', notice='cannot_check', reason=str(exc), affected=True)
+            if (day is not None and target in getattr(self.q, 'review_pending', {})
+                    and check['predicate_result'] not in ('holds', 'fails')):
+                pending = self.q.review_pending[target]
+                check.update(affected=True, predicate_result='cannot_check', notice='pending_review',
+                             reason=f"pending_review; last_verified_day_{pending['last_day']}")
         self._propagate(rows)
+        self.q.check_stats = dict(source_resolution_seconds=refreshing-started,
+            refresh_seconds=comparing-refreshing, comparison_and_propagation_seconds=time.monotonic()-comparing,
+            remote_sources=len(remote), shared_sources=len(representatives), unique_comparisons=len(compared))
         return rows
 
     def _file(self, name):

@@ -85,6 +85,9 @@ def test_group_insights_are_deterministic_and_hide_true_internal_parameters(
     assert first.data["group_id"] == "S1"
     assert first.data["info_level"] == 1
     assert first.data["noise"] == "±65%"
+    assert first.data['snapshot_day'] == 0
+    tools.set_current_day(308)
+    assert tools.get_group_insights('S1').data['snapshot_day'] == 0
 
     estimates = first.data["estimates"]
     assert {

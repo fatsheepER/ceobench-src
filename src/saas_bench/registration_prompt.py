@@ -63,11 +63,27 @@ saw or wrote), a committed file (`MEMORY.md@week-6`), another text (`r4.2`) or
 `unknown: <reason>`. The weekly check reports cited files and texts that changed
 and predicates that no longer hold.
 
+After an ordinary reference needs review, the weekly check retains its first
+finding and last verification day instead of rerunning it each week. Revise the
+text or run `pf depend rN --detail` to review it; incomplete scopes leave uncovered
+issues pending. Explicit selected values and predicates keep being checked.
+Repeated timeouts retry after 1, 2, 4, then 8 simulated weeks; `pf depend` retries
+immediately. Fix invalid SQL or replace its reference before relying on it.
+
+Group insights show their survey's `snapshot_day`, separately from the day you
+retrieve them. Only a completed `research_group` survey updates that date.
+
 `bash`, `write_file` and `edit_file` take an optional `note`: why you ran the
 command or what the change is for. PF keeps it with the outputs and files of
 that call and shows it when you see them again, e.g. above MEMORY.md next week.
 
-Run `pf` in bash on its own (`| head` and `| tail` work):
+Run `pf` in bash; commands, loops, pipes and redirects follow normal Bash rules.
+Citing a whole captured object does not require reading all of it. PF records
+what you actually read separately; selected fields must have reached you.
+Compact DELTA/UNCHANGED returns name the exact baseline and a `pf show ... --full`
+command. Use that command if you need the saved full output.
+
+Commands:
 
 ```
 pf log MEMORY.md           versions of a file, an output (scripts/an_w7d.py.out) or a text (r4)

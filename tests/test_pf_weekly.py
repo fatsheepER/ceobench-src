@@ -166,14 +166,14 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
     runner = offline_runner(text_registration=mode, stop_after_day=7)
     if mode != 'off':
         runner.agent.current_day = 0
-        runner._execute_tool('text_create', declaration())
-        runner._execute_tool('text_create', declaration({'record': 'r1'}, text='Depends on r1'))
+        runner._execute_tool('text_create', declaration(applies_at={'start_day': 0}))
+        runner._execute_tool('text_create', declaration({'record': 'r1'}, text='Depends on r1', applies_at={'start_day': 0}))
         runner._execute_tool('text_revise', dict(record='r1', reason='Corrected'))
         if mode == 'pf':  # A cited query output is rerun through the host's refresh endpoint.
             output = runner._execute_tool('bash', {'command': './novamind-operation query "SELECT COUNT(*) AS n FROM ledger"'})
             send(runner.evidence_store, output)
             handle = re.search(r'\[pf: (cmd\d+@v\d+)', output).group(1)
-            runner._execute_tool('text_create', declaration({'version': handle}, text='Ledger size'))
+            runner._execute_tool('text_create', declaration({'version': handle}, text='Ledger size', applies_at={'start_day': 0}))
         runner.agent.current_day = -1
     requests = fake_weeks(runner, monkeypatch)
     assert runner.run(verbose=False)['outcome'] == 'stopped'

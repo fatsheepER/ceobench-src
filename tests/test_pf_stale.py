@@ -370,7 +370,7 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
         if mode == 'git':
             assert output.startswith('Error: Unknown tool')
             continue
-        assert ('Checked against the current world' in output) is enabled, output
+        assert ('Checked day 7, against the current world' in output) is enabled, output
         # The packed host runtime must contain the refresh module (it was once left out).
         assert 'refresh_failed' not in output and 'refresh_unavailable' not in output, output
         child._save_checkpoint(7)

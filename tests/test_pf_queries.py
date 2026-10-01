@@ -137,19 +137,17 @@ def test_pagination_freezes_snapshot_survives_restore_and_delivers_only_read_chu
     head, chunk, output = read(executor, target={'path': 'long.txt'})
     send(store, output)
     first, more = chunk.rsplit('\n', 1)
-    assert len(first) == 30000 and head['truncated_reason'] == 'character_limit'
-    assert more == f"[5 more characters: pf more {head['next_cursor']}]"
-    with pytest.raises(ValueError, match='not fully delivered'):
-        call(registry, 'create', **declaration({'path': 'long.txt'}))
+    assert len(first) == 24000 and head['truncated_reason'] == 'character_limit'
+    assert more == f"[6,005 more characters: pf more {head['next_cursor']}]"
+    call(registry, 'create', **declaration({'path': 'long.txt'}))
     head2, chunk2, output2 = read(executor, cursor=head['next_cursor'])
     send(store, output + output2)  # Plain string concatenation intentionally loses source mappings.
-    with pytest.raises(ValueError, match='not fully delivered'):
-        call(registry, 'create', **declaration({'path': 'long.txt'}))
+    call(registry, 'create', **declaration({'path': 'long.txt'}))
     from saas_bench.execution_capture import model_request, text_sources
     body = dict(messages=[dict(role='tool', content=output), dict(role='tool', content=output2)])
     event = model_request(store, json.dumps(body).encode(), text_sources(body), 'call', 'attempt', 'week')
     store.complete(event, send_state='response_received')
-    assert call(registry, 'create', **declaration({'path': 'long.txt'}))['id'] == 'r5'
+    assert call(registry, 'create', **declaration({'path': 'long.txt'}))['id'] == 'r7'
     assert first + chunk2 == (workspace / 'long.txt').read_text()
     assert head2['next_cursor'] is None
 
@@ -475,10 +473,10 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py | head -1'})
     assert re.search(r'\[pf: cmd\d+@v1, with part of calc\.py\.out@v2\]$', output), output
     assert send(store, output)
-    # Only the first line reached the model: the whole stdout is not citable, the return is.
+    # Only the first line reached the model; whole capture and actual reading stay distinct.
     refused = runner._execute_tool('text_create', declaration({'version': 'calc.py.out@v2'}))
-    assert refused.startswith('Error:') and 'Only part of this output' in refused, refused
+    assert refused.startswith('Registered r2.1') and 'part read' in refused, refused
     shown = re.search(r'\[pf: (cmd\d+@v1),', output).group(1)
-    assert receipt(runner._execute_tool('text_create', declaration({'version': shown})))['id'] == 'r2'
+    assert receipt(runner._execute_tool('text_create', declaration({'version': shown})))['id'] == 'r3'
     # The script itself is traced too; interpreter caches and session logs get no handles.
     assert '__pycache__' not in output and 'sessions/' not in output

@@ -1,5 +1,5 @@
 """Resolve declaration references against captured versions and actual model sends."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 import csv
 import io
 import json
@@ -214,10 +214,34 @@ def covered(wanted, occurrences):
 class EvidenceResolver:
     def __init__(self, store):
         self.store = store
+        self._cache = None
+
+    @contextmanager
+    def cached(self):
+        previous = self._cache
+        if previous is None:
+            self._cache = {}
+            self._cache_bytes = 0
+            self.read_stats = dict(verified_reads=0, verified_bytes=0, cache_hits=0)
+        try:
+            yield
+        finally:
+            self._cache = previous
 
     def content(self, version):
         try:
-            return self.store.get_content(version)
+            if self._cache is not None and version in self._cache:
+                self.read_stats['cache_hits'] += 1
+                return self._cache[version]
+            value = self.store.get_content(version)
+            if self._cache is not None:
+                self.read_stats['verified_reads'] += 1
+                self.read_stats['verified_bytes'] += len(value[1])
+            # Per-operation verified bytes; bounded memory, no cross-check integrity bypass.
+            if self._cache is not None and self._cache_bytes + len(value[1]) <= 32 * 1024 * 1024:
+                self._cache[version] = value
+                self._cache_bytes += len(value[1])
+            return value
         except (KeyError, ValueError) as exc:
             self.store.fail(exc)
             raise RuntimeError('Captured evidence is missing or corrupt; collection stopped') from exc
@@ -304,6 +328,7 @@ class EvidenceResolver:
             if not candidates:
                 raise ValueError('The committed bytes were never captured')
         predicate = reference.get('predicate', {})
+        whole = not reference.get('select') and not predicate
         if kind == 'record':
             # Registered texts cite each other directly, exactly as in the Git group
             # (design 3.2); the text is the agent's own declaration, not captured evidence.
@@ -320,6 +345,14 @@ class EvidenceResolver:
             raise ValueError('Unknown registered text revision; use unknown with a reason')
         authored = {c for c in candidates if kind == 'file' and self.authored(c)}
         for occurrence_version, meta in versions:
+            if whole and occurrence_version in candidates and (members is None or occurrence_version in members):
+                event = self.store.read_event(meta['created_by_event'])
+                written = (meta['layer'] == 'file_bytes' and occurrence_version.endswith('_after') and
+                           meta.get('object_id') in event['result'].get('changed_paths',
+                                                                     event['result'].get('written_paths', [])))
+                if written:
+                    return self._whole_binding(occurrence_version, latest, [], 'written',
+                                               fully_known=occurrence_version in authored)
             if occurrence_version in authored and not (members is not None and occurrence_version not in members):
                 # The model wrote these exact bytes itself, so it knows the whole file.
                 if predicate.get('type') == 'compare':
@@ -366,6 +399,9 @@ class EvidenceResolver:
                     if kind in ('file', 'other') and not str(object_id).endswith(('.csv', '.json')) and any(selectors):
                         raise ValueError('Plain text supports whole-text equality only')
                     ranges = [r for select in selectors for r in selected_ranges(text, select, content_kind)]
+                    if whole:
+                        delivery = [dict(request_event=meta['created_by_event'], occurrence=item) for item, _ in group]
+                        return self._whole_binding(candidate, latest, delivery, 'observed')
                     if covered(ranges, [item for item, _ in group]):
                         candidate_meta, _ = self.content(candidate)
                         return dict(version_id=candidate, latest_version_id=latest,
@@ -379,6 +415,8 @@ class EvidenceResolver:
                     raise ValueError('Only part of this output reached you; cite the command return handle '
                                      '(cmdN@vK) shown after your command, or use unknown with a reason')
                 raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
+        if whole and explicit is not None:
+            return self._whole_binding(explicit, latest, [], 'explicit_handle')
         if kind == 'query':
             raise ValueError('Evidence has not been delivered to the model: you saw only what your command '
                              'printed, not this raw query result. Cite that output by the first handle in its '
@@ -388,6 +426,23 @@ class EvidenceResolver:
                              'file version. Read it first, cite the handle in the [pf: ...] line of the command '
                              'output you saw, or use unknown with a reason')
         raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
+
+    def _whole_binding(self, version, latest, delivered, basis, fully_known=False):
+        from .pf_queries import PUBLIC_LAYERS
+        meta, raw = self.content(version)
+        if meta['layer'] not in PUBLIC_LAYERS or meta.get('pf_retrieval'):
+            raise ValueError('Only public captured evidence can be cited')
+        if meta['extent'] != 'full' or meta['source_truncated']:
+            raise ValueError('Only part of this object was captured; cite a complete captured output or use unknown')
+        ranges = [item['occurrence'] for item in delivered]
+        full = covered([(0, len(raw.decode('utf-8')))], ranges)
+        result = dict(version_id=version, latest_version_id=latest, source_truncated=False,
+                    basis=basis, delivered_in=delivered, capture_extent=meta['extent'],
+                    reading_scope='full' if full else 'authored' if fully_known else 'partial' if ranges else 'not_read',
+                    read_ranges=[item['source_range'] for item in ranges])
+        if fully_known:
+            result['authored_by'] = meta['created_by_event']
+        return result
 
     def authored(self, version):
         """Whether the model wrote or successfully edited this captured file version.

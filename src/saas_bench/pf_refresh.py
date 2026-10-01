@@ -49,7 +49,7 @@ def refresh(server, versions, parent):
         result[version] = event + ':public_response'
 
     deadline = time.monotonic() + server.QUERY_TIMEOUT_SECONDS
-    # ponytail: hold the world lock for this bounded batch; use frozen SDK readers
+    # ponytail: hold the world lock for this synchronous check; use frozen SDK readers
     # if measured business-action contention warrants releasing it earlier.
     locked = False
     try:
@@ -63,15 +63,18 @@ def refresh(server, versions, parent):
                    else nullcontext((None, {'day': server.tools.current_day})))
         with context as (conn, snapshot):
             for version, source in sources.items():
+                started = time.monotonic()
+                deadline = started + server.QUERY_TIMEOUT_SECONDS
                 definition = source['query_definition']
                 request = source['request'].get('request')
-                execution = dict(snapshot, snapshot_status='success', refresh_of=version)
+                execution = dict(snapshot, snapshot_status='success', refresh_of=version, attempted=True)
                 status = 200
                 try:
                     check_deadline(deadline)
                     if definition:
                         # Reset the denial record for every statement in this shared snapshot.
                         denied = install_authorizer(conn)
+                        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                         try:
                             body = execute_snapshot(conn, definition[5], deadline, execution)
                         except sqlite3.Error as exc:
@@ -88,7 +91,11 @@ def refresh(server, versions, parent):
                         body = {'current_day': server.tools.current_day}
                     else:
                         parsed = request['parsed']
-                        body = server.execute_tool(parsed['tool'], parsed.get('args', {})).to_json()
+                        server.conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                        try:
+                            body = server.execute_tool(parsed['tool'], parsed.get('args', {})).to_json()
+                        finally:
+                            server.conn.set_progress_handler(None, 0)
                     check_deadline(deadline)
                     chunks = []
                     for chunk in json.JSONEncoder(default=str).iterencode(body):
@@ -100,8 +107,12 @@ def refresh(server, versions, parent):
                     status = 403 if isinstance(exc, QueryDenied) else 504 if isinstance(exc, TimeoutError) else 500
                     # Detailed private diagnostics never become a public error string.
                     execution['refresh_error'] = type(exc).__name__
+                    execution['refresh_error_detail'] = str(exc)
+                    execution['permanent_error'] = bool(definition and
+                        (isinstance(exc, QueryDenied) or getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_ERROR))
                     raw = json.dumps(dict(success=False, error='refresh_denied' if status == 403 else
                                           'refresh_timed_out' if status == 504 else 'refresh_failed')).encode()
+                execution['refresh_seconds'] = time.monotonic() - started
                 save(version, status, raw, execution)
         return result
     except (TimeoutError, SnapshotUnavailable) as exc:
@@ -109,7 +120,7 @@ def refresh(server, versions, parent):
             if version not in result:
                 save(version, 504 if isinstance(exc, TimeoutError) else 503,
                      b'{"success":false,"error":"snapshot_unavailable"}',
-                     dict(refresh_of=version, refresh_error=type(exc).__name__))
+                     dict(refresh_of=version, refresh_error=type(exc).__name__, attempted=False))
         return result
     except Exception as exc:
         # A capture failure must stop collection; a failed read is recorded above.

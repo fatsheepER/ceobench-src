@@ -27,7 +27,8 @@ def write_json(path, value):
 
 
 def file_hash(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def tree_hash(path):
@@ -89,8 +90,17 @@ def copy_workspace(source, destination, *, omit_session_world=None):
         if omit_session_world is not None and Path(directory) == source / 'sessions' / omit_session_world:
             ignored.add('world.nmdb')
         return ignored
-    shutil.copytree(source, destination, symlinks=True,
-                    ignore=ignore)
+    def freeze_file(src, dst):
+        # Linux reflinks freeze bytes cheaply. Other filesystems copy while quiescent.
+        import fcntl
+        try:
+            with open(src, 'rb') as reading, open(dst, 'wb') as writing:
+                fcntl.ioctl(writing.fileno(), 0x40049409, reading.fileno())  # FICLONE
+            shutil.copystat(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+        return dst
+    shutil.copytree(source, destination, symlinks=True, ignore=ignore, copy_function=freeze_file)
 
 
 def checkpoint_directory(run, checkpoint):
@@ -205,6 +215,32 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
         manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
                                         fork_seq=checkpoint['sql_evidence']['cutoff'],
                                         source_manifest_sha256=source_manifest)
+    shutil.copy2(source / 'config.json', destination / 'config.json')
+    write_json(destination / 'manifest.json', manifest)
+    write_json(destination / 'checkpoint.json', checkpoint)
+    return destination
+
+
+def recover_run(source, destination):
+    """Start a distinct attempt from the last published generation; never rewind source."""
+    import uuid
+    source, destination = Path(source).resolve(), Path(destination).resolve()
+    if destination.is_relative_to(source):
+        raise ValueError('Recovery destination must be outside the original run')
+    checkpoint = json.loads((source / 'checkpoint.json').read_text())
+    directory = checkpoint_directory(source, checkpoint)
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    attempt = 'recovery-' + uuid.uuid4().hex[:12]
+    manifest['recovery_source'] = dict(directory=str(source), snapshot_id=checkpoint['snapshot_id'],
+        source_manifest_sha256=file_hash(directory / 'manifest.json'), attempt_id=attempt,
+        usage=dict(agent=checkpoint['usage'], simulator=json.loads((directory / 'server_state.json').read_text())['usage']))
+    if parent := manifest.get('sql_evidence'):
+        manifest['sql_evidence'] = dict(parent, branch_id=attempt, parent_branch=parent['branch_id'],
+            fork_seq=checkpoint['sql_evidence']['cutoff'], source_manifest_sha256=file_hash(directory / 'manifest.json'))
+    destination.mkdir(parents=True, exist_ok=False)
+    target = destination / 'checkpoints' / checkpoint['snapshot_id']
+    target.parent.mkdir()
+    shutil.copytree(directory, target)
     shutil.copy2(source / 'config.json', destination / 'config.json')
     write_json(destination / 'manifest.json', manifest)
     write_json(destination / 'checkpoint.json', checkpoint)

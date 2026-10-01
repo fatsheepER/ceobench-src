@@ -185,7 +185,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
-            elif self.path in ('/checkpoint', '/pf-refresh'):
+            elif self.path in ('/checkpoint', '/pf-refresh', '/run-metrics'):
                 import secrets
                 expected_token = self.server._api_server.checkpoint_token
                 supplied_token = self.headers.get('X-Harness-Token', '')
@@ -193,6 +193,11 @@ class _APIHandler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'Harness access required'}, 403)
                     return
                 body = self._read_body()
+                if self.path == '/run-metrics':
+                    api = self.server._api_server
+                    self._send_json({'day': api.tools.current_day,
+                                     'usage': api.simulator.customer_simulator.usage_recorder.summary})
+                    return
                 if self.path == '/pf-refresh':
                     if (set(body) != {'versions', 'parent'} or not isinstance(body['parent'], str) or
                             not isinstance(body['versions'], list) or
@@ -498,6 +503,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({'success': False, 'error': 'Invalid JSON body'}, 400)
         except QueryDenied as exc:
+            self._sql_execution['permanent_error'] = True
             self._send_json({'success': False, 'error': str(exc)}, 403)
         except SnapshotUnavailable as exc:
             self._send_json({'success': False, 'error': str(exc)}, 503)
@@ -505,6 +511,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             if not self._query_response_started:
                 self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
         except sqlite3.Error as exc:
+            self._sql_execution['permanent_error'] = getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_ERROR
             self._send_json({'success': False, 'error': _get_helpful_query_error(exc, sql)}, 500)
         except (BrokenPipeError, ConnectionResetError):
             pass

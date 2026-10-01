@@ -388,7 +388,8 @@ def cmd_start_server(args, base: Path):
     # in-memory conn to a plain tmp file (~10s on 1.5 GB) and submits it;
     # the worker thread does the ~90s encrypt + atomic-replace off the
     # next-week response path. Drained on shutdown.
-    async_saver = AsyncSaver(nmdb_path)
+    managed_checkpoints = bool(os.environ.get('CEOBENCH_CHECKPOINT_ROOT'))
+    async_saver = None if managed_checkpoints else AsyncSaver(nmdb_path)
 
     # Day callback — save state after each day
     def _day_callback(day, dashboard):
@@ -396,8 +397,10 @@ def cmd_start_server(args, base: Path):
         meta["status"] = "running"
         _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
         # Snapshot synchronously, queue encrypt to background worker.
-        plain = snapshot_to_plain(conn, nmdb_path.parent)
-        async_saver.submit(plain)
+        if async_saver:
+            plain = snapshot_to_plain(conn, nmdb_path.parent)
+            async_saver.submit(plain)
+        event_logger.save_incremental()
         # Log to history
         _log_history({"type": "next_week", "day": day, "timestamp": time.time()})
 
@@ -422,7 +425,7 @@ def cmd_start_server(args, base: Path):
         sql_evidence=sql_evidence,
         checkpoint_token=os.environ.get('CEOBENCH_CHECKPOINT_TOKEN'),
     )
-    from saas_bench.run_state import file_hash, write_json
+    from saas_bench.run_state import write_json
     checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')
     if checkpoint_root:
         checkpoint_root = Path(checkpoint_root).resolve()
@@ -434,11 +437,12 @@ def cmd_start_server(args, base: Path):
             snapshot_id = uuid.uuid4().hex
             target = checkpoint_root / snapshot_id
             target.mkdir(parents=True)
-            if not async_saver.drain(timeout=180):
-                raise TimeoutError('Background database save did not finish')
+            started = time.monotonic()
             simulator.save_rng_states()
             event_logger.save_incremental()
-            save_session_db(conn, target / 'world.nmdb')
+            plain = snapshot_to_plain(conn, target)
+            os.replace(plain, target / 'world.plain.sqlite')
+            frozen = time.monotonic()
             saved_meta = dict(meta, current_day=simulator.current_day, status='created')
             for field in ('port', 'pid'):
                 saved_meta.pop(field, None)
@@ -450,15 +454,16 @@ def cmd_start_server(args, base: Path):
                 'event_logger': {name: getattr(event_logger, name) for name in
                                  ('current_day', '_event_count', '_total_llm_cost', '_missing_llm_cost')}})
             receipt = {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
-                    'files': {name: file_hash(target / name) for name in
-                              ('world.nmdb', 'session.json', 'server_state.json')}}
+                       'phase': 'frozen', 'files': ['session.json', 'server_state.json'],
+                       'timings': {'world_freeze_s': frozen-started}}
             if sql_evidence:
-                receipt['sql_evidence'] = sql_evidence.snapshot(target / 'sql-evidence.sqlite')
+                receipt['sql_evidence'] = sql_evidence.snapshot(target / 'sql-evidence.sqlite', checksum=False)
                 control = sql_evidence.path.with_suffix('.controls.jsonl')
                 if control.exists():
                     import shutil
                     shutil.copy2(control, target / control.name)
-                    receipt['files'][control.name] = file_hash(target / control.name)
+                    receipt['files'].append(control.name)
+            receipt['timings']['evidence_and_metadata_freeze_s'] = time.monotonic()-frozen
             return receipt
 
         api_server.checkpoint_callback = _checkpoint
@@ -516,11 +521,10 @@ def cmd_start_server(args, base: Path):
         # Drain the async encrypter, then write a fresh synchronous save so
         # any post-day-callback writes (agent tool calls between days) land
         # before exit.
-        try:
-            async_saver.shutdown(wait=True, timeout=180.0)
-        except Exception:
-            pass
-        save_session_db(conn, nmdb_path)
+        if async_saver:
+            if not async_saver.shutdown(wait=True, timeout=180.0):
+                raise TimeoutError('Background database save did not finish')
+            save_session_db(conn, nmdb_path)
         meta["status"] = "stopped"
         meta.pop("port", None)
         meta.pop("pid", None)

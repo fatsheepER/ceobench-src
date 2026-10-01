@@ -5,6 +5,7 @@ import difflib
 import hashlib
 from itertools import accumulate
 import json
+import shlex
 
 from .execution_capture import CapturedText, CURRENT_EVENT, at_pointer, origin, slice_origins, text_sources
 from . import evidence_handles
@@ -76,19 +77,16 @@ def apply_delta(before, edits):
 def _compact(full, mode, handle, edits):
     header = json.loads(full.split('\n', 1)[0])
     header.update(delivery=mode, base=handle)
+    header['full_command'] = 'pf show ' + shlex.quote(header['target']['version']) + ' --full'
     if mode == 'DELTA':
         header['patch_format'] = 'unicode-replacements-v1'
     return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
 
 
-def tool_base(key):
-    """How the model finds the base: the previous same call, or the same script's last output."""
-    return 'previous_same_call' if key[0] == 'tool_call' else 'previous_output_of:' + key[1]
-
-
-def _compact_tool(mode, target_handle, edits, base='previous_same_call'):
+def _compact_tool(mode, target_handle, edits, base):
     """Compact form of a repeated tool read; the base is its previous result in this request."""
     header = dict(delivery=mode, base=base, target=target_handle)
+    header['full_command'] = 'pf show ' + shlex.quote(target_handle) + ' --full'
     if mode == 'DELTA':
         header['patch_format'] = 'unicode-replacements-v1'
     return encoded(header).decode() + '\n' + (encoded(edits).decode() if mode == 'DELTA' else '')
@@ -216,11 +214,12 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         return dict(choice, reason='delta_verification_failed')
     # Tool-call reads name their own target (for pf_read full text); PF reads name the base.
     # A number is only allocated once the compact form is actually used.
-    named = meta['target'] if tool else base
     handles = evidence_handles.index(store)
-    handle = handles.name(named, allocate=False)
+    handle = handles.name(base, allocate=False)
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
-    labels = (dict(base_handle=tool_base(meta['key']), target_handle=handle) if tool else dict(base_handle=handle))
+    labels = dict(base_handle=handle)
+    if tool:
+        labels['target_handle'] = handles.name(meta['target'], allocate=False)
     payload = _payload(meta, full, mode, dict(labels, edits=edits))
     tokens = _count(counter, payload)
     choice['candidate_tokens'][mode] = tokens
@@ -228,8 +227,10 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         return dict(choice, reason='token_count_failed')
     if tokens >= full_tokens:
         return dict(choice, reason='compact_not_smaller')
-    if handles.name(named) != handle:
+    if handles.name(base) != handle:
         raise RuntimeError('Read baseline handle changed')
+    if tool and handles.name(meta['target']) != labels['target_handle']:
+        raise RuntimeError('Read target handle changed')
     return dict(choice, mode=mode, reason='unchanged' if mode == 'UNCHANGED' else 'delta_smaller',
                 payload=payload, base=base, edits=edits, **labels)
 

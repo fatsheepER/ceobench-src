@@ -367,21 +367,10 @@ class BashAgentToolExecutor:
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
-        facts, view = {}, None
+        facts = {}
         if self.pf_queries:
-            from saas_bench import pf_cli
             from saas_bench.pf_queries import MODELS
             dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
-            dispatch['pf_usage'] = lambda args: args['message']
-            if tool_name == 'bash':
-                # `pf ...` typed in bash is answered here, outside the sandbox (design 3.4).
-                try:
-                    parsed = pf_cli.parse(args.get('command', ''), self._roots())
-                except pf_cli.Usage as exc:
-                    parsed = ('pf_usage', {'message': str(exc)}, None)
-                if parsed:
-                    facts['command'] = args.get('command', '')
-                    tool_name, args, view = parsed
             if tool_name in NOTE_TOOLS and 'note' in args:
                 if not isinstance(args['note'], str):
                     return 'Error: note must be a string'
@@ -419,15 +408,8 @@ class BashAgentToolExecutor:
                         'unobserved_internal_file_reads', 'unobserved_intermediate_file_versions',
                         'unobserved_pipe_streams', 'unobserved_program_data_dependencies']
             result = handler(args)
-            if tool_name == 'pf_usage' or (tool_name != 'bash' and result.startswith('Error:')):
+            if tool_name != 'bash' and result.startswith('Error:'):
                 status = 'failed'
-            if view:
-                from saas_bench.pf_cli import apply_view
-                if getattr(result, 'pf_read', None):
-                    from saas_bench.pf_read import capture_view
-                    result = capture_view(self.evidence_store, result, view)
-                else:
-                    result = apply_view(result, view)
             if capture:
                 capture.origins.extend(getattr(result, 'origins', []))
             if capture and capture.facts.get('timed_out'):
@@ -455,11 +437,12 @@ class BashAgentToolExecutor:
                 body = result
                 if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
-                    if tool_name in DELTA_READ_TOOLS:
+                    if tool_name in DELTA_READ_TOOLS and not getattr(result, 'pf_read', None):
                         read_key = capture.safe(read_identity, capture.store, capture.event,
                                                 self.workspace_path, tool_name, args, self.guest_root)
                 result = capture.finish(result, status, read_key=read_key, body=body,
-                                        read_complete=not capture.facts.get('output_truncated'))
+                                        read_complete=not capture.facts.get('output_truncated') and
+                                                      not capture.facts.get('pf_calls'))
                 if status == 'result_unknown':
                     capture.store.fail('Execution outcome unknown; branch paused')
             if token is not None:
@@ -470,6 +453,8 @@ class BashAgentToolExecutor:
             result.pf_call = dict(operation=tool_name, arguments=args, event_id=capture.event,
                                  outcome='usage_error' if tool_name == 'pf_usage' else
                                          'succeeded' if status == 'succeeded' else 'execution_error')
+        if capture and tool_name == 'bash':
+            result.pf_calls = capture.facts.get('pf_calls', [])
         return result
 
     def _roots(self):
@@ -590,6 +575,8 @@ class BashAgentToolExecutor:
                 cmd.extend(['--ro-bind', sys_path, sys_path])
 
         cmd.extend(['--dev', '/dev'])
+        if getattr(self, '_pf_service', None):
+            cmd.extend(['--ro-bind', str(self._pf_service.root), self._pf_service.guest])
 
         # Writable /tmp (separate from workspace, for temp files)
         cmd.extend(['--tmpfs', '/tmp'])
@@ -673,11 +660,23 @@ class BashAgentToolExecutor:
             return "Error: No command provided"
 
         from saas_bench.process_boundary import Boundary
+        service = None
+        if self.pf_queries:
+            from saas_bench.pf_shell import ShellService
+            service = self._pf_service = ShellService(self)
         boundary = Boundary(command, self.python)
         try:
-            return self._run_bash(command, boundary)
+            result = self._run_bash(command, boundary)
+            if service:
+                self.capture.facts['pf_calls'] = service.calls
+                return service.project(result)
+            return result
         finally:
             boundary.close()
+            if service:
+                service.close()
+                self.capture.facts['pf_calls'] = service.calls
+                self._pf_service = None
 
     def _run_bash(self, command, boundary):
         from saas_bench.process_boundary import BoundaryOpen
@@ -699,6 +698,9 @@ class BashAgentToolExecutor:
             'TERM': os.environ.get('TERM', 'xterm'),
         }
         env.update(self.extra_env)
+        if getattr(self, '_pf_service', None):
+            env['PATH'] = self._pf_service.guest + os.pathsep + env['PATH']
+            env['PF_SOCKET'] = self._pf_service.guest + '/socket'
         env = self._scrub_sandbox_env(env)
         if sandboxed:
             env = {k: self._guest_paths(v) for k, v in env.items()}
