@@ -15,7 +15,8 @@ RECORD = re.compile(r'\br\d+(?:\.\d+)?\b')
 HISTORY = re.compile(r'\bgit\s+(log|diff|show)\b')
 CHECK = re.compile(r'^=== (?:Weekly check|Check of your registered texts)\b', re.M)
 VERBS = dict(pf_log='log', pf_read='show', pf_diff='diff', pf_blame='blame',
-             pf_dependencies='depend', pf_dependents='rdepend', pf_search='search', pf_more='more', pf_usage='usage')
+             pf_dependencies='depend', pf_dependents='rdepend', pf_search='search', pf_more='more',
+             pf_usage='usage', pf_help='help')
 
 
 def pf_call(tool, roots, captured):
@@ -49,6 +50,42 @@ def pf_call(tool, roots, captured):
                 error=audit['outcome'] != 'succeeded', capture_match=match)
 
 
+def pf_calls(tool, roots, captured):
+    """New Bash logs contain one receipt per subprocess; retain old single-call logs."""
+    if 'pf_calls' in tool:
+        return [pf_call(dict(tool, pf_call=call), roots, captured) for call in tool['pf_calls']]
+    call = pf_call(tool, roots, captured)
+    return [call] if call else []
+
+
+def response_calls(response):
+    """Count only this response, never the historical calls in its input messages."""
+    if response.get('choices'):
+        return response['choices'][0]['message'].get('tool_calls') or []
+    return [item for item in response.get('output', response.get('content', []))
+            if item.get('type') in ('function_call', 'tool_use')]
+
+
+def refresh_events(conn):
+    """Classify child request receipts, including failures absent from rendered digests."""
+    rows = conn.execute('''SELECT r.event_id,r.request,s.record,p.request FROM requests r
+        LEFT JOIN results s USING(event_id)
+        JOIN requests p ON p.event_id=json_extract(r.request,'$.parent_event_id')
+        WHERE json_extract(p.request,'$.kind') IN ('pf_dependencies','pf_weekly_check')
+        AND json_extract(r.request,'$.kind') IN ('sql_query','public_http')''')
+    for event, request, result, parent in rows:
+        req, res, p = json.loads(request), json.loads(result) if result else {}, json.loads(parent)
+        execution = res.get('execution') or res
+        http = res.get('http_status')
+        attempted = execution.get('attempted', True)
+        outcome = ('result_unknown' if not result else 'not_attempted' if not attempted else
+                   'timeout' if http == 504 else 'succeeded' if res.get('status') == 'succeeded' else 'error')
+        yield dict(event_id=event, parent_event_id=p['event_id'] if 'event_id' in p else
+                   req.get('parent_event_id'), day=(p.get('request') or {}).get('day', execution.get('day')),
+                   kind=req['kind'], status=res.get('status'), http_status=http, outcome=outcome,
+                   attempted=attempted, reason=execution.get('refresh_error'))
+
+
 def text(content):
     if isinstance(content, str):
         return content
@@ -61,10 +98,11 @@ def analyze(pointer):
     record = json.loads(pointer.read_text())
     run = Path(record['path'])
     start = record['start_day']
-    captured = {}
+    captured, refreshes = {}, []
     evidence = run / 'sql-evidence.sqlite'
     if evidence.exists():
         with closing(sqlite3.connect(evidence.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+            refreshes = list(refresh_events(conn))
             for event, request, result in conn.execute('''SELECT r.event_id,r.request,s.record
                     FROM requests r LEFT JOIN results s USING(event_id)
                     WHERE json_extract(r.request,'$.kind') LIKE 'pf_%' '''):
@@ -83,6 +121,12 @@ def analyze(pointer):
         weeks.setdefault(r['day'], r)
     out = dict(group=record['group'], run_id=record['run_id'], status=record['status'],
                start_day=start, days_run=(record.get('result') or {}).get('days_run'), weeks=[])
+    batches = collections.defaultdict(list)
+    for name in glob.glob(str(run / 'logs' / 'raw_responses_*.jsonl')):
+        with open(name) as stream:
+            for line in stream:
+                response = json.loads(line)
+                batches[response['day']].append(len(response_calls(response['raw_response'])))
     for day, first in sorted(weeks.items()):
         opening = text(first['request']['messages'][1]['content'])
         check = CHECK.search(opening)
@@ -93,11 +137,15 @@ def analyze(pointer):
         day_tools = [t for t in tools if t['day'] == day]
         reasoning = ' '.join(t['result'] or '' for t in day_tools if t['tool'] == '_reasoning')
         calls = [t for t in day_tools if not t['tool'].startswith('_')]
-        pf = [item for t in calls if (item := pf_call(t, roots, captured))]
+        pf = [item for t in calls for item in pf_calls(t, roots, captured)]
+        day_refreshes = [r for r in refreshes if r['day'] == day]
         commands = ' '.join((t['arguments'] or {}).get('command', '') for t in calls if t['tool'] == 'bash')
         mentioned = sorted({m for m in RECORD.findall(reasoning) if any(m.split('.')[0] == f.split('.')[0] for f in flagged)})
         out['weeks'].append(dict(
             day=day, requests=sum(1 for r in requests if r['day'] == day),
+            model_response_tool_counts=batches[day],
+            multiple_call_responses=sum(n > 1 for n in batches[day]),
+            requested_tool_calls=sum(batches[day]),
             digest_chars=len(digest) if digest else 0, flagged=flagged,
             digest_mentioned_in_reasoning=bool(re.search(r'weekly check|check of (?:your|my) registered texts', reasoning, re.I)),
             flagged_ids_in_reasoning=mentioned,
@@ -109,9 +157,11 @@ def analyze(pointer):
                 isinstance((t.get('arguments') or {}).get('note'), str) and t['arguments']['note'].strip())),
             history_commands=HISTORY.findall(commands),
             revisions=[t['arguments'].get('record') for t in calls if t['tool'] in ('text_revise', 'text_retire')],
-            tips=sum('"tip"' in (t['result'] or '') for t in calls if t['tool'] in ('text_create', 'text_revise')),
-            refresh_errors=len(re.findall(r'refresh_(failed|unavailable|timed_out)', (digest or '') + ' '.join(
-                t['result'] or '' for t in calls if t.get('pf_call') or t['tool'].startswith('pf_')))),
+            tips=sum('Business writes this week' in (t['result'] or '') or '"tip"' in (t['result'] or '')
+                     for t in calls if t['tool'] in ('text_create', 'text_revise')),
+            refresh_events=day_refreshes,
+            refresh_outcomes=dict(collections.Counter(r['outcome'] for r in day_refreshes)),
+            refresh_errors=sum(r['outcome'] in ('error', 'timeout') for r in day_refreshes),
             clock_in_results=sum(bool(CLOCK.search(t['result'] or '')) for t in calls
                                  if t.get('pf_call') or t['tool'].startswith(('pf_', 'text_'))) + bool(CLOCK.search(digest or '')),
             digest=digest))
