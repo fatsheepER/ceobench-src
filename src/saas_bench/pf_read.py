@@ -213,7 +213,7 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     if not valid:
         return dict(choice, reason='delta_verification_failed')
     # Tool-call reads name their own target (for pf_read full text); PF reads name the base.
-    # A number is only allocated once the compact form is actually used.
+    # Allocate names after selecting a compact candidate, then check its final cost.
     handles = evidence_handles.index(store)
     handle = handles.name(base, allocate=False)
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
@@ -229,8 +229,16 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         return dict(choice, reason='compact_not_smaller')
     if handles.name(base) != handle:
         raise RuntimeError('Read baseline handle changed')
-    if tool and handles.name(meta['target']) != labels['target_handle']:
-        raise RuntimeError('Read target handle changed')
+    if tool:
+        # Allocating an unnamed base can advance this other command's object number.
+        labels['target_handle'] = handles.name(meta['target'])
+        payload = _payload(meta, full, mode, dict(labels, edits=edits))
+        tokens = _count(counter, payload)
+        choice['candidate_tokens'][mode] = tokens
+        if tokens is None:
+            return dict(choice, reason='token_count_failed')
+        if tokens >= full_tokens:
+            return dict(choice, reason='compact_not_smaller')
     return dict(choice, mode=mode, reason='unchanged' if mode == 'UNCHANGED' else 'delta_smaller',
                 payload=payload, base=base, edits=edits, **labels)
 

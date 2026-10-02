@@ -735,6 +735,22 @@ os._exit(77)
             'checkpoint_unchanged': True, 'restore_refused': True}, indent=2))
 
 
+def test_git_workspace_maintenance_is_synchronous(offline_runner):
+    runner = offline_runner(execution_capture=True)
+    for option in ('gc.autoDetach', 'maintenance.autoDetach'):
+        assert runner._git('config', '--get', option).stdout.strip() == 'false'
+        runner._git('config', option, 'true', check=True)
+    runner._git_init_workspace()  # Existing repositories need the same boundary rule.
+    for option in ('gc.autoDetach', 'maintenance.autoDetach'):
+        assert runner._git('config', '--get', option).stdout.strip() == 'false'
+    for i in range(3):
+        result = runner.tool_executor.execute('bash', {
+            'command': f'git commit --allow-empty -q -m "foreground maintenance {i}" && echo committed'})
+        assert 'committed' in result
+    assert getattr(runner.tool_executor, 'preserved_process', None) is None
+    runner.evidence_store.assert_healthy()
+
+
 def test_harness_preserves_unfinished_descendants_and_server(offline_runner, monkeypatch):
     import signal
     from saas_bench.environment import Action

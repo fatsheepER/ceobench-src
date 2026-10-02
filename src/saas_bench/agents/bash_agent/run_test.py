@@ -550,11 +550,13 @@ __pycache__/
         )
 
     def _git_init_workspace(self):
-        if (self.agent_workspace / ".git").exists():
-            return
-        self._git("init", "-q", "-b", "main")
-        self._git("config", "user.email", "bash-agent@bossbench.local")
-        self._git("config", "user.name", "BashAgent")
+        if not (self.agent_workspace / ".git").exists():
+            self._git("init", "-q", "-b", "main")
+            self._git("config", "user.email", "bash-agent@bossbench.local")
+            self._git("config", "user.name", "BashAgent")
+        # Git commits must finish maintenance before the sandbox boundary closes.
+        self._git("config", "gc.autoDetach", "false", check=True)
+        self._git("config", "maintenance.autoDetach", "false", check=True)
         gitignore_path = self.agent_workspace / ".gitignore"
         if not gitignore_path.exists():
             gitignore_path.write_text(self._GITIGNORE_CONTENT)

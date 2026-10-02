@@ -1,7 +1,9 @@
 """Audit PF/Git use and weekly check delivery from run-pointer JSON files (no model calls)."""
 import argparse
 import collections
+from bisect import bisect_right
 from contextlib import closing
+from datetime import datetime
 import glob
 import json
 from pathlib import Path
@@ -66,6 +68,72 @@ def response_calls(response):
             if item.get('type') in ('function_call', 'tool_use')]
 
 
+def tool_batch_accounting(responses, tools, timing):
+    """Use the runner's pre-execution batch receipts, including cancelled results."""
+    responses = sorted(responses, key=lambda r: r['timestamp'])
+    stamps = [datetime.fromisoformat(r['timestamp']) for r in responses]
+    accepted, errors = set(), []
+    for event in timing:
+        if event.get('event') != 'model_tool_batch':
+            continue
+        index = bisect_right(stamps, datetime.fromisoformat(event['timestamp'])) - 1
+        if index < 0 or responses[index]['day'] != event['day']:
+            errors.append('Batch acceptance receipt has no preceding response')
+            continue
+        if index in accepted or event['calls'] != len(response_calls(responses[index]['raw_response'])):
+            errors.append('Duplicate or mismatched batch acceptance receipt')
+        accepted.add(index)
+    counts = collections.defaultdict(collections.Counter)
+    requested, delivered = collections.Counter(), collections.Counter()
+    origin_days, rejected, unaccounted = {}, [], []
+    for index, response in enumerate(responses):
+        calls = response_calls(response['raw_response'])
+        ids = [c.get('call_id') or c.get('id') for c in calls]
+        invalid = []
+        for call in calls:
+            args = (call.get('function') or call).get('arguments')
+            if args:
+                try:
+                    json.loads(args)
+                except json.JSONDecodeError as exc:
+                    invalid.append(dict(id=call.get('call_id') or call.get('id'), error=str(exc)))
+        day = response['day']
+        counts[day]['declared'] += len(calls)
+        if index in accepted:
+            if invalid or any(not isinstance(i, str) or not i for i in ids):
+                errors.append('Accepted batch has invalid arguments or call IDs')
+            counts[day]['accepted'] += len(calls)
+            requested.update(ids)
+            origin_days.update(dict.fromkeys(ids, day))
+        elif invalid:
+            counts[day]['rejected'] += len(calls)
+            rejected.append(dict(day=day, turn=response.get('turn'), ids=ids, invalid_arguments=invalid))
+        elif calls:
+            counts[day]['unaccounted'] += len(calls)
+            unaccounted.append(dict(day=day, turn=response.get('turn'), ids=ids))
+    for tool in tools:
+        if tool['tool'].startswith('_'):
+            continue
+        call_id = tool.get('call_id')
+        if not call_id:
+            errors.append('Tool result has no call ID')
+            continue
+        delivered[call_id] += 1
+        if call_id in origin_days:
+            outcome = 'cancelled' if tool.get('outcome') == 'cancelled' else 'completed'
+            counts[origin_days[call_id]][outcome] += 1
+    missing, extra = requested - delivered, delivered - requested
+    if missing or extra:
+        errors.append('Missing or duplicate/unaccepted tool result IDs')
+    if unaccounted:
+        errors.append('Declared valid calls have no batch acceptance receipt')
+    return dict(status='failed' if errors else 'passed', errors=errors,
+                counts={name: sum(c[name] for c in counts.values()) for name in
+                        ('declared', 'accepted', 'rejected', 'completed', 'cancelled', 'unaccounted')},
+                weeks={day: dict(c) for day, c in counts.items()}, rejected_batches=rejected,
+                unaccounted_batches=unaccounted, missing_ids=dict(missing), extra_ids=dict(extra))
+
+
 def refresh_events(conn):
     """Classify child request receipts, including failures absent from rendered digests."""
     rows = conn.execute('''SELECT r.event_id,r.request,s.record,p.request FROM requests r
@@ -121,12 +189,13 @@ def analyze(pointer):
         weeks.setdefault(r['day'], r)
     out = dict(group=record['group'], run_id=record['run_id'], status=record['status'],
                start_day=start, days_run=(record.get('result') or {}).get('days_run'), weeks=[])
+    timing = [json.loads(l) for name in glob.glob(str(run / 'logs' / 'timing_*.jsonl')) for l in open(name)]
+    raw = [json.loads(l) for name in glob.glob(str(run / 'logs' / 'raw_responses_*.jsonl')) for l in open(name)]
+    out['tool_batch_accounting'] = tool_batch_accounting(
+        [r for r in raw if r['day'] >= start], tools, [t for t in timing if t['day'] >= start])
     batches = collections.defaultdict(list)
-    for name in glob.glob(str(run / 'logs' / 'raw_responses_*.jsonl')):
-        with open(name) as stream:
-            for line in stream:
-                response = json.loads(line)
-                batches[response['day']].append(len(response_calls(response['raw_response'])))
+    for response in raw:
+        batches[response['day']].append(len(response_calls(response['raw_response'])))
     for day, first in sorted(weeks.items()):
         opening = text(first['request']['messages'][1]['content'])
         check = CHECK.search(opening)
@@ -145,7 +214,9 @@ def analyze(pointer):
             day=day, requests=sum(1 for r in requests if r['day'] == day),
             model_response_tool_counts=batches[day],
             multiple_call_responses=sum(n > 1 for n in batches[day]),
-            requested_tool_calls=sum(batches[day]),
+            declared_tool_calls=sum(batches[day]),
+            requested_tool_calls=out['tool_batch_accounting']['weeks'].get(day, {}).get('accepted', 0),
+            tool_batch_counts=out['tool_batch_accounting']['weeks'].get(day, {}),
             digest_chars=len(digest) if digest else 0, flagged=flagged,
             digest_mentioned_in_reasoning=bool(re.search(r'weekly check|check of (?:your|my) registered texts', reasoning, re.I)),
             flagged_ids_in_reasoning=mentioned,
@@ -178,9 +249,6 @@ def analyze(pointer):
                                cached=usage[role]['known']['cached_tokens'], output=usage[role]['known']['output_tokens'],
                                usd=round(usage[role]['known_cost_usd'], 6), missing_cost=usage[role]['missing_cost'])
                     for role in ('agent', 'simulator') if role in usage}
-    timing = []
-    for name in glob.glob(str(run / 'logs' / 'timing_*.jsonl')):
-        timing += [json.loads(l) for l in open(name)]
     out['weekly_check_seconds'] = {t['day']: t['elapsed_s'] for t in timing if t.get('event') == 'weekly_check'}
     return out
 

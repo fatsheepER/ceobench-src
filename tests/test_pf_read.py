@@ -51,6 +51,29 @@ def sample():
     return ''.join(f'记录 {i:03d}: a useful observation about this business 🙂\r\n' for i in range(100))
 
 
+@pytest.mark.parametrize('changed', [False, True])
+def test_script_output_compaction_allocates_distinct_command_handles(workspace, tmp_path, changed):
+    from saas_bench import evidence_handles
+    from saas_bench.execution_capture import ExecutionCapture
+    store, _, _ = captured(workspace, tmp_path)
+    outputs = []
+    for command, text in [('python report.py', sample()),
+                          ('true; python report.py', sample().replace('记录 005', '修订 005') if changed else sample())]:
+        capture = ExecutionCapture(store)
+        capture.begin('bash', {'command': command}, call=['tool_call', 'bash', command])
+        outputs.append(capture.finish(text, read_key=['script_output', 'report.py']))
+    deliver(store, outputs[:1])
+    _, ledger = deliver(store, outputs)
+    compact = ledger[-1]
+    assert compact['mode'] == ('DELTA' if changed else 'UNCHANGED')
+    assert compact['base_handle'] != compact['target_handle']
+    handles = evidence_handles.index(store)
+    assert compact['base'] in handles.lookup(compact['base_handle'])
+    assert compact['target'] in handles.lookup(compact['target_handle'])
+    assert compact['actual_tokens'] < compact['full_tokens']
+    store.assert_healthy()
+
+
 @pytest.mark.parametrize('command', ['pf show facts.txt', 'pf diff facts.txt'])
 @pytest.mark.parametrize('view', [('head', 2), ('tail', 2)])
 def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_path, command, view):

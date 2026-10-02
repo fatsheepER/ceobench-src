@@ -880,6 +880,7 @@ def init_database(db_path: Path) -> sqlite3.Connection:
         -- Eliminating redundant index saves ~30% insert overhead on 4.6M+ row table.
         CREATE INDEX IF NOT EXISTS idx_ledger_day ON ledger(day);
         CREATE INDEX IF NOT EXISTS idx_ledger_category ON ledger(category);
+        CREATE INDEX IF NOT EXISTS idx_ledger_note_day ON ledger(note, day);
         CREATE INDEX IF NOT EXISTS idx_enterprise_turns_thread ON enterprise_turns(thread_id);
         CREATE INDEX IF NOT EXISTS idx_enterprise_turns_customer ON enterprise_turns(customer_id);
         CREATE INDEX IF NOT EXISTS idx_enterprise_turns_closed ON enterprise_turns(closed);

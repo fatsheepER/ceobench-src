@@ -17,7 +17,7 @@ from saas_bench.api_server import NovaMindAPIServer
 from saas_bench.database import init_database
 from saas_bench.public_sql import (
     PUBLIC_COLUMNS, PUBLIC_POLICY_VERSION, QueryDenied, SnapshotUnavailable,
-    execute_query, install_authorizer, query_snapshot,
+    execute_query, execute_snapshot, install_authorizer, query_snapshot,
 )
 
 
@@ -38,6 +38,33 @@ def server(tmp_path, monkeypatch):
     yield api
     api.stop()
     conn.close()
+
+
+def test_cohort_payment_join_fits_bounded_sql_work(server):
+    server.conn.executemany('''INSERT INTO subscriptions
+        (customer_id,plan,listed_price,effective_price,start_day,status,billing_day_mod30)
+        VALUES (?,'A',10,10,0,'subscribed',0)''', ((i,) for i in range(1, 1001)))
+    server.conn.executemany('INSERT INTO ledger(day,category,amount,note) VALUES (?,?,?,?)',
+        ((day, 'subscription_payment', 10 + day / 15, f'Subscription payment from customer {i}')
+         for day in (0, 30, 60, 90, 120) for i in range(1, 1001)))
+    server.conn.commit()
+    sql = '''SELECT s.start_day,l.day AS payday,ROUND(AVG(l.amount),2) AS avg_amt,COUNT(*) AS n
+        FROM subscriptions s JOIN ledger l
+          ON l.note=('Subscription payment from customer ' || s.customer_id)
+        WHERE s.plan='A' AND s.start_day BETWEEN 0 AND 7
+          AND l.day IN (s.start_day,s.start_day+30)
+        GROUP BY s.start_day,l.day ORDER BY s.start_day,l.day'''
+    deadline = time.monotonic() + 5
+    with query_snapshot(server, deadline) as (conn, metadata):
+        instructions = 0
+        def limit_work():
+            nonlocal instructions
+            instructions += 1000
+            return instructions > 100_000
+        conn.set_progress_handler(limit_work, 1000)
+        result = execute_snapshot(conn, sql, deadline, metadata)
+    assert result['rows'] == [dict(start_day=0, payday=0, avg_amt=10.0, n=1000),
+                              dict(start_day=0, payday=30, avg_amt=12.0, n=1000)]
 
 
 DENIED = [
