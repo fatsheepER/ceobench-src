@@ -3,6 +3,7 @@ from collections import Counter
 import difflib
 import json
 import re
+import shlex
 
 
 def short(text, limit=100):
@@ -13,10 +14,24 @@ def short(text, limit=100):
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\2[ \t]*(?:\n|$)", re.S)
 
 
-def command_summary(command, limit=100):
+def command_summary(command, limit=160):
     """A command without heredoc bodies or a leading cd, e.g. the script it runs."""
     command = _HEREDOC.sub(lambda m: m.group(0).split('\n', 1)[0] + '\n', command)
-    parts = [p.strip() for p in re.split(r'\n|&&|;', command) if p.strip()]
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=';&\n')
+    lexer.whitespace, lexer.whitespace_split, lexer.commenters = ' \t\r', True, ''
+    parts, words = [], []
+    try:
+        for token in lexer:
+            if not token.strip(';&\n'):
+                if words:
+                    parts.append(' '.join(words))
+                    words = []
+            else:
+                words.append(token)
+    except ValueError:
+        return short(command, limit)
+    if words:
+        parts.append(' '.join(words))
     parts = [p for p in parts if not re.fullmatch(r'cd(\s+\S+)?(\s+2>/dev/null)?(\s*\|\|\s*cd\s+\S+)?', p)]
     runs = [p for p in parts if re.search(r'\bpython\b|novamind-operation', p)]
     return short(' ; '.join(runs or parts) or command, limit)

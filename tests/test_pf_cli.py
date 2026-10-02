@@ -133,7 +133,9 @@ def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
         text='S1 dev 300 this week', objects=[dict(kind='customer_group', id='S1')], applies='0-',
         reason='plan', references=[dict(cite=handle)]))
     lines = created.splitlines()
-    assert lines[:2] == ['Registered r1.1 (active).', f'Cited: {handle} (day 0)']
+    assert lines[0] == 'Registered r1.1 (active).'
+    assert lines[1].startswith(f'Cited: {handle} (day 0) — output of ')
+    assert 'set_targeted_dev_spend' in lines[1]
     assert lines[2].startswith('Business writes this week touching S1: day 0 set_targeted_dev_spend(') and '500' in lines[2]
     other = runner._execute_tool('text_create', dict(text='About S2', objects=[dict(kind='customer_group', id='S2')],
                                                      applies='0-', reason='plan', references=[]))

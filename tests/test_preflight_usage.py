@@ -78,9 +78,9 @@ def test_missing_usage_cache_prices_and_restored_subtotals(tmp_path):
     assert recorder.summary['known_cost_usd'] == pytest.approx(0.0123)
     restored = ModelUsage(tmp_path / 'clone.jsonl', 'agent', recorder.pricing)
     restored.summary = copy.deepcopy(recorder.summary)
-    partial = {'model': 'test-model', 'usage': {'completion_tokens': 4}}
+    partial = dict(reply('chat', usage=False), usage={'completion_tokens': 4})
     restored.call('chat', {}, lambda: partial, outer_attempt=2)
-    restored.call('responses', {}, lambda: {}, outer_attempt=3)
+    restored.call('responses', {}, lambda: reply('responses', usage=False), outer_attempt=3)
     assert restored.summary['known']['input_tokens'] == 10
     assert restored.summary['known']['output_tokens'] == 6
     assert restored.summary['missing']['input_tokens'] == 2
@@ -159,14 +159,15 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     client.close()
 
 
-def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monkeypatch):
+@pytest.mark.parametrize('status', [503, 200])
+def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monkeypatch, status):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
     def handle(request):
         requests.append(json.loads(request.content))
         if len(requests) == 1:
-            return httpx.Response(503, json={'error': {'message': 'offline retry', 'type': 'server_error'}})
+            return httpx.Response(status, json={'error': {'message': 'offline retry', 'type': 'server_error'}})
         body = reply('chat', usage=False)
         body['choices'][0]['message']['tool_calls'] = [dict(id='call1', type='function',
             function=dict(name='read_file', arguments='{"path":"MEMORY.md"}'))]
@@ -183,7 +184,60 @@ def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monk
     assert recorder.summary['missing']['input_tokens'] == 2
     assert recorder.summary['known']['input_tokens'] is None
     assert recorder.summary['errors'] == 1
+    assert recorder.summary['failed_http_attempts'] == 1
     client.close()
+
+
+@pytest.mark.parametrize('provider,api', [('deepseek', 'chat'), ('opencode', 'chat'), ('openai', 'responses'),
+                                         ('anthropic', 'messages'), ('bedrock', 'messages')])
+def test_http200_error_body_is_a_failed_model_call(tmp_path, monkeypatch, provider, api):
+    from saas_bench.sql_evidence import SQLEvidenceStore
+    from test_sql_evidence import identity, event_ids
+    monkeypatch.setenv('CEOBENCH_SIMULATOR_USAGE_LOG', str(tmp_path / 'simulator.jsonl'))
+    body = {'error': {'message': 'We were unable to start processing your request within the 900-second '
+                                'timeout limit. Please try again later.'}}
+    http = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
+    if provider == 'bedrock':
+        client = AnthropicBedrock(aws_access_key='offline', aws_secret_key='offline', aws_region='us-east-2',
+                                 http_client=http, max_retries=0)
+    else:
+        client = (Anthropic if api == 'messages' else OpenAI)(api_key='offline', http_client=http, max_retries=0)
+    sim = CustomerSimulator(client if api != 'messages' else None, init_database(':memory:'), BenchmarkConfig())
+    if api == 'messages':
+        setattr(sim, '_bedrock_client' if provider == 'bedrock' else '_anthropic_client', sim.usage_recorder.attach(client))
+    store = SQLEvidenceStore(tmp_path / 'private.sqlite', identity(capture_scope='execution'))
+    sim.usage_recorder.evidence_store = store
+    try:
+        with pytest.raises(ValueError, match='900-second timeout'):
+            sim.complete_text(provider=provider, model='test-model', user='offline replay', max_tokens=30)
+        summary = sim.usage_recorder.summary
+        assert summary['calls'] == summary['errors'] == summary['http_attempts'] == summary['failed_http_attempts'] == 1
+        assert summary['failed_attempts_without_usage'] == summary['missing_cost'] == 1
+        assert summary['known'] == dict.fromkeys(FIELDS) and summary['known_cost_usd'] is None
+        entries = [json.loads(line) for line in (tmp_path / 'simulator.jsonl').read_text().splitlines()]
+        http_response = next(e for e in entries if e['event'] == 'http_response')
+        assert http_response['status'] == 200 and json.loads(http_response['body']) == body
+        assert '900-second timeout' in http_response['error']
+        assert entries[-1]['response']['error'] == body['error'] and entries[-1]['error']
+        captured = store.read_event(event_ids(store)[0])['result']
+        assert captured['status'] == 'failed' and captured['http_status'] == 200
+        assert captured['send_state'] == 'response_received'
+        store.assert_healthy()
+    finally:
+        client.close()
+        sim.conn.close()
+
+
+@pytest.mark.parametrize('api,field', [('chat', 'choices'), ('responses', 'output'), ('messages', 'content')])
+def test_malformed_response_is_recorded_before_returning(tmp_path, api, field):
+    recorder = ModelUsage(tmp_path / 'usage.jsonl', 'agent')
+    malformed = reply(api)
+    malformed[field] = None
+    with pytest.raises(ValueError, match=field):
+        recorder.call(api, {}, lambda: malformed)
+    assert recorder.summary['errors'] == 1
+    assert recorder.summary['known']['input_tokens'] == 10
+    assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] == malformed
 
 
 def test_agent_rejects_empty_tools_before_any_request():

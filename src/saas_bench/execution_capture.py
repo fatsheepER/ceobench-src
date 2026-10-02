@@ -143,7 +143,7 @@ class ExecutionCapture:
         # body is the return before PF appended handles; equal bodies keep one version number.
         from .evidence_handles import body_digest
         extra = dict(body_sha256=body_digest(body)) if body is not None else {}
-        if self.facts.get('pf_calls'):
+        if self.facts.get('pf_retrieval'):
             extra['pf_retrieval'] = True
         version = self.blob('tool_return', text, 'tool_return', segments=self.origins, **extra) if text is not None else None
         pf_read = getattr(text, 'pf_read', None)

@@ -30,8 +30,25 @@ def plain(value):
     return value
 
 
+def response_error(response, api=None):
+    """Provider errors can arrive with HTTP 200 and permissive SDK decoding."""
+    if not isinstance(response, dict):
+        return 'Model response must be an object' if api else None
+    if response.get('error'):
+        return 'Provider error: ' + json.dumps(response['error'], ensure_ascii=False)
+    if api:
+        field = {'chat': 'choices', 'responses': 'output', 'messages': 'content'}[api]
+        items = response.get(field)
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            return f'Model response {field} must be a list of objects'
+        if api == 'chat' and (not items or not isinstance(items[0].get('message'), dict)):
+            return 'Model response choices must contain an assistant message'
+    return None
+
+
 def usage_values(response, api):
-    raw = plain(response) or {}
+    raw = plain(response)
+    raw = raw if isinstance(raw, dict) else {}
     usage = raw.get('usage') or {}
     chat = api == 'chat'
     anthropic = api == 'messages'
@@ -188,6 +205,11 @@ class ModelUsage:
                 response = send(request, *args, **dict(kwargs, stream=True))
                 def finish(content, error):
                     nonlocal failure_recorded, capture_done
+                    try:
+                        reported = json.loads(content)
+                    except (ValueError, UnicodeError):
+                        reported = None
+                    error = error or response_error(reported)
                     if capture_event and not capture_done:
                         capture_done = True
                         try:
@@ -200,13 +222,10 @@ class ModelUsage:
                     except UnicodeDecodeError:
                         body = {'base64': base64.b64encode(content).decode('ascii')}
                     if response.status_code >= 400 or error:
-                        try:
-                            reported = json.loads(content).get('usage')
-                        except (ValueError, AttributeError):
-                            reported = None
                         with recorder.lock:
                             recorder.summary['failed_http_attempts'] += 1
-                            recorder.summary['failed_attempts_without_usage'] += not bool(reported)
+                            recorder.summary['failed_attempts_without_usage'] += not bool(
+                                reported.get('usage') if isinstance(reported, dict) else None)
                         failure_recorded = True
                     recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
@@ -253,6 +272,8 @@ class ModelUsage:
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:
             response = invoke()
+            if message := response_error(plain(response), api):
+                raise ValueError(message)
             return response
         except BaseException as exc:
             error = type(exc).__name__

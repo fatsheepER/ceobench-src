@@ -142,8 +142,19 @@ class TextRegistry:
         if shown.get('status') == 'commit_only':
             seen = f"; you saw {shown['delivered']}" if shown.get('delivered') else ''
             return f"{cite_text(evidence)} (commit only: those bytes never reached you{seen})"
-        group = evidence_handles.index(self.store).group(binding['version_id'])
+        handles = evidence_handles.index(self.store)
+        group = handles.group(binding['version_id'])
         text = shown['version'] + (f" (day {group['day']})" if group else '')
+        meta, _ = self.resolver.content(binding['version_id'])
+        event = self.store.read_event(meta['created_by_event'])
+        record, result = event['request'], event['result']
+        definition = event['query_definition'] if meta['layer'] == 'server_public_response' else None
+        text += ' — ' + pf_render.label(meta['layer'], record['kind'], record.get('request'),
+            definition[5] if definition else None, meta.get('object_id'), result.get('classification'))
+        if result['status'] != 'succeeded':
+            text += f" ({result['status']}" + (f"; exit code: {result['exit_code']}" if 'exit_code' in result else '') + ')'
+        if note := handles.note(binding['version_id']):
+            text += f' — source note: "{pf_render.short(note[1], 120)}"'
         if shown['differs']:
             text += f" (as you last saw it; now {shown['latest']}, {self._change(binding)})"
         if binding.get('reading_scope') in ('partial', 'not_read'):

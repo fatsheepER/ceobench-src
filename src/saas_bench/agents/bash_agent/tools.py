@@ -442,7 +442,7 @@ class BashAgentToolExecutor:
                                                 self.workspace_path, tool_name, args, self.guest_root)
                 result = capture.finish(result, status, read_key=read_key, body=body,
                                         read_complete=not capture.facts.get('output_truncated') and
-                                                      not capture.facts.get('pf_calls'))
+                                                      not capture.facts.get('pf_retrieval'))
                 if status == 'result_unknown':
                     capture.store.fail('Execution outcome unknown; branch paused')
             if token is not None:

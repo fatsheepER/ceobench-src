@@ -1,6 +1,7 @@
 """Round-four regressions: real shell programs and all provider tool batches, offline."""
 import json
 from pathlib import Path
+import re
 
 import httpx
 import pytest
@@ -10,6 +11,86 @@ from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from test_text_registry import workspace, captured, send
 from test_preflight_integration import offline_runner, packed_public
 from test_public_sql import server
+
+
+@pytest.mark.parametrize('command', [
+    './novamind-operation query "SELECT * FROM config_overrides ORDER BY day DESC LIMIT 40"; pf log settings.py | head -30',
+    'pf log settings.py; ./novamind-operation python report.py',
+    './novamind-operation query "SELECT * FROM config_overrides" | head -c 80; pf log settings.py',
+])
+def test_mixed_pf_output_can_be_cited_and_traced(offline_runner, command):
+    from test_pf_queries import query
+    runner = offline_runner(text_registration='pf')
+    runner._execute_tool('write_file', dict(path='settings.py', content='# settings\n'))
+    runner._execute_tool('write_file', dict(path='report.py', content=(
+        'import novamind_api as nm\nprint(nm.query("SELECT * FROM config_overrides"))\n'
+        'raise RuntimeError("after printing")\n')))
+    output = runner._execute_tool('bash', dict(command=command))
+    assert 'columns' in output and output.pf_calls
+    match = re.search(r'\[pf: (cmd\d+@v\d+)', output)
+    assert match, output
+    handle = match.group(1)
+    send(runner.evidence_store, output)
+    receipt = runner._execute_tool('text_create', dict(text='Saved investment history',
+        objects=[dict(kind='customer_group', id='S1')], applies='0-', reason='history',
+        references=[dict(cite=handle)]))
+    assert receipt.startswith('Registered r1.1'), receipt
+    shown = runner._execute_tool('bash', dict(command=f'pf show {handle} --full'))
+    assert shown.split('\n', 1)[1] == output
+    graph = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'},
+                  include_execution=True, depth=4)
+    assert any('config_overrides' in (row['target'] or {}).get('sql', '') for row in graph['items'])
+    # A pure PF check can refresh SQL, but is still a retrieval, not new business evidence.
+    checked = runner._execute_tool('bash', dict(command='pf depend r1 --detail'))
+    assert not re.search(r'\[pf: cmd\d+@v\d+', checked)
+    version = checked.origins[0]['version_id']
+    assert runner.evidence_store.get_content(version)[0]['pf_retrieval']
+    runner.tool_executor.pf_queries._index(None)
+    assert version not in runner.tool_executor.pf_queries.nodes
+    assert any(event['request'].get('parent_event_id') == checked.pf_calls[0]['event_id']
+               and event['result'].get('refresh_of') for event in runner.tool_executor.pf_queries.events.values())
+    send(runner.evidence_store, checked)
+    with pytest.raises(ValueError, match='Only public captured evidence'):
+        resolver = runner.tool_executor.text_registry.resolver
+        resolver.resolve({'version': resolver.handle(version)}, {})
+
+
+def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runner):
+    runner = offline_runner(text_registration='pf')
+    output = runner._execute_tool('bash', dict(command='./novamind-operation python-c \'\n'
+        'import novamind_api as nm\nprint(nm.query("SELECT name FROM sqlite_master"))\n\'',
+        note='List DB tables'))
+    assert '[exit code: 1]' in output
+    handle = re.search(r'\[pf: (cmd\d+@v\d+)', output).group(1)
+    send(runner.evidence_store, output)
+    for i in (1, 2):
+        receipt = runner._execute_tool('text_create', dict(text='Development history verified',
+            objects=[dict(kind='customer_group', id='S1')], applies='0-', reason='reproduce mismatch',
+            references=[dict(cite=handle, note='config_overrides history')]))
+        assert receipt.startswith(f'Registered r{i}.1'), receipt
+        assert 'failed' in receipt and 'sqlite_master' in receipt and 'exit code: 1' in receipt
+        assert 'List DB tables' in receipt
+    query = runner.tool_executor.pf_queries
+    assert 'read_failed' in query.weekly_check(7)
+    saved = runner.evidence_store.load_state('pf_review')
+    second = query.weekly_check(14)
+    assert runner.evidence_store.load_state('pf_review') == saved
+    for i in (1, 2):
+        line = next(line for line in second.splitlines() if f'pf depend r{i}.1 --detail' in line)
+        assert 'read_failed' in line and handle in line
+        assert 'first found day 7, last verified day 7' in line
+    history = runner._execute_tool('bash', dict(command='./novamind-operation query '
+        '"SELECT * FROM config_overrides ORDER BY day DESC LIMIT 40"; pf log MEMORY.md'))
+    send(runner.evidence_store, history)
+    correct = re.search(r'\[pf: (cmd\d+@v\d+)', history).group(1)
+    revised = runner._execute_tool('text_revise', dict(record='r1', text='Use the actual investment history',
+        reason='The earlier citation was a rejected table lookup', references=[dict(cite=correct)]))
+    assert revised.startswith('Revised r1.2') and 'config_overrides' in revised
+    third = query.weekly_check(21)
+    assert 'pf depend r2.1 --detail' in third and 'pf depend r1.1 --detail' not in third
+    records = json.loads(runner.tool_executor.text_registry.path.read_text())['records']['r1']
+    assert records[0]['references'][0]['evidence']['version'] == handle
+    assert records[1]['references'][0]['evidence']['version'] == correct
 
 
 def test_all_28_recorded_pf_programs_use_bash(workspace, tmp_path):

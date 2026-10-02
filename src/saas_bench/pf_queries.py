@@ -181,13 +181,11 @@ class PFQueries:
             return str(text) + '\n[pf: ' + ' | '.join(parts) + ']' if parts else text
         if record['kind'] != 'bash':
             return text
-        if capture.facts.get('pf_calls'):
-            # Query replies stay in the audit, without becoming another history object.
-            return str(text) + '\n[pf: ' + ' | '.join(wrote + noted) + ']' if wrote else text
         with closing(self.store.connect()) as conn:
             observed = conn.execute('''WITH RECURSIVE children(event_id) AS (
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
-                ON json_extract(r.request, '$.parent_event_id')=c.event_id)
+                ON json_extract(r.request, '$.parent_event_id')=c.event_id
+                WHERE json_extract(r.request, '$.kind') NOT GLOB 'pf_*')
                 SELECT count(*) FROM versions v JOIN requests r USING(event_id)
                 WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
                 ''', (capture.event,)).fetchone()[0]
@@ -205,6 +203,11 @@ class PFQueries:
             if output:
                 shown = [o for o in capture.origins if o['version_id'] == version]
                 printed.append((version, covered([(0, len(output))], shown) if shown else False, output == body))
+        # PF's own refreshes are excluded above; ordinary SQL/scripts in the same
+        # shell still produce citable evidence, including failed or piped output.
+        capture.facts['pf_retrieval'] = bool(capture.facts.get('pf_calls')) and not observed and not printed
+        if capture.facts['pf_retrieval']:
+            return body + '\n[pf: ' + ' | '.join(wrote + noted) + ']' if wrote else text
         shown_files = self._shown_notes(after, written, body)
         if not observed and not printed and not written:
             return body + ''.join('\n' + line for line in shown_files) if shown_files else text
@@ -483,7 +486,13 @@ class PFQueries:
                 text += f'\nPending review: {len(self.review_pending)} texts; ordinary findings remain dated until revision or pf depend; transient read failures retry with backoff.'
                 groups = defaultdict(list)
                 for v, p in old:
-                    groups[(p['first_day'], p['last_day'])].append(self.records[v]['version'])
+                    record = self.records[v]['version']
+                    reason = p['reason']
+                    if reason['check']['predicate_result'] == 'cannot_check':
+                        text += (f"\n  {record}: first found day {p['first_day']}, last verified day {p['last_day']}; "
+                                 + pf_render.dependency_line(reason, relation=False) + f'; pf depend {record} --detail')
+                    else:
+                        groups[(p['first_day'], p['last_day'])].append(record)
                 for (first, last), records in groups.items():
                     text += f"\n  {', '.join(records)}: first found day {first}, last verified day {last}; pf depend {records[0]} --detail"
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
@@ -634,7 +643,7 @@ class PFQueries:
             meta = json.loads(row['metadata'])
             event = self.events[row['event_id']]
             retrieval = (meta['layer'] in ('stdout', 'stderr', 'tool_return')
-                         and event['result'].get('pf_calls'))
+                         and event['result'].get('pf_retrieval', bool(event['result'].get('pf_calls'))))
             if meta['layer'] in PUBLIC_LAYERS and not event['request']['kind'].startswith('pf_') and not retrieval:
                 self.nodes[row['version_id']] = dict(row, meta=meta)
                 new_nodes[row['version_id']] = self.nodes[row['version_id']]
