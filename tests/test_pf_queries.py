@@ -142,7 +142,9 @@ def test_pagination_freezes_snapshot_survives_restore_and_delivers_only_read_chu
     call(registry, 'create', **declaration({'path': 'long.txt'}))
     head2, chunk2, output2 = read(executor, cursor=head['next_cursor'])
     send(store, output + output2)  # Plain string concatenation intentionally loses source mappings.
-    call(registry, 'create', **declaration({'path': 'long.txt'}))
+    with pytest.raises(ValueError, match='this request'):
+        call(registry, 'create', **declaration({'path': 'long.txt'}))
+    call(registry, 'create', **declaration({'version': 'long.txt@v1'}))
     from saas_bench.execution_capture import model_request, text_sources
     body = dict(messages=[dict(role='tool', content=output), dict(role='tool', content=output2)])
     event = model_request(store, json.dumps(body).encode(), text_sources(body), 'call', 'attempt', 'week')
@@ -290,6 +292,7 @@ def test_private_layers_siblings_postfork_versions_and_bad_inputs_are_inaccessib
                  {'cursor': 'c999'}, {'target': {'record': 'r1'}, 'limit': 0}):
         result = executor.execute('pf_read', args)
         assert result.startswith('Error:') and 'f' * 64 not in result
+    assert branch.answer('pf_search', {'text': 'PRIVATE_'})['total'] == 0
     assert not store.fault and not fork.fault
 
 
@@ -475,7 +478,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     assert send(store, output)
     # Only the first line reached the model; whole capture and actual reading stay distinct.
     refused = runner._execute_tool('text_create', declaration({'version': 'calc.py.out@v2'}))
-    assert refused.startswith('Registered r2.1') and 'part read' in refused, refused
+    assert refused.startswith('Registered r2.1') and 'part of body present in this request' in refused, refused
     shown = re.search(r'\[pf: (cmd\d+@v1),', output).group(1)
     assert receipt(runner._execute_tool('text_create', declaration({'version': shown})))['id'] == 'r3'
     # The script itself is traced too; interpreter caches and session logs get no handles.

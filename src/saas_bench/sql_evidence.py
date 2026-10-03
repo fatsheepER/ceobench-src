@@ -105,6 +105,8 @@ class SQLEvidenceStore:
                     received BLOB);
                 CREATE TABLE IF NOT EXISTS private_state (name TEXT PRIMARY KEY, value BLOB NOT NULL);
                 CREATE INDEX IF NOT EXISTS versions_object_id ON versions(json_extract(metadata, '$.object_id'));
+                CREATE INDEX IF NOT EXISTS versions_event_id ON versions(event_id);
+                CREATE INDEX IF NOT EXISTS client_calls_event_id ON client_calls(event_id);
             ''')
             source = encoded({k: identity[k] for k in ('run_id', 'data_source_id', 'format')})
             existing = conn.execute('SELECT value FROM identity').fetchone()
@@ -424,8 +426,9 @@ class SQLEvidenceStore:
                         delivery=json.loads(delivery[0]) if delivery else
                         dict(send_state='unknown', receive_state='unknown'))
 
-    def get_content(self, version):
-        with closing(self.connect()) as conn:
+    def get_content(self, version, *, connection=None):
+        from contextlib import nullcontext
+        with closing(self.connect()) if connection is None else nullcontext(connection) as conn:
             row = conn.execute('SELECT * FROM versions WHERE version_id=?', (version,)).fetchone()
             if row is None:
                 raise KeyError(version)

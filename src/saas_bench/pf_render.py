@@ -386,7 +386,7 @@ def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
 
 
-def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0, surveys=()):
+def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Only what the agent itself cited is itemized; changes in the queries behind a cited
@@ -401,24 +401,31 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         lines.append(checked + ': cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
     else:
         lines.append(f'{checked}; {len(flagged)} with changed evidence:')
-    for entry in flagged[:8]:
+    seen, displayed, shared = set(), 0, 0
+    for entry in flagged:
+        rows = [row if isinstance(row, str) else dependency_line(row, relation=False) for row in entry['changed']]
+        distinct = [row for row in dict.fromkeys(rows) if row not in seen]
+        if not distinct:
+            shared += 1
+            continue
+        if displayed == 8:
+            continue
+        seen.update(distinct)
+        displayed += 1
         text = entry['text']
         lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\"")
-        for row in entry['changed'][:3]:
-            lines.append('  - ' + (row if isinstance(row, str) else short(dependency_line(row, relation=False), 320)))
-        if len(entry['changed']) > 3:
-            lines.append(f"  - and {len(entry['changed']) - 3} more")
-    if len(flagged) > 8:
-        lines.append('Also changed: ' + ', '.join(e['text']['record'] for e in flagged[8:]))
+        lines.extend('  - ' + short(row, 320) for row in distinct[:3])
+        if len(distinct) > 3:
+            lines.append(f"  - and {len(distinct) - 3} more source changes")
+    if shared:
+        lines.append(f'{shared} additional texts share the source changes above.')
+    if len(flagged) > displayed + shared:
+        lines.append(f'{len(flagged) - displayed - shared} additional texts have changed evidence.')
     if underlying:
-        lines.append(f"The queries behind outputs cited by {', '.join(underlying)} now return different rows; "
-                     f"pf depend {underlying[0].split('.')[0]} shows which.")
-    if surveys:
-        lines.append('Survey dates (retrieving a survey does not update its measurement date):')
-        lines.extend('  - ' + item_line(item) for item in surveys)
+        lines.append(f"Upstream queries changed for {len(underlying)} texts; "
+                     f"pf depend {underlying[0].split('.')[0]} shows one.")
     if ended:
-        lines.append(f"Not checked because their applies window is over: {', '.join(ended)} "
-                     '(text_retire them if you no longer use them).')
+        lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
     if flagged:
         lines.append('Details: pf depend rN.' if pf else 'Details: run the git diff shown on each line.')
     return '\n'.join(lines)

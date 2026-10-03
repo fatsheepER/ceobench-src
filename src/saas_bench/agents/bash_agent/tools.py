@@ -354,7 +354,7 @@ class BashAgentToolExecutor:
         """The interpreter path valid inside the agent's command environment."""
         return GUEST_PYTHON if self._bwrap() else sys.executable
 
-    def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
+    def execute(self, tool_name: str, args: Dict[str, Any], *, model_request_event=None, model_context_id=None) -> str:
         """Execute a tool and return the result string."""
         dispatch = {
             'bash': self._exec_bash,
@@ -394,6 +394,7 @@ class BashAgentToolExecutor:
         try:
             if capture:
                 capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root),
+                              model_request_event=model_request_event, model_context_id=model_context_id,
                               **{k: v for k, v in facts.items() if k == 'command'})
                 capture.facts.update(facts)
                 token = CURRENT_EVENT.set(capture.event)

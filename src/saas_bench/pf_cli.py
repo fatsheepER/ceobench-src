@@ -13,6 +13,7 @@ USAGE = '''usage: pf <command> ...
   pf depend <object> [--detail] [--history]   what it cites; reruns and checks current references
   pf rdepend <object> [--detail] [--all]      registered texts that cite it
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about S1, t10_2, ...
+  pf search --text "term"              literal text in public captured history, newest first
   pf more <cursor>                     the next page of an earlier result
 Objects: a handle (MEMORY.md@v8, scripts/a.py.out@v2, query7@v1), a file path or output name
 (the latest version) or a text (r4, r4.2). Shell combinations, pipes and redirection work normally.'''
@@ -112,7 +113,7 @@ def parse_argv(words):
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}\n' + USAGE)
     options = dict(show={'full': False}, depend={'detail': False, 'history': False},
-                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True}).get(verb, {})
+                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': False}).get(verb, {})
     flags, rest = _flags(words, options)
     expected = dict(diff=(1, 2)).get(verb, (1, 1))
     if not expected[0] <= len(rest) <= expected[1]:
@@ -123,6 +124,10 @@ def parse_argv(words):
             raise Usage('pf more: give the cursor from a previous result, e.g. pf more c2\n' + USAGE)
         return 'pf_more', {'cursor': first}
     if verb == 'search':
+        if flags.get('text'):
+            if 'kind' in flags or 'all' in flags:
+                raise Usage('pf search --text cannot be combined with --kind or --all')
+            return 'pf_search', {'text': first}
         return 'pf_search', dict(object=dict(id=first, **({'kind': flags['kind']} if 'kind' in flags else {})),
                                  all=bool(flags.get('all')))
     if verb == 'log':

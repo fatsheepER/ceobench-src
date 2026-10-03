@@ -1191,7 +1191,10 @@ __pycache__/
         Raises NextDayTimeoutError if ./novamind-operation next-week times out,
         which triggers run checkpoint + kill in the run loop.
         """
-        result = self.tool_executor.execute(tool_name, arguments)
+        recorder = self.agent.usage_recorder
+        origin = (dict(model_request_event=recorder.last_request_event, model_context_id=recorder.context_id)
+                  if recorder.last_request_event else {})
+        result = self.tool_executor.execute(tool_name, arguments, **origin)
 
         # Check if bash output contains a day advancement
         if tool_name == 'bash':

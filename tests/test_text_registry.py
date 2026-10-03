@@ -244,7 +244,7 @@ def test_pf_files_the_model_wrote_count_as_known_but_script_outputs_do_not(works
     # A file computed by a program was neither read nor written by the model.
     executor.execute('bash', {'command': 'python3 -c "open(\'out.txt\', \'w\').write(str(6 * 7))"'})
     result = call(registry, 'create', **declaration({'path': 'out.txt'}))
-    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_read'
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_in_request'
     # A later write by another program: the model's own earlier version stays the binding.
     (workspace / 'plan.json').write_text('{"price": 79}')
     executor.execute('bash', {'command': 'true'})
@@ -293,7 +293,7 @@ def test_pf_local_edit_is_immediately_citable_by_path_and_handle(workspace, tmp_
     (workspace / 'plan.txt').write_text('external 300\nprice 20\n')
     assert executor.execute('edit_file', dict(path='plan.txt', old_string='absent', new_string='x')).startswith('Error:')
     result = call(registry, 'create', **declaration({'version': 'plan.txt@v3'}))
-    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_read'
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_in_request'
 
 
 @pytest.mark.parametrize('delivered', [False, True])

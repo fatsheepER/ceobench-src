@@ -144,6 +144,7 @@ class ModelUsage:
         self.token_counter = token_counter
         self.source_records = []
         self.context_id = uuid.uuid4().hex if evidence_store else None
+        self.last_request_event = None
         self.path = Path(path) if path else None
         self.role = role
         self.pricing = pricing or {}
@@ -215,6 +216,8 @@ class ModelUsage:
                         try:
                             recorder.evidence_store.complete(capture_event, 'failed' if error or response.status_code >= 400 else 'succeeded',
                                 send_state='response_received', http_status=response.status_code, response_error=error)
+                            if not error and response.status_code < 400:
+                                recorder.last_request_event = capture_event
                         except Exception as exc:
                             recorder.evidence_store.fail(exc)
                     try:
@@ -255,6 +258,7 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        self.last_request_event = None
         replacements = []
         if self.evidence_store:
             from .execution_capture import text_sources

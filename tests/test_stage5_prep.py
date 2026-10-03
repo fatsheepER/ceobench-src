@@ -140,7 +140,7 @@ def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
     for word in ('PF', 'pf ', 'pf_', '@v1', '[pf:', '"compare"', 'delivered', 'last saw', 'keeps the note'):
         assert word not in git_text, word
     for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'keeps the note',
-                 'path@week-N', 'last saw'):
+                 'path@week-N', 'this request'):
         assert word in pf_text, word
     # The function tools are those of Git; PF adds only the optional note on three of them.
     names = lambda pf: [t['name'] for t in get_bash_agent_tool_descriptions(True, pf)]
@@ -160,12 +160,14 @@ def test_pf_accepts_committed_file_references(workspace, tmp_path):
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
     (workspace / 'evidence.json').write_text('{"n":8}')
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
-    # The committed bytes ({"n":7}) were delivered earlier; bind that capture, not the newest read.
+    # A commit is an explicit identity too: pin its captured bytes, while the
+    # reading audit records that only n=8 is present in this request.
     result = call(registry, 'create', **declaration({'path': 'evidence.json', 'commit': head[:7]}))
     shown = result['evidence'][0]
     assert shown['commit'] == head[:7] and shown['version'] != shown['latest'] and shown['differs']
     binding = store.load_state('declaration:' + result['version'])['references'][0]
     assert binding['git_content_matches'] and store.get_content(binding['version_id'])[1] == b'{"n":7}'
+    assert binding['reading_scope'] == 'not_in_request' and not binding['delivered_in']
     # A bare path keeps the PF rule: the version last sent to the model.
     bare = store.load_state('declaration:' + call(registry, 'create', **declaration({'path': 'evidence.json'}))['version'])
     assert store.get_content(bare['references'][0]['version_id'])[1] == b'{"n":8}'

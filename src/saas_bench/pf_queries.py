@@ -3,6 +3,7 @@ from collections import defaultdict, deque
 from contextlib import closing
 import difflib
 import json
+import re
 import time
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -47,7 +48,16 @@ class SearchObject(Input):
 
 class Search(Page):
     object: SearchObject | None = None
+    text: Text | None = None
     all: bool = False
+
+    @model_validator(mode='after')
+    def search_mode(self):
+        if not self.cursor and (self.object is None) == (self.text is None):
+            raise ValueError('Specify one object or literal text')
+        if self.text is not None and self.all:
+            raise ValueError('Text search already includes historical versions')
+        return self
 
 
 class Versions(Page):
@@ -256,6 +266,8 @@ class PFQueries:
         if isinstance(page, str):
             return page  # pf_read content and diff keep their header line and exact body
         if operation == 'pf_search':
+            if 'text' in self.values:
+                return self._render_text_search(page)
             if 'sections' in page:
                 return pf_render.render_search(page)
             wanted = self.values['object']
@@ -294,6 +306,8 @@ class PFQueries:
         self._index(cutoff)
         self.operation, self.values = operation, values
         if operation == 'pf_search':
+            if 'text' in values:
+                return self._search_text(values['text'], offset)
             if 'object' not in values:
                 raise ValueError('object is required')
             wanted = values['object']
@@ -469,32 +483,12 @@ class PFQueries:
                 else:
                     # Do not advance the ordinary problem's last verification date.
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
-            surveys = {}
-            for rows in traced.values():
-                for row in rows:
-                    target = row['edge']['target']
-                    if target and not row['historical_only'] and 'cached_check' not in row:
-                        request = self.events[self.nodes[target]['event_id']]['request'].get('request') or {}
-                        if (request.get('parsed') or {}).get('tool') == 'get_group_insights':
-                            item = self._describe(target)
-                            surveys[item['version']] = item
             text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
-                                          condition_only=len(continuing), pending=len(self.review_pending),
-                                          surveys=surveys.values())
+                                          condition_only=len(continuing), pending=len(self.review_pending))
             if self.review_pending:
-                old = [(v, p) for v, p in self.review_pending.items() if p['first_day'] != day]
-                text += f'\nPending review: {len(self.review_pending)} texts; ordinary findings remain dated until revision or pf depend; transient read failures retry with backoff.'
-                groups = defaultdict(list)
-                for v, p in old:
-                    record = self.records[v]['version']
-                    reason = p['reason']
-                    if reason['check']['predicate_result'] == 'cannot_check':
-                        text += (f"\n  {record}: first found day {p['first_day']}, last verified day {p['last_day']}; "
-                                 + pf_render.dependency_line(reason, relation=False) + f'; pf depend {record} --detail')
-                    else:
-                        groups[(p['first_day'], p['last_day'])].append(record)
-                for (first, last), records in groups.items():
-                    text += f"\n  {', '.join(records)}: first found day {first}, last verified day {last}; pf depend {records[0]} --detail"
+                text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "text")}. '
+                         'Use text_list with review="pending" for dated findings; '
+                         'pf depend rN rechecks one text. Pending does not retire a text.')
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
             self.store.complete(event, index=self.index_stats, check=self.check_stats,
@@ -1072,6 +1066,54 @@ class PFQueries:
         if len(text) > 30000:
             text = text[:30000] + f'\n[truncated; pf show {name} for the whole file]'
         return text
+
+    def _search_text(self, term, offset):
+        """Literal, case-insensitive search of public history at the cursor cutoff."""
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        matches, seen = [], set()
+        handles = evidence_handles.index(self.store)
+        with closing(self.store.connect()) as conn:
+            for version, row in reversed(self.nodes.items()):
+                if self._rerun(version):
+                    continue
+                key = (handles.key(version), row['content_hash'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    body = self.resolver.content(version, connection=conn)[1].decode('utf-8')
+                except UnicodeDecodeError:
+                    continue
+                match = pattern.search(body)
+                if match:
+                    start, end = max(0, match.start() - 80), min(len(body), match.start() + 200)
+                    matches.append(dict(source_version=version,
+                        day=self.event_day[row['event_id']], snippet=body[start:end], source_range=[start, end]))
+        # Bound rendered excerpts too, so a large --limit never skips hits when
+        # the enclosing Bash return reaches its character limit.
+        end, size = offset, 0
+        for item in matches[offset:offset + self.values['limit']]:
+            name = self.resolver.handle(item['source_version'])
+            width = len(name) + len(item['snippet']) + 80
+            if end > offset and size + width > 22000:
+                break
+            item['version'] = name
+            size += width
+            end += 1
+        return dict(items=matches[offset:end], next_cursor=self._cursor(end) if end < len(matches) else None,
+                    remaining=len(matches) - end, total=len(matches), detail=self.values['detail'])
+
+    def _render_text_search(self, page):
+        text = f"pf search --text {self.values['text']!r}: {page['total']} matching objects/content versions, newest first."
+        sources = []
+        for item in page['items']:
+            text += f"\n{item['version']} · day {item['day']} · excerpt:\n"
+            sources.append(dict(version_id=item['source_version'], source_range=item['source_range'],
+                                request_range=[len(text), len(text) + len(item['snippet'])], full_source=False))
+            text += item['snippet']
+        if page['next_cursor']:
+            text += f"\n{page['remaining']} more: pf more {page['next_cursor']}."
+        return CapturedText(text, sources)
 
     def _sections(self, matches, wanted):
         """pf search: registered texts, business writes and latest outputs about one object."""

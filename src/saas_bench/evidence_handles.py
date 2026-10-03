@@ -59,6 +59,7 @@ class HandleIndex:
         self.version_rowid = self.request_rowid = 0
         self.day = 0
         self.events = {}                    # visible event -> (kind, request record, day)
+        self.model_requests = []            # visible model sends, in acquisition order
         self.notes = {}                     # visible event -> (day, note) the agent attached to that call
         self.info = {}                      # version -> (object key, group)
         self.groups = defaultdict(list)     # object key -> [group], oldest first
@@ -90,8 +91,11 @@ class HandleIndex:
                     # Later events happen on the simulated day of the latest weekly dashboard.
                     self.day = (record.get('request') or {}).get('day', self.day)
                 args = record.get('request') if isinstance(record.get('request'), dict) else {}
+                if record['kind'] == 'model_request':
+                    self.model_requests.append((row['event_id'], args.get('context_id')))
                 # Keep only what names an object; commands and wire bodies stay in the store.
                 self.events[row['event_id']] = (record['kind'], dict(
+                    model_context_id=record.get('model_context_id'),
                     call=record.get('call'), request={k: args[k] for k in ('method', 'path', 'parsed', 'script', 'name')
                                                       if k in args}), self.day)
                 # A note on a call covers what it ran, e.g. the scripts of a bash command.

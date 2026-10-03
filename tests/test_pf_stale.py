@@ -243,9 +243,9 @@ def test_all_sdk_reads_preserve_world_and_all_random_streams(workspace, tmp_path
 def test_refresh_permission_rejection_timeout_and_lossy_results(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server)
     for index, (sql, reason) in enumerate([
-        ('SELECT * FROM group_insight_snapshots', 'read_rejected'),
-        ('SELECT actual_completion_day AS done_on FROM main.research_projects', 'read_rejected'),
-        ('WITH c AS (SELECT 1) UPDATE main.ledger SET amount=99', 'read_rejected'),
+        ('SELECT * FROM group_insight_snapshots', 'refresh_failed:rejected'),
+        ('SELECT actual_completion_day AS done_on FROM main.research_projects', 'refresh_failed:rejected'),
+        ('WITH c AS (SELECT 1) UPDATE main.ledger SET amount=99', 'refresh_failed:rejected'),
         ('SELECT 1 AS n,2 AS n', 'duplicate_columns'),
         ('WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<5001) SELECT n FROM x', 'source_truncated'),
         ("SELECT X'41' AS n", 'blob_coercion'),
@@ -261,7 +261,7 @@ def test_refresh_permission_rejection_timeout_and_lossy_results(workspace, tmp_p
     sql = 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) AS n FROM x'
     version = record_sql(store, sql, dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1))
     record = cite(store, registry, executor, version)
-    assert forward(executor, record['id'])['items'][0]['check']['reason'] == 'read_timed_out'
+    assert forward(executor, record['id'])['items'][0]['check']['reason'] == 'refresh_failed:timed_out'
     assert not store.fault
 
 

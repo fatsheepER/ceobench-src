@@ -4147,58 +4147,48 @@ class Simulator:
             }
 
             def _make_regular_call(inp=cand_with_sentiment, pf=prefetched):
-                try:
-                    response = self.customer_simulator.generate_social_post(
-                        day=self.current_day,
-                        customer_id=inp['customer_id'],
-                        satisfaction=inp['satisfaction'],
-                        group_id=inp['group_id'],
-                        sentiment=inp['sentiment'],
-                        post_type=inp['post_type'],
-                        event_context=inp['event_context'],
-                        recent_posts=recent_post_texts,
-                        _prefetched=pf,
-                        _skip_log_cost=True,
-                    )
-                    return {'type': 'regular', **inp, 'text': response.text, 'success': True,
-                            'input_tokens': response.input_tokens, 'output_tokens': response.output_tokens}
-                except Exception as e:
-                    import sys
-                    print(f"[sim] social post LLM failed for customer {inp['customer_id']}: {e}", file=sys.stderr)
-                    return {'type': 'regular', **inp, 'text': None, 'success': False}
+                response = self.customer_simulator.generate_social_post(
+                    day=self.current_day,
+                    customer_id=inp['customer_id'],
+                    satisfaction=inp['satisfaction'],
+                    group_id=inp['group_id'],
+                    sentiment=inp['sentiment'],
+                    post_type=inp['post_type'],
+                    event_context=inp['event_context'],
+                    recent_posts=recent_post_texts,
+                    _prefetched=pf,
+                    _skip_log_cost=True,
+                )
+                return {'type': 'regular', **inp, 'text': response.text, 'success': True,
+                        'input_tokens': response.input_tokens, 'output_tokens': response.output_tokens}
 
             unified_calls.append(_make_regular_call)
 
         # Macro posts (batch + publication) — each gets its own Bedrock call
         for macro_item in macro_work:
             def _make_macro_call(item=macro_item):
-                try:
-                    config = self.config
-                    social_model = config.social_post_llm_model
-                    social_provider = config.social_post_llm_provider
+                config = self.config
+                social_model = config.social_post_llm_model
+                social_provider = config.social_post_llm_provider
 
-                    text, in_tok, out_tok = self.customer_simulator.complete_text(
-                        provider=social_provider,
-                        model=social_model,
-                        system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
-                        user=item['prompt'],
-                        max_tokens=300,
-                        temperature=config.social_media_temperature,
-                    )
+                text, in_tok, out_tok = self.customer_simulator.complete_text(
+                    provider=social_provider,
+                    model=social_model,
+                    system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                    user=item['prompt'],
+                    max_tokens=300,
+                    temperature=config.social_media_temperature,
+                )
 
-                    # Clean: strip numbering/bullets if LLM added them
-                    import re
-                    text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
-                    text = re.sub(r'^[-•]\s*', '', text).strip()
-                    text = text.strip('"').strip("'")
+                # Clean: strip numbering/bullets if LLM added them
+                import re
+                text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
+                text = re.sub(r'^[-•]\s*', '', text).strip()
+                text = text.strip('"').strip("'")
 
-                    return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': in_tok,
-                            'output_tokens': out_tok}
-                except Exception as e:
-                    import sys
-                    print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
-                    return {'type': 'macro', **item, 'text': None, 'success': False}
+                return {'type': 'macro', **item, 'text': text, 'success': True,
+                        'input_tokens': in_tok,
+                        'output_tokens': out_tok}
 
             unified_calls.append(_make_macro_call)
 
@@ -4303,56 +4293,46 @@ class Simulator:
             }
 
             def _make_regular_call(inp=cand_with_sentiment, pf=prefetched):
-                try:
-                    response = self.customer_simulator.generate_social_post(
-                        day=self.current_day,
-                        customer_id=inp['customer_id'],
-                        satisfaction=inp['satisfaction'],
-                        group_id=inp['group_id'],
-                        sentiment=inp['sentiment'],
-                        post_type=inp['post_type'],
-                        event_context=inp['event_context'],
-                        recent_posts=recent_post_texts,
-                        _prefetched=pf,
-                        _skip_log_cost=True,
-                    )
-                    return {'type': 'regular', **inp, 'text': response.text, 'success': True,
-                            'input_tokens': response.input_tokens, 'output_tokens': response.output_tokens}
-                except Exception as e:
-                    import sys
-                    print(f"[sim] social post LLM failed for customer {inp['customer_id']}: {e}", file=sys.stderr)
-                    return {'type': 'regular', **inp, 'text': None, 'success': False}
+                response = self.customer_simulator.generate_social_post(
+                    day=self.current_day,
+                    customer_id=inp['customer_id'],
+                    satisfaction=inp['satisfaction'],
+                    group_id=inp['group_id'],
+                    sentiment=inp['sentiment'],
+                    post_type=inp['post_type'],
+                    event_context=inp['event_context'],
+                    recent_posts=recent_post_texts,
+                    _prefetched=pf,
+                    _skip_log_cost=True,
+                )
+                return {'type': 'regular', **inp, 'text': response.text, 'success': True,
+                        'input_tokens': response.input_tokens, 'output_tokens': response.output_tokens}
 
             unified_calls.append(_make_regular_call)
 
         for macro_item in macro_work:
             def _make_macro_call(item=macro_item):
-                try:
-                    config = self.config
-                    social_model = config.social_post_llm_model
-                    social_provider = config.social_post_llm_provider
+                config = self.config
+                social_model = config.social_post_llm_model
+                social_provider = config.social_post_llm_provider
 
-                    text, in_tok, out_tok = self.customer_simulator.complete_text(
-                        provider=social_provider,
-                        model=social_model,
-                        system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
-                        user=item['prompt'],
-                        max_tokens=300,
-                        temperature=config.social_media_temperature,
-                    )
+                text, in_tok, out_tok = self.customer_simulator.complete_text(
+                    provider=social_provider,
+                    model=social_model,
+                    system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                    user=item['prompt'],
+                    max_tokens=300,
+                    temperature=config.social_media_temperature,
+                )
 
-                    import re
-                    text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
-                    text = re.sub(r'^[-•]\s*', '', text).strip()
-                    text = text.strip('"').strip("'")
+                import re
+                text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
+                text = re.sub(r'^[-•]\s*', '', text).strip()
+                text = text.strip('"').strip("'")
 
-                    return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': in_tok,
-                            'output_tokens': out_tok}
-                except Exception as e:
-                    import sys
-                    print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
-                    return {'type': 'macro', **item, 'text': None, 'success': False}
+                return {'type': 'macro', **item, 'text': text, 'success': True,
+                        'input_tokens': in_tok,
+                        'output_tokens': out_tok}
 
             unified_calls.append(_make_macro_call)
 
@@ -4376,15 +4356,17 @@ class Simulator:
         executor, futures, influence_cache = async_state
         results = []
         # Submission-order iteration — deterministic DB write order across runs.
-        for future in futures:
-            results.append(future.result())
-        executor.shutdown(wait=False)
+        try:
+            for future in futures:
+                results.append(future.result())
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         self._process_social_post_results(results, influence_cache)
 
     def _process_social_post_results(self, results: list, influence_cache: dict):
         """Process completed social post results and write to DB."""
-        from .personas import calculate_virality, generate_template_post
+        from .personas import calculate_virality
         from .database import add_social_media_post
 
         macro_post_count = 0
@@ -4395,7 +4377,7 @@ class Simulator:
             if result['type'] == 'regular':
                 # Regular customer post
                 if not result['success'] or not result['text']:
-                    content = generate_template_post(result['group_id'], result['sentiment'], self.rng)
+                    raise RuntimeError('Live customer simulator returned no social post')
                 else:
                     content = result['text']
 
@@ -4689,17 +4671,14 @@ class Simulator:
                 # Python 3.7+) — not `as_completed`, which yields in completion
                 # order and would make DB write ordering non-deterministic.
                 for future, gid in judge_futures.items():
-                    try:
-                        effect, reasoning, in_tok, out_tok = future.result()
-                        effect_by_group[gid] = effect
-                        reasoning_by_group[gid] = reasoning
-                        # Log cost
-                        self.customer_simulator._log_cost(
-                            self.current_day, 'agent_social_judge',
-                            in_tok, out_tok, model=social_model
-                        )
-                    except Exception:
-                        effect_by_group[gid] = 0.0
+                    effect, reasoning, in_tok, out_tok = future.result()
+                    effect_by_group[gid] = effect
+                    reasoning_by_group[gid] = reasoning
+                    # Log cost
+                    self.customer_simulator._log_cost(
+                        self.current_day, 'agent_social_judge',
+                        in_tok, out_tok, model=social_model
+                    )
 
             # Compute views per group from effect scores
             # Linear 1x-3x below viral threshold, exponential 3x-100x above
@@ -4833,6 +4812,7 @@ class Simulator:
                         except Exception as _e:
                             with open(_debug_log, "a") as _df:
                                 _df.write(f"  FAIL: {gid}: {_e}\n{_tb.format_exc()}\n")
+                            raise
 
             # Store comment post IDs on the agent post
             if comment_post_ids:
@@ -5718,18 +5698,18 @@ Requirements:
             competitor_name = competitor_names[int(self._competitor_rng.integers(0, len(competitor_names)))]
             perspective = perspectives[int(self._competitor_rng.integers(0, len(perspectives)))]
 
-            # Try LLM generation first, fall back to templates
+            # Live service failures propagate; templates are reserved for offline/replay mode.
             content = None
             if self.customer_simulator:
-                try:
-                    content = self._generate_competitor_post_llm(
-                        competitor_name, noisy_boost, severity,
-                        event['description'], product_name, perspective
-                    )
-                except Exception as e:
-                    print(f"[WARN] Competitor post LLM generation failed: {e}")
+                content = self._generate_competitor_post_llm(
+                    competitor_name, noisy_boost, severity,
+                    event['description'], product_name, perspective
+                )
 
             if not content:
+                from . import llm_replay
+                if self.customer_simulator and not llm_replay.is_enabled():
+                    raise RuntimeError('Live customer simulator returned no competitor post')
                 content = self._generate_competitor_post_template(
                     competitor_name, severity
                 )

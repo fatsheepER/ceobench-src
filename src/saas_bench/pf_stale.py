@@ -67,13 +67,13 @@ def compare(resolver, before, after, reference, kind, events=None):
     old_meta, old = resolver.content(before)
     new_meta, new = resolver.content(after)
     cached = events if events is not None else {}
-    for meta in (old_meta, new_meta):
+    for meta, failure in ((old_meta, 'original_execution_failed'), (new_meta, 'refresh_failed')):
         event_id = meta['created_by_event']
         if event_id not in cached:
             cached[event_id] = resolver.store.read_event(event_id)
         event = cached[event_id]
         if event['result'].get('status') != 'succeeded':
-            raise ValueError('read_' + event['result'].get('status', 'failed'))
+            raise ValueError(failure + ":" + event['result'].get('status', 'unknown'))
         if meta['source_truncated']:
             raise ValueError('source_truncated')
         if meta['extent'] != 'full':

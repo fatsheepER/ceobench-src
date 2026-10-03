@@ -31,6 +31,9 @@ class Message:
     reasoning_content: Optional[str] = None
 
 
+NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week with the rationale and "
+                    "12 dollar-valued forecasts specified in the system instructions.")
+
 # Regex to detect dashboard in bash output (day advancement)
 _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
 
@@ -283,6 +286,7 @@ class BashAgent(BaseAgent):
         if self.evidence_store:
             import uuid
             self.usage_recorder.context_id = uuid.uuid4().hex
+            self.usage_recorder.last_request_event = None
         self._pending_tool_calls = []
         self._observation_recorded = False
 
@@ -736,10 +740,7 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no tool_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=(
-                            "You must call a tool to proceed. If you have nothing else to do this week, "
-                            "call `./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash to advance."
-                        )
+                        content=NO_TOOL_FEEDBACK
                     ))
                     continue
 
@@ -927,10 +928,7 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no function_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=(
-                            "You must call a tool to proceed. If you have nothing else to do this week, "
-                            "call `./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash to advance."
-                        )
+                        content=NO_TOOL_FEEDBACK
                     ))
                     continue
 
@@ -1080,9 +1078,7 @@ class BashAgent(BaseAgent):
             preview = preview[:1200] + "..."
 
         return (
-            "You must call a tool to proceed. If you need context, use read_file, "
-            "search_files, or bash. If you have nothing else to do this week, call "
-            "`./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash. "
+            NO_TOOL_FEEDBACK + " "
             f"Previous non-tool response preview: {preview or '(no text)'}"
         )
 

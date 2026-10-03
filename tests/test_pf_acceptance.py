@@ -190,7 +190,7 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
             ('ambiguous rows', [43, 43], False, 'multiple rows'),
             ('wrong type', ['unknown'], False, 'not_numeric'),
             ('truncated', [43] * 5001, False, 'source_truncated'),
-            ('refresh unavailable', [43], True, 'read_failed'),
+            ('refresh unavailable', [43], True, 'refresh_failed:failed'),
         ]:
             server.conn.execute('DELETE FROM ledger')
             server.conn.executemany("INSERT INTO ledger(day,category,amount) VALUES(0,'operations',?)", [(v,) for v in amounts])

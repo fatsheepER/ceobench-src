@@ -59,7 +59,7 @@ CITE_FORMS = dict(
     git='a workspace file path (the version this week\'s closing commit week-N will store), path@week-N or '
         'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>"',
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
-       'version you last saw or wrote), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
+       'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
        'or "unknown: <reason>"')
 _RECORD = re.compile(r'r[1-9][0-9]*(\.[1-9][0-9]*)?')
 _SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')
@@ -251,10 +251,14 @@ class ListTexts(Input):
     limit: Annotated[int, Field(ge=1, le=100)] = 20
 
 
+class PFListTexts(ListTexts):
+    review: Literal['pending'] | None = Field(default=None, description='Only texts with pending source checks; includes first and last verification days.')
+
+
 GIT_CREATE, GIT_REVISE = _declaration_models(pf=False)
 PF_CREATE, PF_REVISE = _declaration_models(pf=True)
 MODELS = dict(git=dict(create=GIT_CREATE, revise=GIT_REVISE, retire=Retire, list=ListTexts),
-              pf=dict(create=PF_CREATE, revise=PF_REVISE, retire=Retire, list=ListTexts))
+              pf=dict(create=PF_CREATE, revise=PF_REVISE, retire=Retire, list=PFListTexts))
 MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word for word.
 
 
@@ -306,5 +310,10 @@ def tool_definitions(pf=False):
                 'Does not check them. Pass next_after as after for the next page.',
     }
     models = MODELS[group]
+    if pf:
+        descriptions['create'] += (' An explicit whole-version citation binds that captured version even when its body '
+                                   'is absent from this request; reading scope is recorded separately. '
+                                   'Selected fields require coverage in this request or your own current-context file write.')
+        descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
             for name, model in models.items()]

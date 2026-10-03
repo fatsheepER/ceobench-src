@@ -1,5 +1,6 @@
 """Workspace declarations with private evidence bindings kept outside the workspace."""
 from copy import deepcopy
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import subprocess
@@ -45,6 +46,10 @@ class TextRegistry:
         return value
 
     def execute(self, operation, args):
+        with self.resolver.binding_scope() if self.resolver else nullcontext():
+            return self._execute(operation, args)
+
+    def _execute(self, operation, args):
         try:
             values = MODELS[self.mode][operation].model_validate(args).model_dump(exclude_none=True)
         except ValidationError as exc:
@@ -156,9 +161,9 @@ class TextRegistry:
         if note := handles.note(binding['version_id']):
             text += f' — source note: "{pf_render.short(note[1], 120)}"'
         if shown['differs']:
-            text += f" (as you last saw it; now {shown['latest']}, {self._change(binding)})"
-        if binding.get('reading_scope') in ('partial', 'not_read'):
-            scope = 'part read' if binding['reading_scope'] == 'partial' else 'not read'
+            text += f" (latest captured {shown['latest']}, {self._change(binding)})"
+        if binding.get('reading_scope') in ('partial', 'not_in_request', 'not_read'):
+            scope = 'part of body present in this request' if binding['reading_scope'] == 'partial' else 'body not present in this request'
             text += f" (whole captured object; {scope}; pf show {shown['version']} --full)"
         return text
 
@@ -315,9 +320,18 @@ class TextRegistry:
         version, latest = (self.resolver.handle(binding[k]) for k in ('version_id', 'latest_version_id'))
         return dict(shown, version=version, latest=latest, differs=version != latest)
 
-    def _list(self, state, after, limit):
+    def _list(self, state, after, limit, review=None):
         active = [versions[-1] for key, versions in sorted(state['records'].items(), key=lambda kv: int(kv[0][1:]))
                   if int(key[1:]) > after and versions[-1]['status'] == 'active']
+        pending = (self.store.load_state('pf_review') or {}).get('pending', {}) if self.mode == 'pf' else {}
+        checks = {}
+        for record in active:
+            binding = self.store.load_state('declaration:' + record['version']) if self.mode == 'pf' else None
+            if binding and (check := pending.get(binding['version_id'])):
+                checks[record['version']] = dict(status='pending', first_day=check['first_day'], last_day=check['last_day'],
+                    reason=pf_render.dependency_line(check['reason'], relation=False))
+        if review == 'pending':
+            active = [record for record in active if record['version'] in checks]
         page = active[:limit]
         result, origins = '{"records":[', []
         for record in page:
@@ -331,4 +345,6 @@ class TextRegistry:
             result += content
         next_after = int(page[-1]['id'][1:]) if len(active) > limit else None
         result += '],"next_after":' + json.dumps(next_after) + '}'
+        if self.mode == 'pf':
+            result = result[:-1] + ',"checks":' + json.dumps({r['version']: checks.get(r['version']) for r in page}) + '}'
         return CapturedText(result, origins)

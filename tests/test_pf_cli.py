@@ -114,8 +114,7 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
     call(registry, 'create', **declaration({'record': 'r1.2'}, text='Depends on the plan'))
     assert registry.weekly_check(7).startswith('=== Check of your registered texts (day 7) ===\n2 active texts')
     late = registry.weekly_check(14)
-    assert late.endswith('Not checked because their applies window is over: r1.2 '
-                         '(text_retire them if you no longer use them).'), late
+    assert late.endswith('Not checked: 1 text past the applies window.'), late
     with pytest.raises(ValueError, match='applies must be'):
         registry.execute('create', dict(text='x', objects=[dict(kind='plan', id='B')], applies='soon',
                                         reason='r', references=[]))

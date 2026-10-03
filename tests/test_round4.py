@@ -71,14 +71,19 @@ def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runn
         assert 'failed' in receipt and 'sqlite_master' in receipt and 'exit code: 1' in receipt
         assert 'List DB tables' in receipt
     query = runner.tool_executor.pf_queries
-    assert 'read_failed' in query.weekly_check(7)
+    assert 'original_execution_failed' in query.weekly_check(7)
     saved = runner.evidence_store.load_state('pf_review')
     second = query.weekly_check(14)
     assert runner.evidence_store.load_state('pf_review') == saved
-    for i in (1, 2):
-        line = next(line for line in second.splitlines() if f'pf depend r{i}.1 --detail' in line)
-        assert 'read_failed' in line and handle in line
-        assert 'first found day 7, last verified day 7' in line
+    assert 'Pending review: 2 texts' in second and 'original_execution_failed' not in second
+    listed = json.loads(runner._execute_tool('text_list', {'review': 'pending', 'limit': 1}))
+    assert listed['next_after'] == 1 and len(listed['records']) == 1
+    assert listed['records'][0]['status'] == 'active'
+    check = listed['checks']['r1.1']
+    assert check['first_day'] == check['last_day'] == 7
+    assert 'original_execution_failed' in check['reason'] and handle in check['reason']
+    more = json.loads(runner._execute_tool('text_list', {'review': 'pending', 'after': listed['next_after']}))
+    assert [r['version'] for r in more['records']] == ['r2.1']
     history = runner._execute_tool('bash', dict(command='./novamind-operation query '
         '"SELECT * FROM config_overrides ORDER BY day DESC LIMIT 40"; pf log MEMORY.md'))
     send(runner.evidence_store, history)
@@ -87,7 +92,10 @@ def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runn
         reason='The earlier citation was a rejected table lookup', references=[dict(cite=correct)]))
     assert revised.startswith('Revised r1.2') and 'config_overrides' in revised
     third = query.weekly_check(21)
-    assert 'pf depend r2.1 --detail' in third and 'pf depend r1.1 --detail' not in third
+    assert 'Pending review:' in third
+    listed = json.loads(runner._execute_tool('text_list', {'review': 'pending'}))
+    assert 'r2.1' in listed['checks'] and 'r1.1' not in listed['checks']
+    assert listed['checks']['r2.1']['first_day'] == listed['checks']['r2.1']['last_day'] == 7
     records = json.loads(runner.tool_executor.text_registry.path.read_text())['records']['r1']
     assert records[0]['references'][0]['evidence']['version'] == handle
     assert records[1]['references'][0]['evidence']['version'] == correct
@@ -207,6 +215,18 @@ def test_runner_cancels_after_week_advance_only(offline_runner, monkeypatch):
     results = [m for m in runner.agent.conversation if m.role == 'tool']
     assert [m.tool_call_id for m in results] == ['0', '1', '2', '3']
     assert results[-1].content.startswith('Cancelled:')
+    # The entire tool batch came from one recorded model request, including the
+    # write that precedes the context reset caused by next-week.
+    from contextlib import closing
+    with closing(runner.evidence_store.connect()) as conn:
+        facts = [json.loads(row[0]) for row in conn.execute("SELECT request FROM requests WHERE "
+            "json_extract(request, '$.request.path') IN ('before','missing') AND "
+            "json_extract(request, '$.model_request_event') IS NOT NULL")]
+    assert len(facts) == 2
+    assert len({f['model_request_event'] for f in facts}) == 1
+    request = runner.evidence_store.read_event(facts[0]['model_request_event'])
+    assert request['result']['send_state'] == 'response_received'
+    assert all(f['model_context_id'] == request['request']['request']['context_id'] for f in facts)
 
 
 def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_runner, monkeypatch, tmp_path):
@@ -274,6 +294,7 @@ def test_pending_review_keeps_conditions_live_and_manual_scope_matters(workspace
     store, registry, executor = chain(workspace, tmp_path, server)
     source = store.load_state('declaration:r1.1')['references'][0]['version_id']
     handle = registry.resolver.handle(source)
+    send(store, executor.execute('pf_read', {'target': {'version': handle}}))
     call(registry, 'revise', record='r1', reason='add an explicit condition', references=[
         dict(evidence={'version': handle}, purpose='current'),
         dict(evidence={'version': handle}, purpose='current', select={'col': 'amount'},
@@ -410,10 +431,10 @@ def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_pa
     cite(store, registry, executor, version)
     executor.pf_queries.refresh = lambda versions, parent: {v: acquire(parent) for v in versions}
     day[0] = 308
-    for output in (executor.weekly_check(308),
-                   executor.execute('bash', dict(command=f'pf log {handle}'))):
-        assert 'survey day 0' in output and 'checked day 308' in output
-        assert 'acquired day' in output and 'research_group' in output
+    assert 'Survey dates' not in executor.weekly_check(308)
+    output = executor.execute('bash', dict(command=f'pf log {handle}'))
+    assert 'survey day 0' in output and 'checked day 308' in output
+    assert 'acquired day' in output and 'research_group' in output
     header = json.loads(executor.execute('pf_read', dict(target={'version': handle})).split('\n')[0])
     assert header['target']['snapshot_day'] == 0
 

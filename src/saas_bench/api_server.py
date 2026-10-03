@@ -959,6 +959,9 @@ class NovaMindAPIServer:
                 "elapsed": elapsed,
                 "message": f"step_week exceeded {self.STEP_WEEK_TIMEOUT}s timeout ({elapsed:.1f}s elapsed). Save checkpoint and exit.",
             }
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
         executor.shutdown(wait=False)
 
         self._last_step_elapsed = _time.monotonic() - _step_start
