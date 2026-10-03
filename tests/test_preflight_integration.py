@@ -277,6 +277,64 @@ def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, mo
     assert summary['simulator']['calls'] > 0
 
 
+@pytest.mark.parametrize('first_response', ['no_tool', 'invalid_json', 'http_error', 'missing_usage'])
+def test_harness_counts_every_response_when_act_regenerates(offline_runner, monkeypatch, first_response):
+    import httpx
+    from openai import OpenAI
+    from test_preflight_usage import reply
+    runner = offline_runner(stop_after_day=14)
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        assert len(requests) <= 4
+        body = reply('chat')
+        if len(requests) % 2:
+            if first_response == 'http_error':
+                return httpx.Response(503, json={'error': {'message': 'offline retry'}})
+            body['choices'][0]['finish_reason'] = 'length'
+            body['usage']['completion_tokens'] = 16384
+            if first_response == 'invalid_json':
+                body['choices'][0]['message']['tool_calls'] = [dict(id=f'bad-{len(requests)}', type='function',
+                    function=dict(name='bash', arguments='{invalid'))]
+            elif first_response == 'missing_usage':
+                body.pop('usage')
+        else:
+            body['usage']['prompt_tokens'] = 20
+            command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+            body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
+                function=dict(name='bash', arguments=json.dumps({'command': command})))]
+        return httpx.Response(200, json=body)
+    runner.client.close()
+    runner.client = OpenAI(api_key='offline-only', base_url='https://api.deepseek.com', max_retries=0,
+                           http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    runner.agent.client = runner.agent.usage_recorder.attach(runner.client)
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    result = runner.run(verbose=False)
+    assert result['days_run'] == 14 and result['outcome'] == 'stopped'
+    assert len(requests) == 4
+    timing = [json.loads(line) for line in runner.timing_log_file.read_text().splitlines()]
+    acts = [row for row in timing if row['event'] == 'llm_call']
+    days = [row for row in timing if row['event'] == 'day_summary']
+    assert len(acts) == len(days) == 2
+    first_known = first_response in ('no_tool', 'invalid_json')
+    expected = dict(input_tokens=30 if first_known else 20, output_tokens=16386 if first_known else 2,
+                    cached_tokens=6 if first_known else 3, reasoning_tokens=2 if first_known else 1)
+    for field, value in expected.items():
+        assert [row[field] for row in acts] == [value, value]
+        assert [row['day_' + field] for row in days] == [value, value]
+    assert [row['model_calls'] for row in acts] == [2, 2]
+    assert [row['day_model_calls'] for row in days] == [2, 2]
+    assert [row['usage_missing']['input_tokens'] for row in acts] == [int(not first_known)] * 2
+    assert [row['day_usage_missing']['input_tokens'] for row in days] == [int(not first_known)] * 2
+    assert all(row['cache_creation_tokens'] is None and row['usage_missing']['cache_creation_tokens'] == 2
+               for row in acts)
+    summary = json.loads((runner.workspace_dir / 'usage_summary.json').read_text())['agent']
+    assert summary['calls'] == 4 and summary['known']['input_tokens'] == 2 * expected['input_tokens']
+    for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'reasoning_tokens'):
+        assert sum(row[field] for row in acts) == sum(row['day_' + field] for row in days) == summary['known'][field]
+
+
 def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_runner, monkeypatch):
     from saas_bench.environment import Action
     runner = offline_runner()

@@ -12,6 +12,7 @@ access. This ensures the harness and the public repo have identical interfaces.
 Supports OpenAI, xAI/Grok, Anthropic (direct and Bedrock).
 """
 
+import copy
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ if str(package_root) not in sys.path:
 
 from openai import OpenAI
 from saas_bench.config import BenchmarkConfig
+from saas_bench.model_usage import usage_delta
 
 try:
     import anthropic
@@ -1323,10 +1325,7 @@ __pycache__/
             day_ended = False
             _day_llm_total = 0.0
             _day_tool_total = 0.0
-            _day_input_tokens = 0
-            _day_output_tokens = 0
-            _day_cached_tokens = 0
-            _day_reasoning_tokens = 0
+            _day_usage_before = copy.deepcopy(self.agent.usage_recorder.summary)
 
             while not day_ended and not game_ended and turns_today < 100:
                 turns_today += 1
@@ -1334,13 +1333,12 @@ __pycache__/
                 # LLM call (timed)
                 _t0 = _time.monotonic()
                 self._begin_operation('model_and_tool', sim_day)
+                _usage_before = copy.deepcopy(self.agent.usage_recorder.summary)
                 action = self.agent.act(observation, 0, False, info)
                 _llm_elapsed = _time.monotonic() - _t0
                 _day_llm_total += _llm_elapsed
-                _day_input_tokens += self.agent.last_input_tokens or 0
-                _day_output_tokens += self.agent.last_output_tokens or 0
-                _day_cached_tokens += self.agent.last_cached_tokens or 0
-                _day_reasoning_tokens += self.agent.last_reasoning_tokens or 0
+                # One act() can regenerate several responses before accepting a tool batch.
+                _usage = usage_delta(_usage_before, self.agent.usage_recorder.summary)
 
                 if action is None:
                     # With the agent's retry-with-feedback loop, _call_* should no
@@ -1362,10 +1360,8 @@ __pycache__/
                 self._log_timing("llm_call", sim_day, turn=turns_today,
                                  elapsed_s=round(_llm_elapsed, 2),
                                  tool=tool_name, tool_preview=tool_args_preview,
-                                 input_tokens=self.agent.last_input_tokens,
-                                 output_tokens=self.agent.last_output_tokens,
-                                 cached_tokens=self.agent.last_cached_tokens,
-                                 reasoning_tokens=self.agent.last_reasoning_tokens,
+                                 **_usage['known'], model_calls=_usage['calls'],
+                                 usage_missing=_usage['missing'],
                                  requested_model=self.model,
                                  served_model=self.agent.last_serving_model,
                                  anthropic_fallback_used=self.agent.last_anthropic_fallback_used,
@@ -1511,6 +1507,11 @@ __pycache__/
             # Per-day timing summary
             _day_elapsed = _time.monotonic() - _day_start
             _day_other = _day_elapsed - _day_llm_total - _day_tool_total - _step_elapsed - _dashboard_elapsed
+            _day_usage = usage_delta(_day_usage_before, self.agent.usage_recorder.summary)
+            _day_input_tokens = _day_usage['known']['input_tokens'] or 0
+            _day_output_tokens = _day_usage['known']['output_tokens'] or 0
+            _day_cached_tokens = _day_usage['known']['cached_tokens'] or 0
+            _day_reasoning_tokens = _day_usage['known']['reasoning_tokens'] or 0
             self._log_timing("day_summary", sim_day,
                              elapsed_s=round(_day_elapsed, 1),
                              llm_total_s=round(_day_llm_total, 1),
@@ -1521,10 +1522,8 @@ __pycache__/
                              turns=turns_today,
                              subs=_subs,
                              cash=_cash,
-                             day_input_tokens=_day_input_tokens,
-                             day_output_tokens=_day_output_tokens,
-                             day_cached_tokens=_day_cached_tokens,
-                             day_reasoning_tokens=_day_reasoning_tokens,
+                             **{'day_' + field: value for field, value in _day_usage['known'].items()},
+                             day_model_calls=_day_usage['calls'], day_usage_missing=_day_usage['missing'],
                              total_input_tokens=self.agent.total_input_tokens,
                              total_output_tokens=self.agent.total_output_tokens,
                              total_cached_tokens=self.agent.total_cached_tokens,

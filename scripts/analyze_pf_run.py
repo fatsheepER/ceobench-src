@@ -11,6 +11,7 @@ import re
 import sqlite3
 
 from saas_bench import pf_cli
+from saas_bench.model_usage import summarize_usage_log
 
 CLOCK = re.compile(r'20\d\d-\d\d-\d\dT\d\d:\d\d')
 RECORD = re.compile(r'\br\d+(?:\.\d+)?\b')
@@ -249,6 +250,7 @@ def analyze(pointer):
                                cached=usage[role]['known']['cached_tokens'], output=usage[role]['known']['output_tokens'],
                                usd=round(usage[role]['known_cost_usd'], 6), missing_cost=usage[role]['missing_cost'])
                     for role in ('agent', 'simulator') if role in usage}
+    out['agent_request_usage'] = summarize_usage_log(run / 'logs/agent_requests.jsonl', start_day=start)
     out['weekly_check_seconds'] = {t['day']: t['elapsed_s'] for t in timing if t.get('event') == 'weekly_check'}
     return out
 

@@ -244,3 +244,63 @@ def test_agent_rejects_empty_tools_before_any_request():
     from saas_bench.agents.bash_agent.agent import BashAgent
     with pytest.raises(ValueError, match='requires tools'):
         BashAgent([], object())
+
+
+def test_usage_log_pairs_responses_by_request_day_and_retains_unknowns(tmp_path):
+    from saas_bench.model_usage import summarize_usage_log
+    events = []
+    def request(call, day):
+        events.append(dict(event='request', call_id=call, day=day))
+    def response(call, body, error=None, cost=None):
+        events.append(dict(event='response', call_id=call, api='chat', response=body,
+                           usage=usage_values(body, 'chat'), error=error, cost_usd=cost))
+    request('prefix', 21)
+    response('prefix', reply('chat'), cost=.1)
+    request('no-tool', 28)
+    request('next-week', 35)
+    response('next-week', reply('chat'), cost=.3)
+    response('no-tool', reply('chat'), cost=.2)
+    request('tool', 28)
+    tool = reply('chat')
+    tool['choices'][0]['message']['tool_calls'] = [dict(id='tool1', type='function',
+        function=dict(name='read_file', arguments='{}'))]
+    tool['usage']['prompt_tokens'] = 20
+    response('tool', tool, cost=.4)
+    request('failed', 28)
+    response('failed', None, error='APITimeoutError')
+    request('unreturned', 28)
+    log = tmp_path / 'agent_requests.jsonl'
+    log.write_text(''.join(json.dumps(row) + '\n' for row in events))
+    usage = summarize_usage_log(log, start_day=28, end_day=35)
+    assert usage['calls'] == 3 and usage['errors'] == 1
+    assert usage['known']['input_tokens'] == 30
+    assert usage['known']['output_tokens'] == 4
+    assert usage['known']['cached_tokens'] == 6
+    assert usage['known']['reasoning_tokens'] == 2
+    assert usage['missing']['input_tokens'] == 1
+    assert usage['known']['cache_creation_tokens'] is None
+    assert usage['missing']['cache_creation_tokens'] == 3
+    assert usage['known_cost_usd'] == pytest.approx(.6) and usage['missing_cost'] == 1
+    assert usage['unreturned_requests'] == 1
+    all_usage = summarize_usage_log(log)
+    assert all_usage['calls'] == 5 and all_usage['known']['input_tokens'] == 50
+
+
+def test_usage_delta_excludes_prior_calls_and_preserves_unknown_or_zero_usage():
+    from saas_bench.model_usage import usage_delta
+    recorder = ModelUsage(None, 'agent')
+    recorder.call('chat', {}, lambda: reply('chat'))
+    previous = copy.deepcopy(recorder.summary)
+    recorder.call('chat', {}, lambda: reply('chat', usage=False))
+    delta = usage_delta(previous, recorder.summary)
+    assert delta['calls'] == 1 and delta['known'] == dict.fromkeys(FIELDS)
+    assert delta['missing'] == dict.fromkeys(FIELDS, 1)
+    previous = copy.deepcopy(recorder.summary)
+    assert usage_delta(previous, recorder.summary) == dict(calls=0, known=dict.fromkeys(FIELDS, 0),
+                                                          missing=dict.fromkeys(FIELDS, 0))
+    zero = reply('chat')
+    zero['usage'] = dict(prompt_tokens=0, completion_tokens=0, prompt_tokens_details={'cached_tokens': 0},
+                         completion_tokens_details={'reasoning_tokens': 0}, cache_creation_input_tokens=0)
+    recorder.call('chat', {}, lambda: zero)
+    delta = usage_delta(previous, recorder.summary)
+    assert delta['calls'] == 1 and delta['known'] == delta['missing'] == dict.fromkeys(FIELDS, 0)

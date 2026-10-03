@@ -69,6 +69,51 @@ def usage_values(response, api):
     return dict(zip(FIELDS, (input_tokens, output_tokens, read, write, reasoning)))
 
 
+def usage_delta(previous, current):
+    """Known subtotals and missing counts for calls made since a summary snapshot."""
+    calls = current['calls'] - previous['calls']
+    missing = {field: current['missing'][field] - previous['missing'][field] for field in FIELDS}
+    known = {field: None if calls and missing[field] == calls else
+             (current['known'][field] or 0) - (previous['known'][field] or 0) for field in FIELDS}
+    return dict(calls=calls, known=known, missing=missing)
+
+
+def summarize_usage_log(path, start_day=0, end_day=None):
+    """Sum every response by its request's day in [start_day, end_day).
+
+    Regenerations and failed calls count even when they produce no tool action.
+    Missing usage remains separate from the known subtotals.
+    """
+    summary = dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
+                   known_cost_usd=None, missing_cost=0, unreturned_requests=0)
+    pending = set()
+    with Path(path).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            call_id = row.get('call_id')
+            if row['event'] == 'request':
+                if row['day'] >= start_day and (end_day is None or row['day'] < end_day):
+                    pending.add(call_id)
+            elif row['event'] == 'response' and call_id in pending:
+                pending.remove(call_id)
+                summary['calls'] += 1
+                summary['errors'] += row.get('error') is not None
+                usage = row.get('usage') or {}
+                for field in FIELDS:
+                    value = usage.get(field)
+                    if value is None:
+                        summary['missing'][field] += 1
+                    else:
+                        summary['known'][field] = (summary['known'][field] or 0) + value
+                cost = row.get('cost_usd')
+                if cost is None:
+                    summary['missing_cost'] += 1
+                else:
+                    summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+    summary['unreturned_requests'] = len(pending)
+    return summary
+
+
 def load_pricing(path):
     """Load a sourced price table; the manifest stores its contents, not its path."""
     data = json.loads(Path(path).read_text())

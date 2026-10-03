@@ -1,4 +1,5 @@
 """Live-model diagnostics on explicitly reconstructed fixtures, never natural adoption."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,9 @@ from test_text_registry import workspace, captured, send
 from test_ceobench_customer_choice import _create_subscribed_customer
 
 ROOT=Path(__file__).resolve().parents[2]
-OUT=Path(__file__).resolve().parent/'round4-postfix/diagnostics'
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--output-dir',type=Path,default=Path(__file__).resolve().parent/'round4-postfix/diagnostics')
+OUT=parser.parse_args().output_dir.resolve()
 OUT.mkdir(parents=True,exist_ok=True)
 assert not (OUT/'frozen-cases.json').exists()
 for k,v in load_env_file(ROOT/'.env').items():os.environ.setdefault(k,v)
