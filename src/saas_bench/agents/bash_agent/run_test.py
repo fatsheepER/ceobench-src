@@ -595,6 +595,9 @@ __pycache__/
                 f"Week {self._last_committed_week} (day {wd})",
                 once_key=f"week-{self._last_committed_week}",
             )
+            registry = getattr(getattr(self, 'tool_executor', None), 'text_registry', None)
+            if registry:
+                registry.finalize_week(f'week-{self._last_committed_week}')
 
     def _initialize_from_public_repo(self):
         """Copy the published layout into the agent workspace and create a session.
@@ -742,7 +745,7 @@ __pycache__/
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
         from .tools import GUEST_WORKSPACE, agent_runtime
-        # Layout 2: fixed guest paths, dedicated agent runtime, no /proc, sessions/ hidden.
+        # Layout 2: fixed guest paths, dedicated agent runtime, sessions/ hidden.
         manifest['agent_sandbox'] = dict(layout=2, workspace=GUEST_WORKSPACE,
                                          runtime=agent_runtime(verify=True) if shutil.which('bwrap') else None)
         if self.sql_evidence_config:
@@ -892,6 +895,8 @@ __pycache__/
         from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
         from saas_bench.db_protection import encrypt_plain_atomic
         self._wait_checkpoint()  # At most one immutable generation is being processed.
+        if self.tool_executor.text_registry:
+            self.tool_executor.text_registry.assert_week_finalized(day)
         started = _time.monotonic()
         if self.agent and self.agent._pending_tool_calls:
             raise RuntimeError('Cannot checkpoint a tool with an unknown outcome')
@@ -1385,8 +1390,8 @@ __pycache__/
                         result = self._execute_tool(action.tool, action.arguments or {})
                     except self._NextDayTimeoutError as e:
                         _tool_elapsed = _time.monotonic() - _t0
-                        print(f"\n⚠️  {tool_name} timed out on sim day {sim_day} ({e})")
-                        raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
+                        print(f"\n⚠️  {tool_name} stopped on sim day {sim_day} ({e})")
+                        raise RuntimeError(f'{e}; branch stopped') from e
                     _tool_elapsed = _time.monotonic() - _t0
                     _day_tool_total += _tool_elapsed
                     observation = result if isinstance(result, str) else json.dumps(result)

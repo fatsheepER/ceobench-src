@@ -102,8 +102,12 @@ class TextRegistry:
                 version = self.store.version(event, 'registered_text', encoded(record),
                                              layer='registered_text', object_id='record:' + record_id)
                 private = dict(version_id=version, references=bindings)
-                self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
-                                   object_id='declaration:' + record['version'])
+                if any(b.get('awaiting_week') for b in bindings):
+                    pending = self.store.load_state('weekly_declarations') or []
+                    self.store.save_state('weekly_declarations', pending + [record['version']])
+                else:
+                    self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
+                                       object_id='declaration:' + record['version'])
                 self.store.save_state('declaration:' + record['version'], private)
                 if owned:
                     self.store.complete(event)
@@ -129,6 +133,74 @@ class TextRegistry:
             lines.append('Business writes this week touching ' + ', '.join(writes[0]) + ': ' + ' · '.join(writes[1]))
         lines += result.get('warnings', [])
         return '\n'.join(lines)
+
+    def finalize_week(self, label):
+        """Publish prefix declarations against the exact bytes of their closing commit.
+
+        Provisional bindings live only in private state, never in the dependency
+        graph. Historical revisions are finalized too, including inherited refs.
+        """
+        if self.mode != 'prefix':
+            return
+        pending = self.store.load_state('weekly_declarations') or []
+        if not pending:
+            return
+        records = {r['version']: r for history in self._load()['records'].values() for r in history}
+        for revision in pending[:]:
+            private = self.store.load_state('declaration:' + revision)
+            refs = private['references']
+            if not any(b.get('awaiting_week') == label for b in refs):
+                continue
+            for i, (ref, binding) in enumerate(zip(records[revision]['references'], refs)):
+                if binding.get('awaiting_week') == label:
+                    refs[i] = self._closing_binding(ref, binding)
+            if any(b.get('awaiting_week') for b in refs):
+                self.store.save_state('declaration:' + revision, private)
+                continue
+            event = self.store.begin_event('prefix_week_binding', dict(revision=revision, week=label))
+            # The declaration and its lookup state become visible together. A crash
+            # cannot publish an old missing edge alongside the completed binding.
+            with self.store.batch():
+                self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
+                                   object_id='declaration:' + revision)
+                self.store.save_state('declaration:' + revision, private)
+                pending.remove(revision)
+                self.store.save_state('weekly_declarations', pending)
+                self.store.complete(event)
+
+    def _closing_binding(self, ref, provisional):
+        binding = dict(git_week=provisional['awaiting_week'])
+        try:
+            evidence, full = git_reference(self.workspace, ref['evidence'])
+            binding['git_commit'] = full
+            raw = subprocess.check_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
+            handles = evidence_handles.index(self.store)
+            handles.refresh()
+            candidates = [v for group in reversed(handles.groups.get(('file', evidence['path']), []))
+                          for v in reversed(group['members'])]
+            matches = [v for v in candidates if self.resolver.content(v)[1] == raw]
+            if not matches:
+                raise ValueError('Closing commit file bytes were not captured in the prefix')
+            if provisional.get('status') == 'resolved' and provisional.get('version_id') in matches:
+                # Retain actual registration-time delivery, never a later read/write.
+                binding.update({k: v for k, v in provisional.items() if k != 'awaiting_week'})
+                binding['latest_version_id'] = candidates[0]
+            elif ref.get('select') or ref.get('predicate'):
+                raise ValueError('Selected closing-commit bytes were not available at registration')
+            else:
+                binding.update(self.resolver._whole_binding(matches[0], candidates[0], [], 'committed_bytes'))
+            binding.update(status='resolved', git_content_matches=True)
+        except ValueError as exc:
+            binding.update(status='unknown', reason=str(exc))
+        return binding
+
+    def assert_week_finalized(self, day):
+        if self.mode == 'prefix':
+            for revision in self.store.load_state('weekly_declarations') or []:
+                private = self.store.load_state('declaration:' + revision)
+                if any(int(b['awaiting_week'].split('-')[1]) * 7 <= day
+                       for b in private['references'] if b.get('awaiting_week')):
+                    raise RuntimeError('Closing-week evidence binding is incomplete: ' + revision)
 
     def _git_cited(self, evidence):
         if 'unknown' in evidence:
@@ -277,6 +349,8 @@ class TextRegistry:
                    dict(status='git', git_week=label) if label else dict(status='registered_text', **evidence))
         if self.mode == 'git':
             return binding
+        if label:
+            binding['awaiting_week'] = label
         accept = None
         if full:
             # Keep the Git identity distinct from the delivered PF version. Bind only a

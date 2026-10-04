@@ -813,13 +813,14 @@ def test_harness_preserves_unfinished_descendants_and_server(offline_runner, mon
     import signal
     from saas_bench.environment import Action
     runner = offline_runner(execution_capture=True)
+    runner.tool_executor.bash_timeout = .3
     runner._save_checkpoint(0)
     pointer = (runner.workspace_dir / 'checkpoint.json').read_bytes()
     monkeypatch.setattr(runner, 'setup', lambda: None)
     monkeypatch.setattr(runner.agent, 'act', lambda *args: Action(tool='bash',
         arguments={'command': 'sleep 60 >/dev/null 2>&1 & echo parent-returned'}))
     try:
-        with pytest.raises(RuntimeError, match='unknown'):
+        with pytest.raises(RuntimeError, match='descendants did not finish before the command deadline'):
             runner.run(verbose=False)
         assert runner._server_proc.poll() is None
         assert runner.tool_executor.preserved_process.poll() is None

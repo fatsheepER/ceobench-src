@@ -93,6 +93,7 @@ pf blame MEMORY.md         the version and day each line was written
 pf depend r4               what r4 cites; reruns the queries behind it and reports changes
 pf rdepend scripts/an_w7d.py.out@v1   registered texts that cite it
 pf search S1               your texts, business writes and latest outputs about S1 (or t10_2, ...)
+pf search --text "market cap"   literal text search across captured history
 ```
 
 Example: MEMORY.md is rewritten almost every week. Before relying on something

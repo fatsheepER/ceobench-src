@@ -239,10 +239,11 @@ def test_running_week_after_timeout_remains_unknown(captured):
 def test_background_descendant_pauses_and_preserves_scene(captured, detached):
     import os
     import signal
-    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
+    from saas_bench.agents.bash_agent.tools import ProcessBoundaryError
     api, store, executor = captured
+    executor.bash_timeout = .3
     try:
-        with pytest.raises(NextDayTimeoutError, match='descendants'):
+        with pytest.raises(ProcessBoundaryError, match='descendants did not finish before the command deadline'):
             command = 'sleep 60 >/dev/null 2>&1 & echo parent-returned'
             if detached:
                 command = '''python -c "import subprocess;subprocess.Popen(['sleep','60'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"'''
@@ -260,6 +261,29 @@ def test_background_descendant_pauses_and_preserves_scene(captured, detached):
         if executor.preserved_process:
             os.killpg(executor.preserved_process.pid, signal.SIGKILL)
             executor.preserved_process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('detached', [False, True])
+def test_descendants_finish_and_streams_drain_after_bash_error(captured, detached):
+    import shlex
+    api, store, executor = captured
+    executor.bash_timeout = 5
+    child = "import time,sys;time.sleep(.08);print('x'*200000);print('child-finished',file=sys.stderr)"
+    if detached:
+        launch = ('import subprocess;subprocess.Popen(["python", "-c", ' + repr(child)
+                  + '], start_new_session=True)')
+        command = 'python -c ' + shlex.quote(launch) + '; exit 2'
+    else:
+        command = 'python -c ' + shlex.quote(child) + ' & exit 2'
+    result = executor.execute('bash', {'command': command})
+    assert 'child-finished' in result and '[exit code: 2]' in result
+    row = records(store)[0]
+    assert row['result']['status'] == 'failed'
+    assert row['result']['process_boundary']['children'] == []
+    assert len(store.get_content(row['request']['event_id'] + ':stdout_bytes')[1]) == 200001
+    assert executor.preserved_process is None
+    store.assert_healthy()
+    assert executor.execute('bash', {'command': 'echo next-command'}) == 'next-command\n'
 
 
 def test_raw_decode_failure_partial_write_and_limits(captured, monkeypatch):

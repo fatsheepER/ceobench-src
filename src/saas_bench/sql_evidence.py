@@ -278,7 +278,7 @@ class SQLEvidenceStore:
         record = dict(status=status, completed_at=None if status == 'result_unknown' else now(),
                       capture_status='missing' if self.fault or self.fault_path.exists() else 'complete', capture_gaps=[])
         record.update(facts)
-        with closing(self.connect()) as conn, conn:
+        with self._writer() as conn:
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
 
     def context(self, event, token=None):
@@ -324,7 +324,7 @@ class SQLEvidenceStore:
                          (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
 
     def save_state(self, name, value):
-        with closing(self.connect()) as conn, conn:
+        with self._writer() as conn:
             conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(value)))
 
     def load_state(self, name):

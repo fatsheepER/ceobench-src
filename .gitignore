@@ -140,6 +140,8 @@ tests/*
 !tests/test_pf_cli.py
 !tests/test_pf_registration_scope.py
 !tests/test_pf_text_search.py
+!tests/test_pf_review_changes.py
+!tests/test_prefix_week_binding.py
 !tests/test_simulator_service_failures.py
 !tests/test_round4.py
 !tests/test_public_result_contracts.py

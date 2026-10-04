@@ -92,6 +92,7 @@ def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(wor
         assert 'You have 10 tools:' in prompt and 'MEMORY.md is the ONLY way' not in prompt
         assert prompt.index('## Registered Texts') < prompt.index('## Weekly Workflow')
         assert ('## File and Output History (pf)' in prompt) == pf and ('## File History (git)' in prompt) != pf
+        assert ('pf search --text "market cap"' in prompt) == pf
     with pytest.raises(ValueError, match='exactly once'):
         integrate(original.replace('You have 6 tools:', ''), False)
     assert git_memory_line(workspace) is None

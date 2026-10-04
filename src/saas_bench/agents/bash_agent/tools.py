@@ -19,12 +19,16 @@ from typing import Any, Dict, List, Optional
 class NextDayTimeoutError(Exception):
     """Raised when ./novamind-operation next-week times out.
 
-    This should cause the runner to save checkpoint and kill the run.
+    The runner stops without publishing a checkpoint for the unknown operation.
     """
     def __init__(self, message: str, partial_stdout: str = "", partial_stderr: str = ""):
         super().__init__(message)
         self.partial_stdout = partial_stdout
         self.partial_stderr = partial_stderr
+
+
+class ProcessBoundaryError(NextDayTimeoutError):
+    """Process completion is unconfirmed; retain the command and server scene."""
 
 
 # =========================================================================
@@ -557,7 +561,8 @@ class BashAgentToolExecutor:
         - System binaries and libraries are read-only; the agent Python
           runtime (scripts/build_agent_runtime.py) is read-only at /opt/python
         - No host home, source, development environment, run or group paths
-        - No /proc: a recursive search of / reaches only ordinary files
+        - /proc/self/fd supports process substitution in a private PID namespace;
+          the read-only, unlistable /proc directory excludes it from recursive scans
         - `import saas_bench` is blocked at the Python meta_path level via
           a `sitecustomize.py` ro-bound at `/opt/_sandbox_init/`
         """
@@ -576,6 +581,12 @@ class BashAgentToolExecutor:
                 cmd.extend(['--ro-bind', sys_path, sys_path])
 
         cmd.extend(['--dev', '/dev'])
+        # bwrap's /dev/fd points to /proc/self/fd. A private procfs provides
+        # dynamic descriptors without exposing host processes or their roots.
+        # Keep its parent unlistable so grep -r / cannot block on virtual files.
+        cmd.extend(['--tmpfs', '/proc', '--proc', '/proc/.kernel',
+                    '--remount-ro', '/proc/.kernel', '--symlink', '.kernel/self', '/proc/self',
+                    '--chmod', '0111', '/proc', '--remount-ro', '/proc'])
         if getattr(self, '_pf_service', None):
             cmd.extend(['--ro-bind', str(self._pf_service.root), self._pf_service.guest])
 
@@ -791,7 +802,7 @@ class BashAgentToolExecutor:
                 self._streams(exc.stdout, exc.stderr, exc.record['exit_code'], partial=True)
             except UnicodeError:
                 pass  # Raw streams were retained; decoding cannot close an open execution.
-            raise NextDayTimeoutError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr))
+            raise ProcessBoundaryError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr)) from exc
         except subprocess.TimeoutExpired:
             # Kill the entire process group (bash + all children)
             try:

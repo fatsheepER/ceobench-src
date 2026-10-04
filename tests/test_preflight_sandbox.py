@@ -83,12 +83,12 @@ def test_sandbox_shows_only_fixed_workspace_and_agent_runtime(tmp_path):
     result = executor.execute('bash', {'command': (
         'pwd; echo "root: $(ls / | tr "\\n" " ")"; echo "sessions: $(ls -A sessions)"; env; '
         'python -c "import sys, numpy, pandas, sklearn; print(sys.executable); print(sys.path)"; '
-        'test -e /proc && echo proc-visible; python -c "import saas_bench" 2>&1 | tail -1')})
+        'test -r /proc && echo proc-listable; python -c "import saas_bench" 2>&1 | tail -1')})
     assert result.startswith('/workspace\n')
-    assert 'root: bin dev etc lib lib64 opt sbin tmp usr workspace ' in result
+    assert 'root: bin dev etc lib lib64 opt proc sbin tmp usr workspace ' in result
     assert 'sessions: \n' in result
     assert '/opt/python/bin/python' in result and 'blocked inside the bash_agent sandbox' in result
-    assert 'proc-visible' not in result
+    assert 'proc-listable' not in result
     for host in (str(tmp_path), str(Path.home()), sys.prefix, 'pf-42'):
         assert host not in result
 
@@ -98,6 +98,27 @@ def test_recursive_root_search_finishes_inside_sandbox(tmp_path):
     workspace, executor = sandboxed_workspace(tmp_path)
     result = executor.execute('bash', {'command': 'grep -rl marker-7c1f / 2>/dev/null; echo done'})
     assert result == '/workspace/note.txt\ndone\n'
+
+
+@linux_only
+def test_process_substitution_and_proc_do_not_expose_host_processes(tmp_path):
+    import json
+    workspace, executor = sandboxed_workspace(tmp_path)
+    body = {'prices': list(range(500))}
+    (workspace / 'pricing.json').write_text(json.dumps(body))
+    command = '''sed -n '120,400p' <(python3 -c "import json;print(json.dumps(json.load(open('pricing.json')),indent=1))")'''
+    expected = '\n'.join(json.dumps(body, indent=1).splitlines()[119:400]) + '\n'
+    assert executor.execute('bash', {'command': command}) == expected
+    secret = tmp_path / 'host-secret'
+    secret.write_text('HOST-PRIVATE-CONTENT')
+    with secret.open() as stream:
+        result = executor.execute('bash', {'command': (
+            f'cat /proc/.kernel/{os.getpid()}/fd/{stream.fileno()}; '
+            f'cat /proc/self/root{secret}; ls /proc; chmod u+r /proc; '
+            'cat <(echo still-working)')})
+    assert 'HOST-PRIVATE-CONTENT' not in result
+    assert 'Permission denied' in result and 'Read-only file system' in result
+    assert 'still-working' in result
 
 
 @linux_only

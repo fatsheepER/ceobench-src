@@ -292,7 +292,10 @@ def render_search(page):
         lines.append(f'{title}:' + (f' (latest {len(items)} of {total})' if total > len(items) else ''))
         for item in items:
             lines.append('  ' + item_line(item))
-    lines.append(f"pf search {wanted['id']} --all lists all {plural(page['total'], 'saved item')}.")
+    if not page['total']:
+        lines.append(f"No object matches. Try literal history search: pf search --text {shlex.quote(wanted['id'])}")
+    else:
+        lines.append(f"pf search {shlex.quote(wanted['id'])} --all lists all {plural(page['total'], 'saved item')}.")
     return '\n'.join(lines)
 
 
@@ -389,8 +392,7 @@ def plural(n, noun):
 def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
-    Only what the agent itself cited is itemized; changes in the queries behind a cited
-    output are normal week-to-week data changes and share one line.
+    Show changes to existing data even behind a cited output. Pure additions share a line.
     """
     flagged = [e for e in entries if e['changed']]
     lines = [f'=== Check of your registered texts (day {day}) ===']
@@ -422,10 +424,25 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if len(flagged) > displayed + shared:
         lines.append(f'{len(flagged) - displayed - shared} additional texts have changed evidence.')
     if underlying:
-        lines.append(f"Upstream queries changed for {len(underlying)} texts; "
+        lines.append(f"Only added rows in checked sources for {plural(len(underlying), 'text')}; "
                      f"pf depend {underlying[0].split('.')[0]} shows one.")
     if ended:
         lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
     if flagged:
         lines.append('Details: pf depend rN.' if pf else 'Details: run the git diff shown on each line.')
     return '\n'.join(lines)
+
+
+def render_pending(items, day):
+    """Resurface dated content changes without pretending to have rechecked them."""
+    additions = sum(p['reason']['check'].get('change_kind') == 'append_only' for p in items)
+    lines = [f'Last findings: {plural(additions, "text")} with only added rows; {len(items) - additions} with other changes or unavailable evidence.']
+    changed = [p for p in items if p['first_day'] != day
+               and p['reason']['check'].get('change_kind') == 'content_changed']
+    changed.sort(key=lambda p: (-p['last_day'], p['record']))
+    for p in changed[:3]:
+        lines.append(f"{p['record']} (last verified day {p['last_day']}): "
+                     + short(dependency_line(p['reason'], relation=False), 240))
+    if len(changed) > 3:
+        lines.append(f'{len(changed) - 3} more texts have earlier content-change findings.')
+    return '\n' + '\n'.join(lines)

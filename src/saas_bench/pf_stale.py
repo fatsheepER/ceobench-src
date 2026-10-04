@@ -1,5 +1,5 @@
 """Current evidence comparison and dependency-edge predicates for PF queries."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import csv
 from decimal import Decimal, InvalidOperation
 import io
@@ -82,6 +82,7 @@ def compare(resolver, before, after, reference, kind, events=None):
             comparison = event['result'].get('comparison', {})
             if comparison.get('status') != 'available':
                 raise ValueError(comparison.get('reason', 'comparison_unavailable'))
+    change_kind = 'content_changed'
     if kind in ('query', 'csv'):
         bodies = [encoded(table(raw, kind)) for raw in (old, new)]
         comparisons = [whole_rows(raw) for raw in bodies]
@@ -89,6 +90,11 @@ def compare(resolver, before, after, reference, kind, events=None):
             if metadata['status'] != 'available':
                 raise ValueError(metadata['reason'])
         changed = comparisons[0][1] != comparisons[1][1]
+        tables = [json.loads(c[1]) for c in comparisons]
+        if (changed and all(c[0]['scope'] == 'complete_for_query' for c in comparisons)
+                and tables[0]['columns'] == tables[1]['columns']
+                and not (Counter(tables[0]['rows']) - Counter(tables[1]['rows']))):
+            change_kind = 'append_only'
     elif kind == 'record':
         changed = before != after
     elif kind == 'public':
@@ -96,9 +102,9 @@ def compare(resolver, before, after, reference, kind, events=None):
     else:
         changed = old != new
     try:
-        return changed, evaluate(old, new, reference, kind, changed), None
+        return changed, evaluate(old, new, reference, kind, changed), None, change_kind if changed else None
     except (ValueError, KeyError, TypeError, UnicodeError) as exc:
-        return changed, None, str(exc)
+        return changed, None, str(exc), change_kind if changed else None
 
 
 def evaluate(old, new, reference, kind, changed):
@@ -234,8 +240,9 @@ class StaleCheck:
                 value = compared[comparison_key]
                 if isinstance(value, Exception):
                     raise value
-                changed, holds, reason = value
+                changed, holds, reason, change_kind = value
                 check['version_changed'] = changed
+                check['change_kind'] = change_kind
                 if reason:
                     raise ValueError(reason)
                 check.update(version_changed=changed, affected=not holds,

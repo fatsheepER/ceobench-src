@@ -397,6 +397,11 @@ class PFQueries:
             pending = state['pending'][target]
             pending['last_day'] = self._check_day
             pending['conditions'] = self._continuing_rows(rows)
+            ordinary = self._ordinary_changes(rows)
+            if ordinary:
+                pending['reason'] = self._describe_edge(ordinary[0])
+            else:
+                del state['pending'][target]
         else:
             del state['pending'][target]
         self.store.save_state('pf_review', state)
@@ -459,23 +464,19 @@ class PFQueries:
                 tops = ([self._describe_edge(r) for r in rows
                          if (self._conditional(r) or r.get('retry_refresh')) and not r['historical_only']]
                         if version in continuing else [self._top(r, rows) for r in rows if _weekly(r)])
-                # Itemize what the agent chose itself: a cited version that was superseded
-                # without a holding predicate, and any predicate on the declared chain that fails
-                # or cannot be checked (a failure propagates, design 3.4). Changes further upstream
-                # of a cited output are the normal week-to-week data changes and share one line.
+                # Old data changing deserves an example even behind an immutable
+                # output. Only verified row additions are folded into a count.
                 direct = [t for t in tops if t['check'].get('below_failed')
+                          or t['check'].get('below_content_changed')
                           or t['check']['predicate_result'] in ('fails', 'cannot_check')
-                          or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds')]
+                          or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds'
+                              and t['check'].get('change_kind') != 'append_only')]
                 entries.append(dict(text=self._describe(version), total=len(tops), changed=direct))
-                if not direct and any(t['check'].get('below_changed') for t in tops):
+                if not direct and any(t['check'].get('below_changed') or
+                                      t['check'].get('change_kind') == 'append_only' for t in tops):
                     underlying.append(self.records[version]['version'])
                 if version not in continuing:
-                    paths = {tuple(p) for r in rows if _weekly(r) for p in r['check']['affected_paths']}
-                    ordinary = [r for r in rows if not self._conditional(r) and not r['historical_only']
-                                and (r['check']['version_changed'] or r['check']['predicate_result'] == 'cannot_check')
-                                and (r['edge']['target'] is None or not self._clock(r['edge']['target']))
-                                and any(tuple(p[-2:]) == (r['edge']['source'], r['edge']['target'])
-                                        or r['edge']['target'] is None and p[-1] == r['edge']['source'] for p in paths)]
+                    ordinary = self._ordinary_changes(rows)
                     if ordinary:
                         reason = self._describe_edge(ordinary[0])
                         self.review_pending[version] = dict(first_day=day, last_day=day,
@@ -489,6 +490,8 @@ class PFQueries:
                 text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "text")}. '
                          'Use text_list with review="pending" for dated findings; '
                          'pf depend rN rechecks one text. Pending does not retire a text.')
+                text += pf_render.render_pending([
+                    dict(record=self.records[v]['version'], **p) for v, p in self.review_pending.items()], day)
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
             self.store.complete(event, index=self.index_stats, check=self.check_stats,
@@ -499,6 +502,17 @@ class PFQueries:
         finally:
             CURRENT_EVENT.reset(token)
         return CapturedText(text, [origin(version, text)])
+
+    def _ordinary_changes(self, rows):
+        paths = {tuple(p) for r in rows if _weekly(r) for p in r['check']['affected_paths']}
+        ordinary = [r for r in rows if not self._conditional(r) and not r['historical_only']
+                    and (r['check']['version_changed'] or r['check']['predicate_result'] == 'cannot_check')
+                    and (r['edge']['target'] is None or not self._clock(r['edge']['target']))
+                    and any(tuple(p[-2:]) == (r['edge']['source'], r['edge']['target'])
+                            or r['edge']['target'] is None and p[-1] == r['edge']['source'] for p in paths)]
+        return sorted(ordinary, key=lambda r: (
+            r['check']['predicate_result'] != 'cannot_check',
+            r['check'].get('change_kind') == 'append_only'))
 
     @staticmethod
     def _conditional(row):
@@ -561,6 +575,7 @@ class PFQueries:
         failed = [r for r in problems.values() if r['check']['predicate_result'] == 'fails']
         changed = [r for r in below if r['check']['version_changed'] and r['check']['predicate_result'] in
                    ('not_declared', 'not_checked')]
+        changed.sort(key=lambda r: r['check'].get('change_kind') == 'append_only')
         unknown = [r for r in problems.values() if r['check']['predicate_result'] == 'cannot_check']
         source_count = len({encoded(r['edge']) for r in below} | problems.keys())
         parts = []
@@ -574,7 +589,8 @@ class PFQueries:
             parts.append(f'{len(unknown)} could not be checked ({reasons})')
         if parts:
             result['check']['sources'] = '; '.join(parts)
-        result['check'].update(below_failed=len(failed) + len(unknown), below_changed=len(changed))
+        result['check'].update(below_failed=len(failed) + len(unknown), below_changed=len(changed),
+                              below_content_changed=sum(r['check'].get('change_kind') != 'append_only' for r in changed))
         return result
 
     def _clock(self, version):

@@ -41,6 +41,16 @@ def test_literal_search_pages_do_not_expand_to_future_or_private_evidence(worksp
     assert executor.pf_queries.answer('pf_search', {'object': {'id': 'q_min.*'}})['total'] == 0
 
 
+def test_empty_object_search_suggests_a_shell_quoted_literal_search(workspace, tmp_path):
+    import shlex
+    _, _, executor = captured(workspace, tmp_path)
+    term = 'cash $(touch unintended) "plan"'
+    result = executor.execute('pf_search', {'object': {'id': term}})
+    command = result.split('Try literal history search: ', 1)[1]
+    assert shlex.split(command) == ['pf', 'search', '--text', term]
+    assert '0 saved items' not in result
+
+
 def test_search_delivers_only_exact_excerpt_and_cannot_support_unseen_field(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     body = json.dumps(dict(padding='x' * 800, match='needle', tail='y' * 800, unseen=42))
