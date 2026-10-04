@@ -223,7 +223,7 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
             manifest['pf_read_tokenizer'] = tokenizer_config(config['provider'], config['model'])
     from contextlib import closing
     import sqlite3
-    with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro', uri=True)) as conn:
+    with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro&immutable=1', uri=True)) as conn:
         if conn.execute('SELECT 1 FROM branches WHERE id=?', (branch_id,)).fetchone():
             raise ValueError('Clone branch ID already exists')
     destination.mkdir(parents=True, exist_ok=False)
