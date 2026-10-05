@@ -282,7 +282,6 @@ class Simulator:
     def _cache_step_day_globals(self, config: dict):
         """Cache global values that don't change within a single step_day. (L3)"""
         # Cache drift accumulators for consistent reads within step_day.
-        # Used by _generate_customer_from_group() and customer param reads.
         global_q_bias = get_global_drift(self.conn)
         all_gp = get_all_group_parameters(self.conn)
         self._drift_cache = {
@@ -1000,7 +999,6 @@ class Simulator:
             grng = self._group_rngs[group_id]
 
         # Use STATIC group config means for deterministic customer creation.
-        # Drift/macro effects apply to existing subscribers post-creation, not at creation time.
         # This ensures the N-th customer in a group has identical attributes across runs.
 
         # === SIGMOID CURVE PARAMETERS (ASYMMETRIC) ===
@@ -1022,27 +1020,14 @@ class Simulator:
         )
 
         # c_max: hard budget constraint (maximum price customer will pay)
-        # Sample from static group distribution, then apply accumulated group drift
         c_max = max(15.0,
             grng.normal(group.c_max_mean, group.c_max_std * 1.2)
         )
 
-        # q_min: quality floor — sample from static, then apply global + group drift
         q_min = max(1e-4, grng.normal(group.q_min_mean, group.q_min_std))
 
         # q_range: independently sampled (unaffected by drift — drift shifts q_min and q_max equally)
         q_range = max(1e-4, grng.normal(group.q_range_mean, group.q_range_std))
-
-        # Apply accumulated drift offsets to new customer parameters.
-        # _drift_cache is set at start of each step_day via _cache_drift_state().
-        # This ensures new customers reflect current market conditions (global + group drift).
-        drift = getattr(self, '_drift_cache', None)
-        if drift:
-            group_drift = drift['groups'].get(group_id, {})
-            q_bias_offset = drift['global_q_bias'] + group_drift.get('drift_q_bias_total', 0.0)
-            c_max_offset = group_drift.get('drift_c_max_total', 0.0)
-            q_min += q_bias_offset
-            c_max = max(15.0, c_max + c_max_offset)
 
         q_max = q_min + q_range
 
@@ -1561,12 +1546,17 @@ class Simulator:
 
         # Get customer's usage_scale, seat_count, group_id, and c_max for usage rate sampling
         customer = self.conn.execute("""
-            SELECT usage_scale, seat_count, group_id, c_max FROM customers WHERE customer_id = ?
+            SELECT c.usage_scale, c.seat_count, c.group_id,
+                   COALESCE(cs.current_c_max, c.c_max) AS c_max
+            FROM customers c
+            LEFT JOIN customer_state cs ON cs.customer_id = c.customer_id
+            WHERE c.customer_id = ?
         """, (customer_id,)).fetchone()
         usage_scale = customer['usage_scale'] if customer else 50.0
         seat_count = int(customer['seat_count'] or 1)
         group_id = customer['group_id'] if customer else 'S1'
         initial_c_max = customer['c_max'] if customer else 100.0
+        _, _, initial_c_max = self._apply_drift_offsets(group_id, 0.0, 0.0, initial_c_max)
 
         # Sample daily usage rate for this billing period
         daily_usage_rate = sample_daily_usage_rate(self.rng, usage_scale, seat_count)
@@ -2157,6 +2147,7 @@ class Simulator:
                 c_max = params.get('c_max', 100.0)
                 q_max = params.get('q_max', 0.75)
                 q_min = params.get('q_min', 0.25)
+                q_min, q_max, c_max = self._apply_drift_offsets(group_id, q_min, q_max, c_max)
 
                 lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
                 effective_price = max(0.0, price - lead_promo)
@@ -2380,6 +2371,7 @@ class Simulator:
                     usage_scale = params.get('usage_scale', 50.0)
                     seat_count = int(params.get('seat_count', 1) or 1)
                     initial_c_max = params.get('c_max', 100.0)
+                    _, _, initial_c_max = self._apply_drift_offsets(gid, 0.0, 0.0, initial_c_max)
                     daily_usage_rate = sample_daily_usage_rate(self.rng, usage_scale, seat_count)
                     lead_promo = params.get('_lead_promo_used')
                     if lead_promo is None:
@@ -2473,6 +2465,7 @@ class Simulator:
         q_max = params.get('q_max', 0.75)
         q_min = params.get('q_min', 0.25)
         group_id = params.get('group_id', 'S1')
+        q_min, q_max, c_max = self._apply_drift_offsets(group_id, q_min, q_max, c_max)
 
         best_plan = 'A'
         best_satisfaction = float('-inf')
@@ -2862,6 +2855,7 @@ class Simulator:
         steep_l_np = np.empty(n, dtype=np.float64)
         steep_r_np = np.empty(n, dtype=np.float64)
         c_max_np = np.empty(n, dtype=np.float64)
+        has_c_max_snapshot_np = np.empty(n, dtype=bool)
         q_max_np = np.empty(n, dtype=np.float64)
         q_min_np = np.empty(n, dtype=np.float64)
         eff_price_np = np.empty(n, dtype=np.float64)
@@ -2918,7 +2912,8 @@ class Simulator:
             steep_r_np[i] = csr if csr else sub['steepness_right']
 
             ec = sub['effective_c_max']
-            if ec:
+            has_c_max_snapshot_np[i] = ec is not None
+            if ec is not None:
                 c_max_np[i] = ec
             else:
                 cc = sub['current_c_max']
@@ -2997,10 +2992,11 @@ class Simulator:
             c_off_per_row = drift_c_grp_np[group_idx_np]
             q_min_np = q_min_np + q_off_per_row
             q_max_np = q_max_np + q_off_per_row
-            mask_cf = c_off_per_row != 0.0
-            if np.any(mask_cf):
-                new_cmax = c_max_np + c_off_per_row
-                c_max_np = np.where(mask_cf, np.maximum(new_cmax, 15.0), c_max_np)
+            c_max_np = np.where(
+                has_c_max_snapshot_np,
+                c_max_np,
+                np.maximum(c_max_np + c_off_per_row, 15.0),
+            )
 
         # q_required (piecewise sigmoid)
         q_range = q_max_np - q_min_np
@@ -6421,6 +6417,7 @@ Guidelines:
         """, (customer_id,)).fetchone()
         deal_group_id = cust_row['group_id'] if cust_row else 'E1'
         deal_c_max = (cust_row['current_c_max'] or cust_row['c_max']) if cust_row else 100.0
+        _, _, deal_c_max = self._apply_drift_offsets(deal_group_id, 0.0, 0.0, deal_c_max)
         deal_plan = agreed_plan or 'C'  # Enterprise typically on plan C
         deal_promo = self._get_effective_promotion(customer_id, deal_group_id, deal_plan)
         deal_eff_price = max(0.0, agreed_price - deal_promo)
@@ -6500,6 +6497,7 @@ Guidelines:
                 'listed_price': agreed_price,
                 'promotion': deal_promo,
                 'effective_price': deal_eff_price,
+                'effective_c_max': deal_c_max,
                 'seat_count': seat_count,
                 'contract_months': contract_months,
                 'contract_end_day': contract_end_day,
@@ -7090,11 +7088,7 @@ Guidelines:
 
             # Snapshot drifted c_max at billing time for satisfaction calculations
             billing_c_max = sub['current_c_max'] or sub['c_max']
-            # Apply group + global drift offset to c_max
-            drift = getattr(self, '_drift_cache', None)
-            if drift:
-                gd = drift['groups'].get(group_id, {})
-                billing_c_max = max(15.0, billing_c_max + gd.get('drift_c_max_total', 0.0))
+            _, _, billing_c_max = self._apply_drift_offsets(group_id, 0.0, 0.0, billing_c_max)
 
             # Compute promotion for this billing period
             existing_promo = self._get_effective_promotion(customer_id, group_id, current_plan)
