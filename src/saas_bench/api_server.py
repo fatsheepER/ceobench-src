@@ -17,7 +17,7 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-# Oracle debug reads expose internal data but still execute on read-only snapshots.
+# Oracle debug reads expose internal data through the same read-only SQL policy.
 # Formal runs reject this startup setting.
 _ORACLE_MODE: bool = os.environ.get("ORACLE_MODE") == "1"
 
@@ -483,7 +483,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                 api._sql_lock.notify_all()
 
     def _handle_query_request(self):
-        """Execute SQL on a separately authorized, read-only world snapshot."""
         sql = ''
         try:
             raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -775,7 +774,6 @@ class NovaMindAPIServer:
         if self._httpd:
             self._httpd.shutdown()
             self._httpd = None
-        self._query_snapshot = None
 
     def execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         """Execute a tool call with thread safety."""
@@ -788,8 +786,8 @@ class NovaMindAPIServer:
     # Maximum allowed time for step_week before auto-quit (seconds)
     STEP_WEEK_TIMEOUT = 4200  # 7× longer than old per-day timeout
 
-    # Lock wait, snapshot backup and SQL share this deadline. SQL executes
-    # on a separate connection after releasing the world lock.
+    # Lock wait, reader setup and SQL share this deadline. The world lock stays
+    # held until the separate query connection closes.
     QUERY_TIMEOUT_SECONDS = 120
     QUERY_RESPONSE_TIMEOUT_SECONDS = 30
 

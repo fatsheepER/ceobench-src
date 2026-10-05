@@ -1,15 +1,12 @@
-"""Read-only SQL snapshots shared by public queries and future evidence replay."""
-
 from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
 import sys
-import tempfile
 import time
 import uuid
 
-from .database import TABLE_DOCS
+from .database import TABLE_DOCS, SharedMemoryConnection
 
 
 PUBLIC_POLICY_VERSION = 'public-sql-v1'
@@ -70,12 +67,13 @@ def install_authorizer(conn, *, oracle=False):
 
 @contextmanager
 def query_snapshot(server, deadline, metadata=None):
-    """Copy the live world under its lock; never query the asynchronous disk save."""
+    """Read the live world on an independent connection while holding its lock."""
     started = time.monotonic()
     metadata = metadata if metadata is not None else {}
     metadata.update(snapshot_ref=uuid.uuid4().hex, public_policy_version=PUBLIC_POLICY_VERSION,
                     oracle=server.oracle_mode, snapshot_status='failed')
     try:
+        # ponytail: serialize queries and world writes; use frozen readers if contention matters.
         if not server._lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise TimeoutError('Query lock wait exceeded time limit')
         try:
@@ -85,75 +83,63 @@ def query_snapshot(server, deadline, metadata=None):
                 raise SnapshotUnavailable('World state unavailable for querying')
             if server.conn.in_transaction:
                 raise SnapshotUnavailable('World has an unfinished transaction')
-            # total_changes includes writes followed by rollback; data_version also catches
-            # commits from other connections. Schema changes and policy changes invalidate too.
-            key = (server.conn, server.conn.total_changes,
-                   server.conn.execute('PRAGMA data_version').fetchone()[0],
-                   server.conn.execute('PRAGMA schema_version').fetchone()[0],
-                   server.tools.current_day, PUBLIC_POLICY_VERSION, server.oracle_mode)
-            snapshot = getattr(server, '_query_snapshot', None)
-            reused = snapshot is not None and snapshot['key'] == key
             before = time.monotonic()
-            if not reused:
-                directory = tempfile.TemporaryDirectory(prefix='novamind-query-')
-                path = Path(directory.name).resolve() / 'snapshot.db'
+            revision = [server.conn.total_changes,
+                        server.conn.execute('PRAGMA data_version').fetchone()[0],
+                        server.conn.execute('PRAGMA schema_version').fetchone()[0],
+                        server.tools.current_day]
+            check_deadline(deadline)
+            if isinstance(server.conn, SharedMemoryConnection):
+                uri = server.conn.query_uri
+            elif isinstance(server.conn, sqlite3.Connection):
+                filename = next(row[2] for row in server.conn.execute('PRAGMA database_list')
+                                if row[1] == 'main')
+                if not filename:
+                    raise SnapshotUnavailable('World requires a named shared-memory connection')
+                path = Path(filename).resolve()
                 if path.is_relative_to(Path(server.script_workspace).resolve()):
-                    directory.cleanup()
-                    raise SnapshotUnavailable('Query snapshots must be outside the agent workspace')
-                target = sqlite3.connect(path)
+                    raise SnapshotUnavailable('World database must be outside the agent workspace')
+                uri = path.as_uri() + '?mode=ro'
+            else:
+                raise SnapshotUnavailable('World requires a standard SQLite connection')
+            metadata.update(day=server.tools.current_day, snapshot_reused=False,
+                            snapshot_bytes=0, world_revision=revision)
+            conn = sqlite3.connect(uri, uri=True,
+                                   timeout=max(0, deadline - time.monotonic()))
+            try:
+                conn.row_factory = sqlite3.Row
+                # Unknown quoted column names must fail, not become string literals.
+                conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+                conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+                if not server.oracle_mode:
+                    for table, columns in PUBLIC_COLUMNS.items():
+                        check_deadline(deadline)
+                        schema = [row[1] for row in conn.execute(f'PRAGMA main.table_info("{table}")')]
+                        if not set(columns).issubset(schema):
+                            raise SnapshotUnavailable('World schema is missing public columns')
+                        names = ', '.join('"' + c + '"' for c in schema if c in columns)
+                        conn.execute(f'CREATE TEMP VIEW "{table}" AS SELECT {names} FROM main."{table}"')
+                conn.execute('PRAGMA query_only=ON')
+                denied = install_authorizer(conn, oracle=server.oracle_mode)
+                conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                check_deadline(deadline)
+                metadata['snapshot_seconds'] = time.monotonic() - before
+                before = time.monotonic()
                 try:
-                    server.conn.backup(target, pages=256,
-                                       progress=lambda *_: check_deadline(deadline), sleep=0.01)
-                except BaseException:
-                    target.close()
-                    directory.cleanup()
+                    yield conn, metadata
+                    metadata['snapshot_status'] = 'success'
+                except sqlite3.Error as exc:
+                    if denied:
+                        raise QueryDenied('Query is not allowed by the read-only SQL policy. Read docs/tables/ for public columns.') from exc
                     raise
                 finally:
-                    target.close()
-                snapshot = dict(key=key, directory=directory, path=path, ref=uuid.uuid4().hex)
-                server._query_snapshot = snapshot
-            # Local reference keeps a retired snapshot alive until its last reader closes.
-            path = snapshot['path']
-            metadata.update(day=server.tools.current_day, snapshot_ref=snapshot['ref'],
-                            snapshot_reused=reused, snapshot_seconds=time.monotonic() - before,
-                            snapshot_bytes=path.stat().st_size,
-                            world_revision=list(key[1:5]))
+                    metadata['sql_seconds'] = time.monotonic() - before
+            finally:
+                conn.close()
         finally:
             server._lock.release()
-        conn = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True,
-                               timeout=max(0, deadline - time.monotonic()))
-        try:
-            conn.row_factory = sqlite3.Row
-            # Unknown quoted column names must fail, not become string literals.
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
-            if not server.oracle_mode:
-                for table, columns in PUBLIC_COLUMNS.items():
-                    # Preserve SELECT * column order from the original schema.
-                    schema = [row[1] for row in conn.execute(f'PRAGMA main.table_info("{table}")')]
-                    if not set(columns).issubset(schema):
-                        raise SnapshotUnavailable('World schema is missing public columns')
-                    names = ', '.join('"' + c + '"' for c in schema if c in columns)
-                    conn.execute(f'CREATE TEMP VIEW "{table}" AS SELECT {names} FROM main."{table}"')
-            conn.execute('PRAGMA query_only=ON')
-            denied = install_authorizer(conn, oracle=server.oracle_mode)
-            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-            check_deadline(deadline)
-            before = time.monotonic()
-            try:
-                yield conn, metadata
-                metadata['snapshot_status'] = 'success'
-            except sqlite3.Error as exc:
-                if denied:
-                    raise QueryDenied('Query is not allowed by the read-only SQL policy. Read docs/tables/ for public columns.') from exc
-                raise
-            finally:
-                metadata['sql_seconds'] = time.monotonic() - before
-        finally:
-            conn.close()
     finally:
         metadata['total_seconds'] = time.monotonic() - started
-        # Server diagnostics only; never add snapshot paths or metadata to public results.
         try:
             print('[public_sql] ' + json.dumps(metadata), file=sys.stderr, flush=True)
         except OSError:

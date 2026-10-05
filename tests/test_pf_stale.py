@@ -384,3 +384,36 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
             assert not restored._execute_tool('pf_dependencies', {'cursor': cursor}).startswith('Error:')
         with pytest.raises(ValueError, match='stale check configuration mismatch'):
             BashAgentRunner(continue_from=child.workspace_dir, pf_stale_checks=not enabled)
+
+
+@pytest.mark.parametrize('sql,status', [
+    ('SELECT * FROM group_insight_snapshots', 403),
+    ('WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x', 504),
+])
+def test_mixed_refresh_keeps_sdk_independent_after_sql_failure(workspace, tmp_path, server, sql, status):
+    from saas_bench.tools import AgentTools
+    store, _, _ = captured(workspace, tmp_path)
+    server.sql_evidence = store
+    server.tools = AgentTools(server.conn, 0, server.script_workspace)
+    sdk_body = server.execute_tool('list_research_projects', {}).to_json()
+    event = store.begin_event('public_http', dict(method='POST', path='/call',
+        parsed=dict(tool='list_research_projects', args={})))
+    finish_http(store, event, 200, '', encoded(sdk_body), {})
+    fast_body = execute_query(server, 'SELECT amount FROM ledger')
+    versions = [record_sql(store, sql, {}), record_sql(store, 'SELECT amount FROM ledger', fast_body),
+                event + ':public_response']
+    parent = store.begin_event('pf_dependencies', {})
+    server.QUERY_TIMEOUT_SECONDS = .05
+    before = server.conn.serialize()
+    refreshed = refresh(server, versions, parent)
+    records, bodies = [], []
+    for version in versions:
+        meta, raw = store.get_content(refreshed[version])
+        records.append(store.read_event(meta['created_by_event'])['result'])
+        bodies.append(json.loads(raw))
+    assert [record['http_status'] for record in records] == [status, 200, 200]
+    assert bodies[1:] == [fast_body, sdk_body]
+    assert len({record['snapshot_ref'] for record in records}) == 1
+    assert {record['day'] for record in records} == {0}
+    assert all(record['snapshot_bytes'] == 0 and not record['snapshot_reused'] for record in records[:2])
+    assert server.conn.serialize() == before

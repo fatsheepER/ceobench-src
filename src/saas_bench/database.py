@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import json
+import uuid
 
 
 # =====================================================================
@@ -317,9 +318,20 @@ TABLE_DOCS = {
 }
 
 
+class SharedMemoryConnection(sqlite3.Connection):
+    query_uri: str
+
+
+def connect_shared_memory() -> SharedMemoryConnection:
+    uri = f'file:ceobench-world-{uuid.uuid4().hex}?mode=memory&cache=shared'
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=SharedMemoryConnection)
+    conn.query_uri = uri
+    return conn
+
+
 def init_database(db_path: Path) -> sqlite3.Connection:
     """Initialize the world database with all required tables."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_shared_memory() if str(db_path) == ':memory:' else sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     # Enable foreign keys

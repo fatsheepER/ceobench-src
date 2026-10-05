@@ -22,6 +22,7 @@ Public API:
     unprotect_db(nmdb, out)     → encrypted .nmdb → plain SQLite
 """
 
+from contextlib import suppress
 import os
 import sqlite3
 import sys
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import Optional, Union
 
 import sqlcipher3
+
+from .database import connect_shared_memory
 
 
 # --------------------------------------------------------------------------- #
@@ -403,7 +406,7 @@ def load_session_db(
 ):
     """Open an encrypted .nmdb file into a SQLite connection.
 
-    in_memory=True  → fully copy DB into :memory: (fast subsequent queries,
+    in_memory=True  → fully copy DB into named shared memory (fast subsequent queries,
                       high RAM). Used by the server.
     in_memory=False → open the .nmdb directly with SQLCipher. On-demand
                       page decryption, low RAM. Used by push_data / monitors.
@@ -411,9 +414,6 @@ def load_session_db(
     nmdb_path = Path(nmdb_path)
 
     if in_memory:
-        # Export encrypted → plain tmp → load tmp into :memory: via sqlite3
-        # backup. Two writes, but this is the server startup path (once per
-        # session), not the hot path.
         key = _get_key()
         plain_fd, plain_path = tempfile.mkstemp(suffix=".plain.tmp", dir=str(nmdb_path.parent))
         os.close(plain_fd)
@@ -421,20 +421,26 @@ def load_session_db(
         try:
             _export_encrypted_to_plain(str(nmdb_path), plain_path, key)
             src_plain = sqlite3.connect(plain_path)
-            mem = sqlite3.connect(":memory:", check_same_thread=False)
             try:
-                src_plain.backup(mem)
+                mem = connect_shared_memory()
+                try:
+                    src_plain.backup(mem)
+                    mem.row_factory = sqlite3.Row
+                    mem.execute("PRAGMA cache_size=-500000")
+                    mem.execute("ANALYZE")
+                except BaseException:
+                    with suppress(Exception):
+                        mem.close()
+                    raise
             finally:
-                src_plain.close()
+                with suppress(Exception):
+                    src_plain.close()
         finally:
             if os.path.exists(plain_path):
                 try:
                     os.unlink(plain_path)
                 except Exception:
                     pass
-        mem.row_factory = sqlite3.Row
-        mem.execute("PRAGMA cache_size=-500000")
-        mem.execute("ANALYZE")
         return mem
 
     # File-backed: open .nmdb directly. Only pages that queries touch are
