@@ -986,7 +986,21 @@ class NovaMindAPIServer:
             week = (new_day + 6) // 7
             dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
 
-        from .execution_capture import dashboard_version
+        from .execution_capture import CapturedText, dashboard_version
+        if predictions:
+            receipt = []
+            for horizon, metrics in predictions.items():
+                if 'cash' not in metrics:
+                    continue
+                cash = metrics['cash']
+                values = cash if isinstance(cash, dict) else {'point': cash}
+                amounts = ', '.join(f"{field}=USD {float(values[field])}"
+                    for field in ('point', 'lower', 'upper') if values.get(field) is not None)
+                receipt.append(f"  +{horizon} days: {amounts}")
+            if receipt:
+                receipt = f"\n\nSubmitted cash forecasts at D{old_day} (USD; horizons from submission):\n" + '\n'.join(receipt)
+                dashboard = CapturedText(dashboard + receipt, getattr(dashboard, 'origins', []))
+
         dashboard = dashboard_version(self, dashboard, new_day)
         with self._lock:
             self._last_dashboard = dashboard

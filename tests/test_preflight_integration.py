@@ -250,13 +250,31 @@ def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, mo
     from openai import OpenAI
     from test_preflight_usage import reply
     runner = offline_runner(execution_capture=execution)
+    rejected = runner._execute_tool('bash', {'command':
+        "./novamind-operation next-week 'invalid forecast'" + ' 20.7 22.1 19.3' * 4})
+    assert '[exit code: 1]' in rejected and 'Error:' in rejected
+    assert 'Submitted cash forecasts' not in rejected
     requests = []
+    amounts = ' 20.7 19.3 22.1 20.7e6 19300000 22100000 -49.15 -50 -48 0.001 -0.002 0.004'
+    forecasts = [
+        '+7 days: point=USD 20.7, lower=USD 19.3, upper=USD 22.1',
+        '+28 days: point=USD 20700000.0, lower=USD 19300000.0, upper=USD 22100000.0',
+        '+84 days: point=USD -49.15, lower=USD -50.0, upper=USD -48.0',
+        '+182 days: point=USD 0.001, lower=USD -0.002, upper=USD 0.004',
+    ]
     def handle(request):
         requests.append(json.loads(request.content))
         if len(requests) > 6:
             raise KeyboardInterrupt('Harness failed to advance the week')
+        observation = '\n'.join(m['content'] for m in requests[-1]['messages'] if m['role'] == 'user')
+        assert observation.count('Forecast units:') == 1
+        assert 'All 12 cash forecast values for next-week are USD.' in observation
+        assert 'For 20.7 million USD, submit 20700000 or 20.7e6.' in observation
+        if len(requests) > 1:
+            assert f'Submitted cash forecasts at D{(len(requests) - 2) * 7} (USD; horizons from submission):' in observation
+            assert all(forecast in observation for forecast in forecasts)
         body = reply('chat')
-        command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+        command = "./novamind-operation next-week 'fixed offline action'" + amounts
         body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
             function=dict(name='bash', arguments=json.dumps({'command': command})))]
         return httpx.Response(200, json=body)
@@ -272,6 +290,19 @@ def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, mo
     assert all(not any(m['role'] == 'tool' for m in request['messages']) for request in requests)
     checkpoint = runner._load_checkpoint()
     assert checkpoint['total_turns'] == 6
+    tool_results = [json.loads(line) for line in (runner.logs_dir / f'tool_results_{runner.run_id}.jsonl').read_text().splitlines()]
+    submissions = [row['result'] for row in tool_results if row['tool'] == 'bash']
+    assert len(submissions) == 6
+    assert all(all(forecast in receipt for forecast in forecasts) for receipt in submissions)
+    conn = load_session_db(checkpoint_directory(runner.workspace_dir, checkpoint) / 'world.nmdb')
+    try:
+        stored = [tuple(row) for row in conn.execute('''SELECT submit_day,horizon_days,
+            predicted_value,predicted_lower,predicted_upper FROM predictions ORDER BY submit_day,horizon_days''')]
+    finally:
+        conn.close()
+    expected = [(7, 20.7, 19.3, 22.1), (28, 20700000.0, 19300000.0, 22100000.0),
+                (84, -49.15, -50.0, -48.0), (182, 0.001, -0.002, 0.004)]
+    assert stored == [(day, *forecast) for day in range(0, 42, 7) for forecast in expected]
     summary = json.loads((runner.workspace_dir / 'usage_summary.json').read_text())
     assert summary['agent']['calls'] == 6 and summary['agent']['known']['input_tokens'] == 60
     assert summary['simulator']['calls'] > 0

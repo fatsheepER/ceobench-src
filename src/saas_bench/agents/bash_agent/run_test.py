@@ -1325,6 +1325,9 @@ __pycache__/
                     self._log_tool_result(0, sim_day, '_weekly_check', {}, check)
                     self._log_timing("weekly_check", sim_day, elapsed_s=round(_time.monotonic() - _t0, 3))
                     observation = _joined(dashboard, '\n\n', check)
+                observation = _joined(observation, '\n\n',
+                    'Forecast units: All 12 cash forecast values for next-week are USD. '
+                    'For 20.7 million USD, submit 20700000 or 20.7e6.')
             info = {'day': sim_day, 'cash': status['cash']}
             turns_today = 0
             day_ended = False
