@@ -75,7 +75,7 @@ def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runn
     saved = runner.evidence_store.load_state('pf_review')
     second = query.weekly_check(14)
     assert runner.evidence_store.load_state('pf_review') == saved
-    assert 'Pending review: 2 texts' in second and 'original_execution_failed' not in second
+    assert 'Pending review: 2 active texts' in second and 'original_execution_failed' not in second
     listed = json.loads(runner._execute_tool('text_list', {'review': 'pending', 'limit': 1}))
     assert listed['next_after'] == 1 and len(listed['records']) == 1
     assert listed['records'][0]['status'] == 'active'

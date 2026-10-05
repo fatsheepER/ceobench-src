@@ -24,7 +24,7 @@ def test_long_chain_reports_failures_and_explicit_check_coverage(workspace, tmp_
     server.conn.execute('UPDATE ledger SET amount=39')
     server.conn.commit()
     weekly = executor.weekly_check(14)
-    assert '6 active texts checked; 6 with changed evidence:' in weekly, weekly
+    assert 'Checked this week: 6 texts; 6 with changed evidence:' in weekly, weekly
     assert 'r6.1 (day 7)' in weekly and 'PREDICATE FAILS' in weekly
     for suffix in ('', ' --detail'):
         limited = executor.execute('bash', {'command': 'pf depend r6' + suffix})
@@ -35,15 +35,15 @@ def test_long_chain_reports_failures_and_explicit_check_coverage(workspace, tmp_
     assert historical['version'] not in executor.weekly_check(14)
     server.conn.execute('UPDATE ledger SET amount=45')
     server.conn.commit()
-    assert '6 active texts checked: cited files and texts are unchanged and no predicate fails.' in executor.weekly_check(14)
+    assert 'Checked this week: 6 texts; cited files and texts are unchanged and no predicate fails.' in executor.weekly_check(14)
     server.conn.execute('DELETE FROM ledger')
     server.conn.commit()
     unknown = executor.weekly_check(14)
-    assert '6 active texts checked; 6 with changed evidence:' in unknown and 'could not be checked' in unknown
+    assert 'Checked this week: 6 texts; 6 with changed evidence:' in unknown and 'could not be checked' in unknown
     # Old revisions still support current descendants even after their own text is retired.
     for i in range(1, 6):
         call(registry, 'retire', record=f'r{i}', reason='Kept only as an earlier dependency')
-    assert '1 active text checked; 1 with changed evidence:' in executor.weekly_check(14)
+    assert 'Checked this week: 1 text; 1 with changed evidence:' in executor.weekly_check(14)
 
 
 def test_shared_dependency_failure_is_reported_on_each_declared_path(workspace, tmp_path, server):
@@ -121,11 +121,12 @@ def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, t
     quiet = executor.weekly_check(14)
     assert server.conn.serialize() == before
     assert quiet == ('=== Check of your registered texts (day 14) ===\n'
-                     '2 active texts checked: cited files and texts are unchanged and no predicate fails.')
+                     'Registered texts: 3 active; 3 within their applies window.\n'
+                     'Checked this week: 2 texts; cited files and texts are unchanged and no predicate fails.')
     server.conn.execute('UPDATE ledger SET amount=39')
     server.conn.commit()
     loud = executor.weekly_check(21)
-    assert '2 active texts checked; 2 with changed evidence:' in loud and 'r1.1 (day 7): "Keep the plan"' in loud
+    assert 'Checked this week: 2 texts; 2 with changed evidence:' in loud and 'r1.1 (day 7): "Keep the plan"' in loud
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39 \(was 42\)', loud), loud
     # r2 cites r1, whose predicate failed: the failure reaches it through the declared chain.
     assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend rN.')
@@ -146,7 +147,7 @@ def test_git_weekly_check_compares_cited_commits_with_current_files(workspace, t
     git(workspace, 'add', '.')
     git(workspace, 'commit', '-qm', 'Week 2 (day 14) [week-2]')
     first = registry.weekly_check(14)
-    assert first == '=== Check of your registered texts (day 14) ===\n2 active texts checked: cited files and texts are unchanged.'
+    assert first == '=== Check of your registered texts (day 14) ===\nChecked this week: 2 texts; cited files and texts are unchanged.'
     (workspace / 'evidence.json').write_text('{"n":9}')
     call(registry, 'revise', record='r1', reason='Updated')
     second = registry.weekly_check(21)

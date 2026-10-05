@@ -113,7 +113,7 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
     assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
     assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
     call(registry, 'create', **declaration({'record': 'r1.2'}, text='Depends on the plan'))
-    assert registry.weekly_check(7).startswith('=== Check of your registered texts (day 7) ===\n2 active texts')
+    assert registry.weekly_check(7).startswith('=== Check of your registered texts (day 7) ===\nChecked this week: 2 texts')
     late = registry.weekly_check(14)
     assert late.endswith('Not checked: 1 text past the applies window.'), late
     with pytest.raises(ValueError, match='applies must be'):
@@ -265,7 +265,7 @@ def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
     store.snapshot(run / 'sql-evidence.sqlite')
     request = dict(event='request', day=28, request=dict(messages=[dict(role='system', content=''),
         dict(role='user', content='Dashboard\n\n=== Check of your registered texts (day 28) ===\n'
-                                  '1 active text checked; 1 with changed evidence:\nr1.1 (day 7): plan')]))
+                                  'Checked this week: 1 text; 1 with changed evidence:\nr1.1 (day 7): plan')]))
     (run / 'logs/agent_requests.jsonl').write_text(json.dumps(request) + '\n')
     (run / 'usage_summary.json').write_text('{}')
     pointer = tmp_path / 'pointer.json'

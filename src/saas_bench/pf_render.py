@@ -389,18 +389,21 @@ def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
 
 
-def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0):
+def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0,
+                  *, active=None, eligible=None):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Show changes to existing data even behind a cited output. Pure additions share a line.
     """
     flagged = [e for e in entries if e['changed']]
     lines = [f'=== Check of your registered texts (day {day}) ===']
-    checked = plural(len(entries), 'active text') + ' checked'
+    if active is not None:
+        lines.append(f'Registered texts: {active} active; {eligible} within their applies window.')
+    checked = 'Checked this week: ' + plural(len(entries), 'text')
     if not flagged and pending:
-        lines.append(f'{checked}; {condition_only} cover continuing conditions or read retries. No new direct issues in these checks.')
+        lines.append(f'{checked}; {condition_only} for continuing conditions or read retries. No new direct issues in these checks.')
     elif not flagged:
-        lines.append(checked + ': cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
+        lines.append(checked + '; cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
     else:
         lines.append(f'{checked}; {len(flagged)} with changed evidence:')
     seen, displayed, shared = set(), 0, 0

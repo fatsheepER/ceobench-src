@@ -485,9 +485,12 @@ class PFQueries:
                     # Do not advance the ordinary problem's last verification date.
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
             text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
-                                          condition_only=len(continuing), pending=len(self.review_pending))
+                                          condition_only=len(continuing), pending=len(self.review_pending),
+                                          active=len(active), eligible=len(eligible))
             if self.review_pending:
-                text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "text")}. '
+                text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "active text")}; '
+                         f'{pf_render.plural(skipped_pending, "earlier finding")} '
+                         f'{"was" if skipped_pending == 1 else "were"} not rechecked this week. '
                          'Use text_list with review="pending" for dated findings; '
                          'pf depend rN rechecks one text. Pending does not retire a text.')
                 text += pf_render.render_pending([

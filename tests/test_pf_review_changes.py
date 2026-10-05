@@ -85,7 +85,7 @@ def test_only_additions_stay_pending_without_content_reminders(workspace, tmp_pa
     query = executor.pf_queries
     query.refresh = lambda versions, parent: {v: record_sql(store, sql, table([{'n': 1}, {'n': 2}]), parent=parent) for v in versions}
     first = query.weekly_check(7)
-    assert 'Only added rows' in first and 'Pending review: 1 text' in first
+    assert 'Only added rows' in first and 'Pending review: 1 active text' in first
     query.refresh = lambda *_: pytest.fail('Pending source was rerun')
     second = query.weekly_check(14)
     assert '1 text with only added rows' in second
@@ -103,3 +103,39 @@ def test_pending_content_examples_have_a_fixed_bound(workspace, tmp_path):
     second = executor.pf_queries.weekly_check(14)
     assert second.count('last verified day 7') == 3
     assert '2 more texts have earlier content-change findings' in second
+
+
+def test_weekly_counts_separate_active_eligible_checked_and_pending(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    for n in range(4):
+        executor.execute('write_file', {'path': f'f{n}.txt', 'content': 'old'})
+        call(registry, 'create', **declaration({'path': f'f{n}.txt'}))
+        (workspace / f'f{n}.txt').write_text('new')
+    executor.weekly_check(7)
+    earlier = store.load_state('pf_review')['pending']
+    assert len(earlier) == 4
+    for n, window in enumerate([
+        {'start_day': 7}, {'start_day': 7}, {'start_day': 7},
+        {'start_day': 7, 'end_day': 13}, {'start_day': 21},
+    ], 4):
+        executor.execute('write_file', {'path': f'f{n}.txt', 'content': 'old'})
+        call(registry, 'create', **declaration({'path': f'f{n}.txt'}, applies_at=window))
+    (workspace / 'f4.txt').write_text('new')
+    registered = registry.path.read_text()
+
+    weekly = executor.weekly_check(14)
+
+    assert weekly.startswith('=== Check of your registered texts (day 14) ===\n'
+                             'Registered texts: 9 active; 7 within their applies window.\n'
+                             'Checked this week: 3 texts; 1 with changed evidence:')
+    assert 'Pending review: 5 active texts; 4 earlier findings were not rechecked this week.' in weekly
+    assert 'Not checked: 1 text past the applies window.' in weekly
+    assert 'Pending does not retire a text.' in weekly
+    pending = store.load_state('pf_review')['pending']
+    assert len(pending) == 5
+    assert {v: pending[v] for v in earlier} == earlier
+    assert all(p['first_day'] == p['last_day'] == 7 for p in earlier.values())
+    newly_pending, = pending.keys() - earlier.keys()
+    assert pending[newly_pending]['first_day'] == pending[newly_pending]['last_day'] == 14
+    assert registry.path.read_text() == registered
+    assert all(r['status'] == 'active' for r in call(registry, 'list')['records'])
