@@ -502,7 +502,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({'success': False, 'error': 'Invalid JSON body'}, 400)
         except QueryDenied as exc:
-            self._sql_execution['permanent_error'] = True
+            self._sql_execution.setdefault('permanent_error', True)
             self._send_json({'success': False, 'error': str(exc)}, 403)
         except SnapshotUnavailable as exc:
             self._send_json({'success': False, 'error': str(exc)}, 503)
@@ -510,7 +510,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             if not self._query_response_started:
                 self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
         except sqlite3.Error as exc:
-            self._sql_execution['permanent_error'] = getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_ERROR
+            self._sql_execution['permanent_error'] = self._sql_execution.get('permanent_error',
+                (getattr(exc, 'sqlite_errorcode', None) or 0) & 0xff == sqlite3.SQLITE_ERROR)
             self._send_json({'success': False, 'error': _get_helpful_query_error(exc, sql)}, 500)
         except (BrokenPipeError, ConnectionResetError):
             pass

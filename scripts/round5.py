@@ -204,20 +204,48 @@ def fork_state(source, destination, group, identity):
     return result
 
 
-def read_increment(path, cursor):
+def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
     if not path.exists():
         return [], cursor
     with path.open('rb') as stream:
         stream.seek(cursor)
         rows = []
-        while True:
+        # ponytail: budget between records; chunk individual lines if diagnostics exceed 1 MiB.
+        while max_bytes is None or stream.tell() - cursor < max_bytes:
             offset = stream.tell()
             line = stream.readline()
             if not line or not line.endswith(b'\n'):
                 stream.seek(offset)
                 break
-            rows.append(json.loads(line))
+            if not line.startswith(prefix):
+                continue
+            try:
+                rows.append(json.loads(line[len(prefix):]))
+            except (ValueError, UnicodeDecodeError):
+                if not prefix:
+                    raise
         return rows, stream.tell()
+
+
+def sql_failures(run, cursor, *, drain=False):
+    path = run / 'logs' / 'api_server_stderr.log'
+    if not path.exists():
+        return [], {}
+    stat = path.stat()
+    identity = [stat.st_dev, stat.st_ino]
+    offset = cursor.get('offset', 0)
+    if cursor.get('path') != str(path) or cursor.get('identity') != identity or offset > stat.st_size:
+        offset = 0
+    fields = ('day', 'snapshot_ref', 'failure_stage', 'error_type', 'sqlite_errorcode', 'sqlite_errorname')
+    issues = []
+    while True:
+        previous = offset
+        rows, offset = read_increment(path, offset, prefix=b'[public_sql] ', max_bytes=1024**2)
+        issues.extend({key: row[key] for key in fields if key in row}
+                      for row in rows if row.get('error_kind') == 'service')
+        if not drain or offset == previous:
+            break
+    return issues, dict(path=str(path), identity=identity, offset=offset)
 
 
 def model_issue(row):
@@ -348,7 +376,8 @@ def monitor(args):
     output = args.output_dir.resolve()
     pointer = stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt)
     previous = read(output / f'{stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt - 1).stem}-cursor.json', {}) if args.attempt > 1 else {}
-    state = dict(offsets=previous.get('offsets', {}), alerts=set(), milestones=set())
+    state = dict(offsets=previous.get('offsets', {}), sql_cursor=previous.get('sql_cursor', {}),
+                 alerts=set(), milestones=set())
     argv = [sys.executable, '-u', str(Path(__file__).resolve()), 'run', args.mode,
             '--seed', str(args.seed), '--stop-after-day', str(args.stop_after_day), '--output-dir', str(output),
             '--attempt', str(args.attempt)]
@@ -368,6 +397,7 @@ def monitor(args):
                 stream.write(json.dumps(item) + '\n')
         print(json.dumps(item), flush=True)
     while True:
+        rc = process.poll()
         record = read(pointer, {})
         run = Path(record['path']) if record.get('path') else None
         cp = read(run / 'checkpoint.json', {}) if run else {}
@@ -384,9 +414,11 @@ def monitor(args):
                        for row in rows if (problem := model_issue(row))]
                 counts[role] = len({row['call_id'] for row in new})
                 issues.extend(new)
+        sql_issues = []
+        if run:
+            sql_issues, state['sql_cursor'] = sql_failures(run, state['sql_cursor'], drain=rc is not None)
         paths = [log] + (list((run / 'logs').glob('*')) + [run / 'weekly.jsonl', run / 'operation.json', run / 'checkpoint.json'] if run else [])
         idle = time.time() - max([started] + [p.stat().st_mtime for p in paths if p.is_file()])
-        rc = process.poll()
         status = 'running' if rc is None else record.get('status', 'unexpected_exit')
         warnings = list(faults)
         if rc is not None and status not in ('stopped', 'completed', 'bankrupt'):
@@ -406,14 +438,16 @@ def monitor(args):
         summary = dict(mode=args.mode, family=SEEDS[args.seed], run_id=record.get('run_id'), pid=process.pid,
             day=week.get('day', cp.get('day', 0)), checkpoint_day=cp.get('day'), status=status,
             idle_seconds=round(idle), warnings=warnings, new_errors=counts, issues=issues,
-            pointer=str(pointer), path=str(run) if run else None, quota=quota)
+            pointer=str(pointer), path=str(run) if run else None, quota=quota, sql_issues=sql_issues)
         for warning in warnings:
             if warning not in state['alerts']:
                 event('attention', dict(summary, warning=warning))
                 state['alerts'].add(warning)
         if issues:
             event('model_attention', summary)
-        if faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
+        if sql_issues:
+            event('sql_attention', summary)
+        if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
             locked_write(output, 'hold.json', summary)
         for day in (210, 280, 350, 420):
             if args.stop_after_day == 497 and cp.get('day', 0) >= day and day not in state['milestones']:
@@ -429,7 +463,8 @@ def monitor(args):
         locked_write(output, 'health.json', health)
         with (output / 'health.jsonl').open('a') as stream:
             stream.write(json.dumps(health) + '\n')
-        write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
+        write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], sql_cursor=state['sql_cursor'],
+                                                             alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
         if rc is not None:
             event('stage_finished', summary)
             return

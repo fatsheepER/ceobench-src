@@ -148,3 +148,81 @@ def test_receipt_audit_preserves_unknown_attempts_and_rejects_pending_or_changed
     path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
     with pytest.raises(ValueError,match='model_route_changed'):
         round5.audit_model_receipts(path, 'agent')
+
+
+@pytest.mark.parametrize('service_failure', [False, True])
+def test_monitor_observes_real_sql_failures_without_holding_on_bad_queries(tmp_path, monkeypatch, capfd,
+                                                                         service_failure):
+    import sqlite3
+    from types import SimpleNamespace
+    from saas_bench.api_server import NovaMindAPIServer
+    from saas_bench.database import init_database
+    from test_public_sql import request
+    run, output = tmp_path / 'run', tmp_path / 'monitor'
+    (run / 'logs').mkdir(parents=True)
+    output.mkdir()
+    args = SimpleNamespace(output_dir=output, mode='git', seed=42, stop_after_day=35,
+                           attempt=1, continue_from=None)
+    pointer = round5.stage_pointer(output, 'git', 42, 35)
+    pointer.write_text(json.dumps(dict(path=str(run), run_id='test', status='completed')))
+    conn = init_database(':memory:')
+    server = NovaMindAPIServer(SimpleNamespace(workspace_path=tmp_path / 'workspace', current_day=0), conn=conn)
+    server.start()
+    connect = sqlite3.connect
+    class Reader(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql == 'SELECT 1 AS private_body':
+                error = sqlite3.OperationalError('disk I/O error')
+                error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+                raise error
+            return super().execute(sql, *args)
+    def failed_reader(*args, **kwargs):
+        return connect(*args, **kwargs, factory=Reader)
+    try:
+        if service_failure:
+            monkeypatch.setattr(sqlite3, 'connect', failed_reader)
+        status, _body = request(server, {'sql': 'SELECT 1 AS private_body' if service_failure else 'SELECT FROM private_body'})
+        assert status == 500
+    finally:
+        monkeypatch.setattr(sqlite3, 'connect', connect)
+        server.stop()
+        conn.close()
+    noise = 'unrelated stderr\n' * (1024**2 // 17 + 1) if service_failure else ''
+    (run / 'logs' / 'api_server_stderr.log').write_text(noise + capfd.readouterr().err)
+    monkeypatch.setattr(round5.subprocess, 'Popen', lambda *args, **kwargs: SimpleNamespace(pid=123, poll=lambda: 0))
+    monkeypatch.setattr(round5, 'quota_health', lambda: {})
+    round5.monitor(args)
+    events = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
+    sql_events = [row for row in events if row['event'] == 'sql_attention']
+    assert bool(sql_events) is service_failure
+    assert (output / 'hold.json').exists() is service_failure
+    if service_failure:
+        alert, = sql_events[0]['sql_issues']
+        assert alert['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
+        assert alert['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'
+        assert 'private_body' not in json.dumps(events)
+    health = json.loads((output / 'health.json').read_text())
+    assert health['sql_issues'] == (sql_events[0]['sql_issues'] if service_failure else [])
+
+
+def test_sql_log_cursor_preserves_partial_lines_and_resets_for_new_runs(tmp_path):
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    for run in (first, second):
+        (run / 'logs').mkdir(parents=True)
+    path = first / 'logs' / 'api_server_stderr.log'
+    row = dict(error_kind='service', failure_stage='setup', sqlite_errorcode=778,
+               sqlite_errorname='SQLITE_IOERR_WRITE', executed_sql='PRIVATE QUERY')
+    line = b'[public_sql] ' + json.dumps(row).encode() + b'\n'
+    path.write_bytes(b'unstructured stderr\n' + line[:30])
+    issues, cursor = round5.sql_failures(first, {}, drain=True)
+    assert issues == []
+    with path.open('ab') as stream:
+        stream.write(line[30:])
+    issues, cursor = round5.sql_failures(first, cursor)
+    assert len(issues) == 1 and 'PRIVATE' not in json.dumps(issues)
+    assert round5.sql_failures(first, cursor)[0] == []
+    (second / 'logs' / 'api_server_stderr.log').write_bytes(line)
+    issues, cursor = round5.sql_failures(second, cursor)
+    assert len(issues) == 1
+    (second / 'logs' / 'api_server_stderr.log').write_bytes(b'old\n')
+    assert round5.sql_failures(second, cursor)[0] == []

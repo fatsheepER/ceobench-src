@@ -273,21 +273,25 @@ class Simulator:
         return float(self._customer_quality_noise_rng.uniform(0.8, 1.1))
 
     # === L3-L5 Performance: Per-step_day cached state ===
-    # These are populated once at the start of step_day and reused by all functions
+    # Global quality/cost values are populated at the start of step_day; drift is
+    # refreshed by preference and competitor writers when they change it.
     _cached_q_shared_bonus: float = 0.0
     _cached_compute_cost_multiplier: float = 1.0
     _cached_q_shared_per_plan: dict = None  # {plan: q_shared} for A, B, C
     _cached_q_group_bonus: dict = None  # {group_id: float} cumulative per-group quality bonus
 
-    def _cache_step_day_globals(self, config: dict):
-        """Cache global values that don't change within a single step_day. (L3)"""
-        # Cache drift accumulators for consistent reads within step_day.
+    def _cache_drift_offsets(self):
+        """Cache current market drift for customer reads in this day phase."""
         global_q_bias = get_global_drift(self.conn)
         all_gp = get_all_group_parameters(self.conn)
         self._drift_cache = {
             'global_q_bias': global_q_bias,
             'groups': {gid: dict(row) for gid, row in all_gp.items()},
         }
+
+    def _cache_step_day_globals(self, config: dict):
+        """Cache global values used during step_day. (L3)"""
+        self._cache_drift_offsets()
 
         self._cached_q_shared_bonus = get_global_state(self.conn, 'q_shared_bonus', 0.0)
         multiplier_row = self.conn.execute(
@@ -596,6 +600,7 @@ class Simulator:
 
         # L6: Cleanup temp table
         self.conn.execute("DROP TABLE IF EXISTS _tmp_active_subs")
+        self._cache_drift_offsets()
 
     def _apply_monthly_leads_noise(self):
         """v3.4aj: perturb every (channel, group) leads_per_1000_dollars entry with N(0, 0.05*v).
@@ -5559,6 +5564,8 @@ Requirements:
                 self.conn, seg_bank_key, max(0.0, seg_unreleased - seg_drain)
             )
 
+        self._cache_drift_offsets()
+
         # No notification for competitor events (agent can observe via social media / quality metrics)
 
     def _fire_replayed_competitor_event(self, src_event: dict):
@@ -5634,6 +5641,8 @@ Requirements:
             set_global_state(
                 self.conn, seg_bank_key, max(0.0, seg_unreleased - seg_drain)
             )
+
+        self._cache_drift_offsets()
 
     def _generate_competitor_event_posts(self):
         """Generate social media posts for active competitor events.

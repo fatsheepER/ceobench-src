@@ -567,3 +567,105 @@ finally:
     result = subprocess.run([sys.executable, '-c', probe], cwd=tmp_path, env=env,
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('failure,stage,kind,code', [
+    ('setup_io', 'setup', 'service', sqlite3.SQLITE_IOERR_WRITE),
+    ('execute_io', 'execute', 'service', sqlite3.SQLITE_IOERR_WRITE),
+    ('setup_syntax', 'setup', 'service', sqlite3.SQLITE_ERROR),
+    ('setup_unexpected', 'setup', 'service', None),
+    ('syntax', 'execute', 'query', sqlite3.SQLITE_ERROR),
+    ('denied', 'execute', 'denied', sqlite3.SQLITE_AUTH),
+    ('readonly', 'execute', 'denied', sqlite3.SQLITE_READONLY),
+    ('readonly_lock', 'execute', 'service', sqlite3.SQLITE_READONLY_CANTLOCK),
+    ('timeout', 'execute', 'timeout', sqlite3.SQLITE_INTERRUPT),
+    ('unavailable', 'setup', 'service', None),
+])
+def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch, capfd,
+                                                        failure, stage, kind, code):
+    connect = sqlite3.connect
+    class Reader(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if ((failure in ('execute_io', 'readonly', 'readonly_lock') and sql == 'SELECT 1 AS n') or
+                    (failure == 'setup_syntax' and sql.startswith('PRAGMA main.table_info'))):
+                error = sqlite3.OperationalError('injected SQL failure')
+                error.sqlite_errorcode = code
+                error.sqlite_errorname = {sqlite3.SQLITE_IOERR_WRITE: 'SQLITE_IOERR_WRITE',
+                                          sqlite3.SQLITE_READONLY: 'SQLITE_READONLY',
+                                          sqlite3.SQLITE_READONLY_CANTLOCK: 'SQLITE_READONLY_CANTLOCK'}.get(code, 'SQLITE_ERROR')
+                raise error
+            return super().execute(sql, *args)
+    def open_reader(*args, **kwargs):
+        if failure == 'setup_io':
+            error = sqlite3.OperationalError('disk I/O error')
+            error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+            raise error
+        if failure == 'setup_unexpected':
+            raise OSError('injected reader failure')
+        return connect(*args, **kwargs, factory=Reader)
+    monkeypatch.setattr(sqlite3, 'connect', open_reader)
+    server._operation_failed = failure == 'unavailable'
+    server.QUERY_TIMEOUT_SECONDS = .02 if failure == 'timeout' else 5
+    sql = {'syntax': 'SELECT FROM ledger', 'denied': 'SELECT * FROM group_insight_snapshots',
+           'timeout': 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x'}.get(failure, 'SELECT 1 AS n')
+    server.start()
+    status, body = request(server, {'sql': sql})
+    assert status >= 400 and not body['success']
+    assert 'sqlite_errorcode' not in body and 'SQLITE_IOERR_WRITE' not in json.dumps(body)
+    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
+                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
+    record, = diagnostics
+    assert record['failure_stage'] == stage and record['error_kind'] == kind
+    assert record['sqlite_errorcode'] == code
+    assert record['permanent_error'] is (kind in ('query', 'denied'))
+    if code == sqlite3.SQLITE_IOERR_WRITE:
+        assert record['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'
+    if code == sqlite3.SQLITE_READONLY_CANTLOCK:
+        assert status == 500 and record['sqlite_errorname'] == 'SQLITE_READONLY_CANTLOCK'
+
+
+@pytest.mark.parametrize('failure', ['setup', 'setup_io', 'execute'])
+def test_pf_refresh_service_failure_has_private_diagnostics(server, tmp_path, monkeypatch, capfd, failure):
+    from saas_bench.pf_refresh import refresh
+    from saas_bench.sql_evidence import FORMAT, SQLEvidenceStore
+    from test_pf_stale import record_sql
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', dict(format=FORMAT, run_id='test', branch_id='test',
+                                                            data_source_id='test'))
+    server.sql_evidence = store
+    version = record_sql(store, 'SELECT 1 AS n', dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1))
+    parent = store.begin_event('pf_weekly_check', {'day': 0})
+    if failure == 'setup':
+        server._operation_failed = True
+    else:
+        connect = sqlite3.connect
+        class Reader(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'SELECT 1 AS n':
+                    error = sqlite3.OperationalError('disk I/O error')
+                    error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+                    raise error
+                return super().execute(sql, *args)
+        def open_reader(*args, **kwargs):
+            if failure == 'setup_io' and kwargs.get('uri'):
+                error = sqlite3.OperationalError('disk I/O error')
+                error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+                raise error
+            return connect(*args, **kwargs, factory=Reader)
+        monkeypatch.setattr(sqlite3, 'connect', open_reader)
+    if failure == 'setup_io':
+        with pytest.raises(sqlite3.OperationalError, match='disk I/O error'):
+            refresh(server, [version], parent)
+    else:
+        result = refresh(server, [version], parent)
+        meta, raw = store.get_content(result[version])
+        assert 'sqlite_errorcode' not in json.loads(raw)
+        captured = store.read_event(meta['created_by_event'])['result']
+        assert captured['error_kind'] == 'service' and captured['failure_stage'] == failure
+    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
+                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
+    failed, = [row for row in diagnostics if row.get('error_kind') == 'service']
+    if failure == 'setup_io':
+        assert failed['failure_stage'] == 'setup' and failed['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
+    if failure == 'execute':
+        assert failed['sqlite_errorcode'] == captured['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
+        assert failed['sqlite_errorname'] == captured['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'

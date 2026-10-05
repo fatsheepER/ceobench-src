@@ -7,7 +7,10 @@ from saas_bench.config import (
     GROUP_PREFERENCE_DRIFT,
     INDIVIDUAL_PREFERENCE_DRIFT,
 )
-from saas_bench.database import update_global_drift, update_group_drift
+from saas_bench.database import (
+    get_global_drift, get_global_state, set_global_state,
+    update_global_drift, update_group_drift,
+)
 from saas_bench.enterprise import (
     create_negotiation_thread,
     get_negotiation_state,
@@ -45,6 +48,72 @@ def _set_market_drift(conn, sim, group_id, *, quality=0.3, budget=20.0):
     update_global_drift(conn, 0.2)
     update_group_drift(conn, group_id, quality - 0.2, budget, sim.current_day)
     sim._cache_step_day_globals(PLAN_CONFIG)
+
+
+@pytest.mark.parametrize("day, competitor", [(90, False), (61, True)])
+def test_step_day_refreshes_drift_before_same_day_decisions(
+    make_initialized_sim, monkeypatch, day, competitor,
+):
+    config = BenchmarkConfig(
+        seed=123,
+        competitor_events_disabled=not competitor,
+        competitor_event_late_cutoff_days=0,
+        competitor_event_mean_interval=1,
+        competitor_event_min_interval=0,
+        competitor_event_boost_min=0.3,
+        competitor_event_boost_max=0.3,
+        competitor_event_magnitude_scale_min=1.0,
+        competitor_event_magnitude_scale_max=1.0,
+    )
+    conn, sim, _ = make_initialized_sim(config=config)
+    sim.current_day = day - 1
+    params = _fixed_customer(sim, "E1")
+    customer_id = sim._create_customer(params)
+    sim._create_enterprise_lead(customer_id, params)
+    thread_id = conn.execute("SELECT thread_id FROM enterprise_turns LIMIT 1").fetchone()[0]
+    baseline = (params["q_min"], params["q_max"], params["c_max"])
+
+    class ReachedDecisions(Exception):
+        pass
+
+    def inspect_same_day(*_args):
+        group = conn.execute(
+            "SELECT drift_q_bias_total, drift_c_max_total FROM group_parameters WHERE group_id = 'E1'"
+        ).fetchone()
+        q_offset = get_global_drift(conn) + group[0]
+        assert (q_offset if competitor else group[1]) != 0
+        expected = (baseline[0] + q_offset, baseline[1] + q_offset,
+                    max(15.0, baseline[2] + group[1]))
+        assert sim._apply_drift_offsets("E1", *baseline) == pytest.approx(expected)
+        state = get_negotiation_state(conn, thread_id)
+        assert (state.q_min, state.q_max, state.c_max) == pytest.approx(expected)
+        assert tuple(conn.execute(
+            "SELECT q_min, q_max, c_max FROM customers WHERE customer_id = ?", (customer_id,)
+        ).fetchone()) == pytest.approx(baseline)
+        raise ReachedDecisions
+
+    monkeypatch.setattr(sim, "_update_customer_satisfaction", inspect_same_day)
+    with pytest.raises(ReachedDecisions):
+        sim.step_day()
+
+
+def test_replayed_competitor_drain_refreshes_drift_cache(make_initialized_sim):
+    conn, sim, _ = make_initialized_sim()
+    sim.current_day = 1
+    sim._cache_step_day_globals(PLAN_CONFIG)
+    set_global_state(conn, "unreleased_targeted_dev_E1", 2.0)
+
+    sim._fire_replayed_competitor_event({
+        "boost_amount": 0.3, "post_end_day": 4,
+    })
+
+    group = conn.execute(
+        "SELECT drift_q_bias_total FROM group_parameters WHERE group_id = 'E1'"
+    ).fetchone()[0]
+    assert 0 < get_global_state(conn, "unreleased_targeted_dev_E1", 0) < 2.0
+    expected = 0.3 + group
+    q_min, q_max, _ = sim._apply_drift_offsets("E1", 0.25, 0.75, 100.0)
+    assert (q_min, q_max) == pytest.approx((0.25 + expected, 0.75 + expected))
 
 
 @pytest.mark.parametrize("group_id", ["S1", "E1"])
@@ -215,7 +284,6 @@ def test_individual_drift_changes_personal_baseline_before_market_offset(make_in
     sim.current_day = 30
 
     sim._apply_preference_drift(days=30)
-    sim._cache_step_day_globals(PLAN_CONFIG)
 
     personal = conn.execute(
         "SELECT current_q_min, current_q_max, current_c_max FROM customer_state WHERE customer_id = ?",

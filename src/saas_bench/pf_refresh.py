@@ -6,7 +6,8 @@ import time
 
 from .execution_capture import READ_TOOLS, finish_http
 from .public_sql import (PUBLIC_POLICY_VERSION, QueryDenied, SnapshotUnavailable,
-                         check_deadline, execute_snapshot, install_authorizer, query_snapshot)
+                         check_deadline, execute_snapshot, install_authorizer, query_snapshot,
+                         record_query_failure)
 
 
 def replayable(event):
@@ -52,14 +53,18 @@ def refresh(server, versions, parent):
     # ponytail: hold the world lock for this synchronous check; use frozen SDK readers
     # if measured business-action contention warrants releasing it earlier.
     locked = False
+    snapshot = {}
+    has_sql = any(e['query_definition'] for e in sources.values())
+    stage = 'lock'
     try:
         locked = server._lock.acquire(timeout=max(0, deadline - time.monotonic()))
         if not locked:
             raise TimeoutError('Refresh lock wait exceeded time limit')
+        stage = 'setup'
         check_deadline(deadline)
         if server._operation_failed or server._step_day_timed_out or server.conn.in_transaction:
             raise SnapshotUnavailable('World state unavailable for refresh')
-        context = (query_snapshot(server, deadline) if any(e['query_definition'] for e in sources.values())
+        context = (query_snapshot(server, deadline, snapshot) if has_sql
                    else nullcontext((None, {'day': server.tools.current_day})))
         with context as (conn, snapshot):
             for version, source in sources.items():
@@ -80,7 +85,7 @@ def refresh(server, versions, parent):
                         except sqlite3.Error as exc:
                             if denied:
                                 raise QueryDenied('Query is not allowed by the read-only SQL policy') from exc
-                            if getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
+                            if (getattr(exc, 'sqlite_errorcode', None) or 0) & 0xff == sqlite3.SQLITE_INTERRUPT:
                                 raise TimeoutError('Query time limit exceeded') from exc
                             raise
                         from .api_server import _get_enum_hint_for_query
@@ -108,21 +113,25 @@ def refresh(server, versions, parent):
                     # Detailed private diagnostics never become a public error string.
                     execution['refresh_error'] = type(exc).__name__
                     execution['refresh_error_detail'] = str(exc)
-                    execution['permanent_error'] = bool(definition and
-                        (isinstance(exc, QueryDenied) or getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_ERROR))
+                    if definition:
+                        record_query_failure(execution, exc, 'execute', log=True)
                     raw = json.dumps(dict(success=False, error='refresh_denied' if status == 403 else
                                           'refresh_timed_out' if status == 504 else 'refresh_failed')).encode()
                 execution['refresh_seconds'] = time.monotonic() - started
                 save(version, status, raw, execution)
         return result
     except (TimeoutError, SnapshotUnavailable) as exc:
+        if has_sql and 'error_kind' not in snapshot:
+            record_query_failure(snapshot, exc, stage, log=True)
         for version in sources:
             if version not in result:
                 save(version, 504 if isinstance(exc, TimeoutError) else 503,
                      b'{"success":false,"error":"snapshot_unavailable"}',
-                     dict(refresh_of=version, refresh_error=type(exc).__name__, attempted=False))
+                     dict(snapshot, refresh_of=version, refresh_error=type(exc).__name__, attempted=False))
         return result
     except Exception as exc:
+        if has_sql and 'error_kind' not in snapshot:
+            record_query_failure(snapshot, exc, stage, log=True)
         # A capture failure must stop collection; a failed read is recorded above.
         store.fail(exc)
         raise

@@ -41,6 +41,34 @@ def check_deadline(deadline):
         raise TimeoutError('Query time limit exceeded')
 
 
+def record_query_failure(metadata, exc, stage, *, log=False):
+    cause = exc
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+    code = getattr(cause, 'sqlite_errorcode', None)
+    base = code & 0xff if code is not None else None
+    kind = 'service'
+    if stage == 'execute':
+        if isinstance(exc, QueryDenied) or base == sqlite3.SQLITE_AUTH or code == sqlite3.SQLITE_READONLY:
+            kind = 'denied'
+        elif isinstance(exc, TimeoutError) or base == sqlite3.SQLITE_INTERRUPT:
+            kind = 'timeout'
+        elif base == sqlite3.SQLITE_ERROR or isinstance(exc, sqlite3.ProgrammingError):
+            kind = 'query'
+    metadata.update(snapshot_status='failed', error_type=type(exc).__name__, failure_stage=stage,
+                    error_kind=kind, permanent_error=kind in ('query', 'denied'),
+                    sqlite_errorcode=code, sqlite_errorname=getattr(cause, 'sqlite_errorname', None))
+    if log:
+        log_query(metadata)
+
+
+def log_query(metadata):
+    try:
+        print('[public_sql] ' + json.dumps(metadata), file=sys.stderr, flush=True)
+    except OSError:
+        pass  # A closed diagnostic stream must not override the query result.
+
+
 def install_authorizer(conn, *, oracle=False):
     """Install a fail-closed policy on a fresh connection with no application UDFs."""
     denied = []
@@ -72,11 +100,13 @@ def query_snapshot(server, deadline, metadata=None):
     metadata = metadata if metadata is not None else {}
     metadata.update(snapshot_ref=uuid.uuid4().hex, public_policy_version=PUBLIC_POLICY_VERSION,
                     oracle=server.oracle_mode, snapshot_status='failed')
+    stage = 'lock'
     try:
         # ponytail: serialize queries and world writes; use frozen readers if contention matters.
         if not server._lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise TimeoutError('Query lock wait exceeded time limit')
         try:
+            stage = 'setup'
             metadata['lock_seconds'] = time.monotonic() - started
             check_deadline(deadline)
             if server.conn is None or server._operation_failed or server._step_day_timed_out:
@@ -126,6 +156,7 @@ def query_snapshot(server, deadline, metadata=None):
                 metadata['snapshot_seconds'] = time.monotonic() - before
                 before = time.monotonic()
                 try:
+                    stage = 'execute'
                     yield conn, metadata
                     metadata['snapshot_status'] = 'success'
                 except sqlite3.Error as exc:
@@ -135,15 +166,19 @@ def query_snapshot(server, deadline, metadata=None):
                 finally:
                     metadata['sql_seconds'] = time.monotonic() - before
             finally:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    stage = 'cleanup'
+                    raise
         finally:
             server._lock.release()
+    except Exception as exc:
+        record_query_failure(metadata, exc, stage)
+        raise
     finally:
         metadata['total_seconds'] = time.monotonic() - started
-        try:
-            print('[public_sql] ' + json.dumps(metadata), file=sys.stderr, flush=True)
-        except OSError:
-            pass  # A closed diagnostic stream must not override the query result.
+        log_query(metadata)
 
 
 def execute_query(server, sql, *, metadata=None):
@@ -154,10 +189,10 @@ def execute_query(server, sql, *, metadata=None):
         with query_snapshot(server, deadline, metadata) as (conn, _):
             return execute_snapshot(conn, sql, deadline, metadata)
     except sqlite3.Error as exc:
-        code = getattr(exc, 'sqlite_errorcode', None)
-        if code in (sqlite3.SQLITE_AUTH, sqlite3.SQLITE_READONLY):
+        code = getattr(exc, 'sqlite_errorcode', None) or 0
+        if code & 0xff == sqlite3.SQLITE_AUTH or code == sqlite3.SQLITE_READONLY:
             raise QueryDenied('Query is not allowed by the read-only SQL policy. Read docs/tables/ for public columns.') from exc
-        if code == sqlite3.SQLITE_INTERRUPT:
+        if code & 0xff == sqlite3.SQLITE_INTERRUPT:
             raise TimeoutError('Query time limit exceeded') from exc
         raise
 
