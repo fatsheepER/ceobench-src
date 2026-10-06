@@ -118,6 +118,22 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
         reached_stop=False, result={'days_run': 42})))
     with pytest.raises(ValueError, match='complete week boundary'):
         round5.validate_start('git', 42, 112, git.workspace_dir, 2, output)
+    for boundary in ('new_week', 'same_week'):
+        git.agent.current_day = 42 if boundary == 'same_week' else 35
+        git._save_checkpoint(42)
+        checkpoint = git._load_checkpoint()
+        assert checkpoint['context_boundary'] == boundary
+        receipt = dict(status='paused', day=42, snapshot_id=checkpoint['snapshot_id'],
+                       context_boundary=boundary)
+        previous.write_text(json.dumps(dict(path=str(git.workspace_dir.resolve()), status='paused',
+            reached_stop=False, result=dict(days_run=42, snapshot_id=checkpoint['snapshot_id']))))
+        pause = git.workspace_dir / 'pause-receipt.json'
+        pause.write_text(json.dumps(receipt))
+        assert round5.validate_start('git', 42, 112, git.workspace_dir, 2, output) == 42
+        for field, wrong in [('day', 35), ('snapshot_id', 'wrong'), ('context_boundary', 'wrong')]:
+            pause.write_text(json.dumps(dict(receipt, **{field: wrong})))
+            with pytest.raises(ValueError, match='complete week boundary'):
+                round5.validate_start('git', 42, 112, git.workspace_dir, 2, output)
 
 
 def test_receipt_audit_preserves_unknown_attempts_and_rejects_pending_or_changed_routes(tmp_path):

@@ -163,10 +163,11 @@ def cost_usd(usage, api, rates, at=None):
 
 
 class _Stream(httpx.SyncByteStream):
-    def __init__(self, source, finish):
+    def __init__(self, source, finish, require_done=False):
         self.source, self.finish = source, finish
         self.chunks = []
         self.finished = False
+        self.require_done = require_done
 
     def _finish(self, error=None):
         if not self.finished:
@@ -182,6 +183,9 @@ class _Stream(httpx.SyncByteStream):
             self._finish(type(exc).__name__)
             raise
         else:
+            if self.require_done and b'data: [DONE]' not in b''.join(self.chunks).splitlines():
+                self._finish('stream_closed_before_completion')
+                raise httpx.ReadError('Chat completion stream ended before [DONE]')
             self._finish()
 
     def close(self):
@@ -291,7 +295,9 @@ class ModelUsage:
                 if response.is_stream_consumed:
                     finish(response.content, None)
                 else:
-                    response.stream = _Stream(response.stream, finish)
+                    require_done = (streaming and request.url.path.endswith('/chat/completions')
+                                    and response.headers.get('content-type', '').startswith('text/event-stream'))
+                    response.stream = _Stream(response.stream, finish, require_done=require_done)
                     if not streaming:
                         response.read()
                 return response

@@ -1163,6 +1163,8 @@ __pycache__/
             pf=self.text_registration == 'pf',
         )
 
+        self.agent.lifecycle = getattr(self, 'lifecycle', None)
+
         # Wire the per-session conversation snapshot path. The agent writes
         # this after every LLM call; on resume, _restore_from_checkpoint can
         # load it to recover the exact accumulated context (see agent.py).
@@ -1216,8 +1218,14 @@ __pycache__/
     def run(self, verbose: bool = True) -> Dict[str, Any]:
         """Stop the branch on any unknown outcome; never publish partial state."""
         from saas_bench.run_state import write_json
+        from contextlib import nullcontext
+        from saas_bench.run_lifecycle import RunCancelled
         try:
-            return self._run(verbose)
+            with getattr(self, 'lifecycle', None) or nullcontext():
+                try:
+                    return self._run(verbose)
+                except RunCancelled as exc:
+                    return self._pause(str(exc))
         except BaseException as exc:
             write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
             raise
@@ -1234,6 +1242,32 @@ __pycache__/
             finally:
                 if not preserve:
                     self._stop_server()
+
+    def _pause(self, reason):
+        from saas_bench.run_state import write_json
+        self._check_capture_health()
+        status = self._get_game_status()
+        if status.get('timed_out') or getattr(self.tool_executor, 'preserved_process', None):
+            raise RuntimeError('Cannot pause with an unknown tool outcome')
+        day = status['day']
+        while self.agent._pending_tool_calls:
+            pending = self.agent._pending_tool_calls[0]
+            cancelled = 'Cancelled: run paused before this tool was executed.'
+            self._log_tool_result(self.agent.total_turns, day, pending['name'],
+                                  pending.get('arguments', {}), cancelled,
+                                  call_id=pending['id'], outcome='cancelled')
+            self.agent.record_tool_result(cancelled)
+        self._save_checkpoint(day)
+        checkpoint = self._load_checkpoint()
+        receipt = dict(day=day, reason=reason, status='paused',
+                       snapshot_id=checkpoint['snapshot_id'],
+                       context_boundary=checkpoint['context_boundary'])
+        write_json(self.workspace_dir / 'pause-receipt.json', receipt)
+        return dict(run_id=self.run_id, seed=self.seed, scenario=self.scenario,
+                    final_cash=status['cash'], days_run=day, outcome='paused',
+                    total_turns=self.agent.total_turns,
+                    total_anthropic_fallbacks=self.agent.total_anthropic_fallbacks,
+                    workspace_dir=str(self.workspace_dir), **{k: receipt[k] for k in ('reason', 'context_boundary', 'snapshot_id')})
 
     def _run(self, verbose=True):
         self.setup()
@@ -1329,7 +1363,7 @@ __pycache__/
                     'Forecast units: All 12 cash forecast values for next-week are USD. '
                     'For 20.7 million USD, submit 20700000 or 20.7e6.')
             info = {'day': sim_day, 'cash': status['cash']}
-            turns_today = 0
+            turns_today = self.agent.turns_today if resumed else 0
             day_ended = False
             _day_llm_total = 0.0
             _day_tool_total = 0.0
@@ -1340,6 +1374,8 @@ __pycache__/
 
                 # LLM call (timed)
                 _t0 = _time.monotonic()
+                if getattr(self, 'lifecycle', None):
+                    self.lifecycle.check()
                 self._begin_operation('model_and_tool', sim_day)
                 _usage_before = copy.deepcopy(self.agent.usage_recorder.summary)
                 action = self.agent.act(observation, 0, False, info)
@@ -1379,6 +1415,8 @@ __pycache__/
                 batch_size = max(1, len(self.agent._pending_tool_calls))
                 self._log_timing('model_tool_batch', sim_day, turn=turns_today, calls=batch_size)
                 while action is not None:
+                    if getattr(self, 'lifecycle', None):
+                        self.lifecycle.check()
                     tool_name = action.tool
                     tool_args_preview = str(action.arguments or {})[:120]
                     # Execute action (timed)
@@ -1453,6 +1491,8 @@ __pycache__/
                         if verbose:
                             print(f"\n💀 BANKRUPT at sim day {sim_day} (cash=${_cash_inner:,.0f})!")
 
+                    if getattr(self, 'lifecycle', None):
+                        self.lifecycle.check()
                     if day_ended or game_ended:
                         reason = ('Cancelled: simulation advanced to a new week; read the new state before deciding.'
                                   if day_ended else 'Cancelled: the simulation ended.')

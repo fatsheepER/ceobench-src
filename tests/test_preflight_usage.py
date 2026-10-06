@@ -204,10 +204,12 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
         requests.append(json.loads(request.content))
         deltas = [
             dict(role='assistant', content='', **reasoning_fields, tool_calls=[dict(index=0, id='call1', type='function', function=dict(name='read_file', arguments='{"path":'))]),
-            dict(**{key: 'again' if value else value for key, value in reasoning_fields.items()}, tool_calls=[dict(index=0, function=dict(arguments='"MEMORY.md"}'))]),
+            dict(tool_calls=[dict(index=0, id=None, type=None, function=None)]),
+            dict(tool_calls=[dict(index=0, id=None, type=None, function=dict(name=None, arguments=None))]),
+            dict(**{key: 'again' if value else value for key, value in reasoning_fields.items()}, tool_calls=[dict(index=0, id=None, type=None, function=dict(name=None, arguments='"MEMORY.md"}'))]),
             {},
         ]
-        frames = [dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model', choices=[dict(index=0, delta=delta, finish_reason=finish_reason if i == 2 else None)]) for i, delta in enumerate(deltas)]
+        frames = [dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model', choices=[dict(index=0, delta=delta, finish_reason=finish_reason if i == len(deltas) - 1 else None)]) for i, delta in enumerate(deltas)]
         frames.append(dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model', choices=[], usage=dict(reply('chat')['usage'], total_tokens=12)))
         data = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames) + 'data: [DONE]\n\n'
         return httpx.Response(200, stream=httpx.ByteStream(data.encode()), headers={'content-type': 'text/event-stream'})
@@ -224,7 +226,9 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
     assert recorder.summary['known_cost_usd'] == pytest.approx(.0113)
     assert recorder.summary['failed_http_attempts'] == recorder.summary['missing_cost'] == 0
     entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
-    assert next(row for row in entries if row['event'] == 'http_response')['error'] is None
+    http_response = next(row for row in entries if row['event'] == 'http_response')
+    assert http_response['error'] is None
+    assert '"type": null' in http_response['body'] and '"function": null' in http_response['body']
     agent.record_tool_result('contents')
     assert agent.act('contents', 0, False, {'day': 7}).tool == 'read_file'
     assistant = next(message for message in requests[1]['messages'] if message['role'] == 'assistant')
@@ -233,6 +237,62 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
         assert assistant['reasoning_content'] == 'think again'
     else:
         assert 'reasoning_content' not in assistant
+    client.close()
+
+
+@pytest.mark.parametrize('fault', ['missing_done', 'missing_finish', 'missing_both', 'missing_id',
+                                  'missing_type', 'missing_name', 'missing_function', 'invalid_json',
+                                  'non_object_arguments', 'empty_arguments'])
+def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, monkeypatch, fault):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    requests, responses, payloads = [], [], []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        first = len(requests) == 1
+        done = not first or fault not in ('missing_done', 'missing_both')
+        finished = not first or fault not in ('missing_finish', 'missing_both')
+        base = dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model')
+        tool = dict(index=0, id='call1', type='function', function=dict(name='read_file',
+                    arguments=json.dumps({'path': 'PARTIAL.md' if first else 'MEMORY.md'})))
+        if first:
+            if fault in ('missing_id', 'missing_type', 'missing_function'):
+                tool[fault.removeprefix('missing_')] = None
+            elif fault == 'missing_name':
+                tool['function']['name'] = None
+            elif fault in ('invalid_json', 'non_object_arguments', 'empty_arguments'):
+                tool['function']['arguments'] = {'invalid_json': '{', 'non_object_arguments': '[]',
+                                                 'empty_arguments': ''}[fault]
+        frames = [dict(base, choices=[dict(index=0, delta=dict(role='assistant', tool_calls=[
+            tool]), finish_reason=None)]),
+            dict(base, choices=[dict(index=0, delta={}, finish_reason='tool_calls' if finished else None)]),
+            dict(base, choices=[], usage=dict(reply('chat')['usage'], total_tokens=12))]
+        payload = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames)
+        if done:
+            payload += 'data: [DONE]\n\n'
+        payloads.append(payload)
+        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=httpx.ByteStream(payload.encode()))
+    client = OpenAI(api_key='offline', base_url='https://opencode.ai/zen/go/v1/', max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent', {'test-model': dict(input=1, output=2, cache_read=.1)})
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='instructions',
+                      workspace_path=tmp_path, usage_recorder=recorder, response_callback=lambda **kwargs: responses.append(kwargs))
+    action = agent.act('dashboard', 0, False, {'day': 7})
+    assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+    assert len(requests) == 2 and requests[0] == requests[1]
+    assert len(responses) == 1 and len(agent.conversation) == 3
+    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == 1
+    assert recorder.summary['known']['input_tokens'] == 10
+    assert recorder.summary['missing']['input_tokens'] == 1
+    entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+    logical = [row for row in entries if row['event'] == 'response']
+    assert logical[0]['error'] == 'APIConnectionError' and logical[0]['response'] is None
+    assert logical[0]['cost_usd'] is None and logical[0]['usage'] == dict.fromkeys(FIELDS)
+    assert logical[1]['error'] is None
+    first_http = next(row for row in entries if row['event'] == 'http_response')
+    assert first_http['body'] == payloads[0]
+    done = fault not in ('missing_done', 'missing_both')
+    assert first_http['error'] == (None if done else 'stream_closed_before_completion')
     client.close()
 
 

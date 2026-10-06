@@ -59,13 +59,21 @@ def verify_frozen(output):
 
 
 def install_pause(runner, request):
+    from saas_bench.run_lifecycle import RunCancelled, WorkerLifecycle
+    if getattr(runner, 'lifecycle', None):
+        runner.lifecycle.hold = request
+        if runner.agent:
+            runner.agent.lifecycle = runner.lifecycle
+        return
+    runner.lifecycle = WorkerLifecycle(request, int(os.environ.get('CEOBENCH_SUPERVISOR_PID', os.getppid())))
+    if runner.agent:
+        runner.agent.lifecycle = runner.lifecycle
     weekly_record = runner._weekly_record
     def weekly(status):
         result = weekly_record(status)
         day = status['day']
-        if request.exists() and 0 < day < runner.total_days and day % 7 == 0:
-            runner.stop_after_day = day
-            write_json(runner.workspace_dir / 'pause-receipt.json', dict(day=day, request=str(request)))
+        if runner.lifecycle.hold.exists() and 0 < day < runner.total_days and day % 7 == 0:
+            raise RunCancelled('hold_at_week_boundary')
         return result
     runner._weekly_record = weekly
 
@@ -95,11 +103,16 @@ def validate_start(mode, seed, stop, source, attempt=1, output=None):
     else:
         previous = read(stage_pointer(output, mode, seed, stop, attempt - 1), {}) if output else {}
         pause = read(source / 'pause-receipt.json', {})
+        legacy = (cp['context_boundary'] == 'new_week' and previous.get('status') == 'stopped'
+                  and pause.get('day') == cp['day'])
+        paused = (previous.get('status') == pause.get('status') == 'paused'
+                  and pause.get('day') == cp['day'] and pause.get('snapshot_id') == cp['snapshot_id']
+                  and pause.get('context_boundary') == cp['context_boundary']
+                  and previous.get('result', {}).get('snapshot_id') == cp['snapshot_id'])
         valid_day = (expected <= cp['day'] < stop and cp['day'] % 7 == 0 and
-                     previous.get('path') == str(source.resolve()) and previous.get('status') == 'stopped' and
-                     not previous.get('reached_stop') and previous.get('result', {}).get('days_run') == cp['day'] and
-                     pause.get('day') == cp['day'])
-    if not valid_day or cp['context_boundary'] != 'new_week':
+                     previous.get('path') == str(source.resolve()) and (legacy or paused) and
+                     not previous.get('reached_stop') and previous.get('result', {}).get('days_run') == cp['day'])
+    if not valid_day or (attempt == 1 and cp['context_boundary'] != 'new_week'):
         raise ValueError('Resume from the specified complete week boundary')
     if manifest.get('text_registration') != mode or manifest['configuration']['seed'] != seed:
         raise ValueError('Resume source group or seed mismatch')
@@ -386,90 +399,108 @@ def monitor(args):
         argv += ['--continue-from', str(args.continue_from.resolve())]
     log = output / f'{pointer.stem}.log'
     started = time.time()
+    ready = output / f'{pointer.stem}-lifecycle-ready.json'
+    ready.unlink(missing_ok=True)
+    env = dict(os.environ, CEOBENCH_SUPERVISOR_PID=str(os.getpid()), CEOBENCH_LIFECYCLE_READY=str(ready))
     with log.open('xb') as stream:
-        process = subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
-    write_json(output / f'{pointer.stem}-process.json', dict(pid=process.pid, supervisor_pid=os.getpid(), pointer=str(pointer), log=str(log)))
-    def event(kind, summary):
-        import fcntl
-        item = dict(at=datetime.now(timezone.utc).isoformat(), event=kind, **summary)
-        with (output / '.monitor.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            with (output / 'events.jsonl').open('a') as stream:
-                stream.write(json.dumps(item) + '\n')
-        print(json.dumps(item), flush=True)
-    while True:
-        rc = process.poll()
-        record = read(pointer, {})
-        run = Path(record['path']) if record.get('path') else None
-        cp = read(run / 'checkpoint.json', {}) if run else {}
-        week = latest_week(run) if run else {}
-        faults = [name for name in ('branch_stop.json', 'sql-evidence.fault.json', 'checkpoint_error.json')
-                  if run and (run / name).exists()]
-        issues = []
-        counts = {}
-        for role in ('agent', 'simulator'):
-            path = run / 'logs' / f'{role}_requests.jsonl' if run else None
-            if path:
-                rows, state['offsets'][role] = read_increment(path, state['offsets'].get(role, 0))
-                new = [dict(role=role, issue=problem, call_id=row.get('call_id'), attempt_id=row.get('attempt_id'), path=str(path))
-                       for row in rows if (problem := model_issue(row))]
-                counts[role] = len({row['call_id'] for row in new})
-                issues.extend(new)
-        sql_issues = []
-        if run:
-            sql_issues, state['sql_cursor'] = sql_failures(run, state['sql_cursor'], drain=rc is not None)
-        paths = [log] + (list((run / 'logs').glob('*')) + [run / 'weekly.jsonl', run / 'operation.json', run / 'checkpoint.json'] if run else [])
-        idle = time.time() - max([started] + [p.stat().st_mtime for p in paths if p.is_file()])
-        status = 'running' if rc is None else record.get('status', 'unexpected_exit')
-        warnings = list(faults)
-        if rc is not None and status not in ('stopped', 'completed', 'bankrupt'):
-            warnings.append('unexpected_exit')
-        if rc is None and idle >= 1800:
-            warnings.append('no_activity_30_minutes')
-        disk = shutil.disk_usage(output)
-        if disk.free < max(2 * 1024**3, disk.total * .01):
-            warnings.append('low_disk_space')
-        quota = None
-        try:
-            quota = quota_health()
-            if any(row['status'] != 'ok' or row['percent'] >= 95 for row in quota.values()):
-                warnings.append('go_quota_near_limit')
-        except Exception as exc:
-            warnings.append('quota_check_failed:' + type(exc).__name__)
-        summary = dict(mode=args.mode, family=SEEDS[args.seed], run_id=record.get('run_id'), pid=process.pid,
-            day=week.get('day', cp.get('day', 0)), checkpoint_day=cp.get('day'), status=status,
-            idle_seconds=round(idle), warnings=warnings, new_errors=counts, issues=issues,
-            pointer=str(pointer), path=str(run) if run else None, quota=quota, sql_issues=sql_issues)
-        for warning in warnings:
-            if warning not in state['alerts']:
-                event('attention', dict(summary, warning=warning))
-                state['alerts'].add(warning)
-        if issues:
-            event('model_attention', summary)
-        if sql_issues:
-            event('sql_attention', summary)
-        if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
-            locked_write(output, 'hold.json', summary)
-        for day in (210, 280, 350, 420):
-            if args.stop_after_day == 497 and cp.get('day', 0) >= day and day not in state['milestones']:
-                try:
-                    result = integrity(run, args.mode, day, output)
-                    write_json(output / f'integrity-{args.mode}-D{day}.json', result)
-                except Exception as exc:
-                    locked_write(output, 'hold.json', dict(day=day, error=str(exc)))
-                    event('integrity_failed', dict(summary, milestone=day, error=str(exc)))
-                state['milestones'].add(day)
-        health = dict(at=datetime.now(timezone.utc).isoformat(), **summary)
-        write_json(output / f'{pointer.stem}-health.json', health)
-        locked_write(output, 'health.json', health)
-        with (output / 'health.jsonl').open('a') as stream:
-            stream.write(json.dumps(health) + '\n')
-        write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], sql_cursor=state['sql_cursor'],
-                                                             alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
-        if rc is not None:
-            event('stage_finished', summary)
-            return
-        time.sleep(300)
+        process = subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, env=env)
+    try:
+        write_json(output / f'{pointer.stem}-process.json', dict(pid=process.pid, supervisor_pid=os.getpid(), pointer=str(pointer), log=str(log)))
+        def event(kind, summary):
+            import fcntl
+            item = dict(at=datetime.now(timezone.utc).isoformat(), event=kind, **summary)
+            with (output / '.monitor.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                with (output / 'events.jsonl').open('a') as stream:
+                    stream.write(json.dumps(item) + '\n')
+            print(json.dumps(item), flush=True)
+        while True:
+            rc = process.poll()
+            record = read(pointer, {})
+            run = Path(record['path']) if record.get('path') else None
+            cp = read(run / 'checkpoint.json', {}) if run else {}
+            week = latest_week(run) if run else {}
+            faults = [name for name in ('branch_stop.json', 'sql-evidence.fault.json', 'checkpoint_error.json')
+                      if run and (run / name).exists()]
+            issues = []
+            counts = {}
+            for role in ('agent', 'simulator'):
+                path = run / 'logs' / f'{role}_requests.jsonl' if run else None
+                if path:
+                    rows, state['offsets'][role] = read_increment(path, state['offsets'].get(role, 0))
+                    new = [dict(role=role, issue=problem, call_id=row.get('call_id'), attempt_id=row.get('attempt_id'), path=str(path))
+                           for row in rows if (problem := model_issue(row))]
+                    counts[role] = len({row['call_id'] for row in new})
+                    issues.extend(new)
+            sql_issues = []
+            if run:
+                sql_issues, state['sql_cursor'] = sql_failures(run, state['sql_cursor'], drain=rc is not None)
+            paths = [log] + (list((run / 'logs').glob('*')) + [run / 'weekly.jsonl', run / 'operation.json', run / 'checkpoint.json'] if run else [])
+            idle = time.time() - max([started] + [p.stat().st_mtime for p in paths if p.is_file()])
+            status = 'running' if rc is None else record.get('status', 'unexpected_exit')
+            warnings = list(faults)
+            if rc is not None and status not in ('stopped', 'paused', 'completed', 'bankrupt'):
+                warnings.append('unexpected_exit')
+            if rc is None and idle >= 1800:
+                warnings.append('no_activity_30_minutes')
+            disk = shutil.disk_usage(output)
+            if disk.free < max(2 * 1024**3, disk.total * .01):
+                warnings.append('low_disk_space')
+            quota = None
+            try:
+                quota = quota_health()
+                if any(row['status'] != 'ok' or row['percent'] >= 95 for row in quota.values()):
+                    warnings.append('go_quota_near_limit')
+            except Exception as exc:
+                warnings.append('quota_check_failed:' + type(exc).__name__)
+            summary = dict(mode=args.mode, family=SEEDS[args.seed], run_id=record.get('run_id'), pid=process.pid,
+                day=week.get('day', cp.get('day', 0)), checkpoint_day=cp.get('day'), status=status,
+                idle_seconds=round(idle), warnings=warnings, new_errors=counts, issues=issues,
+                pointer=str(pointer), path=str(run) if run else None, quota=quota, sql_issues=sql_issues)
+            for warning in warnings:
+                if warning not in state['alerts']:
+                    event('attention', dict(summary, warning=warning))
+                    state['alerts'].add(warning)
+            if issues:
+                event('model_attention', summary)
+            if sql_issues:
+                event('sql_attention', summary)
+            if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
+                locked_write(output, 'hold.json', summary)
+            for day in (210, 280, 350, 420):
+                if args.stop_after_day == 497 and cp.get('day', 0) >= day and day not in state['milestones']:
+                    try:
+                        result = integrity(run, args.mode, day, output)
+                        write_json(output / f'integrity-{args.mode}-D{day}.json', result)
+                    except Exception as exc:
+                        locked_write(output, 'hold.json', dict(day=day, error=str(exc)))
+                        event('integrity_failed', dict(summary, milestone=day, error=str(exc)))
+                    state['milestones'].add(day)
+            health = dict(at=datetime.now(timezone.utc).isoformat(), **summary)
+            write_json(output / f'{pointer.stem}-health.json', health)
+            locked_write(output, 'health.json', health)
+            with (output / 'health.jsonl').open('a') as stream:
+                stream.write(json.dumps(health) + '\n')
+            write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], sql_cursor=state['sql_cursor'],
+                                                                 alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
+            if rc is not None:
+                event('stage_finished', summary)
+                return
+            time.sleep(300)
+    finally:
+        if process.poll() is None:
+            locked_write(output, 'hold.json', dict(reason='supervisor_exit'))
+            deadline = time.monotonic() + 30
+            while process.poll() is None and time.monotonic() < deadline:
+                if read(ready, {}).get('pid') == process.pid:
+                    process.send_signal(__import__('signal').SIGUSR1)
+                    break
+                time.sleep(.1)
+            try:
+                process.wait(timeout=max(.01, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                write_json(output / f'{pointer.stem}-cleanup-pending.json',
+                           dict(pid=process.pid, reason='awaiting_safe_tool_or_checkpoint_boundary'))
 
 
 def main(argv=None):

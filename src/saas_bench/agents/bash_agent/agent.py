@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, asdict
 from ..base import BaseAgent
 from ...environment import Action
 from ...model_usage import ModelUsage, usage_values
+from ...run_lifecycle import RunCancelled
 
 
 @dataclass
@@ -36,6 +37,55 @@ NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week 
 
 # Regex to detect dashboard in bash output (day advancement)
 _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
+
+
+def _stream_chat_completion(client, request):
+    import httpx
+    from openai import APIConnectionError, LengthFinishReasonError
+    from openai.lib.streaming.chat import ChatCompletionStreamState
+    from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
+
+    state = ChatCompletionStreamState()
+    received = False
+    with client.chat.completions.create(**request) as stream:
+        try:
+            for chunk in stream:
+                received = True
+                for choice in chunk.choices:
+                    for tool in choice.delta.tool_calls or []:
+                        # Go uses null for unchanged metadata in continuation chunks.
+                        for field in ('id', 'type'):
+                            if getattr(tool, field) is None:
+                                tool.model_fields_set.discard(field)
+                        if tool.function is None:
+                            tool.function = ChoiceDeltaToolCallFunction()
+                        for field in ('name', 'arguments'):
+                            if getattr(tool.function, field) is None:
+                                tool.function.model_fields_set.discard(field)
+                state.handle_chunk(chunk)
+            if not received:
+                raise httpx.ReadError('Chat completion stream ended without an assistant chunk')
+            snapshot = state.current_completion_snapshot
+            if not snapshot.choices or any(not choice.finish_reason for choice in snapshot.choices):
+                raise httpx.ReadError('Chat completion stream ended without finish_reason')
+            for choice in snapshot.choices:
+                for tool in choice.message.tool_calls or []:
+                    if (not isinstance(tool.id, str) or not tool.id.strip() or tool.type != 'function'
+                            or tool.function is None or not isinstance(tool.function.name, str)
+                            or not tool.function.name.strip()):
+                        raise httpx.ReadError('Chat completion stream ended with incomplete tool metadata')
+                    try:
+                        arguments = json.loads(tool.function.arguments)
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise httpx.ReadError('Chat completion stream ended with invalid tool arguments') from exc
+                    if not isinstance(arguments, dict):
+                        raise httpx.ReadError('Chat completion tool arguments must be a JSON object')
+        except httpx.TransportError as exc:
+            raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
+        try:
+            return state.get_final_completion()
+        except LengthFinishReasonError as exc:
+            return exc.completion
 
 
 class BashAgent(BaseAgent):
@@ -367,7 +417,11 @@ class BashAgent(BaseAgent):
         if self._pending_tool_calls:
             raise RuntimeError('Finish the current tool batch before requesting another model response')
         self._llm_attempt = 0
-        action = self._call_llm()
+        try:
+            action = self._call_llm()
+        except RunCancelled:
+            self._observation_recorded = True
+            raise
         self.turns_today += 1
 
         # Persist conversation snapshot so a mid-day crash can be resumed
@@ -377,7 +431,21 @@ class BashAgent(BaseAgent):
 
         return action
 
+    def _retry_wait(self, seconds):
+        lifecycle = getattr(self, 'lifecycle', None)
+        if lifecycle:
+            lifecycle.sleep(seconds)
+        else:
+            time.sleep(seconds)
+
     def _request_model(self, api, request, invoke):
+        lifecycle = getattr(self, 'lifecycle', None)
+        if lifecycle:
+            lifecycle.check(retry=getattr(self, '_llm_attempt', 0) > 0)
+            original = invoke
+            def invoke():
+                with lifecycle.model_call():
+                    return original()
         self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
         try:
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
@@ -650,11 +718,7 @@ class BashAgent(BaseAgent):
                     def invoke():
                         if not _is_opencode:
                             return self.client.chat.completions.create(**api_kwargs)
-                        with self.client.chat.completions.stream(**{k: v for k, v in api_kwargs.items() if k != 'stream'}) as stream:
-                            try:
-                                return stream.get_final_completion()
-                            except openai.LengthFinishReasonError as exc:
-                                return exc.completion
+                        return _stream_chat_completion(self.client, api_kwargs)
                     response = self._request_model('chat', api_kwargs,
                                                    invoke)
                 finally:
@@ -776,7 +840,7 @@ class BashAgent(BaseAgent):
                     self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                     wait_time = min(120, 10 * (2 ** min(self._consecutive_errors - 1, 3)))
                     print(f"  Server error ({self._consecutive_errors}), retrying in {wait_time}s...")
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     # Free memory before retry (messages/tools rebuilt at top of loop)
                     del messages, tools
                     continue  # Loop back to retry
@@ -797,7 +861,7 @@ class BashAgent(BaseAgent):
                             f"If the error mentions context length, produce a shorter response."
                         )
                     ))
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del messages, tools
                     continue
 
@@ -962,7 +1026,7 @@ class BashAgent(BaseAgent):
                     self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                     wait_time = min(120, 10 * (2 ** min(self._consecutive_errors - 1, 3)))
                     print(f"  Server error ({self._consecutive_errors}), retrying in {wait_time}s...")
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del input_items, tools
                     continue  # Loop back to retry
                 else:
@@ -982,7 +1046,7 @@ class BashAgent(BaseAgent):
                             f"If the error mentions context length, produce a shorter response."
                         )
                     ))
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del input_items, tools
                     continue
 
@@ -1261,7 +1325,7 @@ class BashAgent(BaseAgent):
                 if self._consecutive_errors <= 3:
                     wait = 2 ** self._consecutive_errors
                     print(f"  Retrying in {wait}s (attempt {self._consecutive_errors}/3)...")
-                    time.sleep(wait)
+                    self._retry_wait(wait)
                     return self._call_anthropic()
 
                 raise RuntimeError(

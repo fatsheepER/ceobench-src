@@ -28,6 +28,8 @@ class RolloutRunner(BashAgentRunner):
         self.agent.usage_recorder.token_counter = self.payload_token_counter
 
     def _restore_from_checkpoint(self, checkpoint):
+        if checkpoint['context_boundary'] == 'same_week':
+            return super()._restore_from_checkpoint(checkpoint)
         # The server restores the world; prior conversation and charges stay outside this episode.
         self.agent.reset()
         self._suppress_force_step_day_once = True
@@ -79,7 +81,7 @@ def execute(source, destination, group, identity, output, *, api_key=None):
         result = runner.run(verbose=False)
         write_json(destination / 'result.json', result)
         record.update(status=result['outcome'], result=result, reached_stop=result['outcome']=='stopped' and result['days_run']==end)
-        if result['outcome'] not in ('stopped', 'bankrupt'):
+        if result['outcome'] not in ('stopped', 'paused', 'bankrupt'):
             raise RuntimeError('Episode did not finish or naturally terminate')
         record['public_outcomes'] = public_outcomes(destination, start)
         if record['reached_stop'] and record['public_outcomes']['completed_weeks'] != 3:
