@@ -210,7 +210,8 @@ class Rejected(BaseException):
 
 
 @pytest.mark.parametrize('effort', ['high', 'none'])
-def test_deepseek_thinking_returns_reasoning_after_tool_calls_and_restore(tmp_path, monkeypatch, effort):
+@pytest.mark.parametrize('reasoning_field', ['reasoning_content', 'reasoning'])
+def test_deepseek_thinking_returns_reasoning_after_tool_calls_and_restore(tmp_path, monkeypatch, effort, reasoning_field):
     import httpx
     from openai import OpenAI
     from test_preflight_usage import reply
@@ -233,7 +234,7 @@ def test_deepseek_thinking_returns_reasoning_after_tool_calls_and_restore(tmp_pa
         result = reply('chat')
         message = result['choices'][0]['message']
         if thinking:
-            message['reasoning_content'] = f"think {len(assistants)}"
+            message[reasoning_field] = f"think {len(assistants)}"
         message['tool_calls'] = [dict(id=f'call{len(assistants)}', type='function',
                                       function=dict(name='read_file', arguments='{"path":"MEMORY.md"}'))]
         return httpx.Response(200, json=result)
@@ -251,6 +252,10 @@ def test_deepseek_thinking_returns_reasoning_after_tool_calls_and_restore(tmp_pa
     first._save_conversation_snapshot(strict=True)
     second = new_agent()
     assert second.load_conversation_snapshot(second._snapshot_path)
+    saved = json.loads(first._snapshot_path.read_text())['conversation']
+    assert all('reasoning' not in message for message in saved)
+    expected = ['think 0', 'think 1'] if effort == 'high' else [None, None]
+    assert [message.reasoning_content for message in second.conversation if message.role == 'assistant'] == expected
     first.act('contents', 0, False, {'day': 0})
     second.act('contents', 0, False, {'day': 0})
     assert not rejected and captured[-1] == captured[-2]

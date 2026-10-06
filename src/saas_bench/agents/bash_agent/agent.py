@@ -673,11 +673,12 @@ class BashAgent(BaseAgent):
 
                 assistant_msg = response.choices[0].message
 
-                # Log reasoning_content if present (e.g. GLM-5 reasoning model)
                 reasoning_content = getattr(assistant_msg, 'reasoning_content', None)
                 if not reasoning_content:
                     extras = getattr(assistant_msg, 'model_extra', {}) or {}
-                    reasoning_content = extras.get('reasoning_content')
+                    reasoning_content = (extras.get('reasoning_content')
+                                         or getattr(assistant_msg, 'reasoning', None)
+                                         or extras.get('reasoning'))
                 if reasoning_content and self.tool_result_callback:
                     self.tool_result_callback(
                         self.total_turns, self.current_day, '_reasoning', {},
