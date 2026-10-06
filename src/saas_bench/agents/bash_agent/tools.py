@@ -368,6 +368,8 @@ class BashAgentToolExecutor:
             'search_files': self._exec_search_files,
             'glob_files': self._exec_glob_files,
         }
+        if getattr(self, 'submit_handler', None):
+            dispatch['submit_decision'] = self.submit_handler
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})

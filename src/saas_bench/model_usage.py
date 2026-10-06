@@ -127,10 +127,13 @@ def load_pricing(path):
         if not model or not isinstance(rates, dict) or not rates:
             raise ValueError('Invalid model pricing')
         for key, value in rates.items():
-            if key in ('valid_from', 'valid_until'):
+            if key == 'peak_schedule':
+                if value != 'weekday_01_04_06_10_utc':
+                    raise ValueError('Unsupported peak pricing schedule')
+            elif key in ('valid_from', 'valid_until'):
                 if datetime.fromisoformat(value).tzinfo is None:
                     raise ValueError('Price validity requires a timezone')
-            elif key not in ('input', 'output', 'cache_read', 'cache_write') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            elif key not in ('input', 'output', 'cache_read', 'cache_write', 'peak_multiplier') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError('Price must be a finite nonnegative USD/1k token rate')
         if 'valid_from' in rates and 'valid_until' in rates and datetime.fromisoformat(rates['valid_from']) >= datetime.fromisoformat(rates['valid_until']):
             raise ValueError('Invalid price validity interval')
@@ -151,7 +154,12 @@ def cost_usd(usage, api, rates, at=None):
               'output': usage['output_tokens'], 'cache_read': usage['cached_tokens'], 'cache_write': write}
     if any(n < 0 or (n and k not in rates) for k, n in counts.items()):
         return None
-    return sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
+    multiplier = 1
+    if rates.get('peak_schedule') == 'weekday_01_04_06_10_utc':
+        utc = at.astimezone(timezone.utc)
+        if utc.weekday() < 5 and (1 <= utc.hour < 4 or 6 <= utc.hour < 10):
+            multiplier = rates.get('peak_multiplier', 1)
+    return multiplier * sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
 
 
 class _Stream(httpx.SyncByteStream):
@@ -180,7 +188,9 @@ class _Stream(httpx.SyncByteStream):
         try:
             self.source.close()
         finally:
-            self._finish('stream_closed_before_completion')
+            lines = b''.join(self.chunks).rstrip().splitlines()
+            completed = bool(lines and lines[-1] == b'data: [DONE]')
+            self._finish(None if completed else 'stream_closed_before_completion')
 
 
 class ModelUsage:

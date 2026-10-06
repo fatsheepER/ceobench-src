@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional
 # Formal runs reject this startup setting.
 _ORACLE_MODE: bool = os.environ.get("ORACLE_MODE") == "1"
 
+READ_ONLY_TASK_TOOLS = frozenset(('get_social_posts', 'get_cost_info', 'get_market_overview',
+    'get_group_insights', 'list_research_projects', 'list_all_tables', 'describe_tables',
+    'get_tool_documentation', 'list_daily_calculations', 'list_scripts'))
+
 from .tools import AgentTools, ToolResult
 from .database import TABLE_DOCS
 from .environment import build_weekly_dashboard
@@ -177,6 +181,10 @@ class _APIHandler(BaseHTTPRequestHandler):
     @public_handler
     def do_POST(self):
         try:
+            if (self.server._api_server.read_only_task and
+                    self.path not in ('/call', '/query', '/checkpoint', '/pf-refresh', '/run-metrics')):
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             if self.path == '/call':
                 self._handle_call()
             elif self.path == '/next-week':
@@ -244,6 +252,9 @@ class _APIHandler(BaseHTTPRequestHandler):
     @public_handler
     def do_DELETE(self):
         try:
+            if self.server._api_server.read_only_task:
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             if self.path == '/daily-scripts':
                 self._handle_daily_scripts_delete()
             else:
@@ -361,6 +372,9 @@ class _APIHandler(BaseHTTPRequestHandler):
             args = body.get('args', {})
 
             server: NovaMindAPIServer = self.server._api_server
+            if server.read_only_task and tool_name not in READ_ONLY_TASK_TOOLS:
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             result = server.execute_tool(tool_name, args)
 
             if isinstance(result, ToolResult):
@@ -718,6 +732,7 @@ class NovaMindAPIServer:
             event_logger: Optional EventLogger for logging events
         """
         self.oracle_mode = _ORACLE_MODE
+        self.read_only_task = os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'
         self.sql_evidence = sql_evidence
         if sql_evidence is not None:
             if self.oracle_mode:

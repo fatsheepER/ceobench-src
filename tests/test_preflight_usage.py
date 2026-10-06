@@ -188,6 +188,36 @@ def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monk
     client.close()
 
 
+@pytest.mark.parametrize('finish_reason', ['tool_calls', 'length'])
+def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path, finish_reason):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        deltas = [
+            dict(role='assistant', content='', reasoning_content='think ', tool_calls=[dict(index=0, id='call1', type='function', function=dict(name='read_file', arguments='{"path":'))]),
+            dict(reasoning_content='again', tool_calls=[dict(index=0, function=dict(arguments='"MEMORY.md"}'))]),
+            {},
+        ]
+        frames = [dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model', choices=[dict(index=0, delta=delta, finish_reason=finish_reason if i == 2 else None)]) for i, delta in enumerate(deltas)]
+        frames.append(dict(id='chat1', object='chat.completion.chunk', created=1, model='test-model', choices=[], usage=dict(reply('chat')['usage'], total_tokens=12)))
+        data = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames) + 'data: [DONE]\n\n'
+        return httpx.Response(200, stream=httpx.ByteStream(data.encode()), headers={'content-type': 'text/event-stream'})
+    client = OpenAI(api_key='offline', base_url='https://opencode.ai/zen/go/v1/', max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent', {'test-model': dict(input=1, output=2, cache_read=.1)})
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', reasoning_effort='high', system_prompt='instructions', workspace_path=tmp_path, usage_recorder=recorder)
+    action = agent.act('dashboard', 0, False, {'day': 7})
+    assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+    assert agent.conversation[-1].reasoning_content == 'think again'
+    assert requests[0]['stream'] and requests[0]['stream_options'] == {'include_usage': True}
+    assert recorder.summary['known']['input_tokens'] == 10 and recorder.summary['known']['cached_tokens'] == 3
+    assert recorder.summary['known_cost_usd'] == pytest.approx(.0113)
+    assert recorder.summary['failed_http_attempts'] == recorder.summary['missing_cost'] == 0
+    entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+    assert next(row for row in entries if row['event'] == 'http_response')['error'] is None
+    client.close()
+
+
 @pytest.mark.parametrize('provider,api', [('deepseek', 'chat'), ('opencode', 'chat'), ('openai', 'responses'),
                                          ('anthropic', 'messages'), ('bedrock', 'messages')])
 def test_http200_error_body_is_a_failed_model_call(tmp_path, monkeypatch, provider, api):

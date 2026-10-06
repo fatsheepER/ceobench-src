@@ -607,8 +607,9 @@ class BashAgent(BaseAgent):
                 _base_url = str(getattr(self.client, 'base_url', '') or '')
                 _is_together = 'api.together.xyz' in _base_url
                 _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
+                _is_opencode = 'opencode.ai' in _base_url
                 _is_deepseek_compat = (
-                    'api.deepseek.com' in _base_url or 'opencode.ai' in _base_url
+                    'api.deepseek.com' in _base_url or _is_opencode
                 )
                 api_kwargs = {
                     'model': self.model,
@@ -644,8 +645,18 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
+                    if _is_opencode:
+                        api_kwargs.update(stream=True, stream_options={'include_usage': True})
+                    def invoke():
+                        if not _is_opencode:
+                            return self.client.chat.completions.create(**api_kwargs)
+                        with self.client.chat.completions.stream(**{k: v for k, v in api_kwargs.items() if k != 'stream'}) as stream:
+                            try:
+                                return stream.get_final_completion()
+                            except openai.LengthFinishReasonError as exc:
+                                return exc.completion
                     response = self._request_model('chat', api_kwargs,
-                                                   lambda: self.client.chat.completions.create(**api_kwargs))
+                                                   invoke)
                 finally:
                     signal.alarm(0)  # Cancel alarm
                     signal.signal(signal.SIGALRM, old_handler)  # Restore handler
@@ -740,7 +751,7 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no tool_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=NO_TOOL_FEEDBACK
+                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
                     ))
                     continue
 
@@ -928,7 +939,7 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no function_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=NO_TOOL_FEEDBACK
+                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
                     ))
                     continue
 
@@ -1078,7 +1089,7 @@ class BashAgent(BaseAgent):
             preview = preview[:1200] + "..."
 
         return (
-            NO_TOOL_FEEDBACK + " "
+            getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK) + " "
             f"Previous non-tool response preview: {preview or '(no text)'}"
         )
 

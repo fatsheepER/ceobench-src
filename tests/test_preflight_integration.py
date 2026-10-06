@@ -53,7 +53,7 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
     runners = []
     def create(restore=None, **options):
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
-                                total_days=42, workspace_base=tmp_path, continue_from=restore,
+                                total_days=options.pop('total_days', 42), workspace_base=tmp_path, continue_from=restore,
                                 run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
         runners.append(runner)
         runner.setup()

@@ -41,6 +41,7 @@ def environment():
                  'CEOBENCH_PUBLIC_DIR', 'CEOBENCH_TEST_PUBLIC', 'NOVAMIND_PUBLIC_DIR',
                  'CEOBENCH_SIMULATOR_USAGE_LOG', 'CEOBENCH_MODEL_SESSION'):
         os.environ.pop(name, None)
+    os.environ.pop('CEOBENCH_READ_ONLY_TASK', None)
 
 
 def verify_frozen(output):
