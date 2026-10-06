@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Any
 from pathlib import Path
@@ -1908,6 +1909,14 @@ class AgentTools:
         """Update the current day."""
         self.current_day = day
 
+    def _record_config_override(self, tool_name, setting_type, settings):
+        try:
+            record_config_override(self.conn, self.current_day, tool_name, setting_type, settings)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def set_prices(self, prices: Dict[str, float]) -> ToolResult:
         """Set prices for plans A, B, C. Only provided keys are changed.
 
@@ -2146,15 +2155,8 @@ class AgentTools:
                     f"Valid groups: {sorted(valid_groups)}"
                 )
             for group_id, amount in groups.items():
-                if not isinstance(amount, (int, float)) or amount < 0:
+                if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
                     return ToolResult(False, f"Amount for ({channel_id}, {group_id}) must be a non-negative number")
-
-        # Store in config
-        self.config.targeted_ad_spend = targeted_spend
-
-        # Log to config_history (store as JSON in a comment-style approach —
-        # the actual config object holds the state, no DB column needed)
-        # The simulation reads from self.config.targeted_ad_spend directly
 
         # Calculate total daily ad cost
         total_per_day = sum(
@@ -2174,9 +2176,9 @@ class AgentTools:
         else:
             result_msg = "Ad spend cleared. No advertising spend."
 
-        record_config_override(self.conn, self.current_day, 'set_targeted_ad_spend', 'targeted_ad_spend',
-                               {'targeted_spend': targeted_spend})
-        self.conn.commit()
+        self._record_config_override('set_targeted_ad_spend', 'targeted_ad_spend',
+                                     {'targeted_spend': targeted_spend})
+        self.config.targeted_ad_spend = targeted_spend
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_per_day': total_per_day,
@@ -2221,6 +2223,10 @@ class AgentTools:
 
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_plans = {'A', 'B', 'C'}
+        g = self.config.targeted_ops_spend
+        p = self.config.targeted_ops_spend_by_plan
+        gp = self.config.targeted_ops_spend_by_group_plan
+        c = self.config.targeted_ops_spend_by_customer
 
         # ── by_group ──
         if by_group is not None:
@@ -2230,9 +2236,9 @@ class AgentTools:
             if invalid:
                 return ToolResult(False, f"Invalid group IDs: {invalid}. Valid: {sorted(valid_groups)}")
             for gid, amt in by_group.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for {gid} must be a non-negative number")
-            self.config.targeted_ops_spend = {k: float(v) for k, v in by_group.items()}
+            g = {k: float(v) for k, v in by_group.items()}
 
         # ── by_plan ──
         if by_plan is not None:
@@ -2242,9 +2248,9 @@ class AgentTools:
             if invalid_plans:
                 return ToolResult(False, f"Invalid plans: {invalid_plans}. Valid: {sorted(valid_plans)}")
             for plan, amt in by_plan.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for plan {plan} must be a non-negative number")
-            self.config.targeted_ops_spend_by_plan = {k: float(v) for k, v in by_plan.items()}
+            p = {k: float(v) for k, v in by_plan.items()}
 
         # ── by_group_plan ──
         if by_group_plan is not None:
@@ -2262,11 +2268,11 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plans for group {gid}: {bad_plans}. Valid: {sorted(valid_plans)}")
                 inner: Dict[str, float] = {}
                 for plan, amt in plans_dict.items():
-                    if not isinstance(amt, (int, float)) or amt < 0:
+                    if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                         return ToolResult(False, f"Amount for {gid}/{plan} must be a non-negative number")
                     inner[plan] = float(amt)
                 parsed_gp[gid] = inner
-            self.config.targeted_ops_spend_by_group_plan = parsed_gp
+            gp = parsed_gp
 
         # ── by_customer ──
         if by_customer is not None:
@@ -2278,16 +2284,12 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for customer {k} must be a non-negative number")
                 parsed_c[cid] = float(amt)
-            self.config.targeted_ops_spend_by_customer = parsed_c
+            c = parsed_c
 
         # Summarise current state
-        g = self.config.targeted_ops_spend
-        p = self.config.targeted_ops_spend_by_plan
-        gp = self.config.targeted_ops_spend_by_group_plan
-        c = self.config.targeted_ops_spend_by_customer
         total_extra = (
             sum(g.values()) + sum(p.values())
             + sum(v for inner in gp.values() for v in inner.values())
@@ -2313,8 +2315,8 @@ class AgentTools:
                 "Pure-group pools collapse to scale_g × spend; mixed pools are composition-weighted."
             )
 
-        record_config_override(
-            self.conn, self.current_day, 'set_targeted_ops_spend', 'targeted_ops_spend',
+        self._record_config_override(
+            'set_targeted_ops_spend', 'targeted_ops_spend',
             {
                 'by_group': g,
                 'by_plan': p,
@@ -2322,7 +2324,10 @@ class AgentTools:
                 'by_customer': {str(k): v for k, v in c.items()},
             },
         )
-        self.conn.commit()
+        self.config.targeted_ops_spend = g
+        self.config.targeted_ops_spend_by_plan = p
+        self.config.targeted_ops_spend_by_group_plan = gp
+        self.config.targeted_ops_spend_by_customer = c
         return ToolResult(True, result_msg, {
             'by_group': g,
             'by_plan': p,
@@ -2357,10 +2362,8 @@ class AgentTools:
                 f"Valid groups: {sorted(valid_groups)}"
             )
         for group_id, amount in targeted_spend.items():
-            if not isinstance(amount, (int, float)) or amount < 0:
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
                 return ToolResult(False, f"Amount for {group_id} must be a non-negative number")
-
-        self.config.targeted_dev_spend = targeted_spend
 
         total_extra = sum(targeted_spend.values())
         summary_parts = [f"  • {gid}: +${amt:.0f}/day" for gid, amt in targeted_spend.items()]
@@ -2372,9 +2375,9 @@ class AgentTools:
         else:
             result_msg += "  (no targeted dev spend — all dev spend is global)"
 
-        record_config_override(self.conn, self.current_day, 'set_targeted_dev_spend', 'targeted_dev_spend',
-                               {'targeted_spend': targeted_spend})
-        self.conn.commit()
+        self._record_config_override('set_targeted_dev_spend', 'targeted_dev_spend',
+                                     {'targeted_spend': targeted_spend})
+        self.config.targeted_dev_spend = targeted_spend
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_extra_per_day': total_extra,
@@ -2392,14 +2395,15 @@ class AgentTools:
             by_customer: {customer_id_str: strength}. None = no change.
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
+        strength = self.config.ads_strength_global
+        groups = self.config.ads_strength_by_group
+        customers = self.config.ads_strength_by_customer
 
-        # Validate and apply global strength
         if global_strength is not None:
-            if not isinstance(global_strength, (int, float)) or global_strength < 0 or global_strength > 1:
+            if type(global_strength) not in (int, float) or not math.isfinite(global_strength) or global_strength < 0 or global_strength > 1:
                 return ToolResult(False, "Global ads strength must be between 0.0 and 1.0")
-            self.config.ads_strength_global = float(global_strength)
+            strength = float(global_strength)
 
-        # Validate and apply per-group strength
         if by_group is not None:
             if not isinstance(by_group, dict):
                 return ToolResult(False, "by_group must be a dict of {group_id: strength}")
@@ -2407,11 +2411,10 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0 or val > 1:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0 or val > 1:
                     return ToolResult(False, f"Strength for {gid} must be between 0.0 and 1.0")
-            self.config.ads_strength_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
-        # Validate and apply per-customer strength
         if by_customer is not None:
             if not isinstance(by_customer, dict):
                 return ToolResult(False, "by_customer must be a dict of {customer_id: strength}")
@@ -2421,23 +2424,19 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0 or v > 1:
+                if type(v) not in (int, float) or not math.isfinite(v) or v < 0 or v > 1:
                     return ToolResult(False, f"Strength for customer {k} must be between 0.0 and 1.0")
                 parsed[cid] = float(v)
-            self.config.ads_strength_by_customer = parsed
+            customers = parsed
 
-        # Build summary
-        parts = [f"Global: {self.config.ads_strength_global:.2f}"]
-        if self.config.ads_strength_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: {v:.2f}' for k, v in self.config.ads_strength_by_group.items())}}}")
-        if self.config.ads_strength_by_customer:
-            parts.append(f"Customers: {len(self.config.ads_strength_by_customer)} custom")
-        record_config_override(self.conn, self.current_day, 'set_ads_strength', 'ads_strength', {
-            'global': self.config.ads_strength_global,
-            'by_group': self.config.ads_strength_by_group,
-            'by_customer': {str(k): v for k, v in self.config.ads_strength_by_customer.items()},
+        self._record_config_override('set_ads_strength', 'ads_strength', {
+            'global': strength,
+            'by_group': groups,
+            'by_customer': {str(k): v for k, v in customers.items()},
         })
-        self.conn.commit()
+        self.config.ads_strength_global = strength
+        self.config.ads_strength_by_group = groups
+        self.config.ads_strength_by_customer = customers
         return ToolResult(True, "Ads strength updated.", {
             'global': self.config.ads_strength_global,
             'by_group': self.config.ads_strength_by_group,
@@ -2457,11 +2456,15 @@ class AgentTools:
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_channels = set(AD_CHANNELS.keys())
+        promotion = self.config.lead_promotion_global
+        groups = self.config.lead_promotion_by_group
+        channels = self.config.lead_promotion_by_channel
+        channel_groups = self.config.lead_promotion_by_channel_group
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if type(global_promotion) not in (int, float) or not math.isfinite(global_promotion) or global_promotion < 0:
                 return ToolResult(False, "Global lead promotion must be non-negative")
-            self.config.lead_promotion_global = float(global_promotion)
+            promotion = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2470,9 +2473,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.lead_promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
         if by_channel is not None:
             if not isinstance(by_channel, dict):
@@ -2481,9 +2484,9 @@ class AgentTools:
             if invalid_channels_found:
                 return ToolResult(False, f"Invalid channels: {invalid_channels_found}. Valid: {sorted(valid_channels)}")
             for ch_id, val in by_channel.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for channel '{ch_id}' must be non-negative")
-            self.config.lead_promotion_by_channel = {k: float(v) for k, v in by_channel.items()}
+            channels = {k: float(v) for k, v in by_channel.items()}
 
         if by_channel_group is not None:
             if not isinstance(by_channel_group, dict):
@@ -2499,29 +2502,21 @@ class AgentTools:
                 if invalid_groups:
                     return ToolResult(False, f"Invalid group IDs for channel '{ch_id}': {invalid_groups}. Valid: {sorted(valid_groups)}")
                 for gid, val in group_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                         return ToolResult(False, f"Promotion for channel '{ch_id}', group '{gid}' must be non-negative")
                 parsed[ch_id] = {k: float(v) for k, v in group_dict.items()}
-            self.config.lead_promotion_by_channel_group = parsed
+            channel_groups = parsed
 
-        parts = [f"Global: ${self.config.lead_promotion_global:.2f}/mo"]
-        if self.config.lead_promotion_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.lead_promotion_by_group.items())}}}")
-        if self.config.lead_promotion_by_channel:
-            parts.append(f"Channels: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.lead_promotion_by_channel.items())}}}")
-        if self.config.lead_promotion_by_channel_group:
-            ch_parts = []
-            for ch_id, grp_dict in self.config.lead_promotion_by_channel_group.items():
-                for gid, val in grp_dict.items():
-                    ch_parts.append(f"{ch_id}→{gid}: ${val:.2f}")
-            parts.append(f"Channel×Group: {{{', '.join(ch_parts)}}}")
-        record_config_override(self.conn, self.current_day, 'set_lead_promotion', 'lead_promotion', {
-            'global': self.config.lead_promotion_global,
-            'by_group': self.config.lead_promotion_by_group,
-            'by_channel': self.config.lead_promotion_by_channel,
-            'by_channel_group': self.config.lead_promotion_by_channel_group,
+        self._record_config_override('set_lead_promotion', 'lead_promotion', {
+            'global': promotion,
+            'by_group': groups,
+            'by_channel': channels,
+            'by_channel_group': channel_groups,
         })
-        self.conn.commit()
+        self.config.lead_promotion_global = promotion
+        self.config.lead_promotion_by_group = groups
+        self.config.lead_promotion_by_channel = channels
+        self.config.lead_promotion_by_channel_group = channel_groups
         return ToolResult(True, "Lead promotion updated.", {
             'global': self.config.lead_promotion_global,
             'by_group': self.config.lead_promotion_by_group,
@@ -2543,11 +2538,15 @@ class AgentTools:
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_plans = {'A', 'B', 'C'}
+        promotion = self.config.promotion_global
+        groups = self.config.promotion_by_group
+        customers = self.config.promotion_by_customer
+        group_plans = self.config.promotion_by_group_plan
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if type(global_promotion) not in (int, float) or not math.isfinite(global_promotion) or global_promotion < 0:
                 return ToolResult(False, "Global promotion must be non-negative")
-            self.config.promotion_global = float(global_promotion)
+            promotion = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2556,9 +2555,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
         if by_customer is not None:
             if not isinstance(by_customer, dict):
@@ -2569,10 +2568,10 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0:
+                if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
                     return ToolResult(False, f"Promotion for customer {k} must be non-negative")
                 parsed[cid] = float(v)
-            self.config.promotion_by_customer = parsed
+            customers = parsed
 
         if by_group_plan is not None:
             if not isinstance(by_group_plan, dict):
@@ -2589,30 +2588,22 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plan keys for group {gid}: {invalid_plans}. Valid: {sorted(valid_plans)}")
                 parsed_inner = {}
                 for plan, val in plans_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                         return ToolResult(False, f"Promotion for {gid}/{plan} must be non-negative")
                     parsed_inner[plan] = float(val)
                 parsed_gp[gid] = parsed_inner
-            self.config.promotion_by_group_plan = parsed_gp
+            group_plans = parsed_gp
 
-        parts = [f"Global: ${self.config.promotion_global:.2f}/mo"]
-        if self.config.promotion_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.promotion_by_group.items())}}}")
-        if self.config.promotion_by_customer:
-            parts.append(f"Customers: {len(self.config.promotion_by_customer)} custom")
-        if self.config.promotion_by_group_plan:
-            gp_parts = []
-            for gid, plans in self.config.promotion_by_group_plan.items():
-                for plan, val in plans.items():
-                    gp_parts.append(f"{gid}/{plan}: ${val:.2f}")
-            parts.append(f"Group-Plans: {{{', '.join(gp_parts)}}}")
-        record_config_override(self.conn, self.current_day, 'set_promotion', 'promotion', {
-            'global': self.config.promotion_global,
-            'by_group': self.config.promotion_by_group,
-            'by_customer': {str(k): v for k, v in self.config.promotion_by_customer.items()},
-            'by_group_plan': self.config.promotion_by_group_plan,
+        self._record_config_override('set_promotion', 'promotion', {
+            'global': promotion,
+            'by_group': groups,
+            'by_customer': {str(k): v for k, v in customers.items()},
+            'by_group_plan': group_plans,
         })
-        self.conn.commit()
+        self.config.promotion_global = promotion
+        self.config.promotion_by_group = groups
+        self.config.promotion_by_customer = customers
+        self.config.promotion_by_group_plan = group_plans
         return ToolResult(True, "Promotion updated.", {
             'global': self.config.promotion_global,
             'by_group': self.config.promotion_by_group,

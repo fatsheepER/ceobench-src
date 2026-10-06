@@ -683,7 +683,14 @@ _TOOL_DISPATCH = {
     'research_group': lambda tools, args: tools.research_group(args.get('group_id', ''), args.get('target_level')),
     'get_market_overview': lambda tools, args: tools.get_market_overview(),
     'get_group_insights': lambda tools, args: tools.get_group_insights(args.get('group_id', '')),
-    'set_targeted_ops_spend': lambda tools, args: tools.set_targeted_ops_spend(args.get('targeted_spend', args)),
+    'set_targeted_ops_spend': lambda tools, args: tools.set_targeted_ops_spend(
+        targeted_spend=args.get('targeted_spend', None if any(key in args for key in
+            ('by_group', 'by_plan', 'by_group_plan', 'by_customer')) else args),
+        by_group=args.get('by_group'),
+        by_plan=args.get('by_plan'),
+        by_group_plan=args.get('by_group_plan'),
+        by_customer=args.get('by_customer'),
+    ),
     'set_targeted_dev_spend': lambda tools, args: tools.set_targeted_dev_spend(args.get('targeted_spend', args)),
     'set_ads_strength': lambda tools, args: tools.set_ads_strength(
         global_strength=args.get('global_strength'),

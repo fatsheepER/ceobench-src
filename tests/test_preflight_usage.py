@@ -242,7 +242,8 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
 
 @pytest.mark.parametrize('fault', ['missing_done', 'missing_finish', 'missing_both', 'missing_id',
                                   'missing_type', 'missing_name', 'missing_function', 'invalid_json',
-                                  'non_object_arguments', 'empty_arguments'])
+                                  'non_object_arguments', 'empty_arguments', 'sse_json', 'null_choice',
+                                  'null_delta', 'null_choices', 'null_tool'])
 def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, monkeypatch, fault):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
@@ -267,7 +268,18 @@ def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, m
             tool]), finish_reason=None)]),
             dict(base, choices=[dict(index=0, delta={}, finish_reason='tool_calls' if finished else None)]),
             dict(base, choices=[], usage=dict(reply('chat')['usage'], total_tokens=12))]
+        if first:
+            if fault == 'null_choice':
+                frames[0]['choices'] = [None]
+            elif fault == 'null_delta':
+                frames[0]['choices'][0]['delta'] = None
+            elif fault == 'null_choices':
+                frames[0]['choices'] = None
+            elif fault == 'null_tool':
+                frames[0]['choices'][0]['delta']['tool_calls'] = [None]
         payload = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames)
+        if first and fault == 'sse_json':
+            payload = 'data: {broken\n\n' + payload
         if done:
             payload += 'data: [DONE]\n\n'
         payloads.append(payload)
@@ -294,6 +306,75 @@ def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, m
     done = fault not in ('missing_done', 'missing_both')
     assert first_http['error'] == (None if done else 'stream_closed_before_completion')
     client.close()
+
+
+@pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
+@pytest.mark.parametrize('fault', ['connection', 'no_tool', 'status'])
+def test_model_regeneration_has_one_shared_attempt_budget(tmp_path, monkeypatch, api, fault):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    from saas_bench.run_lifecycle import RunCancelled
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        if len(requests) > 4:
+            raise RunCancelled('unexpected_fifth_request')
+        if fault == 'connection':
+            raise httpx.ConnectError('offline', request=request)
+        if fault == 'status':
+            return httpx.Response(503, json={'error': {'type': 'server_error', 'message': 'offline'}})
+        if api == 'messages':
+            events = [dict(type='message_start', message=reply('messages')),
+                      dict(type='message_stop')]
+            payload = ''.join('event: ' + event['type'] + '\ndata: ' + json.dumps(event) + '\n\n'
+                              for event in events)
+            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                                  stream=httpx.ByteStream(payload.encode()))
+        return httpx.Response(200, json=reply(api))
+    http = httpx.Client(transport=httpx.MockTransport(handle))
+    client = (Anthropic(api_key='offline', http_client=http, max_retries=0) if api == 'messages'
+              else OpenAI(api_key='offline', http_client=http, max_retries=0))
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
+                      system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
+                      workspace_path=tmp_path, usage_recorder=recorder)
+    try:
+        with pytest.raises(RunCancelled, match='model_attempt_limit'):
+            agent.act('dashboard', 0, False, {'day': 7})
+        assert len(requests) == recorder.summary['calls'] == 4
+        assert recorder.summary['errors'] == (0 if fault == 'no_tool' else 4)
+        assert agent._observation_recorded and not agent._pending_tool_calls
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
+@pytest.mark.parametrize('status', [400, 401, 403])
+def test_permanent_model_rejection_pauses_without_feedback(tmp_path, monkeypatch, api, status):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    from saas_bench.run_lifecycle import RunCancelled
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        if len(requests) > 1:
+            raise RunCancelled('unexpected_second_request')
+        return httpx.Response(status, json={'error': {'type': 'invalid_request_error', 'message': 'rejected'}})
+    http = httpx.Client(transport=httpx.MockTransport(handle))
+    client = (Anthropic(api_key='offline', http_client=http, max_retries=0) if api == 'messages'
+              else OpenAI(api_key='offline', http_client=http, max_retries=0))
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
+                      system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
+                      workspace_path=tmp_path, usage_recorder=recorder)
+    try:
+        with pytest.raises(RunCancelled, match=f'model_request_rejected:{status}'):
+            agent.act('dashboard', 0, False, {'day': 7})
+        assert len(requests) == recorder.summary['calls'] == recorder.summary['errors'] == 1
+        assert recorder.summary['missing_cost'] == 1
+        assert [message.role for message in agent.conversation] == ['system', 'user']
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize('provider,api', [('deepseek', 'chat'), ('opencode', 'chat'), ('openai', 'responses'),

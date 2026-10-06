@@ -52,9 +52,17 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
     monkeypatch.setattr(subprocess, 'Popen', launch)
     runners = []
     def create(restore=None, **options):
+        managed_checkpoints = options.pop('managed_checkpoints', True)
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
                                 total_days=options.pop('total_days', 42), workspace_base=tmp_path, continue_from=restore,
                                 run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
+        if not managed_checkpoints:
+            server_environment = runner._server_environment
+            def unmanaged_environment():
+                env = server_environment()
+                env.pop('CEOBENCH_CHECKPOINT_ROOT', None)
+                return env
+            monkeypatch.setattr(runner, '_server_environment', unmanaged_environment)
         runners.append(runner)
         runner.setup()
         if restore:
@@ -70,6 +78,113 @@ def advance(runner):
     return runner._http_post('/next-week', {'rationale': 'fixed offline action',
         'predictions': {h: {'point': 100000, 'lower': -100000, 'upper': 1000000}
                         for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}, timeout=120)
+
+
+def set_runtime_config(runner, values):
+    calls = [
+        ('set_targeted_ad_spend', {'targeted_spend': values['targeted_ad_spend']}),
+        ('set_targeted_ops_spend', {
+            'by_group': values['targeted_ops_spend'],
+            'by_plan': values['targeted_ops_spend_by_plan'],
+            'by_group_plan': values['targeted_ops_spend_by_group_plan'],
+            'by_customer': values['targeted_ops_spend_by_customer']}),
+        ('set_targeted_dev_spend', {'targeted_spend': values['targeted_dev_spend']}),
+        ('set_ads_strength', {'global_strength': values['ads_strength_global'],
+            'by_group': values['ads_strength_by_group'], 'by_customer': values['ads_strength_by_customer']}),
+        ('set_lead_promotion', {'global_promotion': values['lead_promotion_global'],
+            'by_group': values['lead_promotion_by_group'], 'by_channel': values['lead_promotion_by_channel'],
+            'by_channel_group': values['lead_promotion_by_channel_group']}),
+        ('set_promotion', {'global_promotion': values['promotion_global'],
+            'by_group': values['promotion_by_group'], 'by_customer': values['promotion_by_customer'],
+            'by_group_plan': values['promotion_by_group_plan']}),
+    ]
+    for tool, args in calls:
+        result = runner._http_post('/call', {'tool': tool, 'args': args})
+        assert result['success'], result
+
+
+def saved_runtime_config(path):
+    conn = load_session_db(path)
+    try:
+        state = json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])
+        assert state['version'] == 3
+        return state['runtime_config']
+    finally:
+        conn.close()
+
+
+def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_path):
+    from test_preflight_rng import runtime_values
+
+    first = offline_runner()
+    manifest = (first.workspace_dir / 'manifest.json').read_bytes()
+    expected = runtime_values()
+    set_runtime_config(first, expected)
+    expected['targeted_ad_spend'] = {'social_media': {'S1': 19.0}}
+    expected['targeted_ops_spend_by_plan'] = {}
+    expected['targeted_dev_spend'] = {}
+    expected['promotion_global'] = 15.0
+    set_runtime_config(first, expected)
+    first._save_checkpoint(0)
+    directory = checkpoint_directory(first.workspace_dir, first._load_checkpoint())
+    encoded = json.loads(json.dumps(expected))
+    assert len(encoded) == 17
+    assert saved_runtime_config(directory / 'world.nmdb') == encoded
+    restored = offline_runner(clone(first, tmp_path / 'runtime-restored'))
+    for _ in range(2):
+        assert advance(restored) == advance(first)
+    for runner in (first, restored):
+        runner._save_checkpoint(14)
+        directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
+        assert saved_runtime_config(directory / 'world.nmdb') == encoded
+        assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+    assert business_state(restored) == business_state(first)
+
+
+def test_packed_runtime_config_survives_ordinary_stop_start(offline_runner):
+    from test_preflight_rng import runtime_values
+
+    runner = offline_runner(managed_checkpoints=False)
+    manifest = (runner.workspace_dir / 'manifest.json').read_bytes()
+    expected = runtime_values()
+    set_runtime_config(runner, expected)
+    runner._stop_server()
+    directory = runner.agent_workspace / 'sessions' / runner._session_id
+    assert saved_runtime_config(directory / 'world.nmdb') == json.loads(json.dumps(expected))
+    assert json.loads((directory / 'session.json').read_text())['current_day'] == 0
+    runner._launch_server()
+    assert advance(runner)['success']
+    runner._stop_server()
+    assert saved_runtime_config(directory / 'world.nmdb') == json.loads(json.dumps(expected))
+    assert json.loads((directory / 'session.json').read_text())['current_day'] == 7
+    assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+
+
+@pytest.mark.parametrize('invalid', ['legacy', 'bad_runtime', 'missing_state'])
+def test_packed_start_refuses_legacy_or_invalid_runtime(offline_runner, invalid):
+    from saas_bench.db_protection import save_session_db
+
+    runner = offline_runner(managed_checkpoints=False)
+    runner._stop_server()
+    path = runner.agent_workspace / 'sessions' / runner._session_id / 'world.nmdb'
+    conn = load_session_db(path)
+    try:
+        if invalid == 'missing_state':
+            conn.execute('DROP TABLE _rng_states')
+        else:
+            state = json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])
+            if invalid == 'legacy':
+                state['version'] = 2
+                del state['runtime_config']
+            else:
+                state['runtime_config']['promotion_global'] = float('nan')
+            conn.execute("UPDATE _rng_states SET state_json=?", (json.dumps(state),))
+        conn.commit()
+        save_session_db(conn, path)
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match='version 3 required|runtime'):
+        runner._launch_server()
 
 
 def test_agent_zipapp_excludes_engine_and_survives_restore(offline_runner, packed_public):

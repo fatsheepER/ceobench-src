@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Tuple
+import math
 import numpy as np
 
 
@@ -366,6 +367,58 @@ AD_CHANNELS: Dict[str, AdChannel] = {
         }
     ),
 }
+
+
+RUNTIME_CONFIG_FIELDS = {
+    'targeted_ad_spend': (str, str),
+    'targeted_ops_spend': (str,),
+    'targeted_ops_spend_by_plan': (str,),
+    'targeted_ops_spend_by_group_plan': (str, str),
+    'targeted_ops_spend_by_customer': (int,),
+    'targeted_dev_spend': (str,),
+    'ads_strength_global': (),
+    'ads_strength_by_group': (str,),
+    'ads_strength_by_customer': (int,),
+    'lead_promotion_global': (),
+    'lead_promotion_by_group': (str,),
+    'lead_promotion_by_channel': (str,),
+    'lead_promotion_by_channel_group': (str, str),
+    'promotion_global': (),
+    'promotion_by_group': (str,),
+    'promotion_by_customer': (int,),
+    'promotion_by_group_plan': (str, str),
+}
+
+
+def normalize_runtime_config(values):
+    """Validate a complete runtime snapshot and restore integer customer keys."""
+    if not isinstance(values, dict) or values.keys() != RUNTIME_CONFIG_FIELDS.keys():
+        raise ValueError('Incomplete runtime configuration fields')
+
+    def normalize(value, keys, path, strength):
+        if not keys:
+            if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                    or (strength and value > 1)):
+                raise ValueError(f'Invalid runtime configuration value for {path}')
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(f'Runtime configuration {path} must be a dict')
+        result = {}
+        for key, item in value.items():
+            if keys[0] is int:
+                try:
+                    key = int(key)
+                except (ValueError, TypeError, OverflowError) as error:
+                    raise ValueError(f'Invalid runtime customer ID in {path}') from error
+            elif not isinstance(key, str):
+                raise ValueError(f'Runtime configuration keys in {path} must be strings')
+            if key in result:
+                raise ValueError(f'Duplicate runtime configuration key in {path}')
+            result[key] = normalize(item, keys[1:], f'{path}.{key}', strength)
+        return result
+
+    return {name: normalize(values[name], keys, name, name.startswith('ads_strength'))
+            for name, keys in RUNTIME_CONFIG_FIELDS.items()}
 
 
 @dataclass

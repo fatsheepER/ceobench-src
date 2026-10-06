@@ -78,6 +78,43 @@ def test_hold_only_interrupts_retry(tmp_path):
             control.sleep(60)
 
 
+@pytest.mark.parametrize('rejected', [False, True])
+def test_model_failure_pauses_without_supervisor_and_restores_context(offline_runner, monkeypatch, rejected):
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    runner = offline_runner()
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        if rejected:
+            return httpx.Response(401, json={'error': {'message': 'offline rejection'}})
+        return httpx.Response(200, json=dict(id='offline', model='test-model', object='chat.completion', created=0,
+            choices=[dict(index=0, finish_reason='stop', message=dict(role='assistant', content='No tool'))],
+            usage=dict(prompt_tokens=13, completion_tokens=7)))
+    client = OpenAI(api_key='offline', base_url='https://api.deepseek.com/', max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+    runner.agent.client = runner.agent.usage_recorder.attach(client)
+    try:
+        result = runner.run(verbose=False)
+        assert result['outcome'] == 'paused' and result['days_run'] == 0
+        assert result['reason'] == ('model_request_rejected:401' if rejected else 'model_attempt_limit')
+        assert len(requests) == (1 if rejected else 4)
+        checkpoint = runner._load_checkpoint()
+        assert checkpoint['context_boundary'] == 'same_week'
+        assert checkpoint['usage']['calls'] == len(requests)
+        assert checkpoint['usage']['errors'] == int(rejected)
+        assert checkpoint['usage']['missing_cost'] == len(requests)
+        original = runner.agent._snapshot_path.read_bytes()
+        restored = offline_runner(runner.workspace_dir)
+        assert restored.agent._snapshot_path.read_bytes() == original
+        before = [restored.agent._serialize_message(m) for m in restored.agent.conversation]
+        monkeypatch.setattr(restored.agent, '_call_llm', lambda: None)
+        restored.agent.act(restored.agent._last_observation, 0, False, {'day': 0})
+        assert [restored.agent._serialize_message(m) for m in restored.agent.conversation] == before
+    finally:
+        client.close()
+
+
 def test_retry_hold_checkpoint_restores_exact_conversation(offline_runner, tmp_path, monkeypatch):
     runner = offline_runner()
     monkeypatch.setattr(runner, 'setup', lambda: None)

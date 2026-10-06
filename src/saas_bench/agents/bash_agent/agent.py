@@ -43,13 +43,17 @@ def _stream_chat_completion(client, request):
     import httpx
     from openai import APIConnectionError, LengthFinishReasonError
     from openai.lib.streaming.chat import ChatCompletionStreamState
+    from openai.types.chat import ChatCompletionChunk
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
+    from pydantic import ValidationError
 
     state = ChatCompletionStreamState()
     received = False
     with client.chat.completions.create(**request) as stream:
         try:
             for chunk in stream:
+                chunk = ChatCompletionChunk.model_validate(
+                    chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
                 received = True
                 for choice in chunk.choices:
                     for tool in choice.delta.tool_calls or []:
@@ -80,7 +84,7 @@ def _stream_chat_completion(client, request):
                         raise httpx.ReadError('Chat completion stream ended with invalid tool arguments') from exc
                     if not isinstance(arguments, dict):
                         raise httpx.ReadError('Chat completion tool arguments must be a JSON object')
-        except httpx.TransportError as exc:
+        except (httpx.TransportError, json.JSONDecodeError, ValidationError) as exc:
             raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
         try:
             return state.get_final_completion()
@@ -432,6 +436,8 @@ class BashAgent(BaseAgent):
         return action
 
     def _retry_wait(self, seconds):
+        if getattr(self, '_llm_attempt', 0) >= 4:
+            raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
             lifecycle.sleep(seconds)
@@ -439,6 +445,8 @@ class BashAgent(BaseAgent):
             time.sleep(seconds)
 
     def _request_model(self, api, request, invoke):
+        if getattr(self, '_llm_attempt', 0) >= 4:
+            raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
             lifecycle.check(retry=getattr(self, '_llm_attempt', 0) > 0)
@@ -450,6 +458,11 @@ class BashAgent(BaseAgent):
         try:
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
                                                 turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+        except Exception as exc:
+            status = getattr(exc, 'status_code', 0) or 0
+            if 400 <= status < 500 and status not in (408, 409, 429):
+                raise RunCancelled(f'model_request_rejected:{status}') from exc
+            raise
         finally:
             for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
                 setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)
@@ -835,8 +848,6 @@ class BashAgent(BaseAgent):
                     is_retryable = any(code in str(e) for code in ('429', '500', '502', '503', '504', '529'))
                 print(f"OpenAI LLM call error (retryable={is_retryable}, status={status}): {e}")
                 if is_retryable:
-                    # Retry with exponential backoff — keep trying forever until
-                    # the endpoint comes back. Never fall back to next-week.
                     self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                     wait_time = min(120, 10 * (2 ** min(self._consecutive_errors - 1, 3)))
                     print(f"  Server error ({self._consecutive_errors}), retrying in {wait_time}s...")
@@ -1287,11 +1298,6 @@ class BashAgent(BaseAgent):
                             {'stop_reason': stop_reason, 'attempt': no_tool_retries},
                             self._anthropic_content_text(assistant_content),
                         )
-                    if no_tool_retries > 3:
-                        raise RuntimeError(
-                            "Anthropic response did not include a tool_use block after "
-                            f"{no_tool_retries} attempts (last stop_reason={stop_reason!r})."
-                        )
                     print(
                         f"  Anthropic returned no tool_use "
                         f"(stop_reason={stop_reason!r}); feeding feedback and regenerating."
@@ -1310,8 +1316,6 @@ class BashAgent(BaseAgent):
                 if self.evidence_store:
                     self.evidence_store.assert_healthy(quiescent=False)
                 import traceback
-                if str(e).startswith("Anthropic response did not include a tool_use block"):
-                    raise
                 error_msg = f"Anthropic LLM call error: {e}"
                 tb = traceback.format_exc()
                 print(f"\n{'='*60}")
@@ -1322,13 +1326,7 @@ class BashAgent(BaseAgent):
                 print(f"{'='*60}\n")
 
                 self._consecutive_errors += 1
-                if self._consecutive_errors <= 3:
-                    wait = 2 ** self._consecutive_errors
-                    print(f"  Retrying in {wait}s (attempt {self._consecutive_errors}/3)...")
-                    self._retry_wait(wait)
-                    return self._call_anthropic()
-
-                raise RuntimeError(
-                    f"LLM failed {self._consecutive_errors} consecutive times. "
-                    f"Last error: {e}"
-                ) from e
+                wait = 2 ** min(self._consecutive_errors, 3)
+                print(f"  Retrying in {wait}s...")
+                self._retry_wait(wait)
+                return self._call_anthropic()

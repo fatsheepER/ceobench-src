@@ -11,7 +11,7 @@ import numpy as np
 from numpy.random import Generator, PCG64
 
 from .config import (
-    BenchmarkConfig, MODEL_TIERS, CAPACITY_TIERS,
+    BenchmarkConfig, MODEL_TIERS, CAPACITY_TIERS, RUNTIME_CONFIG_FIELDS, normalize_runtime_config,
     # Customer group system
     CUSTOMER_GROUPS, INITIAL_CUSTOMER_GROUPS, CustomerGroupConfig,
     SMALL_CUSTOMER_GROUPS, ENTERPRISE_CUSTOMER_GROUPS,
@@ -822,7 +822,9 @@ class Simulator:
             return s
 
         states = {
-            'version': 2,
+            'version': 3,
+            'runtime_config': normalize_runtime_config(
+                {name: getattr(self.config, name) for name in RUNTIME_CONFIG_FIELDS}),
             'rng': _serialize_state(self.rng),
             '_macro_rng': _serialize_state(self._macro_rng),
             '_competitor_rng': _serialize_state(self._competitor_rng),
@@ -892,12 +894,13 @@ class Simulator:
         states = _json.loads(row['state_json'])
         required = {'rng', '_macro_rng', '_competitor_rng', '_competitor_post_noise_rng',
                     '_competitor_template_rng', '_quality_rng', '_customer_quality_noise_rng',
-                    '_customer_pick_rng', '_group_rngs', '_sim_state'}
+                    '_customer_pick_rng', '_group_rngs', '_sim_state', 'runtime_config'}
         if getattr(self, 'shock_manager', None) is not None:
             required.add('_shock_rng')
         missing = required - states.keys()
-        if states.get('version') != 2 or missing:
-            raise ValueError(f'Incomplete RNG checkpoint; missing {sorted(missing)}; version 2 required')
+        if states.get('version') != 3 or missing:
+            raise ValueError(f'Incomplete RNG checkpoint; missing {sorted(missing)}; version 3 required')
+        runtime_config = normalize_runtime_config(states['runtime_config'])
         required_state = {'current_day', 'shutdown_mode', 'consecutive_negative_cash_days',
                           '_involuntary_churn_seed', '_leads_drift_seed', '_macro_pmi_current',
                           '_macro_cycle_phase_offset', '_macro_last_update_day', '_macro_last_social_post_day',
@@ -965,6 +968,8 @@ class Simulator:
             self._leads_per_1k_overrides = {(ch, gid): float(v) for ch, gid, v in saved_leads}
             self._restore_leads_overrides_to_ad_channels()
 
+        for name, value in runtime_config.items():
+            setattr(self.config, name, value)
         return True
 
     def get_current_config(self) -> dict:

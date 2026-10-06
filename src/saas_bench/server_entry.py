@@ -25,7 +25,9 @@ from typing import Optional
 
 from numpy.random import Generator, PCG64
 
-from saas_bench.config import BenchmarkConfig, SCENARIO_PACKS, ScenarioPack
+from saas_bench.config import (
+    BenchmarkConfig, SCENARIO_PACKS, ScenarioPack, RUNTIME_CONFIG_FIELDS, normalize_runtime_config,
+)
 from saas_bench.database import init_database
 from saas_bench.simulation import Simulator
 from saas_bench.customer_llm import CustomerSimulator
@@ -199,6 +201,9 @@ def _session_config(seed, total_days, initial_cash, meta=None):
         frozen = requested
     config = BenchmarkConfig(**frozen) if frozen else BenchmarkConfig(
         seed=seed, total_days=total_days, initial_cash=initial_cash)
+    for name, value in normalize_runtime_config(
+            {name: getattr(config, name) for name in RUNTIME_CONFIG_FIELDS}).items():
+        setattr(config, name, value)
     if meta and not frozen:
         _restore_simulator_llm_config(config, meta)
     before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
@@ -359,8 +364,8 @@ def cmd_start_server(args, base: Path):
     simulator.shock_manager = shock_manager
     # Construct all random streams before restoring the saved positions.
     restored = simulator.restore_rng_states()
-    if current_day > 0 and not restored:
-        raise ValueError('Cannot resume: checkpoint has no random states')
+    if not restored and (current_day > 0 or meta.get('status') != 'created'):
+        raise ValueError('Cannot resume: checkpoint has no runtime or random states')
     if restored and simulator.current_day != current_day:
         raise ValueError('Checkpoint metadata and simulator day differ')
 
@@ -524,7 +529,10 @@ def cmd_start_server(args, base: Path):
         if async_saver:
             if not async_saver.shutdown(wait=True, timeout=180.0):
                 raise TimeoutError('Background database save did not finish')
-            save_session_db(conn, nmdb_path)
+            with api_server._lock:
+                simulator.save_rng_states()
+                save_session_db(conn, nmdb_path)
+                meta['current_day'] = simulator.current_day
         meta["status"] = "stopped"
         meta.pop("port", None)
         meta.pop("pid", None)
