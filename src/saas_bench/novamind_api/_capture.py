@@ -3,6 +3,8 @@ import builtins
 from contextvars import ContextVar
 from functools import wraps
 import io
+import http.client
+import socket
 import json
 import os
 import sys
@@ -14,14 +16,33 @@ _CALLS = ContextVar('novamind_observations', default=None)
 _CONTEXT = 'NOVAMIND_CAPTURE_CONTEXT'
 
 
+class _UnixConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            self.sock.settimeout(self.timeout)
+        self.sock.connect(os.environ['NOVAMIND_API_SOCKET'])
+
+
+class _UnixHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(_UnixConnection, request)
+
+
+def _transport(request, *args, **kwargs):
+    if os.environ.get('NOVAMIND_API_SOCKET'):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), _UnixHandler()).open(request, *args, **kwargs)
+    return urllib.request.urlopen(request, *args, **kwargs)
+
+
 def submit(body):
-    port = os.environ.get('NOVAMIND_API_PORT')
+    port = os.environ.get('NOVAMIND_API_PORT') or ('1' if os.environ.get('NOVAMIND_API_SOCKET') else None)
     if not port:
         return False
     request = urllib.request.Request(f'http://127.0.0.1:{int(port)}/_capture',
         data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with _transport(request, timeout=5) as response:
             return json.load(response).get('accepted') is True
     except Exception:
         # Server-side expected receipt / unfinished execution prevents a healthy checkpoint.
@@ -64,7 +85,7 @@ def urlopen(request, *args, **kwargs):
     state = _CALLS.get()
     context = os.environ.get(_CONTEXT)
     if state is None or not context or request.full_url.rsplit('/', 1)[-1] in ('health', 'game-status', 'checkpoint'):
-        return urllib.request.urlopen(request, *args, **kwargs)
+        return _transport(request, *args, **kwargs)
     call = uuid.uuid4().hex
     request.add_header('X-Capture-Context', context)
     request.add_header('X-Capture-Call', call)
@@ -88,7 +109,7 @@ def urlopen(request, *args, **kwargs):
         response.read = observed_read
         return response
     try:
-        return wrap(urllib.request.urlopen(request, *args, **kwargs))
+        return wrap(_transport(request, *args, **kwargs))
     except urllib.error.HTTPError as exc:
         wrap(exc)
         raise

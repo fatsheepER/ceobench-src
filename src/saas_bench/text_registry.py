@@ -23,9 +23,12 @@ def applies_ended(record, day):
 
 
 class TextRegistry:
-    def __init__(self, workspace, mode, store=None, sim_day=lambda: None):
+    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None):
         if mode not in ('git', 'prefix', 'pf'):
             raise ValueError('Invalid registration mode')
+        self.git_run = subprocess.run
+        self.identity = identity
+        self.role = identity.role if identity else "ceo"
         self.workspace = Path(workspace).resolve()
         self.path = self.workspace / 'registrations.json'
         self.mode, self.store, self.sim_day = mode, store, sim_day
@@ -40,10 +43,20 @@ class TextRegistry:
             raise ValueError('Registration storage must not be a symlink')
         if not self.path.exists():
             return dict(format='ceobench.text-register.v1', records={})
-        value = json.loads(self.path.read_text())
+        from .workspace_io import open_file
+        with open_file(self.workspace, self.path) as stream:
+            value = json.load(stream)
         if value.get('format') != 'ceobench.text-register.v1' or not isinstance(value.get('records'), dict):
             raise ValueError('Invalid registration file')
+        if self.identity:
+            for revisions in value['records'].values():
+                for record in revisions:
+                    if record.get('author') != self.role or any(record.get(k) != v for k, v in self.identity.fields().items()):
+                        raise ValueError('Registration identity differs from its workspace owner')
         return value
+
+    def _git_output(self, argv, **kwargs):
+        return self.git_run(argv, capture_output=True, check=True, timeout=10, **kwargs).stdout
 
     def execute(self, operation, args):
         with self.resolver.binding_scope() if self.resolver else nullcontext():
@@ -78,7 +91,9 @@ class TextRegistry:
             if operation == 'retire':
                 record['status'] = 'retired'
         # Agents reason in simulated days; clock time stays in the private event record.
-        record.update(version=f"{record_id}.{record['revision']}", sim_day=self.sim_day(), author='ceo')
+        record.update(version=f"{record_id}.{record['revision']}", sim_day=self.sim_day(), author=self.role)
+        if self.identity:
+            record.update(self.identity.fields())
         warnings, bindings = [], []
         if operation == 'create' or 'references' in values:
             for ref in record['references']:
@@ -92,7 +107,26 @@ class TextRegistry:
         records.setdefault(record_id, []).append(record)
         # Validate every reference before touching the workspace. A failed declaration
         # does not consume a revision or save partially validated references.
-        write_json(self.path, state)
+        if self.identity:
+            import os
+            import uuid
+            from .workspace_io import parent_fd
+            with parent_fd(self.workspace, self.path) as (directory, name):
+                temp = '.registration-' + uuid.uuid4().hex
+                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+                try:
+                    with os.fdopen(fd, 'w') as stream:
+                        json.dump(state, stream, ensure_ascii=False)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temp, name, src_dir_fd=directory, dst_dir_fd=directory)
+                finally:
+                    try:
+                        os.unlink(temp, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+        else:
+            write_json(self.path, state)
         if self.store:
             try:
                 event = CURRENT_EVENT.get()
@@ -171,9 +205,9 @@ class TextRegistry:
     def _closing_binding(self, ref, provisional):
         binding = dict(git_week=provisional['awaiting_week'])
         try:
-            evidence, full = git_reference(self.workspace, ref['evidence'])
+            evidence, full = git_reference(self.workspace, ref['evidence'], run=self.git_run)
             binding['git_commit'] = full
-            raw = subprocess.check_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
+            raw = self._git_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
             handles = evidence_handles.index(self.store)
             handles.refresh()
             candidates = [v for group in reversed(handles.groups.get(('file', evidence['path']), []))
@@ -294,15 +328,20 @@ class TextRegistry:
                                                       'revised to ' + latest['version'])
         cited = evidence['path'] + '@' + evidence['commit']
         try:
-            _, full = git_reference(self.workspace, evidence)
-            old = subprocess.run(['git', '-C', str(self.workspace), 'show', f"{full}:{evidence['path']}"],
+            _, full = git_reference(self.workspace, evidence, run=self.git_run)
+            old = self.git_run(['git', '-C', str(self.workspace), 'show', f"{full}:{evidence['path']}"],
                                  capture_output=True, timeout=10, check=True).stdout
         except (ValueError, subprocess.SubprocessError) as exc:
             return f'{cited}: cannot check ({exc})'
         current = self.workspace / evidence['path']
         if current.is_symlink() or not current.is_file():
             return f'{cited}: the file no longer exists'
-        new = current.read_bytes()
+        from .workspace_io import open_file
+        try:
+            with open_file(self.workspace, current) as stream:
+                new = stream.read()
+        except (OSError, ValueError):
+            return f'{cited}: the file no longer exists inside the workspace'
         if new == old:
             return None
         kind = 'json' if evidence['path'].endswith('.json') else 'text'
@@ -329,7 +368,7 @@ class TextRegistry:
             evidence['record'] = target['version']
         elif self.mode in ('git', 'prefix') and 'path' in evidence and 'commit' not in evidence \
                 and '@' not in evidence['path']:
-            ref['evidence'] = weekly_reference(self.workspace, evidence['path'], week_label(self.sim_day()))
+            ref['evidence'] = weekly_reference(self.workspace, evidence['path'], week_label(self.sim_day()), run=self.git_run)
             label = ref['evidence']['commit']
             if (ref.get('select') or ref.get('predicate')) and not evidence['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
@@ -338,7 +377,7 @@ class TextRegistry:
             # PF keeps the Git group's committed-file references (design 4.1).
             if 'path' not in evidence:
                 raise ValueError('Evidence must be a workspace file path or a registered text rN.M; otherwise use unknown with a reason')
-            ref['evidence'], full = git_reference(self.workspace, evidence)
+            ref['evidence'], full = git_reference(self.workspace, evidence, run=self.git_run)
             if (ref.get('select') or ref.get('predicate')) and not ref['evidence']['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
         elif 'path' in evidence:
@@ -355,11 +394,11 @@ class TextRegistry:
         if full:
             # Keep the Git identity distinct from the delivered PF version. Bind only a
             # delivered capture whose bytes hash to that committed blob.
-            blob = subprocess.check_output(['git', '-C', str(self.workspace), 'rev-parse',
+            blob = self._git_output(['git', '-C', str(self.workspace), 'rev-parse',
                 full + ':' + ref['evidence']['path']], text=True).strip()
             def accept(version):
                 raw = self.store.get_content(version)[1]
-                return blob == subprocess.check_output(['git', '-C', str(self.workspace), 'hash-object', '--stdin'],
+                return blob == self._git_output(['git', '-C', str(self.workspace), 'hash-object', '--stdin'],
                                                        input=raw).decode().strip()
         try:
             try:

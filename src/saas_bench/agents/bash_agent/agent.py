@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field, asdict
@@ -30,6 +31,7 @@ class Message:
     name: Optional[str] = None
     # DeepSeek thinking mode: returned reasoning must be sent back verbatim after tool calls.
     reasoning_content: Optional[str] = None
+    message_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week with the rationale and "
@@ -120,10 +122,13 @@ class BashAgent(BaseAgent):
         usage_recorder: Optional[ModelUsage] = None,
         text_registration: bool = False,
         pf: bool = False,
+        identity=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
         super().__init__(tool_descriptions)
+        self.identity = identity
+        self.role = identity.role if identity else "ceo"
         self.client = client
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
         self.usage_recorder.attach(client)
@@ -257,7 +262,9 @@ class BashAgent(BaseAgent):
             raise ValueError('MEMORY.md must stay within the agent workspace')
         if memory_path.exists():
             try:
-                original_memory = memory_path.read_bytes()
+                from saas_bench.workspace_io import open_file
+                with open_file(self.workspace_path.resolve(), memory_path.resolve()) as stream:
+                    original_memory = stream.read()
                 from saas_bench.execution_capture import ExecutionCapture, CapturedText, decoded, origin
                 memory_text = decoded(original_memory)
                 memory_content = memory_text.strip()
@@ -306,7 +313,7 @@ class BashAgent(BaseAgent):
         from saas_bench import registration_prompt
         if self.pf:
             return registration_prompt.pf_memory_line(self.evidence_store, version) if version else None
-        return registration_prompt.git_memory_line(self.workspace_path)
+        return registration_prompt.git_memory_line(self.workspace_path, run=getattr(self, 'git_run', None))
 
     def _context_system_prompt(self) -> str:
         """Reuse the frozen prompt, including its private source ranges."""
@@ -337,7 +344,7 @@ class BashAgent(BaseAgent):
         The agent reads its own files via tools when it needs context.
         """
         self.conversation = []
-        if self.evidence_store:
+        if self.evidence_store or self.identity:
             import uuid
             self.usage_recorder.context_id = uuid.uuid4().hex
             self.usage_recorder.last_request_event = None
@@ -456,6 +463,7 @@ class BashAgent(BaseAgent):
                     return original()
         self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
         try:
+            self.usage_recorder.message_ids = [m.message_id for m in self.conversation]
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
                                                 turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
         except Exception as exc:
@@ -526,6 +534,7 @@ class BashAgent(BaseAgent):
             content = [self._serialize_content_item(x) for x in content]
         data = {
             "role": m.role,
+            "message_id": m.message_id,
             "content": content,
             "tool_calls": m.tool_calls,
             "tool_call_id": m.tool_call_id,
@@ -558,6 +567,7 @@ class BashAgent(BaseAgent):
                 "last_observation": self._last_observation,
                 "observation_recorded": getattr(self, "_observation_recorded", False),
                 "saved_at": time.time(),
+                "identity": self.identity.fields() if self.identity else None,
             }
             tmp_path = self._snapshot_path.with_suffix(self._snapshot_path.suffix + ".tmp")
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -603,6 +613,7 @@ class BashAgent(BaseAgent):
             msgs: List[Message] = []
             for m in raw_msgs:
                 msgs.append(Message(
+                    message_id=m.get("message_id") or uuid.uuid4().hex,
                     role=m.get("role", "user"),
                     content=m.get("content", ""),
                     tool_calls=m.get("tool_calls"),

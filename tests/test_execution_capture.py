@@ -294,13 +294,17 @@ def test_raw_decode_failure_partial_write_and_limits(captured, monkeypatch):
     assert store.get_content(event + ':stdout_bytes')[1] == b'\xff'
     assert store.read_event(event)['result']['exit_code'] == 0
     path = executor.workspace_path / 'partial.txt'
-    original = Path.write_text
-    def partial(self, text, *args, **kwargs):
-        if self == path:
-            self.write_bytes(b'partial')
-            raise OSError('injected short write')
-        return original(self, text, *args, **kwargs)
-    monkeypatch.setattr(Path, 'write_text', partial)
+    from contextlib import contextmanager
+    from saas_bench import workspace_io
+    original = workspace_io.open_file
+    @contextmanager
+    def partial(root, target, mode='rb'):
+        with original(root, target, mode) as stream:
+            if target == path and mode == 'wb':
+                stream.write(b'partial')
+                raise OSError('injected short write')
+            yield stream
+    monkeypatch.setattr(workspace_io, 'open_file', partial)
     assert 'injected short write' in executor.execute('write_file', {'path': 'partial.txt', 'content': 'complete'})
     event = event_ids(store)[-1]
     snapshot = json.loads(store.get_content(event + ':workspace_after')[1])
@@ -458,7 +462,7 @@ def test_capture_channel_failure_keeps_business_result_and_refuses_next_call(cap
 def test_batch_partial_receipt_and_public_object_fields(captured, monkeypatch):
     from saas_bench.tools import ToolResult
     api, store, _ = captured
-    monkeypatch.setattr(api, 'execute_tool', lambda tool, args: ToolResult(True, 'batch result',
+    monkeypatch.setattr(api, 'execute_tool', lambda tool, args, **kwargs: ToolResult(True, 'batch result',
         dict(results=[dict(customer_id=42, success=True), dict(customer_id=43, error='rejected')])))
     with urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{api.port}/call',
             data=b'{"tool":"reject_enterprise_deal","args":{"deals":[{"customer_id":42}]}}')) as response:

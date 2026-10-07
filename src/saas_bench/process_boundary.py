@@ -5,13 +5,18 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 
 # This code runs inside the same sandbox as Bash, with no engine imports.
 SUPERVISOR = r'''
 import ctypes, json, os, signal, socket, subprocess, sys
-port, key, command = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-channel = socket.create_connection(('127.0.0.1', port))
+address, key, command = sys.argv[1], sys.argv[2], sys.argv[3]
+if address.startswith('/'):
+    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    channel.connect(address)
+else:
+    channel = socket.create_connection(('127.0.0.1', int(address)))
 channel.sendall((key + '\n').encode())
 linux = sys.platform == 'linux'
 if linux:
@@ -75,13 +80,14 @@ class BoundaryOpen(RuntimeError):
 
 
 class Boundary:
-    def __init__(self, command, python=sys.executable):
-        self.listener = socket.socket()
-        self.listener.bind(('127.0.0.1', 0))
+    def __init__(self, command, python=sys.executable, *, isolated=False):
+        self.socket_dir = tempfile.TemporaryDirectory(prefix='ceobench-boundary-') if isolated else None
+        self.listener = socket.socket(socket.AF_UNIX if isolated else socket.AF_INET)
+        self.listener.bind(self.socket_dir.name + '/socket' if isolated else ('127.0.0.1', 0))
         self.listener.listen(1)
         self.key = uuid.uuid4().hex
         self.command = shlex.join([python, '-c', SUPERVISOR,
-                                  str(self.listener.getsockname()[1]), self.key, command])
+                                  '/run/novamind-boundary/socket' if isolated else str(self.listener.getsockname()[1]), self.key, command])
         self.channel = None
         self.record = None
 
@@ -89,6 +95,8 @@ class Boundary:
         if self.channel:
             self.channel.close()
         self.listener.close()
+        if self.socket_dir:
+            self.socket_dir.cleanup()
 
     def communicate(self, process, timeout):
         try:

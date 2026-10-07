@@ -183,6 +183,12 @@ class SQLEvidenceStore:
         if unknown:
             raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
 
+    def actor_fields(self):
+        fields = {k: self.identity[k] for k in ('run_id', 'world_id', 'role', 'agent_id', 'session_id') if k in self.identity}
+        if hasattr(self, 'world_state'):
+            fields['world_state_id'] = self.world_state()
+        return fields
+
     def begin_event(self, kind, request=None, parent=None, requires_delivery=False, admitted=False, **facts):
         deadline = time.monotonic() + 180
         while True:
@@ -195,7 +201,7 @@ class SQLEvidenceStore:
                         self._visible(conn, parent)
                     seq = self.sequence(conn) + 1
                     event = f"{self.identity['run_id']}/{self.identity['branch_id']}/{seq}"
-                    record = dict(event_id=event, seq=seq, author='ceo', kind=kind, request=request,
+                    record = dict(event_id=event, seq=seq, author=self.identity.get('role', 'ceo'), kind=kind, request=request, **self.actor_fields(),
                                   started_at=now(), parent_event_id=parent, requires_delivery=requires_delivery,
                                   query_id=None, **facts)
                     conn.execute('INSERT INTO requests VALUES (?,?,?,?,?)',
@@ -278,6 +284,8 @@ class SQLEvidenceStore:
         record = dict(status=status, completed_at=None if status == 'result_unknown' else now(),
                       capture_status='missing' if self.fault or self.fault_path.exists() else 'complete', capture_gaps=[])
         record.update(facts)
+        if hasattr(self, 'world_state'):
+            record['world_state_id'] = self.world_state()
         with self._writer() as conn:
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
 
@@ -349,10 +357,10 @@ class SQLEvidenceStore:
             event = f"{self.identity['run_id']}/{self.identity['branch_id']}/{seq}"
             if query:
                 conn.execute('INSERT OR IGNORE INTO queries VALUES (?,?)', (query, encoded(definition)))
-            request = dict(event_id=event, seq=seq, author='ceo', kind='sql_query',
+            request = dict(event_id=event, seq=seq, author=self.identity.get('role', 'ceo'), kind='sql_query',
                            started_at=now(), candidate_sql=sql, bound_parameters=None,
                            raw_request_hex=raw_body.hex(), parent_event_id=parent,
-                           parent_reason=None if parent else 'unpropagated_context', query_id=query)
+                           parent_reason=None if parent else 'unpropagated_context', query_id=query, **self.actor_fields())
             conn.execute('INSERT INTO requests VALUES (?,?,?,?,?)',
                          (event, self.identity['branch_id'], seq, query, encoded(request)))
         return event

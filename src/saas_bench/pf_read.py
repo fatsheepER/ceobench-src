@@ -364,7 +364,7 @@ def record_request(store, event, body, sources, context):
             chain = base['chain']
             common = dict(request_range=[0, len(actual)], reconstructible=True,
                 representation=delivery['mode'], reconstructed_from=chain, read_id=read_id,
-                reader='ceo', context_id=context, json_pointer=source['pointer'],
+                reader=store.identity.get('role', 'ceo'), context_id=context, json_pointer=source['pointer'],
                 send_state_event_id=event)
             if tool:
                 reconstructed.extend(dict(common, version_id=item['version_id'], source_range=item['source_range'],

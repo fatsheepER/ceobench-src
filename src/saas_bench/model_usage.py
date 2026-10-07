@@ -198,11 +198,15 @@ class _Stream(httpx.SyncByteStream):
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None):
+        self.identity = identity
+        self.message_ids = []
+        self.world_state = lambda: None
+        self.call_world_state = None
         self.evidence_store = evidence_store
         self.token_counter = token_counter
         self.source_records = []
-        self.context_id = uuid.uuid4().hex if evidence_store else None
+        self.context_id = uuid.uuid4().hex if evidence_store or identity else None
         self.last_request_event = None
         self.path = Path(path) if path else None
         self.role = role
@@ -215,6 +219,9 @@ class ModelUsage:
     def write(self, event, **values):
         if self.path:
             entry = dict(event=event, role=self.role, timestamp=datetime.now(timezone.utc).isoformat(), **values)
+            if self.identity:
+                entry.update(self.identity.fields(), context_id=self.context_id, message_ids=list(self.message_ids),
+                             world_state_id=self.call_world_state)
             with self.lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open('a') as stream:
@@ -246,7 +253,7 @@ class ModelUsage:
                 # Required evidence is durable before sending a model request.
                 try:
                     capture_event = model_request(recorder.evidence_store, raw_body, recorder.source_records,
-                                                  call_id, attempt_id, recorder.context_id)
+                                                  call_id, attempt_id, recorder.context_id, recorder.message_ids)
                 except Exception as exc:
                     recorder.evidence_store.fail(exc)
                     raise
@@ -320,6 +327,7 @@ class ModelUsage:
 
     def call(self, api, request, invoke, **context):
         self.last_request_event = None
+        self.call_world_state = self.world_state()
         replacements = []
         if self.evidence_store:
             from .execution_capture import text_sources

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -299,7 +300,8 @@ class BashAgentToolExecutor:
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
-                 text_registry=None, pf_stale_checks=True, pf_refresh=None):
+                 text_registry=None, pf_stale_checks=True, pf_refresh=None,
+                 identity=None, readable_workspaces=(), api_socket=None, audit=None):
         """Initialize the tool executor.
 
         Args:
@@ -307,7 +309,15 @@ class BashAgentToolExecutor:
             env: Extra environment variables for bash commands.
             bash_timeout: Timeout in seconds for bash commands (default 5 min).
         """
-        self.workspace_path = workspace_path
+        self.audit = audit
+        self.identity = identity
+        self.role = identity.role if identity else 'ceo'
+        self.api_socket = Path(api_socket) if api_socket else None
+        self.readable_workspaces = tuple(Path(p).resolve() for p in readable_workspaces)
+        self._execute_lock = threading.RLock()
+        if identity and not require_sandbox:
+            raise ValueError('Team execution requires the Linux sandbox')
+        self.workspace_path = Path(workspace_path).resolve()
         self.extra_env = env or {}
         self.bash_timeout = bash_timeout
         self.require_sandbox = require_sandbox
@@ -319,6 +329,7 @@ class BashAgentToolExecutor:
             from saas_bench.pf_queries import PFQueries
             self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh)
         self.capture = None
+        self.world_status = None
         self.preserved_process = None
 
     def weekly_check(self, day):
@@ -351,7 +362,7 @@ class BashAgentToolExecutor:
     @property
     def guest_root(self) -> str:
         """The workspace path as the agent sees it."""
-        return GUEST_WORKSPACE if self._bwrap() else str(self.workspace_path)
+        return GUEST_WORKSPACE if self._bwrap() and not self.identity else str(self.workspace_path)
 
     @property
     def python(self) -> str:
@@ -360,6 +371,12 @@ class BashAgentToolExecutor:
 
     def execute(self, tool_name: str, args: Dict[str, Any], *, model_request_event=None, model_context_id=None) -> str:
         """Execute a tool and return the result string."""
+        with self._execute_lock:
+            if self.preserved_process:
+                raise ProcessBoundaryError('Previous process boundary remains open')
+            return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id)
+
+    def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None):
         dispatch = {
             'bash': self._exec_bash,
             'read_file': self._exec_read_file,
@@ -374,6 +391,8 @@ class BashAgentToolExecutor:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
         facts = {}
+        self._exit_code = None
+        self._timed_out = False
         if self.pf_queries:
             from saas_bench.pf_queries import MODELS
             dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
@@ -419,9 +438,9 @@ class BashAgentToolExecutor:
                 status = 'failed'
             if capture:
                 capture.origins.extend(getattr(result, 'origins', []))
-            if capture and capture.facts.get('timed_out'):
+            if self._timed_out:
                 status = 'timed_out'
-            elif capture and capture.facts.get('exit_code', 0):
+            elif self._exit_code:
                 status = 'failed'
         except NextDayTimeoutError:
             result = None
@@ -456,6 +475,10 @@ class BashAgentToolExecutor:
                 CURRENT_EVENT.reset(token)
             self.extra_env = previous_env
             self.capture = None
+            self.last_status = status
+            if self.audit:
+                self.audit.record('tool_execution', tool=tool_name, status=status,
+                    model_request_event=model_request_event, context_id=model_context_id)
         if capture and tool_name.startswith('pf_'):
             result.pf_call = dict(operation=tool_name, arguments=args, event_id=capture.event,
                                  outcome='usage_error' if tool_name == 'pf_usage' else
@@ -471,18 +494,20 @@ class BashAgentToolExecutor:
     def _read_text(self, path, reuse=False):
         from saas_bench.execution_capture import decoded
         from saas_bench.sql_evidence import digest
-        raw = path.read_bytes()
+        from saas_bench.workspace_io import open_file
+        with open_file(self._read_root(path), path) as stream:
+            raw = stream.read()
         raw_version = None
         if self.capture and reuse and self.capture.event:
             # Plain reads of unchanged bytes observe the existing version (same path@vK handle);
             # edits keep their own read version as the observed edit input.
             latest, sha = self.capture.safe(self.capture.store.latest_version,
-                                            str(path.relative_to(self.workspace_path)), 'file_bytes') or (None, None)
+                                            self._file_name(path), 'file_bytes') or (None, None)
             if latest and sha == digest(raw):
                 self.capture.slots += 1
                 raw_version = latest
         if self.capture and raw_version is None:
-            raw_version = self.capture.file(str(path.relative_to(self.workspace_path)), raw)
+            raw_version = self.capture.file(self._file_name(path), raw)
         text = decoded(raw)
         version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version) if self.capture else None
         return text, version
@@ -492,13 +517,25 @@ class BashAgentToolExecutor:
             from saas_bench.execution_capture import origin
             self.capture.origins.append(origin(version, text, start, end, target))
 
-    def _resolve_path(self, path_str: str) -> Path:
+    def _read_root(self, path):
+        return next(root for root in (self.workspace_path, *self.readable_workspaces)
+                    if path.is_relative_to(root))
+
+    def _file_name(self, path):
+        return str(path.relative_to(self.workspace_path)) if path.is_relative_to(self.workspace_path) else str(path)
+
+    def _resolve_path(self, path_str: str, *, write=False) -> Path:
         """Resolve a workspace-relative or agent-visible absolute path, preventing escape."""
-        return self._contained(self._host_path(path_str), path_str)
+        path = self._contained(self._host_path(path_str), path_str)
+        if write and not path.is_relative_to(self.workspace_path):
+            raise ValueError('Only the owned workspace is writable')
+        return path
 
     def _host_path(self, path_str: str) -> Path:
         """Map an agent-visible path onto the host workspace."""
         p = Path(path_str)
+        if self.identity:
+            return p if p.is_absolute() else self.workspace_path / p
         if p.is_absolute():
             p = Path(os.path.normpath(p))
             roots = [Path(self.guest_root)] + ([] if self._bwrap() else [self.workspace_path.resolve()])
@@ -513,7 +550,7 @@ class BashAgentToolExecutor:
         resolved = path.resolve()
         # Ensure it's within workspace
         ws_resolved = self.workspace_path.resolve()
-        if not resolved.is_relative_to(ws_resolved):
+        if not any(resolved.is_relative_to(root) for root in (ws_resolved, *self.readable_workspaces)):
             raise ValueError(f"Path escapes workspace: {shown}")
         if self._hidden(resolved):
             raise ValueError(f"Path not found in workspace: {shown}")
@@ -521,6 +558,8 @@ class BashAgentToolExecutor:
 
     def _guest_paths(self, value: str) -> str:
         """Rewrite host workspace paths in a path-list value to their sandbox location."""
+        if self.identity:
+            return value
         hosts = {str(self.workspace_path), str(self.workspace_path.resolve())}
         parts = value.split(os.pathsep)
         for i, part in enumerate(parts):
@@ -530,7 +569,7 @@ class BashAgentToolExecutor:
         return os.pathsep.join(parts)
 
     def _hidden(self, path: Path) -> bool:
-        for root in (self.workspace_path, self.workspace_path.resolve()):
+        for root in (self.workspace_path, self.workspace_path.resolve(), *self.readable_workspaces):
             if path.is_relative_to(root):
                 parts = path.relative_to(root).parts
                 return bool(parts) and parts[0] in HIDDEN_WORKSPACE_DIRS
@@ -558,8 +597,8 @@ class BashAgentToolExecutor:
         """Build a bwrap command that sandboxes bash to the workspace.
 
         Uses bubblewrap (bwrap) to create a filesystem namespace where:
-        - The agent workspace, mounted at /workspace, is the ONLY writable
-          directory; harness-owned `sessions/` under it appears empty
+        - The owned workspace is writable; permitted peer workspaces are
+          read-only, and harness-owned `sessions/` directories appear empty
         - System binaries and libraries are read-only; the agent Python
           runtime (scripts/build_agent_runtime.py) is read-only at /opt/python
         - No host home, source, development environment, run or group paths
@@ -642,16 +681,26 @@ class BashAgentToolExecutor:
                 )
 
         # The agent workspace — ONLY writable directory
-        cmd.extend(['--bind', ws, GUEST_WORKSPACE])
-        for name in HIDDEN_WORKSPACE_DIRS:
-            if os.path.isdir(os.path.join(ws, name)):
-                cmd.extend(['--tmpfs', GUEST_WORKSPACE + '/' + name])
+        cmd.extend(['--bind', ws, self.guest_root])
+        mounts = [(ws, self.guest_root)]
+        for peer in self.readable_workspaces:
+            if peer != self.workspace_path:
+                cmd.extend(['--ro-bind', str(peer), str(peer)])
+                mounts.append((str(peer), str(peer)))
+        for host, guest in mounts:
+            for name in HIDDEN_WORKSPACE_DIRS:
+                if os.path.isdir(os.path.join(host, name)):
+                    cmd.extend(['--tmpfs', guest + '/' + name])
+        if self.api_socket:
+            cmd.extend(['--ro-bind', str(self.api_socket), '/run/novamind-api/api.sock'])
+        if getattr(self, '_boundary_socket_dir', None):
+            cmd.extend(['--ro-bind', self._boundary_socket_dir, '/run/novamind-boundary'])
 
         # Set working directory
-        cmd.extend(['--chdir', GUEST_WORKSPACE])
+        cmd.extend(['--chdir', self.guest_root])
 
         # Unshare namespaces for isolation
-        cmd.extend(['--unshare-all', '--share-net'])  # Keep network for API calls
+        cmd.extend(['--unshare-all'] + ([] if self.identity else ['--share-net']))
 
         # Set environment variables
         for k, v in env.items():
@@ -661,6 +710,14 @@ class BashAgentToolExecutor:
         cmd.extend(['bash', '-c', command])
 
         return cmd
+
+    def run_private(self, argv, **kwargs):
+        """Run host-requested Git inspection under the same filesystem authority."""
+        import shlex
+        env = dict(PATH=GUEST_PYTHON_ROOT + '/bin:' + os.defpath,
+                   HOME=self.guest_root, GIT_CONFIG_NOSYSTEM='1', LANG='C.UTF-8')
+        command = self._build_bwrap_cmd(shlex.join(argv), str(self.workspace_path), env)
+        return subprocess.run(command, env=env, **kwargs)
 
     def _exec_bash(self, args: Dict) -> str:
         """Execute a bash command, sandboxed to the workspace directory.
@@ -678,7 +735,8 @@ class BashAgentToolExecutor:
         if self.pf_queries:
             from saas_bench.pf_shell import ShellService
             service = self._pf_service = ShellService(self)
-        boundary = Boundary(command, self.python)
+        boundary = Boundary(command, self.python, isolated=bool(self.identity))
+        self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
         try:
             result = self._run_bash(command, boundary)
             if service:
@@ -687,6 +745,7 @@ class BashAgentToolExecutor:
             return result
         finally:
             boundary.close()
+            self._boundary_socket_dir = None
             if service:
                 service.close()
                 self.capture.facts['pf_calls'] = service.calls
@@ -786,8 +845,10 @@ class BashAgentToolExecutor:
                         slice_origins(self.capture.origins, len(output) - 15000, len(output), 15000 + len(marker)))
                 output = output[:15000] + "\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n" + output[-15000:]
 
+            if self.world_status and self.world_status():
+                raise NextDayTimeoutError('Server operation outcome unknown', partial_stdout=stdout, partial_stderr=stderr)
             port = self.extra_env.get('NOVAMIND_API_PORT')
-            if port and int(port) > 0:
+            if port and int(port) > 0 and not self.identity:
                 import json
                 import urllib.request
                 with urllib.request.urlopen(f'http://127.0.0.1:{int(port)}/game-status', timeout=5) as response:
@@ -806,6 +867,7 @@ class BashAgentToolExecutor:
                 pass  # Raw streams were retained; decoding cannot close an open execution.
             raise ProcessBoundaryError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr)) from exc
         except subprocess.TimeoutExpired:
+            self._timed_out = True
             # Kill the entire process group (bash + all children)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -852,6 +914,7 @@ class BashAgentToolExecutor:
             write_json(self.capture.store.fault_path, self.capture.store.fault)
 
     def _streams(self, stdout, stderr, exit_code, partial=False):
+        self._exit_code = exit_code
         from saas_bench.execution_capture import decoded
         if self.capture:
             self.capture.facts['exit_code'] = exit_code
@@ -917,16 +980,17 @@ class BashAgentToolExecutor:
 
     def _exec_write_file(self, args: Dict) -> str:
         """Write file contents."""
-        path = self._resolve_path(args['path'])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(args['content'])
+        path = self._resolve_path(args['path'], write=True)
+        from saas_bench.workspace_io import open_file
+        with open_file(self.workspace_path, path, 'wb') as stream:
+            stream.write(args['content'].encode())
         if self.capture:
-            self.capture.facts['written_paths'] = [str(path.relative_to(self.workspace_path))]
+            self.capture.facts['written_paths'] = [self._file_name(path)]
         return f"File written: {args['path']} ({path.stat().st_size} bytes)"
 
     def _exec_edit_file(self, args: Dict) -> str:
         """Edit a file by replacing old_string with new_string."""
-        path = self._resolve_path(args['path'])
+        path = self._resolve_path(args['path'], write=True)
         if not path.exists():
             return f"Error: File not found: {args['path']}"
 
@@ -941,9 +1005,11 @@ class BashAgentToolExecutor:
             return f"Error: old_string found {count} times in {args['path']} (must be unique)"
 
         new_content = content.replace(old_str, new_str, 1)
-        path.write_text(new_content)
+        from saas_bench.workspace_io import open_file
+        with open_file(self.workspace_path, path, 'wb') as stream:
+            stream.write(new_content.encode())
         if self.capture:
-            self.capture.facts['written_paths'] = [str(path.relative_to(self.workspace_path))]
+            self.capture.facts['written_paths'] = [self._file_name(path)]
         return f"File edited: {args['path']}"
 
     def _exec_search_files(self, args: Dict) -> str:
@@ -971,14 +1037,14 @@ class BashAgentToolExecutor:
         scanned, skipped = [], []
         for fpath in files[:100]:  # Limit file count
             try:
-                self._contained(fpath, str(fpath))
+                checked = self._contained(fpath, str(fpath))
             except ValueError:
                 skipped.append(str(fpath))
                 continue
             if not fpath.is_file():
                 continue
             try:
-                content, version = self._read_text(fpath, reuse=True)
+                content, version = self._read_text(checked, reuse=True)
                 scanned.append(str(fpath))
             except (UnicodeDecodeError, PermissionError):
                 skipped.append(str(fpath))
@@ -986,7 +1052,7 @@ class BashAgentToolExecutor:
             source_start = 0
             for i, line in enumerate(content.split('\n'), 1):
                 if regex.search(line):
-                    rel = fpath.relative_to(self.workspace_path)
+                    rel = self._file_name(fpath)
                     prefix = f"{rel}:{i}: "
                     self._source(version, content, source_start, source_start + len(line), target + len(prefix))
                     matches.append(prefix + line)
@@ -1011,16 +1077,29 @@ class BashAgentToolExecutor:
     def _exec_glob_files(self, args: Dict) -> str:
         """Find files matching a glob pattern."""
         pattern = args['pattern']
-        if Path(pattern).is_absolute() or '..' in Path(pattern).parts:
-            return 'Error: Glob must stay within workspace'
-        matches = sorted(m for m in self.workspace_path.glob(pattern) if not self._hidden(m))
+        root = self.workspace_path
+        if self.identity:
+            parts = Path(pattern).parts
+            static = []
+            for part in parts:
+                if any(c in part for c in '*?['):
+                    break
+                static.append(part)
+            if static:
+                root = self._resolve_path(str(Path(*static)))
+                pattern = str(Path(*parts[len(static):])) if len(static) < len(parts) else ''
+            matches = sorted(m for m in (root.glob(pattern) if pattern else [root]) if not self._hidden(m))
+        else:
+            if Path(pattern).is_absolute() or '..' in Path(pattern).parts:
+                return 'Error: Glob must stay within workspace'
+            matches = sorted(m for m in root.glob(pattern) if not self._hidden(m))
         if not matches:
             return "No matching files."
         result = []
         for m in matches[:200]:
             try:
                 self._contained(m, str(m))
-                rel = m.relative_to(self.workspace_path)
+                rel = self._file_name(m)
                 result.append(str(rel))
             except ValueError:
                 result.append('[Skipped out-of-workspace path]')

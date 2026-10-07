@@ -153,12 +153,12 @@ MEMORY_HEADER = ('\n\n## Your MEMORY.md (auto-loaded)\n\n'
                  'This is automatically loaded into your context at the start of every week.\n')
 
 
-def git_memory_line(workspace):
+def git_memory_line(workspace, run=None):
     """[git: MEMORY.md last committed in week-7 (3f9a2c1) | ...], or None before any commit."""
     import re
     import subprocess
     try:
-        result = subprocess.run(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', 'MEMORY.md'],
+        result = (run or subprocess.run)(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', 'MEMORY.md'],
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None

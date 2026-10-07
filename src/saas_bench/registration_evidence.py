@@ -25,7 +25,7 @@ def week_commit_subject(label):
     return f'Week {week} (day {week * 7}) [{label}]'
 
 
-def git_reference(workspace, evidence):
+def git_reference(workspace, evidence, run=subprocess.run):
     path = evidence['path']
     commit = evidence.get('commit')
     if '@' in path:
@@ -37,7 +37,7 @@ def git_reference(workspace, evidence):
     if not path or p.is_absolute() or '..' in p.parts or p.as_posix() != path or '\x00' in path:
         raise ValueError('Evidence path must be a normalized workspace-relative file path')
     def git(*args):
-        result = subprocess.run(['git', '--no-replace-objects', '-C', str(workspace), *args],
+        result = run(['git', '--no-replace-objects', '-C', str(workspace), *args],
                                 capture_output=True, timeout=10)
         if result.returncode:
             raise ValueError('Cannot resolve file/commit; commit the file yourself or use unknown with a reason')
@@ -66,7 +66,7 @@ def git_reference(workspace, evidence):
     return dict(path=path, commit=commit if WEEK_LABEL.fullmatch(commit or '') else full[:7]), full
 
 
-def weekly_reference(workspace, path, label):
+def weekly_reference(workspace, path, label, run=subprocess.run):
     """Cite a working-tree file as the weekly harness commit labelled `label` will store it."""
     p = PurePosixPath(path)
     if not path or p.is_absolute() or '..' in p.parts or p.as_posix() != path or '\x00' in path:
@@ -74,7 +74,7 @@ def weekly_reference(workspace, path, label):
     target = workspace / path
     if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(workspace):
         raise ValueError('Reference must name an existing workspace file, or use unknown with a reason')
-    ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', '--', path],
+    ignored = run(['git', '-C', str(workspace), 'check-ignore', '-q', '--', path],
                              capture_output=True, timeout=10)
     if ignored.returncode == 0:
         raise ValueError('File is ignored by Git and never committed; use unknown with a reason')

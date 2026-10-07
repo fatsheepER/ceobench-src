@@ -43,6 +43,8 @@ _ENGINE_MODULES = [
     "_embedded_key",
     "_sql_chunk",
     "api_server",
+    "role_policy",
+    "workspace_io",
     "public_sql",
     "sql_evidence",
     "execution_capture",

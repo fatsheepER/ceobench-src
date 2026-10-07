@@ -271,8 +271,8 @@ class StaleCheck:
             path = (self.q.workspace / name).resolve()
             if not path.is_relative_to(self.q.workspace):
                 raise ValueError('file_outside_workspace')
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(fd, 'rb') as stream:
+            from .workspace_io import open_file
+            with open_file(self.q.workspace, path) as stream:
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode):
                     raise ValueError('not_regular_file')

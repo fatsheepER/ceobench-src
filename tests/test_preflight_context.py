@@ -11,6 +11,7 @@ from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
 def agent(tmp_path, anthropic=False):
     value = BashAgent.__new__(BashAgent)
+    value.identity = None
     value.conversation = []
     value._pending_tool_calls = []
     value.current_day = 7

@@ -191,7 +191,7 @@ def test_begin_failure_and_send_failure_preserve_observed_facts(captured, monkey
     from saas_bench.api_server import _APIHandler
     from types import SimpleNamespace
     handler = _APIHandler.__new__(_APIHandler)
-    handler.server = SimpleNamespace(_api_server=api)
+    handler.server = SimpleNamespace(_api_server=api, _role="ceo")
     handler.connection = SimpleNamespace(settimeout=lambda _: None)
     handler.request_version = 'HTTP/1.1'
     handler._sql_event = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION)

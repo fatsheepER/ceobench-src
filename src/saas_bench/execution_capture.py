@@ -110,8 +110,8 @@ class ExecutionCapture:
                     item.update(type='symlink', target=os.readlink(path))
                 elif stat.S_ISREG(info.st_mode):
                     # O_NOFOLLOW prevents a replacement symlink escaping the workspace.
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                    with os.fdopen(fd, 'rb') as stream:
+                    from .workspace_io import open_file
+                    with open_file(root, path) as stream:
                         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                             raise RuntimeError('File changed type during capture: ' + rel)
                         raw = stream.read()
@@ -162,7 +162,7 @@ class ExecutionCapture:
 
 
 def capture_http(handler, raw):
-    store = handler.server._api_server.sql_evidence
+    store = handler.evidence
     token = handler.headers.get('X-Capture-Context')
     parent = store.parent(token) if token else None
     try:
@@ -240,9 +240,20 @@ def public_handler(method):
     """Admit complete public operations, allowing active executions to finish callbacks."""
     from functools import wraps
     @wraps(method)
+    def audited(handler):
+        try:
+            return observed(handler)
+        finally:
+            api = handler.server._api_server
+            if audit := api.role_audits.get(handler.role):
+                audit.record('public_http', method=handler.command, path=handler.path,
+                    tool=getattr(handler, '_audit_tool', None), http_status=getattr(handler, '_audit_status', None))
+
     def observed(handler):
         api = handler.server._api_server
-        store = api.sql_evidence
+        if not handler.admit():
+            return
+        store = handler.evidence
         if handler.path == '/_capture':
             return receive_client(handler)
         if not store or not store.execution_capture:
@@ -262,6 +273,12 @@ def public_handler(method):
                                 os.fsync(stream.fileno())
                     except Exception as exc:
                         store.fail(exc)
+        if api.team_mode:
+            try:
+                store.parent(handler.headers.get('X-Capture-Context'))
+            except (ValueError, KeyError):
+                handler._send_json({'success': False, 'error': 'Capture context belongs to a different execution'}, 403)
+                return
         if store.fault or store.fault_path.exists():
             handler._send_json({'success': False, 'error': 'Execution capture failed; branch stopped'}, 503)
             return
@@ -302,11 +319,11 @@ def public_handler(method):
             with api._sql_lock:
                 api._sql_active -= 1
                 api._sql_lock.notify_all()
-    return observed
+    return audited
 
 
 def receive_client(handler):
-    store = handler.server._api_server.sql_evidence
+    store = handler.evidence
     if not store or not store.execution_capture or handler.command != 'POST':
         handler._send_json({'error': 'Unknown endpoint'}, 404)
         return
@@ -360,7 +377,8 @@ def receive_client(handler):
         store.received(body['call'], body['record'])
         handler._send_json({'accepted': True})
     except Exception as exc:
-        store.fail(exc)
+        if not handler.server._api_server.team_mode or not isinstance(exc, (ValueError, KeyError, TypeError)):
+            store.fail(exc)
         handler._send_json({'accepted': False}, 400)
 
 
@@ -499,8 +517,8 @@ def restore_sources(value, records):
         target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'))
 
 
-def model_request(store, raw, sources, call_id, attempt_id, context_id):
-    event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id))
+def model_request(store, raw, sources, call_id, attempt_id, context_id, message_ids=()):
+    event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id, message_ids=list(message_ids)))
     # One transaction for the wire, occurrences and every read of this request.
     with store.batch():
         _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id)
@@ -524,7 +542,7 @@ def _record_model_request(store, event, raw, sources, call_id, attempt_id, conte
             c, d = item['request_range']
             if not (0 <= a <= b <= len(original) and 0 <= c <= d <= len(text)) or original[a:b] != text[c:d]:
                 raise ValueError('Source occurrence range does not match final request')
-            occurrences.append(dict(item, reader='ceo', role=role, context_id=context_id, call_id=call_id,
+            occurrences.append(dict(item, reader=store.identity.get('role', 'ceo'), role=role, context_id=context_id, call_id=call_id,
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')
@@ -533,8 +551,8 @@ def _record_model_request(store, event, raw, sources, call_id, attempt_id, conte
         record_request(store, event, body, sources, context_id)
 
 
-def registered_scripts(api, scripts, before, registration=None):
-    store = api.sql_evidence
+def registered_scripts(api, scripts, before, registration=None, *, role="ceo"):
+    store = api.evidence_for(role)
     if not store or not store.execution_capture:
         return
     capture = ExecutionCapture(store)
@@ -552,8 +570,8 @@ def registered_scripts(api, scripts, before, registration=None):
         capture.safe(store.complete, capture.event, outputs=list(versions.values()))
 
 
-def dashboard_version(api, text, day):
-    store = api.sql_evidence
+def dashboard_version(api, text, day, *, role="ceo"):
+    store = api.evidence_for(role)
     if not store or not store.execution_capture:
         return text
     capture = ExecutionCapture(store)

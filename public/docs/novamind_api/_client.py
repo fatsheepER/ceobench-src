@@ -27,7 +27,7 @@ class _Vars:
 
 def _get_port() -> int:
     """Get the API server port from environment."""
-    port_str = os.environ.get('NOVAMIND_API_PORT', '')
+    port_str = os.environ.get('NOVAMIND_API_PORT') or ('1' if os.environ.get('NOVAMIND_API_SOCKET') else '')
     if not port_str:
         raise NovaMindAPIError(
             "NOVAMIND_API_PORT not set. Are you running inside a novamind-operation environment?"
