@@ -12,6 +12,7 @@ access. This ensures the harness and the public repo have identical interfaces.
 Supports OpenAI, xAI/Grok, Anthropic (direct and Bedrock).
 """
 
+import copy
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ if str(package_root) not in sys.path:
 
 from openai import OpenAI
 from saas_bench.config import BenchmarkConfig
+from saas_bench.model_usage import usage_delta
 
 try:
     import anthropic
@@ -66,6 +68,16 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 ANTHROPIC_FABLE_FALLBACK_MODEL = "claude-opus-4-8"
 
 
+def _joined(first, separator, second):
+    """Concatenate texts, keeping the evidence source ranges of both parts."""
+    from saas_bench.execution_capture import CapturedText, slice_origins
+    text = first + separator + second
+    origins = list(getattr(first, 'origins', []))
+    if getattr(second, 'origins', None):
+        origins += slice_origins(second.origins, 0, len(second), target=len(first) + len(separator))
+    return CapturedText(text, origins) if origins else text
+
+
 class BashAgentRunner:
     """Runner for bash_agent with SaaS Bench.
 
@@ -93,6 +105,8 @@ class BashAgentRunner:
         sql_capture: Optional[bool] = None,
         execution_capture: Optional[bool] = None,
         text_registration: Optional[str] = None,
+        pf_stale_checks: Optional[bool] = None,
+        stop_after_day: Optional[int] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -104,6 +118,10 @@ class BashAgentRunner:
             if text_registration is not None and text_registration != saved_registration:
                 raise ValueError('Resume text registration configuration mismatch')
             text_registration = saved_registration
+            saved_stale = saved_manifest.get('pf_stale_checks', False)
+            if pf_stale_checks is not None and pf_stale_checks != saved_stale:
+                raise ValueError('Resume stale check configuration mismatch')
+            pf_stale_checks = saved_stale
             saved_capture = bool(saved_manifest.get('sql_evidence'))
             saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
             if execution_capture is not None and execution_capture != saved_execution:
@@ -133,6 +151,9 @@ class BashAgentRunner:
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
             run_kind = saved['run_kind']
         self.text_registration = text_registration or 'off'
+        self.pf_stale_checks = (self.text_registration == 'pf' if pf_stale_checks is None else pf_stale_checks)
+        if self.pf_stale_checks and self.text_registration != 'pf':
+            raise ValueError('Automatic stale checks require PF mode')
         if self.text_registration not in ('off', 'git', 'prefix', 'pf'):
             raise ValueError('Invalid text registration mode')
         if self.text_registration in ('prefix', 'pf'):
@@ -150,7 +171,7 @@ class BashAgentRunner:
             raise ValueError('Invalid run kind')
         seed = 42 if seed is None else seed
         scenario = 'default' if scenario is None else scenario
-        total_days = 3650 if total_days is None else total_days
+        total_days = default_config.total_days if total_days is None else total_days
         initial_cash = 1_000_000.0 if initial_cash is None else initial_cash
         self.model = model or default_config.agent_llm_model
         self.provider = provider or default_config.agent_llm_provider
@@ -160,6 +181,12 @@ class BashAgentRunner:
         # week boundary (no partial trailing week). e.g. 500 -> 497.
         self.total_days = (total_days // 7) * 7
         self.initial_cash = initial_cash
+        # Harness-only stop at a completed week: never shown to the Agent and not part of
+        # the effective configuration, so a stopped prefix can be forked and continued.
+        if stop_after_day is not None and (stop_after_day <= 0 or stop_after_day % 7 or
+                                           stop_after_day >= self.total_days):
+            raise ValueError('stop_after_day must be a whole week before the configured end')
+        self.stop_after_day = stop_after_day
         self.reasoning_effort = reasoning_effort or default_config.agent_llm_reasoning_effort
         self.continue_from = continue_from
         self.label = label  # Optional human-readable variant tag — surfaced on the dashboard
@@ -194,6 +221,8 @@ class BashAgentRunner:
         # Agent working directory (inside the run directory)
         self.agent_workspace = self.workspace_dir / "agent_workspace"
         from saas_bench.sql_evidence import FORMAT
+        self.fork_source = saved_manifest.get('fork_source') if continue_from else None
+        self.recovery_source = saved_manifest.get('recovery_source') if continue_from else None
         self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
             dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
                  data_source_id=uuid.uuid4().hex) if sql_capture else None)
@@ -402,7 +431,7 @@ class BashAgentRunner:
     def _http_post(self, path: str, data: Optional[Dict] = None, timeout: float = 1800) -> Dict:
         body = json.dumps(data or {}).encode()
         headers = {'Content-Type': 'application/json'}
-        if path == '/checkpoint':
+        if path in ('/checkpoint', '/pf-refresh', '/run-metrics'):
             headers['X-Harness-Token'] = self._checkpoint_token
         req = urllib.request.Request(
             self._server_url(path), data=body,
@@ -410,6 +439,12 @@ class BashAgentRunner:
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
+
+    def _pf_refresh(self, versions, parent):
+        from saas_bench.api_server import NovaMindAPIServer
+        # Each source has its own timeout; this transport must let all sources finish.
+        timeout = (len(versions) + 1) * NovaMindAPIServer.QUERY_TIMEOUT_SECONDS + 30
+        return self._http_post('/pf-refresh', dict(versions=versions, parent=parent), timeout=timeout)['versions']
 
     def _get_cash(self) -> float:
         """Use the same status receipt as the run loop."""
@@ -452,7 +487,8 @@ class BashAgentRunner:
         with open(self.response_log_file, 'a') as f:
             f.write(json.dumps(entry) + "\n")
 
-    def _log_tool_result(self, turn: int, day: int, tool_name: str, arguments: Dict, result: str):
+    def _log_tool_result(self, turn: int, day: int, tool_name: str, arguments: Dict, result: str,
+                         **metadata):
         tool_results_file = self.logs_dir / f"tool_results_{self.run_id}.jsonl"
         entry = {
             "timestamp": now(),
@@ -462,6 +498,11 @@ class BashAgentRunner:
             "arguments": arguments,
             "result": result,
         }
+        entry.update(metadata)
+        if hasattr(result, 'pf_calls'):
+            entry['pf_calls'] = result.pf_calls
+        if getattr(result, 'pf_call', None):
+            entry['pf_call'] = result.pf_call
         with open(tool_results_file, 'a') as f:
             f.write(json.dumps(entry) + "\n")
 
@@ -511,11 +552,13 @@ __pycache__/
         )
 
     def _git_init_workspace(self):
-        if (self.agent_workspace / ".git").exists():
-            return
-        self._git("init", "-q", "-b", "main")
-        self._git("config", "user.email", "bash-agent@bossbench.local")
-        self._git("config", "user.name", "BashAgent")
+        if not (self.agent_workspace / ".git").exists():
+            self._git("init", "-q", "-b", "main")
+            self._git("config", "user.email", "bash-agent@bossbench.local")
+            self._git("config", "user.name", "BashAgent")
+        # Git commits must finish maintenance before the sandbox boundary closes.
+        self._git("config", "gc.autoDetach", "false", check=True)
+        self._git("config", "maintenance.autoDetach", "false", check=True)
         gitignore_path = self.agent_workspace / ".gitignore"
         if not gitignore_path.exists():
             gitignore_path.write_text(self._GITIGNORE_CONTENT)
@@ -552,6 +595,9 @@ __pycache__/
                 f"Week {self._last_committed_week} (day {wd})",
                 once_key=f"week-{self._last_committed_week}",
             )
+            registry = getattr(getattr(self, 'tool_executor', None), 'text_registry', None)
+            if registry:
+                registry.finalize_week(f'week-{self._last_committed_week}')
 
     def _initialize_from_public_repo(self):
         """Copy the published layout into the agent workspace and create a session.
@@ -657,6 +703,8 @@ __pycache__/
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
+        from .tools import agent_runtime_dir
+        env['CEOBENCH_AGENT_RUNTIME'] = str(agent_runtime_dir())
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
         env['CEOBENCH_CHECKPOINT_TOKEN'] = self._checkpoint_token
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
@@ -696,10 +744,22 @@ __pycache__/
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
+        from .tools import GUEST_WORKSPACE, agent_runtime
+        # Layout 2: fixed guest paths, dedicated agent runtime, sessions/ hidden.
+        manifest['agent_sandbox'] = dict(layout=2, workspace=GUEST_WORKSPACE,
+                                         runtime=agent_runtime(verify=True) if shutil.which('bwrap') else None)
         if self.sql_evidence_config:
             manifest['sql_evidence'] = self.sql_evidence_config
+        if self.fork_source:
+            manifest['fork_source'] = self.fork_source
+        if self.recovery_source:
+            manifest['recovery_source'] = self.recovery_source
         if self.text_registration != 'off':
             manifest['text_registration'] = self.text_registration
+        if self.text_registration == 'pf':
+            from saas_bench.payload_tokens import tokenizer_config
+            manifest['pf_stale_checks'] = self.pf_stale_checks
+            manifest['pf_read_tokenizer'] = tokenizer_config(self.provider, self.model)
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
@@ -818,9 +878,26 @@ __pycache__/
             flagged.append(str(suspicious.relative_to(self.agent_workspace)))
         return flagged
 
-    def _save_checkpoint(self, day: int, fetch_daily_scripts: bool = True):
-        """Publish only a complete, quiescent generation; keep the previous one on failure."""
+    def _wait_checkpoint(self):
+        pending = getattr(self, '_checkpoint_future', None)
+        if pending is not None:
+            self._checkpoint_future = None
+            started = _time.monotonic()
+            try:
+                pending.result()
+            finally:
+                self._log_timing('checkpoint_wait', self.agent.current_day if self.agent else 0,
+                                 elapsed_s=_time.monotonic()-started)
+
+    def _save_checkpoint(self, day: int, fetch_daily_scripts: bool = True, *, wait=True):
+        """Freeze while quiescent; one worker publishes only fully verified generations."""
+        from concurrent.futures import ThreadPoolExecutor
         from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
+        from saas_bench.db_protection import encrypt_plain_atomic
+        self._wait_checkpoint()  # At most one immutable generation is being processed.
+        if self.tool_executor.text_registry:
+            self.tool_executor.text_registry.assert_week_finalized(day)
+        started = _time.monotonic()
         if self.agent and self.agent._pending_tool_calls:
             raise RuntimeError('Cannot checkpoint a tool with an unknown outcome')
         if self.agent:
@@ -832,60 +909,87 @@ __pycache__/
         if len(snapshot_id) != 32 or any(c not in '0123456789abcdef' for c in snapshot_id):
             raise ValueError('Invalid server snapshot identifier')
         directory = self.workspace_dir / 'checkpoints' / snapshot_id
-        for name in ('world.nmdb', 'session.json', 'server_state.json'):
-            if file_hash(directory / name) != receipt['files'].get(name):
-                raise ValueError('Server snapshot checksum mismatch: ' + name)
+        if receipt.get('phase') != 'frozen':
+            raise ValueError('Server did not freeze a checkpoint generation')
         shutil.copy2(self.workspace_dir / 'manifest.json', directory / 'manifest.json')
-        receipt['files']['manifest.json'] = file_hash(directory / 'manifest.json')
+        copying = _time.monotonic()
         copy_workspace(self.agent_workspace, directory / 'agent_workspace', omit_session_world=self._session_id)
+        workspace_copy_s = _time.monotonic()-copying
+        # Open descriptors and exact cutoffs bind append-only logs without copying them
+        # on the model's critical path. A later append cannot enter this generation.
         request_logs = {}
         for name in ('agent_requests.jsonl', 'simulator_requests.jsonl'):
             source = self.logs_dir / name
             if source.exists():
-                (directory / 'request_logs').mkdir(exist_ok=True)
-                shutil.copy2(source, directory / 'request_logs' / name)
-                request_logs[name] = file_hash(directory / 'request_logs' / name)
+                stream = source.open('rb')
+                request_logs[name] = (stream, os.fstat(stream.fileno()).st_size)
         checkpoint = dict(version=2, day=day, run_id=self.run_id,
                           session_id=self._session_id, snapshot_id=snapshot_id,
-                          files=receipt['files'], request_logs=request_logs,
-                          workspace_sha256=tree_hash(directory / 'agent_workspace'))
+                          files={}, request_logs={},
+                          request_log_cutoffs={n: size for n, (_, size) in request_logs.items()})
         if self.sql_evidence_config:
             evidence = receipt.get('sql_evidence')
             if not evidence or evidence['identity'] != self.sql_evidence_config:
                 raise ValueError('Missing or mismatched SQL evidence checkpoint')
-            if file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']:
-                raise ValueError('SQL evidence checkpoint checksum mismatch')
             checkpoint['sql_evidence'] = evidence
         checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
         progress = self.workspace_dir / 'operation.json'
         checkpoint['operation_id'] = json.loads(progress.read_text())['id'] if progress.exists() else None
-        checkpoint['usage'] = self.agent.usage_recorder.summary if self.agent else None
+        checkpoint['usage'] = json.loads(json.dumps(self.agent.usage_recorder.summary)) if self.agent else None
+        if getattr(self, '_last_weekly_day', None) != day:
+            write_json(self.workspace_dir / 'usage_summary.json', {
+                'snapshot_id': snapshot_id, 'day': day, 'agent': checkpoint['usage'],
+                'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                       'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
             checkpoint[field] = getattr(self.agent, field, 0)
-        write_json(directory / 'checkpoint.json', checkpoint)
-        write_json(self.workspace_dir / 'checkpoint.json', checkpoint)
-        write_json(self.workspace_dir / 'usage_summary.json', {
-            'snapshot_id': snapshot_id, 'day': day, 'agent': checkpoint['usage'],
-            'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
+        frozen = _time.monotonic()
+        self._log_timing('checkpoint_freeze', day, elapsed_s=round(frozen-started, 3), snapshot_id=snapshot_id,
+                         workspace_copy_s=workspace_copy_s, **receipt['timings'])
+
+        def publish():
+            try:
+                plain = directory / 'world.plain.sqlite'
+                encrypt_plain_atomic(plain, directory / 'world.nmdb')
+                plain.unlink()
+                encrypted = _time.monotonic()
+                for name in [*receipt['files'], 'world.nmdb', 'manifest.json']:
+                    checkpoint['files'][name] = file_hash(directory / name)
+                for name, (stream, remaining) in request_logs.items():
+                    target = directory / 'request_logs' / name
+                    target.parent.mkdir(exist_ok=True)
+                    with target.open('wb') as output:
+                        while remaining:
+                            data = stream.read(min(1024 * 1024, remaining))
+                            if not data:
+                                raise ValueError('Request log ended before frozen cutoff')
+                            output.write(data)
+                            remaining -= len(data)
+                    checkpoint['request_logs'][name] = file_hash(target)
+                copied = _time.monotonic()
+                checkpoint['workspace_sha256'] = tree_hash(directory / 'agent_workspace')
+                if self.sql_evidence_config:
+                    checkpoint['sql_evidence']['sha256'] = file_hash(directory / 'sql-evidence.sqlite')
+                write_json(directory / 'checkpoint.json', checkpoint)
+                write_json(self.workspace_dir / 'checkpoint.json', checkpoint)
+                self._log_timing('checkpoint_publish', day, elapsed_s=round(_time.monotonic()-frozen, 3),
+                                 snapshot_id=snapshot_id, encryption_s=encrypted-frozen,
+                                 log_copy_and_file_hash_s=copied-encrypted,
+                                 workspace_and_evidence_hash_s=_time.monotonic()-copied)
+            finally:
+                for stream, _ in request_logs.values():
+                    stream.close()
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='checkpoint')
+        self._checkpoint_future = pool.submit(publish)
+        pool.shutdown(wait=False)
+        if wait:
+            self._wait_checkpoint()
 
     def _restore_checkpoint_files(self, checkpoint):
-        from saas_bench.run_state import checkpoint_directory, copy_workspace, restore_sql_evidence
+        from saas_bench.run_state import checkpoint_directory, checkpoint_manifest, copy_workspace, restore_sql_evidence
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
-        saved_manifest = json.loads((directory / 'manifest.json').read_text())
-        current_manifest = json.loads((self.workspace_dir / 'manifest.json').read_text())
-        expected_manifest = dict(current_manifest)
-        if (self.sql_evidence_config != saved_manifest.get('sql_evidence') and
-                self.sql_evidence_config and self.sql_evidence_config.get('source_manifest_sha256')):
-            from saas_bench.run_state import file_hash
-            if file_hash(directory / 'manifest.json') != self.sql_evidence_config['source_manifest_sha256']:
-                raise ValueError('Clone source manifest mismatch')
-            expected_manifest['sql_evidence'] = saved_manifest['sql_evidence']
-            if (saved_manifest.get('text_registration') == 'prefix' and
-                    expected_manifest.get('text_registration') in ('git', 'pf')):
-                expected_manifest['text_registration'] = 'prefix'
-        if saved_manifest != expected_manifest:
-            raise ValueError('Checkpoint configuration differs from run manifest')
+        checkpoint_manifest(self.workspace_dir, directory)
         if self.sql_evidence_config:
             restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
             controls = directory / 'sql-evidence.controls.jsonl'
@@ -921,7 +1025,7 @@ __pycache__/
                 checkpoint = json.load(f)
             progress = self.workspace_dir / 'operation.json'
             if progress.exists() and json.loads(progress.read_text())['id'] != checkpoint.get('operation_id'):
-                raise ValueError('Uncheckpointed operation outcome unknown; branch cannot resume')
+                raise ValueError('Uncheckpointed operation outcome unknown; use scripts/recover_run.py to preserve this run and start a new attempt')
             return checkpoint
         return None
 
@@ -929,6 +1033,27 @@ __pycache__/
         from saas_bench.run_state import write_json
         self._check_capture_health()
         write_json(self.workspace_dir / 'operation.json', {'id': uuid.uuid4().hex, 'kind': kind, 'day': day})
+
+    def _weekly_record(self, status):
+        from saas_bench.run_state import write_json
+        metrics = self._http_post('/run-metrics', {})
+        if metrics['day'] != status['day']:
+            raise ValueError('Weekly metrics day differs from world')
+        record = dict(status, agent=self.agent.usage_recorder.summary, simulator=metrics['usage'],
+                      model_turns=self.agent.total_turns)
+        if self.recovery_source:
+            def difference(current, baseline):
+                return {k: difference(v, baseline.get(k, {})) if isinstance(v, dict) else
+                        v - (baseline.get(k) or 0) if type(v) in (int, float) else v for k, v in current.items()}
+            record['attempt_usage'] = {role: difference(record[role], self.recovery_source['usage'][role])
+                                       for role in ('agent', 'simulator')}
+            record['attempt_id'] = self.recovery_source['attempt_id']
+        with (self.workspace_dir / 'weekly.jsonl').open('a') as stream:
+            stream.write(json.dumps(record) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        write_json(self.workspace_dir / 'usage_summary.json', record)
+        self._last_weekly_day = status['day']
 
     def _check_capture_health(self):
         if self.evidence_store:
@@ -974,6 +1099,10 @@ __pycache__/
             if os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1':
                 raise ValueError('Formal runs cannot enable replay or oracle mode')
         self._prepare_manifest()
+        self.payload_token_counter = None
+        if self.text_registration == 'pf':
+            from saas_bench.payload_tokens import load_counter
+            self.payload_token_counter = load_counter(self.provider, self.model)
         self._NextDayTimeoutError = NextDayTimeoutError
 
         # ── Step 1: Copy public/ and create session via CLI ──
@@ -1011,9 +1140,10 @@ __pycache__/
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
             evidence_store=self.evidence_store,
             text_registry=registry,
+            pf_stale_checks=self.pf_stale_checks, pf_refresh=self._pf_refresh,
         )
 
-        tool_descriptions = get_bash_agent_tool_descriptions(registry is not None)
+        tool_descriptions = get_bash_agent_tool_descriptions(registry is not None, self.text_registration == 'pf')
         from saas_bench.model_usage import ModelUsage
 
         self.agent = BashAgent(
@@ -1027,9 +1157,13 @@ __pycache__/
             workspace_path=self.agent_workspace,
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
-            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing, self.evidence_store),
+            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing,
+                                      self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
+            pf=self.text_registration == 'pf',
         )
+
+        self.agent.lifecycle = getattr(self, 'lifecycle', None)
 
         # Wire the per-session conversation snapshot path. The agent writes
         # this after every LLM call; on resume, _restore_from_checkpoint can
@@ -1055,6 +1189,7 @@ __pycache__/
             'label': self.label,
             'public_dir_override': os.environ.get('NOVAMIND_PUBLIC_DIR') or None,
             'text_registration': self.text_registration,
+            'pf_stale_checks': self.pf_stale_checks,
         }
         with open(self.workspace_dir / "config.json", 'w') as f:
             json.dump(config, f, indent=2)
@@ -1065,7 +1200,10 @@ __pycache__/
         Raises NextDayTimeoutError if ./novamind-operation next-week times out,
         which triggers run checkpoint + kill in the run loop.
         """
-        result = self.tool_executor.execute(tool_name, arguments)
+        recorder = self.agent.usage_recorder
+        origin = (dict(model_request_event=recorder.last_request_event, model_context_id=recorder.context_id)
+                  if recorder.last_request_event else {})
+        result = self.tool_executor.execute(tool_name, arguments, **origin)
 
         # Check if bash output contains a day advancement
         if tool_name == 'bash':
@@ -1080,8 +1218,14 @@ __pycache__/
     def run(self, verbose: bool = True) -> Dict[str, Any]:
         """Stop the branch on any unknown outcome; never publish partial state."""
         from saas_bench.run_state import write_json
+        from contextlib import nullcontext
+        from saas_bench.run_lifecycle import RunCancelled
         try:
-            return self._run(verbose)
+            with getattr(self, 'lifecycle', None) or nullcontext():
+                try:
+                    return self._run(verbose)
+                except RunCancelled as exc:
+                    return self._pause(str(exc))
         except BaseException as exc:
             write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
             raise
@@ -1090,11 +1234,45 @@ __pycache__/
             preserve = bool(getattr(self.tool_executor, 'preserved_process', None))
             if fault_path.exists():
                 preserve = preserve or json.loads(fault_path.read_text()).get('preserve_scene', False)
-            if not preserve:
-                self._stop_server()
+            try:
+                self._wait_checkpoint()
+            except BaseException as exc:
+                write_json(self.workspace_dir / 'checkpoint_error.json', {'error': type(exc).__name__, 'reason': str(exc)})
+                raise
+            finally:
+                if not preserve:
+                    self._stop_server()
+
+    def _pause(self, reason):
+        from saas_bench.run_state import write_json
+        self._check_capture_health()
+        status = self._get_game_status()
+        if status.get('timed_out') or getattr(self.tool_executor, 'preserved_process', None):
+            raise RuntimeError('Cannot pause with an unknown tool outcome')
+        day = status['day']
+        while self.agent._pending_tool_calls:
+            pending = self.agent._pending_tool_calls[0]
+            cancelled = 'Cancelled: run paused before this tool was executed.'
+            self._log_tool_result(self.agent.total_turns, day, pending['name'],
+                                  pending.get('arguments', {}), cancelled,
+                                  call_id=pending['id'], outcome='cancelled')
+            self.agent.record_tool_result(cancelled)
+        self._save_checkpoint(day)
+        checkpoint = self._load_checkpoint()
+        receipt = dict(day=day, reason=reason, status='paused',
+                       snapshot_id=checkpoint['snapshot_id'],
+                       context_boundary=checkpoint['context_boundary'])
+        write_json(self.workspace_dir / 'pause-receipt.json', receipt)
+        return dict(run_id=self.run_id, seed=self.seed, scenario=self.scenario,
+                    final_cash=status['cash'], days_run=day, outcome='paused',
+                    total_turns=self.agent.total_turns,
+                    total_anthropic_fallbacks=self.agent.total_anthropic_fallbacks,
+                    workspace_dir=str(self.workspace_dir), **{k: receipt[k] for k in ('reason', 'context_boundary', 'snapshot_id')})
 
     def _run(self, verbose=True):
         self.setup()
+        if not self.continue_from and not (self.workspace_dir / 'checkpoint.json').exists():
+            self._save_checkpoint(self._get_game_status()['day'])
 
         start_day = 1
         if self.continue_from:
@@ -1146,6 +1324,9 @@ __pycache__/
         last_status: Dict[str, Any] = {}
 
         for day in range(start_day, self.total_days + 1):
+            pending = getattr(self, '_checkpoint_future', None)
+            if pending is not None and pending.done():
+                self._wait_checkpoint()
             _day_start = _time.monotonic()
             current_day = day
 
@@ -1168,32 +1349,40 @@ __pycache__/
             self._log_timing("dashboard", sim_day, elapsed_s=round(_dashboard_elapsed, 3))
 
             # Agent loop for this day
-            observation = (self.agent._last_observation
-                           if getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
-                           else dashboard)
+            resumed = getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
+            observation = self.agent._last_observation if resumed else dashboard
+            if not resumed:
+                # A new week's context: registered texts whose cited evidence changed follow the dashboard.
+                _t0 = _time.monotonic()
+                check = self.tool_executor.weekly_check(sim_day)
+                if check:
+                    self._log_tool_result(0, sim_day, '_weekly_check', {}, check)
+                    self._log_timing("weekly_check", sim_day, elapsed_s=round(_time.monotonic() - _t0, 3))
+                    observation = _joined(dashboard, '\n\n', check)
+                observation = _joined(observation, '\n\n',
+                    'Forecast units: All 12 cash forecast values for next-week are USD. '
+                    'For 20.7 million USD, submit 20700000 or 20.7e6.')
             info = {'day': sim_day, 'cash': status['cash']}
-            turns_today = 0
+            turns_today = self.agent.turns_today if resumed else 0
             day_ended = False
             _day_llm_total = 0.0
             _day_tool_total = 0.0
-            _day_input_tokens = 0
-            _day_output_tokens = 0
-            _day_cached_tokens = 0
-            _day_reasoning_tokens = 0
+            _day_usage_before = copy.deepcopy(self.agent.usage_recorder.summary)
 
-            while not day_ended and turns_today < 100:
+            while not day_ended and not game_ended and turns_today < 100:
                 turns_today += 1
 
                 # LLM call (timed)
                 _t0 = _time.monotonic()
+                if getattr(self, 'lifecycle', None):
+                    self.lifecycle.check()
                 self._begin_operation('model_and_tool', sim_day)
+                _usage_before = copy.deepcopy(self.agent.usage_recorder.summary)
                 action = self.agent.act(observation, 0, False, info)
                 _llm_elapsed = _time.monotonic() - _t0
                 _day_llm_total += _llm_elapsed
-                _day_input_tokens += self.agent.last_input_tokens or 0
-                _day_output_tokens += self.agent.last_output_tokens or 0
-                _day_cached_tokens += self.agent.last_cached_tokens or 0
-                _day_reasoning_tokens += self.agent.last_reasoning_tokens or 0
+                # One act() can regenerate several responses before accepting a tool batch.
+                _usage = usage_delta(_usage_before, self.agent.usage_recorder.summary)
 
                 if action is None:
                     # With the agent's retry-with-feedback loop, _call_* should no
@@ -1215,84 +1404,106 @@ __pycache__/
                 self._log_timing("llm_call", sim_day, turn=turns_today,
                                  elapsed_s=round(_llm_elapsed, 2),
                                  tool=tool_name, tool_preview=tool_args_preview,
-                                 input_tokens=self.agent.last_input_tokens,
-                                 output_tokens=self.agent.last_output_tokens,
-                                 cached_tokens=self.agent.last_cached_tokens,
-                                 reasoning_tokens=self.agent.last_reasoning_tokens,
+                                 **_usage['known'], model_calls=_usage['calls'],
+                                 usage_missing=_usage['missing'],
                                  requested_model=self.model,
                                  served_model=self.agent.last_serving_model,
                                  anthropic_fallback_used=self.agent.last_anthropic_fallback_used,
                                  anthropic_fallbacks=self.agent.last_anthropic_fallbacks,
                                  total_anthropic_fallbacks=self.agent.total_anthropic_fallbacks)
 
-                # Execute action (timed)
-                if verbose:
-                    if tool_name == 'bash':
-                        print(f"    [Turn {turns_today}] bash: {tool_args_preview[:100]}")
-                    else:
-                        print(f"    [Turn {turns_today}] {tool_name}({tool_args_preview[:100]})")
+                batch_size = max(1, len(self.agent._pending_tool_calls))
+                self._log_timing('model_tool_batch', sim_day, turn=turns_today, calls=batch_size)
+                while action is not None:
+                    if getattr(self, 'lifecycle', None):
+                        self.lifecycle.check()
+                    tool_name = action.tool
+                    tool_args_preview = str(action.arguments or {})[:120]
+                    # Execute action (timed)
+                    if verbose:
+                        if tool_name == 'bash':
+                            print(f"    [Turn {turns_today}] bash: {tool_args_preview[:100]}")
+                        else:
+                            print(f"    [Turn {turns_today}] {tool_name}({tool_args_preview[:100]})")
 
-                _t0 = _time.monotonic()
-                try:
-                    result = self._execute_tool(action.tool, action.arguments or {})
-                except self._NextDayTimeoutError as e:
+                    _t0 = _time.monotonic()
+                    try:
+                        result = self._execute_tool(action.tool, action.arguments or {})
+                    except self._NextDayTimeoutError as e:
+                        _tool_elapsed = _time.monotonic() - _t0
+                        print(f"\n⚠️  {tool_name} stopped on sim day {sim_day} ({e})")
+                        raise RuntimeError(f'{e}; branch stopped') from e
                     _tool_elapsed = _time.monotonic() - _t0
-                    print(f"\n⚠️  next_week timed out on sim day {sim_day} ({e})")
-                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
-                _tool_elapsed = _time.monotonic() - _t0
-                _day_tool_total += _tool_elapsed
-                observation = result if isinstance(result, str) else json.dumps(result)
-                self.agent.record_tool_result(observation)
+                    _day_tool_total += _tool_elapsed
+                    observation = result if isinstance(result, str) else json.dumps(result)
+                    call_id = self.agent._pending_tool_calls[0]['id'] if self.agent._pending_tool_calls else None
+                    self.agent.record_tool_result(observation)
 
-                self._log_timing("tool_exec", sim_day, turn=turns_today,
-                                 elapsed_s=round(_tool_elapsed, 3),
-                                 tool=tool_name, tool_preview=tool_args_preview)
+                    self._log_timing("tool_exec", sim_day, turn=turns_today,
+                                     elapsed_s=round(_tool_elapsed, 3),
+                                     tool=tool_name, tool_preview=tool_args_preview)
 
-                # Log tool result
-                self._log_tool_result(
-                    self.agent.total_turns, sim_day,
-                    action.tool, action.arguments or {},
-                    observation  # Full result in JSONL (tool already caps at 50K)
-                )
-                self._check_capture_health()
+                    # Log tool result
+                    self._log_tool_result(
+                        self.agent.total_turns, sim_day,
+                        action.tool, action.arguments or {},
+                        observation, call_id=call_id
+                    )
+                    self._check_capture_health()
 
-                if verbose:
-                    print(f"      → {observation[:200]}")
-                    print(f"      ⏱ llm={_llm_elapsed:.1f}s tool={_tool_elapsed:.1f}s")
-
-                # Check if the agent detected a day advancement
-                if self.agent.day_advanced:
-                    day_ended = True
-                    self.agent.clear_day_advanced()
-
-                # Check server for timeout (via game-status)
-                status = self._get_game_status()
-                last_status = status
-                sim_day = status.get('day', sim_day)  # Update sim_day after potential next-week
-                self._commit_weeks_up_to(sim_day)  # Commit any sim-week boundary just crossed
-
-                # Check if simulation reached total_days (inside inner loop)
-                if sim_day >= self.total_days:
-                    game_ended = True
-                    game_outcome = 'completed'
                     if verbose:
-                        print(f"\n✅ Simulation reached {sim_day} days (target: {self.total_days})")
-                    break
+                        print(f"      → {observation[:200]}")
+                        print(f"      ⏱ llm={_llm_elapsed:.1f}s tool={_tool_elapsed:.1f}s")
 
-                if status.get('timed_out'):
-                    print(f"\n⚠️  step_day timed out on sim day {sim_day}")
-                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
+                    # Check if the agent detected a day advancement
+                    if self.agent.day_advanced:
+                        day_ended = True
+                        self.agent.clear_day_advanced()
 
-                _cash_inner = status.get('cash', 0)
-                info = {'day': sim_day, 'cash': _cash_inner}
+                    # Check server for timeout (via game-status)
+                    status = self._get_game_status()
+                    last_status = status
+                    # Shell pipelines can trim the dashboard header; the server day
+                    # still ends the week and must trigger checkpoint/stop handling.
+                    if status.get('day', sim_day) > sim_day:
+                        day_ended = True
+                    sim_day = status.get('day', sim_day)  # Update sim_day after potential next-week
+                    self._commit_weeks_up_to(sim_day)  # Commit any sim-week boundary just crossed
 
-                # Check bankruptcy inside inner loop (don't let agent keep playing while bankrupt)
-                if _cash_inner < 0:
-                    game_ended = True
-                    game_outcome = 'bankrupt'
-                    if verbose:
-                        print(f"\n💀 BANKRUPT at sim day {sim_day} (cash=${_cash_inner:,.0f})!")
-                    break
+                    # Check if simulation reached total_days (inside inner loop)
+                    if sim_day >= self.total_days:
+                        game_ended = True
+                        game_outcome = 'completed'
+                        if verbose:
+                            print(f"\n✅ Simulation reached {sim_day} days (target: {self.total_days})")
+
+                    if status.get('timed_out'):
+                        print(f"\n⚠️  step_day timed out on sim day {sim_day}")
+                        raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
+
+                    _cash_inner = status.get('cash', 0)
+                    info = {'day': sim_day, 'cash': _cash_inner}
+
+                    # Check bankruptcy inside inner loop (don't let agent keep playing while bankrupt)
+                    if _cash_inner < 0:
+                        game_ended = True
+                        game_outcome = 'bankrupt'
+                        if verbose:
+                            print(f"\n💀 BANKRUPT at sim day {sim_day} (cash=${_cash_inner:,.0f})!")
+
+                    if getattr(self, 'lifecycle', None):
+                        self.lifecycle.check()
+                    if day_ended or game_ended:
+                        reason = ('Cancelled: simulation advanced to a new week; read the new state before deciding.'
+                                  if day_ended else 'Cancelled: the simulation ended.')
+                        while self.agent._pending_tool_calls:
+                            pending = self.agent._pending_tool_calls[0]
+                            self._log_tool_result(self.agent.total_turns, sim_day, pending['name'],
+                                                  pending.get('arguments', {}), reason,
+                                                  call_id=pending['id'], outcome='cancelled')
+                            self.agent.record_tool_result(reason)
+                        break
+                    action = self.agent.next_tool_action()
 
             if game_ended:
                 break
@@ -1344,6 +1555,11 @@ __pycache__/
             # Per-day timing summary
             _day_elapsed = _time.monotonic() - _day_start
             _day_other = _day_elapsed - _day_llm_total - _day_tool_total - _step_elapsed - _dashboard_elapsed
+            _day_usage = usage_delta(_day_usage_before, self.agent.usage_recorder.summary)
+            _day_input_tokens = _day_usage['known']['input_tokens'] or 0
+            _day_output_tokens = _day_usage['known']['output_tokens'] or 0
+            _day_cached_tokens = _day_usage['known']['cached_tokens'] or 0
+            _day_reasoning_tokens = _day_usage['known']['reasoning_tokens'] or 0
             self._log_timing("day_summary", sim_day,
                              elapsed_s=round(_day_elapsed, 1),
                              llm_total_s=round(_day_llm_total, 1),
@@ -1354,10 +1570,8 @@ __pycache__/
                              turns=turns_today,
                              subs=_subs,
                              cash=_cash,
-                             day_input_tokens=_day_input_tokens,
-                             day_output_tokens=_day_output_tokens,
-                             day_cached_tokens=_day_cached_tokens,
-                             day_reasoning_tokens=_day_reasoning_tokens,
+                             **{'day_' + field: value for field, value in _day_usage['known'].items()},
+                             day_model_calls=_day_usage['calls'], day_usage_missing=_day_usage['missing'],
                              total_input_tokens=self.agent.total_input_tokens,
                              total_output_tokens=self.agent.total_output_tokens,
                              total_cached_tokens=self.agent.total_cached_tokens,
@@ -1387,8 +1601,20 @@ __pycache__/
             # Idempotent via once_key — _commit_weeks_up_to may have already committed this week.
             self._commit_weeks_up_to(sim_day)
 
-            # Save checkpoint (use actual sim day, not harness loop counter)
-            self._save_checkpoint(sim_day)
+            self._weekly_record(status)
+            if self.stop_after_day is not None and sim_day >= self.stop_after_day and _cash >= 0:
+                self._save_checkpoint(sim_day)
+                checkpoint = self._load_checkpoint()
+                if sim_day != self.stop_after_day or checkpoint['context_boundary'] != 'new_week':
+                    raise RuntimeError('Harness stop did not land on the requested week boundary')
+                game_ended = True
+                game_outcome = 'stopped'
+                if verbose:
+                    print(f"\n⏸ Harness stop at sim day {sim_day} (configured end: {self.total_days})")
+                break
+
+            if sim_day % 35 == 0 and _cash >= 0 and not game_ended:
+                self._save_checkpoint(sim_day, wait=False)
 
             # Check bankruptcy
             if _cash < 0:
@@ -1418,7 +1644,11 @@ __pycache__/
             final_cash = self._get_cash() if self._server_port else _cash
 
         # Publish while the server can synchronize its complete state.
-        self._save_checkpoint(sim_day)
+        if getattr(self, '_last_weekly_day', None) != sim_day:
+            self._weekly_record(final_status)
+        if game_outcome != 'stopped':
+            self._save_checkpoint(sim_day)
+        self._wait_checkpoint()
         self._stop_server()
 
         if verbose:
@@ -1463,7 +1693,9 @@ def main():
     parser.add_argument("--base-url", help="Custom API base URL")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (new run: 42)")
     parser.add_argument("--scenario", default=None, help="Scenario name (new run: default)")
-    parser.add_argument("--days", type=int, default=None, help="Total simulation days (new run: 3650)")
+    parser.add_argument("--days", type=int, default=None, help="Total simulation days shown to the agent (new run: 500)")
+    parser.add_argument('--stop-after-day', type=int, default=None,
+                        help='Harness-only stop after this completed week; the agent still sees --days')
     parser.add_argument("--workspace", type=Path, help="Workspace base directory")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     parser.add_argument("--reasoning-effort",
@@ -1480,6 +1712,8 @@ def main():
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
     parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
+    parser.add_argument('--pf-stale-checks', action=argparse.BooleanOptionalAction, default=None,
+                        help='Automatic current-purpose PF dependency checks; default on in PF, disable for offline ablation')
     parser.add_argument('--text-registration', choices=['off', 'git', 'prefix', 'pf'], default=None,
                         help='Shared text tools; prefix privately binds evidence, pf validates delivered evidence; default off')
     parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
@@ -1501,6 +1735,8 @@ def main():
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
         sql_capture=args.sql_capture, execution_capture=args.execution_capture, text_registration=args.text_registration,
+        pf_stale_checks=args.pf_stale_checks,
+        stop_after_day=args.stop_after_day,
     )
 
     result = runner.run(verbose=not args.quiet)

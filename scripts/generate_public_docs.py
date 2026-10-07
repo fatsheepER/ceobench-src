@@ -87,6 +87,11 @@ def render_tools_reference(output_path: Path):
                 lines.append("```")
                 lines.append("")
 
+            # Structured SDK result
+            if schema := doc.get("output_schema"):
+                lines.extend(["**Output Schema:**", "", "```json",
+                              json.dumps(schema, indent=2, ensure_ascii=False), "```", ""])
+
             # Returns
             returns = doc.get("returns", {})
             if returns:
@@ -234,21 +239,30 @@ novamind-operation stop
 
 ### Simulation Control
 
-#### `novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk> [--session ID]`
-Advance the simulation by one week (7 days). **Requires 3 cash predictions** as positional arguments — all three are mandatory, numeric (dollars).
+#### `novamind-operation next-week <rationale> <c1_pt> <c1_lo> <c1_hi> <c4_pt> <c4_lo> <c4_hi> <c12_pt> <c12_lo> <c12_hi> <c26_pt> <c26_lo> <c26_hi> [--session ID]`
+Advance the simulation by one week (7 days). Requires a non-empty rationale string and 12 cash forecast values in USD.
+
+For 20.7 million USD, submit `20700000` or `20.7e6`.
 
 ```bash
-novamind-operation next-week 1050000 1200000 1800000
+novamind-operation next-week \\
+    "Holding prices and raising enterprise ad spend" \\
+    1050000 1000000 1100000 \\
+    1200000 1050000 1400000 \\
+    1800000 1400000 2300000 \\
+    3000000 2000000 4500000
 ```
 
 **Arguments:**
-- `cash_1wk`: Predicted cash 1 week from today (+7 days)
-- `cash_4wk`: Predicted cash 4 weeks from today (+28 days)
-- `cash_12wk`: Predicted cash 12 weeks from today (+84 days)
+- `rationale`: Strategic reasoning for this week's actions, as a non-empty quoted string.
+- `c1_pt`, `c1_lo`, `c1_hi`: Cash point estimate, 95% CI lower bound, and upper bound in USD, +7 days.
+- `c4_pt`, `c4_lo`, `c4_hi`: Cash point estimate, 95% CI lower bound, and upper bound in USD, +28 days.
+- `c12_pt`, `c12_lo`, `c12_hi`: Cash point estimate, 95% CI lower bound, and upper bound in USD, +84 days.
+- `c26_pt`, `c26_lo`, `c26_hi`: Cash point estimate, 95% CI lower bound, and upper bound in USD, +182 days.
 
-Predictions are stored in the `predictions` table at submission time and scored on percent error `(predicted - actual) / actual` when the actual cash at each horizon is known. The agent is evaluated on prediction accuracy at each horizon in addition to realized cash.
+Each horizon requires `lower <= point <= upper`. Predictions are stored in the `predictions` table at submission time and scored on point percent error `(point - actual) / actual`, CI coverage, and sharpness when actual cash is known.
 
-**Output:** The weekly dashboard showing cash, subscribers, MRR, this week's metrics, current config, product quality, and inbox notifications.
+**Output:** The weekly dashboard showing cash, subscribers, MRR, this week's metrics, current config, product quality, inbox notifications, and submitted cash forecasts in USD.
 
 ---
 

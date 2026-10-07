@@ -32,7 +32,7 @@ and run scripts with `./novamind-operation python <script.py>` or
 | `get_market_overview` | Get an overview of all known customer segments, their info levels, how many segments remain undiscovered, and latest published macroeconomic conditions (ISM PMI — published monthly with ~30 day delay, showing average PMI over the measurement period). |
 | `get_group_insights` | Retrieve estimated parameters for a discovered customer group. Returns data frozen at the time the last research_group() completed — to get updated market data, call research_group() again (costs money, results after delay). Accuracy depends on info level (Level 1: ±65%, Level 5: ±5%). Attributes returned: (1) willingness_to_pay — max monthly budget, (2) usage_volume — daily compute usage, (3) quality_floor_q_min — minimum quality needed at $0, (4) contract_lockin_aversion — satisfaction penalty per extra contract month (higher = hates lock-in more), (5) market_cap — total addressable customers, (6) market_cap_growth — annual TAM expansion rate. Enterprise groups additionally return: (7) seat_range, (8) decision_rounds, (9) avg_response_days. Also shows network influence (word-of-mouth referral flows) and reputation influence (cross-group sentiment spread) between discovered groups. Free and read-only. |
 | `start_research_project` | Start an R&D research tier. Costs deducted immediately. Completes after sampled duration with sampled quality boost. Tiers are REPEATABLE — same tier can be started again after completion. Only one invocation per tier can be in-progress at a time. Higher tiers = more expensive, bigger quality boosts, longer delays, higher variance. |
-| `list_research_projects` | List all 10 R&D research tiers with their status. Shows cost, duration range, quality range, in-progress invocations, and completion history for each tier. Tiers are repeatable. |
+| `list_research_projects` | List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, in-progress and completed counts, and total quality boost for each tier. Tiers are repeatable. Query the public research_projects table for individual projects and their dates. |
 | `list_all_tables` | List all available database tables with their descriptions. Quick overview of what data is available — use describe_tables() for detailed column schemas. |
 | `describe_tables` | Get descriptions of visible columns for specified database tables. Returns column names, types, and descriptions. Useful for understanding schemas before writing SQL queries via python_exec(). |
 | `get_tool_documentation` | Get detailed documentation for environment tools including parameters, examples, and expected outputs. |
@@ -55,6 +55,17 @@ and run scripts with `./novamind-operation python <script.py>` or
 **Python:** `novamind_api.infrastructure.get_cost_info(...)`
 
 Get current cost structure for compute and capacity. Shows model tier costs and capacity tier costs.
+
+**Output Schema:**
+
+```json
+{
+  "model_tiers": "Dict[int, Dict] — {tier_num: {cost_per_usage_unit: float, quality_multiplier: float, class: str}}",
+  "capacity_tiers": "Dict[int, Dict] — {tier_num: {capacity_units: int, cost_per_day: int}}",
+  "note": "str — explanation text",
+  "_access": "result['model_tiers'][3]['cost_per_usage_unit'] → cost for tier 3"
+}
+```
 
 **Returns:**
 - success: {'model_tiers': {'1': {'cost_per_usage_unit': 0.0003, 'quality_multiplier': 0.6, 'class': 'Flash-Lite/4o-mini'}, '2': {'cost_per_usage_unit': 0.002, 'quality_multiplier': 0.75, 'class': 'Haiku/Flash'}, '3': {'cost_per_usage_unit': 0.006, 'quality_multiplier': 0.9, 'class': 'Sonnet/GPT-4o'}, '4': {'cost_per_usage_unit': 0.012, 'quality_multiplier': 1.0, 'class': 'Opus/GPT-5'}, '5': {'cost_per_usage_unit': 0.03, 'quality_multiplier': 1.1, 'class': 'o1/o3 reasoning'}}, 'capacity_tiers': {'0': {'capacity_units': 50000, 'cost_per_day': 85}, '1': {'capacity_units': 200000, 'cost_per_day': 215}, '2': {'capacity_units': 800000, 'cost_per_day': 530}, '3': {'capacity_units': 2500000, 'cost_per_day': 1330}, '4': {'capacity_units': 8000000, 'cost_per_day': 4000}, '5': {'capacity_units': 25000000, 'cost_per_day': 10000}, '6': {'capacity_units': 80000000, 'cost_per_day': 28000}, '7': {'capacity_units': 300000000, 'cost_per_day': 75000}}, 'note': '1 usage unit = 1K tokens. Model tiers are quality multipliers on product quality (Tier 4 = 1.0×, Tier 5 = 1.1×). delivered_quality = product_quality × tier_multiplier. Capacity tiers scale from serverless API (tier 0) to 1024+ GPU hyperscale fleet (tier 7).'}
@@ -98,6 +109,17 @@ Search social media posts about your company. NOTE: Sentiment is NOT provided - 
       "description": "Max posts to return"
     }
   }
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "posts": "List[Dict] — each post has: day (int), content (str), group_id (str), customer_type (str), custom_name (str), persona_name (str)",
+  "total": "int — total number of posts found",
+  "_access": "for post in result['posts']: print(post['day'], post['content'])",
+  "_warning": "result is a dict with 'posts' key — do NOT iterate result directly, iterate result['posts']"
 }
 ```
 
@@ -154,6 +176,17 @@ Set in-app advertising strength (0-1). Ads generate revenue but reduce perceived
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "global": "float — global ads strength (0-1)",
+  "by_group": "Dict[str, float] — per-group ads strength",
+  "by_customer": "Dict[str, float] — per-customer ads strength (customer_id as str key)",
+  "_access": "result['global'] → current global ads strength"
+}
+```
+
 **Returns:**
 - success: Ads strength updated. Global: 0.30, Groups: {E1: 0.10}, Customers: {}
 - failure: Invalid group IDs / Strength must be between 0 and 1
@@ -198,6 +231,17 @@ Set infrastructure capacity tier. Higher tiers handle more usage but cost more p
   "required": [
     "tier"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "tier": "int — selected tier (0-7)",
+  "capacity_units": "int — units/day capacity",
+  "cost_per_day": "float — daily cost in $",
+  "_access": "result['capacity_units'] → capacity units per day"
 }
 ```
 
@@ -254,6 +298,18 @@ Set promotion (dollar deduction) for new leads. Applied automatically to first b
       "description": "Per-channel-per-group: {channel_id: {group_id: $/month}}. Most granular level. Additive with all other levels."
     }
   }
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "global": "float — global lead promotion $/mo",
+  "by_group": "Dict[str, float] — per-group promotion",
+  "by_channel": "Dict[str, float] — per-channel promotion",
+  "by_channel_group": "Dict[str, Dict[str, float]] — {channel: {group: $/mo}}",
+  "_access": "result['global'] → current global lead promotion"
 }
 ```
 
@@ -321,6 +377,16 @@ Set AI model tiers for plans A, B, and C. Higher tiers = higher quality multipli
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "updated": "Dict[str, int] — the tier changes applied (only keys you sent)",
+  "current": "Dict[str, int] — final tiers for all plans {'A': int, 'B': int, 'C': int}",
+  "_access": "result['current']['B'] → current tier of plan B"
+}
+```
+
 **Returns:**
 - success: Model tiers updated: A=tier2, B=tier3, C=tier4
 - failure: Missing tier for plan X / Tier for plan X must be 1-5
@@ -379,6 +445,16 @@ Set monthly subscription prices for plans A, B, and C.
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "updated": "Dict[str, float] — the price changes applied (only keys you sent)",
+  "current": "Dict[str, float] — final prices for all plans {'A': float, 'B': float, 'C': float}",
+  "_access": "result['current']['A'] → current price of plan A"
+}
+```
+
 **Returns:**
 - success: Prices updated: A=$29.00, B=$79.00, C=$199.00
 - failure: Missing price for plan X / Price for plan X must be positive
@@ -434,6 +510,18 @@ Set ongoing promotion (dollar deduction) for existing subscribers. Applied at ea
       "description": "Per-group-plan promotion: {group_id: {plan: $/month}}. Additive with all other levels."
     }
   }
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "global": "float — global promotion $/mo",
+  "by_group": "Dict[str, float] — per-group promotion",
+  "by_customer": "Dict[str, float] — per-customer promotion (customer_id as str key)",
+  "by_group_plan": "Dict[str, Dict[str, float]] — {group: {plan: $/mo}}",
+  "_access": "result['global'] → current global promotion"
 }
 ```
 
@@ -501,6 +589,15 @@ Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "quotas": "Dict[str, int] — {'A': int, 'B': int, 'C': int} units/day per customer",
+  "_access": "result['quotas']['A'] → plan A daily quota"
+}
+```
+
 **Returns:**
 - success: Usage quotas updated: A=100 units/day, B=500 units/day, C=2,000 units/day
 - failure: Missing quota for plan X / Quota for plan X cannot be negative
@@ -561,6 +658,15 @@ Reject one or more enterprise deals. List-based: each deal identified by custome
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "results": "List[Dict] — one dict per deal with keys: customer_id (int), success (bool), thread_type (str), error (str, if failed)",
+  "_access": "for r in result['results']: print(r['customer_id'], r['success'])"
+}
+```
+
 **Returns:**
 - success: Processed 2/2 rejections:
   Customer #312: Rejected (new_lead). Lead marked as lost.
@@ -613,6 +719,15 @@ Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, 
   "required": [
     "deals"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "results": "List[Dict] — one dict per deal with keys: customer_id (int), success (bool), status (str), error (str, if failed)",
+  "_access": "for r in result['results']: print(r['customer_id'], r['status'])"
 }
 ```
 
@@ -690,6 +805,23 @@ Retrieve estimated parameters for a discovered customer group. Returns data froz
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "group_id": "str",
+  "group_name": "str",
+  "segment": "str ('Individual'|'Enterprise')",
+  "info_level": "int (1-5)",
+  "noise": "str (e.g. '±65%')",
+  "snapshot_day": "int — survey measurement day (0 is valid); only completed research_group updates it, not this read",
+  "estimates": "Dict — keys: willingness_to_pay (float), usage_volume (float), quality_floor_q_min (float), contract_lockin_aversion (float), market_cap (int), annual_market_cap_growth_rate (float). Enterprise adds: seat_range (List[int]), decision_rounds (int), avg_response_days (float)",
+  "network_influence": "Dict — keys: self_referral (float), outgoing (Dict[str,float]), incoming (Dict[str,float]) — all rates in leads per 1000 subs/day",
+  "reputation_influence": "Dict — keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) — influence weights 0-1",
+  "_access": "result['estimates']['willingness_to_pay'] → group's WTP"
+}
+```
+
 **Returns:**
 - example: === Group Insights: Niche Creators (D_S01) ===
 Segment: Individual
@@ -729,7 +861,7 @@ Incoming (other groups' events → this group):
 
 Note: All estimates have ±40% uncertainty at Level 2.
 Use research_group('D_S01') to upgrade to Level 3 (±25%).
-- data: {'group_id': 'S1', 'group_name': 'Price-Sensitive Individuals', 'segment': 'Individual', 'info_level': 1, 'noise': '±65%', 'estimates': {'willingness_to_pay': 25.86, 'usage_volume': 91.0, 'quality_floor_q_min': 0.452, 'contract_lockin_aversion': 0.0045, 'market_cap': 802000, 'annual_market_cap_growth_rate': 0.035}, 'network_influence': {'self_referral': 0.0015, 'outgoing': {'S3': 0.002}, 'incoming': {'S2': 0.001}}, 'reputation_influence': {'outgoing': {'E1': 0.36}, 'incoming': {}}, '_enterprise_extra_fields': ['seat_range', 'negotiation_rounds', 'negotiation_pace_days']}
+- data: {'group_id': 'S1', 'group_name': 'Price-Sensitive Individuals', 'segment': 'Individual', 'info_level': 1, 'noise': '±65%', 'snapshot_day': 0, 'estimates': {'willingness_to_pay': 25.86, 'usage_volume': 91.0, 'quality_floor_q_min': 0.452, 'contract_lockin_aversion': 0.0045, 'market_cap': 802000, 'annual_market_cap_growth_rate': 0.035}, 'network_influence': {'self_referral': 1.5, 'outgoing': {'S3': 2.0}, 'incoming': {'S2': 1.0}}, 'reputation_influence': {'outgoing': {'E1': 0.36}, 'incoming': {}}}
 
 **Impact:** Read-only. No cost. Returns data frozen at the time the last research_group() completed for this group. Calling multiple times returns the same data. To refresh with current market conditions, call research_group() again (costs money, updated after delay). Also shows network and reputation influence relationships between discovered groups.
 
@@ -751,6 +883,18 @@ Use research_group('D_S01') to upgrade to Level 3 (±25%).
 
 Get an overview of all known customer segments, their info levels, how many segments remain undiscovered, and latest published macroeconomic conditions (ISM PMI — published monthly with ~30 day delay, showing average PMI over the measurement period).
 
+**Output Schema:**
+
+```json
+{
+  "known_groups": "List[Dict] — each: group_id (str), group_name (str), segment (str: 'Individual'|'Enterprise'), info_level (int 1-5), noise (str e.g. '±65%')",
+  "undiscovered_count": "int — segments not yet discovered",
+  "macroeconomic": "Dict|None — keys: measurement_day (int, when PMI was measured, not published), publication_delay_days (int, configured delay; not an exact publication timestamp), pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
+  "_access": "for g in result['known_groups']: print(g['group_id'], g['group_name'])",
+  "_warning": "Key is 'known_groups' NOT 'groups'"
+}
+```
+
 **Returns:**
 - example: === Market Overview ===
 
@@ -764,7 +908,7 @@ Known Segments:
 Undiscovered segments: 15
 Use research_market() to discover new segments ($25K/attempt).
 Use research_group(group_id) to improve accuracy.
-- data: {'known_groups': [{'group_id': 'S1', 'group_name': 'Price-Sensitive Individuals', 'segment': 'Individual', 'info_level': 1, 'noise': '±65%'}], 'undiscovered_count': 14, 'macroeconomic': {'ism_pmi': 54.2, 'change': 1.3, 'phase': 'expansion', 'cycle': 'recovering'}}
+- data: {'known_groups': [{'group_id': 'S1', 'group_name': 'Price-Sensitive Individuals', 'segment': 'Individual', 'info_level': 1, 'noise': '±65%'}], 'undiscovered_count': 14, 'macroeconomic': {'measurement_day': 270, 'publication_delay_days': 30, 'pmi_value': 54.2, 'pmi_trend': 'expansion', 'pmi_change': 1.3, 'cycle_phase': 'recovering', 'description': 'Period average'}}
 
 **Impact:** Read-only. No cost.
 
@@ -809,6 +953,17 @@ Research a discovered customer group to a specific info level. Each level has it
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "group_id": "str — group ID being researched",
+  "new_level": "int — target info level",
+  "expected_completion_day": "int — sim day when research completes",
+  "_access": "result['expected_completion_day'] → when results arrive"
+}
+```
+
 **Returns:**
 - success: === Research Started ===
 Group: Niche Creators (D_S01)
@@ -841,6 +996,18 @@ New parameter accuracy will be: ±5%
 
 Conduct market research to discover new customer segments. Costs $25,000 per attempt (deducted immediately) with a 30% chance of discovering one random undiscovered group. Result is instant (no delay). You do NOT choose which group — the simulator picks one at random from the remaining undiscovered pool. Discovered groups start at Info Level 1 (±65% accuracy). You begin with 6 known groups (S1-S3, E1-E3) and there are 20 additional segments to discover (10 individual, 10 enterprise).
 
+**Output Schema:**
+
+```json
+{
+  "status": "str — 'discovered', 'not_found' (can retry), or 'exhausted' (all segments identified)",
+  "cost": "float — cost deducted for this attempt, including when exhausted",
+  "remaining_undiscovered": "int — segments still undiscovered after this attempt",
+  "discovered_group_id": "str — group ID if discovered (e.g., 'D_S01'), absent otherwise",
+  "_access": "if 'discovered_group_id' in result: print('Found:', result['discovered_group_id'])"
+}
+```
+
 **Returns:**
 - success: === Market Research Success ===
 Cost: $25,000
@@ -858,8 +1025,9 @@ Use get_group_insights('D_S01') for full parameter estimates.
 Use research_group('D_S01') to improve accuracy.
 - failure: Market research complete ($25,000). No new segments discovered this time. Try again for another chance.
 - no_funds: Insufficient funds. Market research costs $25,000. Available: $12,000
-- data_on_success: {'discovered_group_id': 'D_S01', 'group_name': 'Niche Creators', 'segment': 'Individual', 'info_level': 1, 'cost': 25000}
-- data_on_failure: {'cost': 25000}
+- data_on_success: {'discovered_group_id': 'D_S01', 'cost': 25000, 'status': 'discovered', 'remaining_undiscovered': 19}
+- data_on_failure: {'cost': 25000, 'status': 'not_found', 'remaining_undiscovered': 20}
+- data_when_exhausted: {'cost': 25000, 'status': 'exhausted', 'remaining_undiscovered': 0}
 
 **Impact:** Costs $25,000 per attempt. On success, unlocks a new customer segment with initial parameter estimates.
 
@@ -903,6 +1071,17 @@ Post a social media message on company social media account. You can either post
   "required": [
     "content"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "agent_post_id": "int — ID of the new post in agent_social_media_posts table",
+  "day": "int — day the post was made",
+  "content": "str — the posted content",
+  "reply_to_post_id": "int or null — post being replied to"
 }
 ```
 
@@ -958,11 +1137,21 @@ Set daily spending for operations and development. Advertising spend is set via 
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "updated": "Dict[str, float] — the spend changes applied (only keys you sent)",
+  "current": "Dict[str, float] — final spend {'operations': float, 'development': float}",
+  "_access": "result['current']['operations'] → current ops spend"
+}
+```
+
 **Returns:**
 - success: Daily spend updated: operations=$1000, development=$500
 - failure: Missing spend for X / Spend for X cannot be negative
 
-**Impact:** {'operations': 'CRITICAL: (1) REDUCES OUTAGE PROBABILITY - At $0: ~3% daily outage risk (~1/month). At $500: ~1.1% daily (~3/year). (2) Speeds up issue resolution. The global issue-resolution pool is partitioned by customer group: each group g draws Poisson((base_rate + scale_g × spend) × n_g / total_open_issues), where scale_g = 0.3 for individual groups (S*, D_S*) and 0.05 for enterprise groups (E*, D_E*). So $1 of ops spend resolves ~0.3 individual issues/day vs ~0.05 enterprise issues/day. WARNING: Without ops spending, frequent outages damage reputation and cause churn!', 'development': 'Dev spending improves product quality (amplified by model tier). Global improvement = 0.006 × ln(1 + global_spend/5000) per day (applies to all groups). Targeted per-group improvement = 0.030 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier.'}
+**Impact:** {'operations': 'CRITICAL: (1) REDUCES OUTAGE PROBABILITY - At $0: ~3% daily outage risk (~1/month). At $500: ~1.1% daily (~3/year). (2) Speeds up issue resolution. The global issue-resolution pool is partitioned by customer group: each group g draws Poisson((base_rate + scale_g × spend) × n_g / total_open_issues), where scale_g = 0.3 for individual groups (S*, D_S*) and 0.05 for enterprise groups (E*, D_E*). So $1 of ops spend resolves ~0.3 individual issues/day vs ~0.05 enterprise issues/day. WARNING: Without ops spending, frequent outages damage reputation and cause churn!', 'development': 'Dev spending improves product quality (amplified by model tier). Global improvement = 0.0045 × ln(1 + global_spend/5000) per day plus small random noise (applies to all groups). Targeted per-group improvement = 0.0225 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier.'}
 
 **Example:**
 ```json
@@ -1006,6 +1195,16 @@ Set per-(channel, group) ad spend. THIS IS THE ONLY WAY TO SPEND ON ADVERTISING 
   "required": [
     "targeted_spend"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "targeted_spend": "Dict[str, Dict[str, float]] — {channel: {group: $/day}}",
+  "total_per_day": "float — total ad spend per day",
+  "_access": "result['targeted_spend']['linkedin']['E1'] → E1's LinkedIn spend"
 }
 ```
 
@@ -1063,6 +1262,16 @@ Set ADDITIONAL per-group development spending on top of the global dev spend. Pr
   "required": [
     "targeted_spend"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "targeted_spend": "Dict[str, float] — {group_id: $/day}",
+  "total_extra_per_day": "float — total additional dev spend per day",
+  "_access": "result['targeted_spend']['E1'] → E1's extra dev spend"
 }
 ```
 
@@ -1148,6 +1357,19 @@ Set ADDITIONAL operations spending targeted at specific scopes (group, plan, gro
 }
 ```
 
+**Output Schema:**
+
+```json
+{
+  "by_group": "Dict[str, float]",
+  "by_plan": "Dict[str, float]",
+  "by_group_plan": "Dict[str, Dict[str, float]]",
+  "by_customer": "Dict[str, float] — keys are customer_id as strings",
+  "total_extra_per_day": "float — sum of all scopes",
+  "targeted_spend": "Dict[str, float] — legacy alias for by_group"
+}
+```
+
 **Returns:**
 - success: Targeted ops spend updated (extra $650/day on top of global ops):
   Groups: E1: +$300/day
@@ -1189,11 +1411,20 @@ Set ADDITIONAL operations spending targeted at specific scopes (group, plan, gro
 
 **Python:** `novamind_api.research.list_research_projects(...)`
 
-List all 10 R&D research tiers with their status. Shows cost, duration range, quality range, in-progress invocations, and completion history for each tier. Tiers are repeatable.
+List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, in-progress and completed counts, and total quality boost for each tier. Tiers are repeatable. Query the public research_projects table for individual projects and their dates.
+
+**Output Schema:**
+
+```json
+{
+  "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float). Tier summaries only; query research_projects for individual projects and their dates.",
+  "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
+}
+```
 
 **Returns:**
-- output: All 10 tiers with: cost, duration mean±std, quality mean±std, current status (not started / in progress / completed Nx with total quality)
-- data: {'tiers': [{'tier': 1, 'name': 'Prompt Engineering Optimization', 'cost': 100000, 'mean_days': 35, 'mean_quality_boost': 0.04, 'in_progress': 0, 'completed': 0, 'total_quality_boost': 0}]}
+- output: All 20 tiers with: cost, duration mean±std, quality mean±std, in-progress/completed counts and total quality boost
+- data: {'tiers': [{'tier': 1, 'name': 'Prompt Engineering Optimization', 'cost': 166667, 'mean_days': 12, 'std_days': 12, 'mean_quality_boost': 0.04, 'std_quality_boost': 0.02, 'in_progress': 0, 'completed': 0, 'total_quality_boost': 0}]}
 
 **Impact:** Read-only. No cost. Use to plan R&D investments.
 
@@ -1230,6 +1461,21 @@ Start an R&D research tier. Costs deducted immediately. Completes after sampled 
   "required": [
     "tier"
   ]
+}
+```
+
+**Output Schema:**
+
+```json
+{
+  "project_id": "str — invocation ID (e.g., 't3_1')",
+  "tier": "int — tier number",
+  "name": "str — research project name",
+  "cost": "float — cost deducted",
+  "expected_completion_day": "int — sim day when project completes",
+  "expected_duration_days": "int — days until completion",
+  "expected_quality_boost": "float — sampled quality boost",
+  "_access": "result['expected_completion_day'] → when to expect completion"
 }
 ```
 

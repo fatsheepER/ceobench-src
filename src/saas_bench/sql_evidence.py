@@ -5,7 +5,7 @@ Blob/version storage adapted from provenancefs/store.py at
 every execution has its own version, including identical responses.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -77,6 +78,7 @@ class SQLEvidenceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fault_path = self.path.with_suffix('.fault.json')
         self.fault = None
+        self._local = threading.local()
         with closing(self.connect()) as conn, conn:
             conn.executescript('''
                 CREATE TABLE IF NOT EXISTS identity (value BLOB NOT NULL);
@@ -102,6 +104,9 @@ class SQLEvidenceStore:
                     token TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES requests(event_id),
                     received BLOB);
                 CREATE TABLE IF NOT EXISTS private_state (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+                CREATE INDEX IF NOT EXISTS versions_object_id ON versions(json_extract(metadata, '$.object_id'));
+                CREATE INDEX IF NOT EXISTS versions_event_id ON versions(event_id);
+                CREATE INDEX IF NOT EXISTS client_calls_event_id ON client_calls(event_id);
             ''')
             source = encoded({k: identity[k] for k in ('run_id', 'data_source_id', 'format')})
             existing = conn.execute('SELECT value FROM identity').fetchone()
@@ -207,18 +212,9 @@ class SQLEvidenceStore:
             raise TypeError('Evidence content must be bytes or text')
         version = event + ':' + slot
         sha = digest(payload)
-        with closing(self.connect()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
+        with self._writer() as conn:
             self._visible(conn, event)
-            previous = None
-            if object_id:
-                for row in conn.execute('SELECT version_id,event_id FROM versions WHERE json_extract(metadata, \'$.object_id\')=? ORDER BY rowid DESC', (object_id,)):
-                    try:
-                        self._visible(conn, row['event_id'])
-                        previous = row['version_id']
-                        break
-                    except KeyError:
-                        continue
+            previous = self._latest(conn, object_id)[0] if object_id else None
             record = dict(layer=layer, object_id=object_id, created_by_event=event, extent='full',
                           source_truncated=False, acquired_at=now(),
                           content_time={'status': 'unknown', 'reason': 'not_declared'})
@@ -228,11 +224,61 @@ class SQLEvidenceStore:
                          (version, event, previous, sha, encoded(record)))
         return version
 
+    def _latest(self, conn, object_id, layer=None):
+        # Indexed by versions_object_id; visibility follows the branch ancestry.
+        for row in conn.execute("SELECT version_id,event_id,content_hash FROM versions "
+                                "WHERE json_extract(metadata, '$.object_id')=? "
+                                "AND (? IS NULL OR json_extract(metadata, '$.layer')=?) ORDER BY rowid DESC",
+                                (object_id, layer, layer)):
+            try:
+                self._visible(conn, row['event_id'])
+                return row['version_id'], row['content_hash']
+            except KeyError:
+                continue
+        return None, None
+
+    def latest_version(self, object_id, layer=None):
+        """The newest visible version of an object and its content hash."""
+        conn = getattr(self._local, 'batch', None)
+        if conn is not None:
+            return self._latest(conn, object_id, layer)
+        with closing(self.connect()) as conn:
+            return self._latest(conn, object_id, layer)
+
+    @contextmanager
+    def _writer(self):
+        conn = getattr(self._local, 'batch', None)
+        if conn is not None:
+            yield conn
+            return
+        with closing(self.connect()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            yield conn
+
+    @contextmanager
+    def batch(self):
+        """Group many version writes into one durable transaction (one fsync)."""
+        if getattr(self._local, 'batch', None) is not None:
+            yield
+            return
+        conn = self.connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            self._local.batch = conn
+            yield
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            self._local.batch = None
+            conn.close()
+
     def complete(self, event, status='succeeded', **facts):
         record = dict(status=status, completed_at=None if status == 'result_unknown' else now(),
                       capture_status='missing' if self.fault or self.fault_path.exists() else 'complete', capture_gaps=[])
         record.update(facts)
-        with closing(self.connect()) as conn, conn:
+        with self._writer() as conn:
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
 
     def context(self, event, token=None):
@@ -278,7 +324,7 @@ class SQLEvidenceStore:
                          (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
 
     def save_state(self, name, value):
-        with closing(self.connect()) as conn, conn:
+        with self._writer() as conn:
             conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(value)))
 
     def load_state(self, name):
@@ -380,8 +426,9 @@ class SQLEvidenceStore:
                         delivery=json.loads(delivery[0]) if delivery else
                         dict(send_state='unknown', receive_state='unknown'))
 
-    def get_content(self, version):
-        with closing(self.connect()) as conn:
+    def get_content(self, version, *, connection=None):
+        from contextlib import nullcontext
+        with closing(self.connect()) if connection is None else nullcontext(connection) as conn:
             row = conn.execute('SELECT * FROM versions WHERE version_id=?', (version,)).fetchone()
             if row is None:
                 raise KeyError(version)
@@ -392,7 +439,7 @@ class SQLEvidenceStore:
             return dict(version_id=version, previous_version=row['previous_version'],
                         blob_sha256=row['content_hash'], **json.loads(row['metadata'])), bytes(blob[0])
 
-    def snapshot(self, target):
+    def snapshot(self, target, *, checksum=True):
         self.assert_healthy()
         with closing(self.connect()) as conn, closing(sqlite3.connect(target)) as backup:
             conn.backup(backup)
@@ -400,4 +447,6 @@ class SQLEvidenceStore:
             backup.execute("DELETE FROM private_state WHERE name='admission_paused'")
             backup.commit()
             cutoff = self.sequence(conn)
-        return dict(identity=self.identity, cutoff=cutoff, sha256=digest(Path(target).read_bytes()))
+        from .run_state import file_hash
+        return dict(identity=self.identity, cutoff=cutoff,
+                    sha256=file_hash(target) if checksum else None)

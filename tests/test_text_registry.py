@@ -1,5 +1,6 @@
 """Shared declaration behavior using real Git, captured reads, and model requests."""
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ from saas_bench.sql_evidence import SQLEvidenceStore
 from saas_bench.text_registry import TextRegistry
 from test_sql_evidence import identity
 from test_public_sql import server
-from test_preflight_integration import offline_runner, packed_public
+from test_preflight_integration import offline_runner, packed_public, advance
 
 
 def git(ws, *args):
@@ -34,14 +35,25 @@ def workspace(tmp_path):
 
 def declaration(evidence=None, **changes):
     data = dict(text='Keep the plan', objects=[dict(kind='plan', id='B')],
-                applies_at={'start_day': 7, 'end_day': 14}, reason='Initial observation',
+                applies_at={'start_day': 7}, reason='Initial observation',
                 references=[dict(evidence=evidence or {'unknown': 'No saved evidence'}, purpose='current')])
     data.update(changes)
     return data
 
 
 def call(registry, op, **args):
-    return json.loads(registry.execute(op, args))
+    text = registry.execute(op, args)
+    return json.loads(text) if op == 'list' else registry.last_result
+
+
+RECEIPT = re.compile(r'(Registered|Revised|Retired) (r[1-9][0-9]*)\.([1-9][0-9]*) \((active|retired)\)\.')
+
+
+def receipt(text):
+    """id, version and status of a text receipt, e.g. 'Registered r1.1 (active).'."""
+    match = RECEIPT.match(text)
+    assert match, text
+    return dict(id=match.group(2), version=f'{match.group(2)}.{match.group(3)}', status=match.group(4))
 
 
 def send(store, text, state='response_received'):
@@ -64,7 +76,8 @@ def test_git_lifecycle_pins_references_preserves_history_and_never_copies(worksp
     created = call(registry, 'create', **declaration({'path': 'evidence.json'}))
     assert created == dict(id='r1', version='r1.1', status='active')
     original = json.loads(registry.path.read_text())['records']['r1'][0]
-    assert original['references'][0]['evidence'] == dict(path='evidence.json', commit=head[:7])
+    # A bare path waits for the weekly commit that closes day 7's week.
+    assert original['references'][0]['evidence'] == dict(path='evidence.json', commit='week-2')
     assert head not in registry.path.read_text() and '"n":7' not in registry.path.read_text()
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert git(workspace, 'diff', '--cached', '--name-only') == ''
@@ -81,6 +94,31 @@ def test_git_lifecycle_pins_references_preserves_history_and_never_copies(worksp
     assert len(json.loads(registry.path.read_text())['records']['r1']) == 3
     with pytest.raises(ValueError, match='retired'):
         call(registry, 'revise', record='r1', reason='retry')
+
+
+def test_bare_path_binds_the_weekly_commit_and_week_labels_resolve_after_it(workspace):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from saas_bench.registration_evidence import week_commit_subject
+    registry = TextRegistry(workspace, 'git', sim_day=lambda: 20)
+    (workspace / 'plan.json').write_text('{"v":1}')
+    (workspace / '.gitignore').write_text('*.db\n')
+    (workspace / 'cache.db').write_text('x')
+    call(registry, 'create', **declaration({'path': 'plan.json'}))
+    assert call(registry, 'list')['records'][0]['references'][0]['evidence'] == dict(path='plan.json', commit='week-3')
+    for evidence in ({'path': 'cache.db'}, {'path': 'missing.json'}, {'path': 'plan.json@week-3'}):
+        with pytest.raises(ValueError):
+            call(registry, 'create', **declaration(evidence))
+    (workspace / 'plan.json').write_text('{"v":2}')  # later edits in the week belong to the binding
+    runner = BashAgentRunner.__new__(BashAgentRunner)
+    runner.agent_workspace = workspace
+    runner._commit_weeks_up_to(21)
+    subjects = git(workspace, 'log', '--format=%s').splitlines()
+    assert week_commit_subject('week-3') in subjects
+    assert git(workspace, 'show', 'HEAD:plan.json') == '{"v":2}'
+    call(registry, 'create', **declaration({'path': 'plan.json@week-3'}))
+    call(registry, 'create', **declaration({'path': 'plan.json', 'commit': 'week-2'}))
+    refs = [r['references'][0]['evidence'] for r in call(registry, 'list')['records']]
+    assert refs[1] == dict(path='plan.json', commit='week-3') and refs[2]['commit'] == 'week-2'
 
 
 def test_direct_registered_text_reference_before_commit_and_pagination(workspace):
@@ -116,7 +154,7 @@ def test_notes_and_predicate_fields_are_saved_without_evaluation(workspace):
     ref = dict(evidence={'path': 'evidence.json'}, purpose='historical_only', select={'path': '/n'},
                predicate={'type': 'threshold', 'op': '>=', 'value': 99999}, note='中🙂' * 101)
     result = call(registry, 'create', **declaration(references=[ref]))
-    assert result['warnings'] == ['备注已截至 200 字']
+    assert result['warnings'] == ['Note truncated to 200 characters.']
     saved = call(registry, 'list')['records'][0]['references'][0]
     assert len(saved['note']) == 200 and saved['predicate']['value'] == 99999
     for changes in ({'select': {'row': 3, 'col': 'n'}}, {'predicate': {'type': 'eval', 'code': 'x'}},
@@ -131,9 +169,11 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     with pytest.raises(ValueError, match='not been delivered'):
         call(registry, 'create', **declaration({'path': 'evidence.json'}))
     request = send(store, text)
-    executor.execute('write_file', {'path': 'evidence.json', 'content': '{"n":8}'})
+    # Bytes from another program: captured at the next Bash boundary but never sent.
+    (workspace / 'evidence.json').write_text('{"n":8}')
+    executor.execute('bash', {'command': 'true'})
     result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
-    assert result['evidence'][0] == dict(version='v1', latest='v2', differs=True)
+    assert result['evidence'][0] == dict(version='evidence.json@v1', latest='evidence.json@v2', differs=True)
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert binding['delivered_in'][0]['request_event'] == request
     assert store.get_content(binding['version_id'])[1] == b'{"n":7}'
@@ -144,7 +184,7 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     assert store.load_state('declaration:r1.2')['references'] == [binding]
     call(registry, 'revise', record='r1', reason='New evidence', references=declaration({'path': 'evidence.json'})['references'])
     assert store.load_state('declaration:r1.3')['references'][0]['version_id'] != binding['version_id']
-    with pytest.raises(ValueError, match='use a path'):
+    with pytest.raises(ValueError, match='or a file path'):
         call(registry, 'create', **declaration({'version': 'v999'}))
 
 
@@ -155,34 +195,109 @@ def test_pf_partial_read_selectors_and_latest_delivery_not_latest_capture(worksp
     send(store, text)
     ref = dict(evidence={'path': 'evidence.json'}, purpose='current', select={'path': '/n'})
     call(registry, 'create', **declaration(references=[ref]))
-    for selection in ({'path': '/hidden'}, None):
+    for selection in ({'path': '/hidden'},):
         with pytest.raises(ValueError, match='not fully delivered'):
             call(registry, 'create', **declaration(references=[dict(ref, select=selection)]))
     # An unconfirmed HTTP attempt does not establish delivery.
     full = executor.execute('read_file', {'path': 'evidence.json'})
     send(store, full, state='unknown')
-    with pytest.raises(ValueError, match='not fully delivered'):
-        call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    binding = store.load_state('declaration:' + result['version'])['references'][0]
+    assert binding['reading_scope'] == 'partial'
     send(store, full)
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
 
 
-def test_pf_registered_text_must_be_read_and_retirement_keeps_old_reference(workspace, tmp_path):
+def test_pf_registered_text_cites_directly_like_git_and_retirement_keeps_old_reference(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     call(registry, 'create', **declaration())
-    with pytest.raises(ValueError, match='not been delivered'):
-        call(registry, 'create', **declaration({'record': 'r1.1'}))
-    page = executor.execute('text_list', {})
-    send(store, page)
+    # Design 3.2: registered texts cite each other directly in both groups, unread.
+    result = call(registry, 'create', **declaration({'record': 'r1'}))
+    binding = store.load_state('declaration:r2.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['basis'] == 'registered_text'
+    assert json.loads(store.get_content(binding['version_id'])[1])['version'] == 'r1.1'
+    assert result['evidence'][0]['version'] == 'r1.1'  # a registered text's handle is its revision
+    with pytest.raises(ValueError, match='whole-text'):
+        call(registry, 'create', **declaration(references=[dict(evidence={'record': 'r1.1'}, purpose='current',
+                                                                select={'path': '/text'})]))
+    with pytest.raises(ValueError, match='Unknown registered text'):
+        call(registry, 'create', **declaration({'record': 'r1.9'}))
     call(registry, 'create', **declaration({'record': 'r1.1'}))
     call(registry, 'retire', record='r1', reason='Superseded')
     assert call(registry, 'list')['records'][0]['references'][0]['evidence'] == {'record': 'r1.1'}
     assert len(json.loads(registry.path.read_text())['records']['r1']) == 2
 
 
+def test_pf_files_the_model_wrote_count_as_known_but_script_outputs_do_not(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', {'path': 'plan.json', 'content': '{"price": 99}'})
+    ref = dict(evidence={'path': 'plan.json'}, purpose='current', select={'path': '/price'},
+               predicate=dict(type='threshold', op='>=', value=90))
+    call(registry, 'create', **declaration(references=[ref]))
+    binding = store.load_state('declaration:r1.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['authored_by'] and binding['delivered_in'] == []
+    assert store.get_content(binding['version_id'])[1] == b'{"price": 99}'
+    # A quoted heredoc writes exactly the text in the model's command.
+    executor.execute('bash', {'command': "cat > setup.py <<'EOF'\nPRICE = 9\nEOF"})
+    call(registry, 'create', **declaration({'path': 'setup.py'}))
+    assert store.load_state('declaration:r2.1')['references'][0]['authored_by']
+    # A file computed by a program was neither read nor written by the model.
+    executor.execute('bash', {'command': 'python3 -c "open(\'out.txt\', \'w\').write(str(6 * 7))"'})
+    result = call(registry, 'create', **declaration({'path': 'out.txt'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_in_request'
+    # A later write by another program: the model's own earlier version stays the binding.
+    (workspace / 'plan.json').write_text('{"price": 79}')
+    executor.execute('bash', {'command': 'true'})
+    call(registry, 'create', **declaration({'path': 'plan.json'}))
+    binding = store.load_state('declaration:r4.1')['references'][0]
+    assert store.get_content(binding['version_id'])[1] == b'{"price": 99}'
+    assert binding['version_id'] != binding['latest_version_id']
+
+
+def test_pf_frozen_old_memory_does_not_hide_a_new_authored_version(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    (workspace / 'MEMORY.md').write_text('Old plan\nOld detail\n')
+    frozen = executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1})
+    send(store, frozen)
+    current = 'New plan\nNew detail\n'
+    executor.execute('write_file', {'path': 'MEMORY.md', 'content': current})
+    # Every subsequent request repeats the frozen week-start MEMORY.
+    send(store, frozen)
+    call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    binding = store.load_state('declaration:r1.1')['references'][0]
+    assert binding['authored_by'] and store.get_content(binding['version_id'])[1] == current.encode()
+    # A partial reread of these same authored bytes cannot erase that knowledge.
+    send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
+    call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    assert store.load_state('declaration:r2.1')['references'][0]['version_id'] == binding['version_id']
+    # A newer partial read binds that version without claiming a complete read.
+    (workspace / 'MEMORY.md').write_text('External plan\nUnread detail\n')
+    send(store, executor.execute('read_file', {'path': 'MEMORY.md', 'limit': 1}))
+    result = call(registry, 'create', **declaration({'path': 'MEMORY.md'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'partial'
+
+
+def test_pf_local_edit_is_immediately_citable_by_path_and_handle(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', dict(path='plan.txt', content='budget 100\nprice 20\n'))
+    old = executor.execute('read_file', dict(path='plan.txt', limit=1))
+    edited = executor.execute('edit_file', dict(path='plan.txt', old_string='100', new_string='200'))
+    assert 'wrote plan.txt@v2' in edited
+    send(store, old)  # Repeated frozen context must not hide the edit.
+    for evidence in ({'path': 'plan.txt'}, {'version': 'plan.txt@v2'}):
+        created = call(registry, 'create', **declaration(evidence))
+        binding = store.load_state('declaration:' + created['version'])['references'][0]
+        assert binding['version_id'] == binding['latest_version_id']
+        assert store.get_content(binding['version_id'])[1] == b'budget 200\nprice 20\n'
+        assert store.read_event(binding['authored_by'])['request']['kind'] == 'edit_file'
+    (workspace / 'plan.txt').write_text('external 300\nprice 20\n')
+    assert executor.execute('edit_file', dict(path='plan.txt', old_string='absent', new_string='x')).startswith('Error:')
+    result = call(registry, 'create', **declaration({'version': 'plan.txt@v3'}))
+    assert store.load_state('declaration:' + result['version'])['references'][0]['reading_scope'] == 'not_in_request'
+
+
 @pytest.mark.parametrize('delivered', [False, True])
-def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, monkeypatch, delivered):
-    monkeypatch.setattr('saas_bench.text_registry.now', lambda: 'fixed-time')
+def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(workspace, tmp_path, delivered):
     store, prefix, executor = captured(workspace, tmp_path, 'prefix')
     if delivered:
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))
@@ -244,14 +359,14 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     import shlex
     command = 'python -c ' + shlex.quote('from cli_fixture import cmd_query; from argparse import Namespace; cmd_query(Namespace(session=None, sql=' + repr(sql) + '))')
     result = executor.execute('bash', {'command': command})
-    assert json.loads(result)['row_count'] == 2
+    assert json.loads(result.rsplit('\n[', 1)[0])['row_count'] == 2
     settled(server)
     send(store, result)
     ref = dict(evidence={'sql': sql}, purpose='current', predicate=dict(type='compare',
                left={'row': {'channel': 'search'}, 'col': 'cost'}, op='<',
                right={'row': {'channel': 'social'}, 'col': 'cost'}))
     registered = call(registry, 'create', **declaration(references=[ref]))
-    assert registered['evidence'][0]['version'].startswith('v')
+    assert re.fullmatch(r'query\d+@v1', registered['evidence'][0]['version'])
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert binding['version_id'].endswith(':public_response')
     assert store.read_event(binding['version_id'].rsplit(':', 1)[0])['request']['candidate_sql'] == sql
@@ -278,7 +393,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
     from openai import OpenAI
     from anthropic import Anthropic
     from saas_bench.agents.bash_agent.agent import BashAgent
-    from saas_bench.registration_schema import REGISTRATION_PROMPT
+    from saas_bench.registration_prompt import integrate
     from test_preflight_usage import reply
     requests = []
     def handle(request):
@@ -304,7 +419,7 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         original = BashAgent(get_bash_agent_tool_descriptions(), client, workspace_path=workspace)
         enhanced = BashAgent(get_bash_agent_tool_descriptions(True), client, workspace_path=workspace,
                              text_registration=True, reasoning_effort='low' if api == 'responses' else None)
-        assert enhanced.system_prompt == original.system_prompt + REGISTRATION_PROMPT
+        assert enhanced.system_prompt == integrate(original.system_prompt, pf=False)
         assert enhanced.act('dashboard', 0, False, {'day': 0}).tool == 'text_list'
         request = requests[-1]
         tools = [t.get('function', t) for t in request['tools']]
@@ -335,10 +450,11 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     runner = offline_runner(text_registration='prefix')
     runner.agent.current_day = 0
     runner._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":7}'})
-    result = runner._execute_tool('bash', {'command': 'git add facts.json && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m facts'})
+    # Keep this fixture synchronous: Git's detached maintenance is an open process boundary.
+    result = runner._execute_tool('bash', {'command': 'git add facts.json && git -c maintenance.auto=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -m facts'})
     assert '[exit code:' not in result
     send(runner.evidence_store, runner._execute_tool('read_file', {'path': 'facts.json'}))
-    assert json.loads(runner._execute_tool('text_create', declaration({'path': 'facts.json'})))['version'] == 'r1.1'
+    assert receipt(runner._execute_tool('text_create', declaration({'path': 'facts.json'})))['version'] == 'r1.1'
     page = runner._execute_tool('text_list', {})
     send(runner.evidence_store, page)
     runner._save_checkpoint(0)
@@ -348,19 +464,29 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     restored = offline_runner(runner.workspace_dir)
     assert restored.text_registration == 'prefix'
     assert restored._execute_tool('text_list', {}) == page
-    restored._save_checkpoint(0)
+    # Group forks start at a completed week boundary (design 4.3).
+    assert advance(restored)['success']
+    restored._commit_weeks_up_to(7)
+    restored._save_checkpoint(7)
     children = [offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / mode, mode,
                                            text_registration=mode)) for mode in ('git', 'pf')]
     for child in children:
-        result = json.loads(child._execute_tool('text_create', declaration({'record': 'r1.1'})))
+        result = receipt(child._execute_tool('text_create', declaration({'record': 'r1.1'})))
         assert result['id'] == 'r2'
-        assert ('evidence' in result) == (child.text_registration == 'pf')
-        assert child._execute_tool('pf_query', {}).startswith('Error: Unknown tool')
-        # The only copy of resolved evidence identities is outside the workspace.
+        assert ('evidence' in child.tool_executor.text_registry.last_result) == (child.text_registration == 'pf')
+        history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})
+        if child.text_registration == 'pf':
+            assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
+        else:
+            assert history.startswith('Error: Unknown tool')
+        # The only copy of resolved evidence identities is outside the workspace; a Git
+        # branch neither captures nor receives the prefix evidence.
         assert not list(child.agent_workspace.rglob('*evidence.sqlite'))
-        private = child.workspace_dir / 'sql-evidence.sqlite'
+        if child.text_registration == 'git':
+            assert child.evidence_store is None and not list(child.workspace_dir.rglob('sql-evidence*'))
+        private = restored.workspace_dir / 'sql-evidence.sqlite'
         assert '[exit code:' in child._execute_tool('bash', {'command': 'cat ' + str(private)})
-        child._save_checkpoint(0)
+        child._save_checkpoint(7)
     assert json.loads(restored._execute_tool('text_list', {}))['records'][0]['id'] == 'r1'
     import os
     if destination := os.environ.get('CEOBENCH_REGISTRATION_ARTIFACTS'):
@@ -369,7 +495,8 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
             target = output / branch.text_registration
             target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(branch.agent_workspace / 'registrations.json', target / 'registrations.json')
-            branch.evidence_store.snapshot(target / 'evidence.sqlite')
+            if branch.evidence_store:
+                branch.evidence_store.snapshot(target / 'evidence.sqlite')
         (output / 'validation.json').write_text(json.dumps(dict(
             evidence_kind='constructed_offline_integration', external_model_calls=0,
             stages=['packed CLI', 'captured file read', 'model send', 'declaration',
@@ -414,9 +541,28 @@ def test_prefix_records_git_bytes_mismatch_without_changing_public_reference(wor
     store, registry, executor = captured(workspace, tmp_path, 'prefix')
     (workspace / 'evidence.json').write_text('{"n":99}')
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
-    result = call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    head = git(workspace, 'rev-parse', 'HEAD')[:7]
+    result = call(registry, 'create', **declaration({'path': 'evidence.json@' + head}))
     assert 'evidence' not in result
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert not binding['git_content_matches']
     assert store.get_content(binding['version_id'])[1] == b'{"n":99}'
-    assert call(registry, 'list')['records'][0]['references'][0]['evidence']['commit'] == git(workspace, 'rev-parse', 'HEAD')[:7]
+    assert call(registry, 'list')['records'][0]['references'][0]['evidence']['commit'] == head
+    # A bare path waits for the weekly commit; privately it binds the last delivered version.
+    assert 'evidence' not in call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    binding = store.load_state('declaration:r2.1')['references'][0]
+    assert binding['status'] == 'resolved' and binding['git_week'] == 'week-2' and 'git_content_matches' not in binding
+    assert store.get_content(binding['version_id'])[1] == b'{"n":99}'
+    assert call(registry, 'list')['records'][1]['references'][0]['evidence']['commit'] == 'week-2'
+
+
+def test_applicability_accepts_open_ended_start_and_explains_shapes(workspace):
+    registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
+    # Both groups repeatedly sent {"start_day": N} meaning "until revised" in the free runs.
+    call(registry, 'create', **declaration(applies_at={'start_day': 7}))
+    assert call(registry, 'list')['records'][0]['applies_at'] == {'start_day': 7}
+    for bad in ({'end_day': 7}, {'start_day': 9, 'end_day': 7}, {'day': 7, 'start_day': 7},
+                {'start_day': 7, 'unknown': 'until revised'}):
+        with pytest.raises(ValueError, match='until revised or retired') as error:
+            call(registry, 'create', **declaration(applies_at=bad))
+        assert '"21-27"' in str(error.value) and '"unknown: <reason>"' in str(error.value)

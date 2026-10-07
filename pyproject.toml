@@ -26,6 +26,7 @@ dependencies = [
     # ships them for macOS + Windows. Split by platform so both get a wheel.
     "sqlcipher3-binary>=0.6.0 ; sys_platform == 'linux'",
     "sqlcipher3>=0.6.2 ; sys_platform != 'linux'",
+    "tokenizers==0.23.1",
     "uvicorn>=0.40.0",
     "weasyprint>=68.0",
 ]

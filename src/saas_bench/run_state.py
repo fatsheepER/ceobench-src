@@ -27,7 +27,8 @@ def write_json(path, value):
 
 
 def file_hash(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def tree_hash(path):
@@ -89,8 +90,17 @@ def copy_workspace(source, destination, *, omit_session_world=None):
         if omit_session_world is not None and Path(directory) == source / 'sessions' / omit_session_world:
             ignored.add('world.nmdb')
         return ignored
-    shutil.copytree(source, destination, symlinks=True,
-                    ignore=ignore)
+    def freeze_file(src, dst):
+        # Linux reflinks freeze bytes cheaply. Other filesystems copy while quiescent.
+        import fcntl
+        try:
+            with open(src, 'rb') as reading, open(dst, 'wb') as writing:
+                fcntl.ioctl(writing.fileno(), 0x40049409, reading.fileno())  # FICLONE
+            shutil.copystat(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+        return dst
+    shutil.copytree(source, destination, symlinks=True, ignore=ignore, copy_function=freeze_file)
 
 
 def checkpoint_directory(run, checkpoint):
@@ -114,12 +124,51 @@ def checkpoint_directory(run, checkpoint):
         raise ValueError('Checkpoint workspace checksum mismatch')
     evidence = checkpoint.get('sql_evidence')
     manifest = json.loads((directory / 'manifest.json').read_text())
-    if bool(evidence) != bool(manifest.get('sql_evidence')):
+    dropped = checkpoint.get('dropped_sql_evidence')
+    if dropped:
+        # A Git fork of a captured prefix: the evidence was deliberately not copied.
+        if evidence or dropped['identity'] != manifest.get('sql_evidence'):
+            raise ValueError('Invalid dropped SQL evidence record')
+    elif bool(evidence) != bool(manifest.get('sql_evidence')):
         raise ValueError('Checkpoint SQL evidence is missing or unexpected')
     if evidence and (evidence['identity'] != manifest['sql_evidence'] or
                      file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']):
         raise ValueError('Checkpoint SQL evidence checksum or identity mismatch')
     return directory
+
+
+def checkpoint_manifest(run, directory):
+    """Validate the run's fork/recovery overrides against its frozen manifest."""
+    saved = json.loads((directory / 'manifest.json').read_text())
+    current = json.loads((Path(run) / 'manifest.json').read_text())
+    expected = dict(current)
+    source_hash = file_hash(directory / 'manifest.json')
+    recovery = current.get('recovery_source')
+    if recovery and recovery != saved.get('recovery_source'):
+        if source_hash != recovery['source_manifest_sha256']:
+            raise ValueError('Recovery source manifest mismatch')
+        expected.pop('recovery_source')
+        if 'recovery_source' in saved:
+            expected['recovery_source'] = saved['recovery_source']
+    evidence = current.get('sql_evidence')
+    if evidence != saved.get('sql_evidence') and evidence and evidence.get('source_manifest_sha256'):
+        if source_hash != evidence['source_manifest_sha256']:
+            raise ValueError('Clone source manifest mismatch')
+        expected['sql_evidence'] = saved['sql_evidence']
+        if saved.get('text_registration') == 'prefix' and expected.get('text_registration') == 'pf':
+            expected['text_registration'] = 'prefix'
+            expected.pop('pf_stale_checks', None)
+            expected.pop('pf_read_tokenizer', None)
+    fork = current.get('fork_source')
+    if fork and saved.get('text_registration') == 'prefix':
+        if source_hash != fork['source_manifest_sha256']:
+            raise ValueError('Clone source manifest mismatch')
+        expected.pop('fork_source')
+        expected['sql_evidence'] = saved.get('sql_evidence')
+        expected['text_registration'] = 'prefix'
+    if saved != expected:
+        raise ValueError('Checkpoint configuration differs from run manifest')
+    return current
 
 
 def restore_sql_evidence(run, directory, checkpoint, identity):
@@ -148,7 +197,7 @@ def restore_sql_evidence(run, directory, checkpoint, identity):
         store.assert_healthy()
 
 
-def clone_sql_run(source, destination, branch_id, *, text_registration=None):
+def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_stale_checks=None):
     """Clone a frozen SQL-capture checkpoint, assigning an explicit new branch."""
     import re
     source, destination = Path(source), Path(destination)
@@ -156,25 +205,78 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None):
     directory = checkpoint_directory(source, checkpoint)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', branch_id):
         raise ValueError('Invalid evidence branch ID')
+    if checkpoint.get('context_boundary') != 'new_week':
+        # Design 4.3: fork only after a completed week, before the next Agent call.
+        raise ValueError('Fork snapshots must be taken at a completed week boundary')
     manifest = json.loads((directory / 'manifest.json').read_text())
     parent = manifest['sql_evidence']
+    if pf_stale_checks is not None and text_registration != 'pf':
+        raise ValueError('Stale check setting is chosen when forking a PF branch')
     if text_registration is not None:
         if manifest.get('text_registration') != 'prefix' or text_registration not in ('git', 'pf'):
             raise ValueError('Registration forks must change prefix to git or pf')
         manifest['text_registration'] = text_registration
+        if text_registration == 'pf':
+            from .payload_tokens import tokenizer_config
+            manifest['pf_stale_checks'] = True if pf_stale_checks is None else pf_stale_checks
+            config = manifest['configuration']
+            manifest['pf_read_tokenizer'] = tokenizer_config(config['provider'], config['model'])
     from contextlib import closing
     import sqlite3
-    with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro', uri=True)) as conn:
+    with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro&immutable=1', uri=True)) as conn:
         if conn.execute('SELECT 1 FROM branches WHERE id=?', (branch_id,)).fetchone():
             raise ValueError('Clone branch ID already exists')
     destination.mkdir(parents=True, exist_ok=False)
     target = destination / 'checkpoints' / checkpoint['snapshot_id']
     target.parent.mkdir()
+    source_manifest = file_hash(directory / 'manifest.json')
+    if text_registration == 'git':
+        # A Git branch never uses PF: it neither captures nor receives the prefix
+        # evidence database. The dropped evidence stays recorded for provenance.
+        private = ('sql-evidence.sqlite', 'sql-evidence.controls.jsonl')
+        # Also skip SQLite sidecars (-wal/-shm) that a read-only open may leave behind.
+        shutil.copytree(directory, target, ignore=lambda d, names: {n for n in names if n.startswith('sql-evidence')}
+                        if Path(d) == directory else set())
+        del manifest['sql_evidence']
+        manifest['fork_source'] = dict(source_manifest_sha256=source_manifest, branch_id=branch_id,
+                                       parent_branch=parent['branch_id'], capture='off')
+        checkpoint = dict(checkpoint, files={k: v for k, v in checkpoint['files'].items() if k not in private},
+                          dropped_sql_evidence=dict(checkpoint['sql_evidence'],
+                                                    files={k: v for k, v in checkpoint['files'].items() if k in private}))
+        del checkpoint['sql_evidence']
+    else:
+        shutil.copytree(directory, target)
+        manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
+                                        fork_seq=checkpoint['sql_evidence']['cutoff'],
+                                        source_manifest_sha256=source_manifest)
+    shutil.copy2(source / 'config.json', destination / 'config.json')
+    write_json(destination / 'manifest.json', manifest)
+    write_json(destination / 'checkpoint.json', checkpoint)
+    return destination
+
+
+def recover_run(source, destination):
+    """Start a distinct attempt from the last published generation; never rewind source."""
+    import uuid
+    source, destination = Path(source).resolve(), Path(destination).resolve()
+    if destination.is_relative_to(source):
+        raise ValueError('Recovery destination must be outside the original run')
+    checkpoint = json.loads((source / 'checkpoint.json').read_text())
+    directory = checkpoint_directory(source, checkpoint)
+    manifest = checkpoint_manifest(source, directory)
+    attempt = 'recovery-' + uuid.uuid4().hex[:12]
+    manifest['recovery_source'] = dict(directory=str(source), snapshot_id=checkpoint['snapshot_id'],
+        source_manifest_sha256=file_hash(directory / 'manifest.json'), attempt_id=attempt,
+        usage=dict(agent=checkpoint['usage'], simulator=json.loads((directory / 'server_state.json').read_text())['usage']))
+    if manifest.get('sql_evidence'):
+        parent = checkpoint['sql_evidence']['identity']
+        manifest['sql_evidence'] = dict(parent, branch_id=attempt, parent_branch=parent['branch_id'],
+            fork_seq=checkpoint['sql_evidence']['cutoff'], source_manifest_sha256=file_hash(directory / 'manifest.json'))
+    destination.mkdir(parents=True, exist_ok=False)
+    target = destination / 'checkpoints' / checkpoint['snapshot_id']
+    target.parent.mkdir()
     shutil.copytree(directory, target)
     shutil.copy2(source / 'config.json', destination / 'config.json')
-    manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
-                                    fork_seq=checkpoint['sql_evidence']['cutoff'],
-                                    source_manifest_sha256=file_hash(directory / 'manifest.json'))
     write_json(destination / 'manifest.json', manifest)
     write_json(destination / 'checkpoint.json', checkpoint)
     return destination

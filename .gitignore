@@ -133,11 +133,25 @@ tests/*
 !tests/test_sql_evidence.py
 !tests/test_execution_capture.py
 !tests/test_text_registry.py
+!tests/test_pf_queries.py
+!tests/test_pf_stale.py
+!tests/test_pf_read.py
+!tests/test_pf_acceptance.py
+!tests/test_pf_cli.py
+!tests/test_pf_registration_scope.py
+!tests/test_pf_text_search.py
+!tests/test_pf_review_changes.py
+!tests/test_prefix_week_binding.py
+!tests/test_simulator_service_failures.py
+!tests/test_round4.py
+!tests/test_public_result_contracts.py
+!tests/test_stage5_prep.py
 !tests/test_preflight_*.py
 !tests/preflight_*.py
 !tests/fixtures/
 tests/fixtures/*
 !tests/fixtures/original_bash_agent.json
+!tests/fixtures/round4_pf_commands.json
 tools/
 variants/
 viz/
@@ -162,3 +176,6 @@ cleanup_wiki_layout.py
 rename_to_bossbench.py
 upload_diagrams_to_notion.py
 core.*
+
+# Agent sandbox Python runtime (scripts/build_agent_runtime.py)
+agent-runtime/

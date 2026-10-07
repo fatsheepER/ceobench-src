@@ -471,8 +471,9 @@ Examples:
   ./novamind-operation new-session --days 365 --seed 42
   ./novamind-operation next-week "Holding prices, raising ad spend on E1 to push enterprise pipeline" \
                                   1050000 1000000 1100000  1200000 1050000 1400000  1800000 1400000 2300000  3000000 2000000 4500000
-                                  # rationale (required, non-empty) + 12 cash forecasts:
-                                  # per horizon (+7d/+28d/+84d/+182d), submit point + 95% CI low/high
+                                  # rationale (required, non-empty) + 12 cash forecasts in USD:
+                                  # per horizon (+7d/+28d/+84d/+182d), submit point + 95% CI low/high in USD
+                                  # for 20.7 million USD, submit 20700000 or 20.7e6
   ./novamind-operation python my_strategy.py
   ./novamind-operation python-c "import novamind_api as nm; nm.pricing.set_prices(A=25)"
   ./novamind-operation query "SELECT * FROM subscriptions LIMIT 10"
@@ -492,30 +493,31 @@ Examples:
 
     p = subparsers.add_parser(
         "next-week",
-        help="Advance simulation by one week (7 days). Requires a rationale string + 12 cash forecasts.",
+        help="Advance simulation by one week (7 days). Requires a rationale string + 12 cash forecasts in USD.",
         description=(
             "Advance the simulation by 7 days. You MUST submit:\n"
             "  1. A rationale string (your strategic reasoning for this week's actions, non-empty).\n"
             "  2. Cash forecasts at four horizons (+7d, +28d, +84d, +182d). For EACH horizon submit a "
-            "point estimate plus 95% CI lower and upper bounds (lower <= point <= upper). 12 numbers total. "
+            "point estimate plus 95% CI lower and upper bounds (lower <= point <= upper). All 12 numbers are in USD. "
+            "For 20.7 million USD, submit 20700000 or 20.7e6. "
             "Scored on point-percent-error, CI coverage, and sharpness at each horizon.\n"
             "\n"
             "Rationale replaces the old standalone log_rationale tool — it is now a required argument here."
         ),
     )
     p.add_argument("rationale", type=str, help="Your strategic reasoning for this week's actions (required, non-empty)")
-    p.add_argument("cash_1wk_point",  type=float, help="Point estimate of cash +7 days")
-    p.add_argument("cash_1wk_lower",  type=float, help="95%% CI lower bound, +7 days")
-    p.add_argument("cash_1wk_upper",  type=float, help="95%% CI upper bound, +7 days")
-    p.add_argument("cash_4wk_point",  type=float, help="Point estimate of cash +28 days")
-    p.add_argument("cash_4wk_lower",  type=float, help="95%% CI lower bound, +28 days")
-    p.add_argument("cash_4wk_upper",  type=float, help="95%% CI upper bound, +28 days")
-    p.add_argument("cash_12wk_point", type=float, help="Point estimate of cash +84 days")
-    p.add_argument("cash_12wk_lower", type=float, help="95%% CI lower bound, +84 days")
-    p.add_argument("cash_12wk_upper", type=float, help="95%% CI upper bound, +84 days")
-    p.add_argument("cash_26wk_point", type=float, help="Point estimate of cash +182 days (~6 months)")
-    p.add_argument("cash_26wk_lower", type=float, help="95%% CI lower bound, +182 days")
-    p.add_argument("cash_26wk_upper", type=float, help="95%% CI upper bound, +182 days")
+    p.add_argument("cash_1wk_point",  type=float, help="Point estimate of cash in USD, +7 days")
+    p.add_argument("cash_1wk_lower",  type=float, help="95%% CI lower bound in USD, +7 days")
+    p.add_argument("cash_1wk_upper",  type=float, help="95%% CI upper bound in USD, +7 days")
+    p.add_argument("cash_4wk_point",  type=float, help="Point estimate of cash in USD, +28 days")
+    p.add_argument("cash_4wk_lower",  type=float, help="95%% CI lower bound in USD, +28 days")
+    p.add_argument("cash_4wk_upper",  type=float, help="95%% CI upper bound in USD, +28 days")
+    p.add_argument("cash_12wk_point", type=float, help="Point estimate of cash in USD, +84 days")
+    p.add_argument("cash_12wk_lower", type=float, help="95%% CI lower bound in USD, +84 days")
+    p.add_argument("cash_12wk_upper", type=float, help="95%% CI upper bound in USD, +84 days")
+    p.add_argument("cash_26wk_point", type=float, help="Point estimate of cash in USD, +182 days (~6 months)")
+    p.add_argument("cash_26wk_lower", type=float, help="95%% CI lower bound in USD, +182 days")
+    p.add_argument("cash_26wk_upper", type=float, help="95%% CI upper bound in USD, +182 days")
     p.add_argument("--session", type=str, default=None, help="Session ID (default: latest)")
 
     p = subparsers.add_parser("python", help="Execute a Python script with novamind_api")

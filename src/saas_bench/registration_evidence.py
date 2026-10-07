@@ -1,5 +1,5 @@
 """Resolve declaration references against captured versions and actual model sends."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 import csv
 import io
 import json
@@ -7,7 +7,22 @@ from pathlib import PurePosixPath
 import re
 import subprocess
 
-from .execution_capture import decoded
+from . import evidence_handles
+from .evidence_handles import HANDLES  # noqa: F401  (re-exported for callers)
+
+
+WEEK_LABEL = re.compile('week-[1-9][0-9]*')
+
+
+def week_label(day):
+    """Label of the weekly harness commit that closes the week containing day."""
+    return f'week-{max(day or 0, 0) // 7 + 1}'
+
+
+def week_commit_subject(label):
+    # Must equal the runner's weekly commit message (`_commit_weeks_up_to`).
+    week = int(label.split('-')[1])
+    return f'Week {week} (day {week * 7}) [{label}]'
 
 
 def git_reference(workspace, evidence):
@@ -29,6 +44,12 @@ def git_reference(workspace, evidence):
         return result.stdout.decode().strip()
     if commit is None:
         full = git('rev-parse', '--verify', 'HEAD^{commit}')
+    elif WEEK_LABEL.fullmatch(commit):
+        subject = week_commit_subject(commit)
+        matches = [line[:40] for line in git('log', '--format=%H %s').splitlines() if line[41:] == subject]
+        if not matches:
+            raise ValueError('That weekly commit does not exist yet; a bare path cites this week\'s file')
+        full = matches[-1]
     else:
         if not re.fullmatch('[0-9a-fA-F]{1,40}', commit):
             raise ValueError('Commit must be a unique hexadecimal prefix')
@@ -42,7 +63,23 @@ def git_reference(workspace, evidence):
     if git('cat-file', '-t', full + ':' + path) != 'blob':
         raise ValueError('Reference must name a committed file')
     # No git show, checkout, snapshot, or commit: existence checking reads no cited contents.
-    return dict(path=path, commit=full[:7]), full
+    return dict(path=path, commit=commit if WEEK_LABEL.fullmatch(commit or '') else full[:7]), full
+
+
+def weekly_reference(workspace, path, label):
+    """Cite a working-tree file as the weekly harness commit labelled `label` will store it."""
+    p = PurePosixPath(path)
+    if not path or p.is_absolute() or '..' in p.parts or p.as_posix() != path or '\x00' in path:
+        raise ValueError('Evidence path must be a normalized workspace-relative file path')
+    target = workspace / path
+    if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(workspace):
+        raise ValueError('Reference must name an existing workspace file, or use unknown with a reason')
+    ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', '--', path],
+                             capture_output=True, timeout=10)
+    if ignored.returncode == 0:
+        raise ValueError('File is ignored by Git and never committed; use unknown with a reason')
+    # Bound silently to that week's closing commit; later edits in the week are included.
+    return dict(path=path, commit=label)
 
 
 def json_spans(text):
@@ -159,7 +196,7 @@ def select_row(rows, columns, selector):
     matches = [i for i, row in enumerate(rows) if all(k in row and equal(row[k], v)
                 for k, v in selector['row'].items())]
     if len(matches) != 1:
-        raise ValueError('Row selector must match exactly one row')
+        raise ValueError('Row selector must match exactly one row; matched ' + ('no rows' if not matches else 'multiple rows'))
     return matches[0]
 
 
@@ -177,24 +214,37 @@ def covered(wanted, occurrences):
 class EvidenceResolver:
     def __init__(self, store):
         self.store = store
+        self._cache = None
 
-    def content(self, version):
+    @contextmanager
+    def cached(self):
+        previous = self._cache
+        if previous is None:
+            self._cache = {}
+            self._cache_bytes = 0
+            self.read_stats = dict(verified_reads=0, verified_bytes=0, cache_hits=0)
         try:
-            return self.store.get_content(version)
+            yield
+        finally:
+            self._cache = previous
+
+    def content(self, version, *, connection=None):
+        try:
+            if self._cache is not None and version in self._cache:
+                self.read_stats['cache_hits'] += 1
+                return self._cache[version]
+            value = self.store.get_content(version, **({'connection': connection} if connection is not None else {}))
+            if self._cache is not None:
+                self.read_stats['verified_reads'] += 1
+                self.read_stats['verified_bytes'] += len(value[1])
+            # Per-operation verified bytes; bounded memory, no cross-check integrity bypass.
+            if self._cache is not None and self._cache_bytes + len(value[1]) <= 32 * 1024 * 1024:
+                self._cache[version] = value
+                self._cache_bytes += len(value[1])
+            return value
         except (KeyError, ValueError) as exc:
             self.store.fail(exc)
             raise RuntimeError('Captured evidence is missing or corrupt; collection stopped') from exc
-
-    def versions(self):
-        with closing(self.store.connect()) as conn:
-            result = []
-            for row in conn.execute('SELECT version_id,event_id,metadata FROM versions ORDER BY rowid DESC'):
-                try:
-                    self.store._visible(conn, row['event_id'])
-                except KeyError:
-                    continue
-                result.append((row['version_id'], json.loads(row['metadata'])))
-        return result
 
     def identity(self, version):
         meta, body = self.content(version)
@@ -205,7 +255,7 @@ class EvidenceResolver:
             raw, _ = self.content(meta['derived_from'])
             return meta['derived_from'], raw['object_id'], body.decode(), 'query'
         if meta['layer'] == 'file_bytes':
-            return version, meta['object_id'], decoded(body), 'file'
+            return version, meta['object_id'], body.decode('utf-8'), 'file'
         if meta['layer'] == 'registered_text':
             return version, meta['object_id'], body.decode(), 'record'
         event = self.store.read_event(meta['created_by_event'])
@@ -215,91 +265,215 @@ class EvidenceResolver:
         # observations. They can be cited by handle without inventing an update chain.
         return version, meta.get('object_id') or version, body.decode(), 'other'
 
-    def handle(self, version):
-        # Branch-qualified state prevents a fork from inheriting another branch's handles.
-        name = 'registration_handles:' + self.store.identity['branch_id']
-        handles = self.store.load_state(name) or {}
-        if version not in handles.values():
-            handles['v' + str(len(handles) + 1)] = version
-            self.store.save_state(name, handles)
-        return next(k for k, v in handles.items() if v == version)
+    def handle(self, version, allocate=True):
+        """Agent-facing handle, e.g. forecast.json@v3; see evidence_handles."""
+        return evidence_handles.index(self.store).name(version, allocate)
 
-    def resolve(self, evidence, reference):
-        versions = self.versions()
-        explicit = None
-        if 'version' in evidence:
-            handles = self.store.load_state('registration_handles:' + self.store.identity['branch_id']) or {}
-            explicit = handles.get(evidence['version'])
-            if explicit is None:
-                raise ValueError('Unknown version handle; use a path or SQL instead')
-            _, object_id, _, kind = self.identity(explicit)
-        elif 'path' in evidence:
-            object_id, kind = evidence['path'], 'file'
-        elif 'record' in evidence:
-            object_id, kind = 'record:' + evidence['record'].split('.')[0], 'record'
-        elif 'sql' in evidence:
-            object_id, kind = None, 'query'
-        else:
-            raise ValueError('Unsupported PF evidence reference')
-        candidates = []
-        for version, meta in versions:
-            if kind != 'other' and meta['layer'] not in ('file_bytes', 'server_public_response', 'registered_text'):
-                continue
-            if kind == 'query' and 'sql' in evidence:
-                event = self.store.read_event(meta['created_by_event'])
-                if event['request'].get('candidate_sql') != evidence['sql']:
-                    continue
-            elif (meta.get('object_id') or version) != object_id:
-                continue
-            candidates.append(version)
-        if not candidates:
-            raise ValueError('No captured evidence exists; use unknown with a reason')
-        latest = candidates[0]
-        for occurrence_version, meta in versions:
-            if meta['layer'] != 'model_source_occurrences':
-                continue
-            event = self.store.read_event(meta['created_by_event'])
+    def lookup(self, handle):
+        return evidence_handles.index(self.store).lookup(handle)
+
+    @contextmanager
+    def binding_scope(self, request_event=None, context_id=None):
+        """Share one originating request's verified sources across all references."""
+        previous = getattr(self, '_binding_context', None)
+        self._binding_context = dict(request_event=request_event, context_id=context_id)
+        try:
+            with self.cached():
+                yield
+        finally:
+            self._binding_context = previous
+
+    def _request_sources(self):
+        from .execution_capture import CURRENT_EVENT
+        scope = self._binding_context
+        if 'sources' in scope:
+            return scope
+        handles = evidence_handles.index(self.store)
+        handles.refresh()
+        if CURRENT_EVENT.get() and not scope['request_event']:
+            facts = self.store.read_event(CURRENT_EVENT.get())['request']
+            scope.update(request_event=facts.get('model_request_event'), context_id=facts.get('model_context_id'))
+        # Offline callers and old captures lack batch origin facts. Stay in their
+        # latest context; never look through earlier weeks for a better read.
+        if not scope['request_event'] and not scope['context_id'] and handles.model_requests:
+            scope['context_id'] = handles.model_requests[-1][1]
+            for event, context in reversed(handles.model_requests):
+                if context != scope['context_id']:
+                    break
+                result = self.store.read_event(event)['result']
+                if result.get('send_state') == 'response_received' and result.get('status') == 'succeeded':
+                    scope['request_event'] = event
+                    break
+        scope['sources'] = {}
+        if scope['request_event']:
+            event = self.store.read_event(scope['request_event'])
+            if event['request']['kind'] != 'model_request' or (
+                    scope['context_id'] != event['request']['request'].get('context_id')):
+                raise ValueError('Registration origin does not match its model context')
             if (event['result'].get('send_state') != 'response_received' or
                     event['result'].get('status') != 'succeeded'):
-                continue
-            occurrences = json.loads(self.content(occurrence_version)[1])
-            # Newest acquired evidence in the last actual request wins, regardless of
-            # message field ordering (old tool messages often recur in the same request).
+                raise ValueError('Registration requires a successful originating model request')
+            for slot in (':occurrences', ':reconstructed'):
+                version = scope['request_event'] + slot
+                if version not in event['outputs']:
+                    continue
+                for item in json.loads(self.content(version)[1]):
+                    source, _, content, kind = self.identity(item['version_id'])
+                    scope['sources'].setdefault(source, []).append((item, content, kind))
+        return scope
+
+    def _current_write(self, version, scope):
+        handles = evidence_handles.index(self.store)
+        meta, _ = self.content(version)
+        kind, facts, day = handles.events[meta['created_by_event']]
+        context = facts.get('model_context_id')
+        outside = context != scope['context_id'] if context is not None else day != handles.day
+        if outside:
+            return False
+        # Only successful writes count; a before-snapshot is not authored evidence.
+        if meta['layer'] != 'file_bytes' or not version.endswith('_after'):
+            return False
+        event = self.store.read_event(meta['created_by_event'])
+        return (event['result'].get('status') == 'succeeded' and
+                meta.get('object_id') in event['result'].get('changed_paths',
+                                                          event['result'].get('written_paths', [])))
+
+    def resolve(self, evidence, reference, accept=None):
+        if getattr(self, '_binding_context', None) is None:
+            with self.binding_scope():
+                return self.resolve(evidence, reference, accept)
+        handles = evidence_handles.index(self.store)
+        handles.refresh()
+        members = None
+        if 'version' in evidence:
+            named = self.lookup(evidence['version'])
+            if not named:
+                raise ValueError('Unknown version handle; cite the handle shown in a [pf: ...] line, or a file path')
+            members = set(named)
+            _, object_id, _, kind = self.identity(named[-1])
+            groups = handles.versions(named[-1])
+        elif 'path' in evidence:
+            object_id, kind = evidence['path'], 'file'
+            groups = handles.groups.get(('file', object_id), [])
+        elif 'record' in evidence:
+            object_id, kind = 'record:' + evidence['record'].split('.')[0], 'record'
+            with closing(self.store.connect()) as conn:
+                candidates = [row[0] for row in conn.execute(
+                    "SELECT version_id FROM versions WHERE json_extract(metadata, '$.object_id')=? ORDER BY rowid DESC",
+                    (object_id,)) if row[0] in handles.info]
+            groups = []
+        elif 'sql' in evidence:
+            object_id, kind = None, 'query'
+            groups = [group for key, history in handles.groups.items()
+                      if key[0] == 'query' and json.loads(key[1])[3] == evidence['sql'] for group in history]
+        else:
+            raise ValueError('Unsupported PF evidence reference')
+        if kind != 'record':
+            candidates = [v for group in reversed(groups) for v in reversed(group['members'])]
+        if not candidates:
+            raise ValueError('No captured evidence exists for this reference; cite a captured handle or use unknown with a reason')
+        latest = candidates[0]
+        if members is not None:
+            candidates = [c for c in candidates if c in members]
+        if accept is not None:
+            candidates = [c for c in candidates if accept(c)]
+            if not candidates:
+                raise ValueError('The committed bytes were never captured')
+        predicate = reference.get('predicate', {})
+        whole = not reference.get('select') and not predicate
+        if kind == 'record':
+            if not whole:
+                raise ValueError('Registered text supports whole-text equality only')
+            wanted = evidence.get('record', '')
             for candidate in candidates:
-                if explicit and candidate != explicit:
+                if '.' in wanted and json.loads(self.content(candidate)[1])['version'] != wanted:
                     continue
-                matches = []
-                for item in occurrences:
-                    source, _, content, source_kind = self.identity(item['version_id'])
-                    if source == candidate:
-                        matches.append((item, content, source_kind))
-                if not matches:
-                    continue
-                wanted_record = evidence.get('record', '')
-                if '.' in wanted_record:
-                    record = json.loads(self.content(candidate)[1])
-                    if record['version'] != wanted_record:
-                        continue
-                predicate = reference.get('predicate', {})
-                if kind == 'record' and (reference.get('select') or predicate):
-                    raise ValueError('Registered text supports whole-text equality only')
-                if predicate.get('type') == 'compare' and kind != 'query':
-                    raise ValueError('compare requires one query view')
-                selectors = ([predicate['left'], predicate['right']] if predicate.get('type') == 'compare'
-                             else [reference.get('select')])
-                for source_version in dict.fromkeys(item['version_id'] for item, _, _ in matches):
-                    group = [(item, content) for item, content, _ in matches if item['version_id'] == source_version]
-                    text = group[0][1]
-                    content_kind = ('csv' if str(object_id).endswith('.csv') else 'json')
-                    if kind == 'file' and not str(object_id).endswith(('.csv', '.json')) and any(selectors):
-                        raise ValueError('Plain text supports whole-text equality only')
-                    ranges = [r for select in selectors for r in selected_ranges(text, select, content_kind)]
-                    if covered(ranges, [item for item, _ in group]):
-                        candidate_meta, _ = self.content(candidate)
-                        return dict(version_id=candidate, latest_version_id=latest,
-                                    source_truncated=candidate_meta['source_truncated'],
-                                    delivered_in=[dict(request_event=meta['created_by_event'], occurrence=item)
-                                                  for item, _ in group], selected_ranges=ranges)
-                # Never silently fall back to an older, more fully read version.
-                raise ValueError('Selected evidence was not fully delivered to the model; use unknown with a reason')
-        raise ValueError('Evidence has not been delivered to the model; use unknown with a reason')
+                return dict(version_id=candidate, latest_version_id=latest, source_truncated=False,
+                            delivered_in=[], basis='registered_text')
+            raise ValueError('Unknown registered text revision; use unknown with a reason')
+        scope = self._request_sources()
+        selectors = ([predicate['left'], predicate['right']] if predicate.get('type') == 'compare'
+                     else [reference.get('select')])
+        if predicate.get('type') == 'compare' and kind != 'query':
+            raise ValueError('compare requires one query view')
+        if kind in ('file', 'other') and not str(object_id).endswith(('.csv', '.json')) and any(selectors):
+            raise ValueError('Plain text supports whole-text equality only')
+        for candidate in candidates:
+            matches = scope['sources'].get(candidate, [])
+            written = kind == 'file' and self._current_write(candidate, scope)
+            authored = written and self.authored(candidate)
+            if written and (whole or authored) and (not whole or not matches):
+                if whole:
+                    return self._whole_binding(candidate, latest, [], 'written', fully_known=authored)
+                meta, raw = self.content(candidate)
+                return dict(version_id=candidate, latest_version_id=latest, source_truncated=False,
+                            delivered_in=[], authored_by=meta['created_by_event'],
+                            selected_ranges=selected_ranges(raw.decode(), reference.get('select'),
+                                                            'csv' if str(object_id).endswith('.csv') else 'json'))
+            if not matches:
+                if written:
+                    raise ValueError('Selected evidence was not fully delivered in this request; read the computed file first')
+                continue
+            for source_version in dict.fromkeys(item['version_id'] for item, _, _ in matches):
+                group = [(item, content) for item, content, _ in matches if item['version_id'] == source_version]
+                text = group[0][1]
+                delivery = [dict(request_event=scope['request_event'], occurrence=item) for item, _ in group]
+                if whole:
+                    return self._whole_binding(candidate, latest, delivery, 'observed', fully_known=authored)
+                ranges = [r for select in selectors for r in selected_ranges(
+                    text, select, 'csv' if str(object_id).endswith('.csv') else 'json')]
+                if covered(ranges, [item for item, _ in group]):
+                    meta, _ = self.content(candidate)
+                    return dict(version_id=candidate, latest_version_id=latest,
+                                source_truncated=meta['source_truncated'], delivered_in=delivery, selected_ranges=ranges)
+            raise ValueError('Selected evidence was not fully delivered in this request; use unknown with a reason')
+        if whole and (members is not None or accept is not None):
+            return self._whole_binding(candidates[0], latest, [],
+                                       'explicit_handle' if members is not None else 'committed_bytes')
+        if kind == 'query':
+            raise ValueError('Evidence has not been delivered in this request: cite the command output by the '
+                             'first handle in its [pf: ...] line, or read the query version first')
+        raise ValueError('Evidence has not been delivered in this request or written in this context; '
+                         'read it first, cite an explicit whole version, or use unknown with a reason')
+
+    def _whole_binding(self, version, latest, delivered, basis, fully_known=False):
+        from .pf_queries import PUBLIC_LAYERS
+        meta, raw = self.content(version)
+        if meta['layer'] not in PUBLIC_LAYERS or meta.get('pf_retrieval'):
+            raise ValueError('Only public captured evidence can be cited')
+        if meta['extent'] != 'full' or meta['source_truncated']:
+            raise ValueError('Only part of this object was captured; cite a complete captured output or use unknown')
+        ranges = [item['occurrence'] for item in delivered]
+        full = covered([(0, len(raw.decode('utf-8')))], ranges)
+        result = dict(version_id=version, latest_version_id=latest, source_truncated=False,
+                    basis=basis, delivered_in=delivered, capture_extent=meta['extent'],
+                    reading_scope='full' if full else 'authored' if fully_known else 'partial' if ranges else 'not_in_request',
+                    read_ranges=[item['source_range'] for item in ranges])
+        if fully_known:
+            result['authored_by'] = meta['created_by_event']
+        return result
+
+    def authored(self, version):
+        """Whether the model wrote or successfully edited this captured file version.
+
+        write_file writes its content argument verbatim; a Bash command counts only when
+        the complete decoded file text appears in the command the model wrote (for
+        example a quoted heredoc). Successful edit_file calls own their resulting
+        snapshot; their internal reads do not count as model delivery.
+        """
+        meta, raw = self.content(version)
+        if meta['layer'] != 'file_bytes':
+            return False
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+        event = self.store.read_event(meta['created_by_event'])
+        request = event['request']
+        args = request.get('request') or {}
+        if request['kind'] == 'edit_file':
+            return (version.endswith('_after') and event['result'].get('status') == 'succeeded'
+                    and meta['object_id'] in event['result'].get('written_paths', []))
+        if request['kind'] == 'write_file':
+            return args.get('content') == text
+        return request['kind'] == 'bash' and bool(text) and text in (args.get('command') or '')

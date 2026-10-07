@@ -9,7 +9,8 @@ import pytest
 
 from saas_bench.agents.bash_agent.agent import BashAgent
 from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
-from test_text_registry import captured, declaration, git, send, workspace
+from saas_bench.registration_evidence import HANDLES
+from test_text_registry import captured, declaration, git, receipt, send, workspace
 from test_public_sql import server
 from test_preflight_integration import offline_runner, packed_public, advance
 
@@ -21,6 +22,12 @@ def original_prompt(days):
     # Frozen inputs from the design's original source baseline, not the current
     # prompt generator. Keep the fixture independent of shallow Git checkouts.
     sim = ORIGINAL['simulator_instructions'].replace('{tool_list}\n', '').replace('{tool_list}', '')
+    # User-approved common repair (2026-09-27): the original sentence contradicted the
+    # simulator, where ads_strength defaults to 0 and never scales lead generation.
+    sim = sim.replace('- `ads_strength` is a multiplier on ad effectiveness (default 1.0) — increase it to amplify '
+                      'lead generation from all ad spend',
+                      '- `ads_strength` (0–1, default 0) controls in-app ads only; it does not change how many '
+                      'leads ad spend generates')
     years = days / 365
     return (ORIGINAL['system_template'].replace('{simulator_instructions}', sim)
             .replace('{total_days}', str(days))
@@ -77,7 +84,8 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     import httpx
     from openai import OpenAI
     from anthropic import Anthropic
-    from saas_bench.registration_schema import REGISTRATION_PROMPT
+    from saas_bench.registration_prompt import MEMORY_HEADER, integrate
+    from saas_bench.agents.bash_agent.tools import NOTE_TOOLS
     from saas_bench.model_usage import ModelUsage
     store, registry, executor = captured(workspace, tmp_path, mode if mode != 'off' else 'git')
     registry.execute('create', declaration(text='DO_NOT_AUTOLOAD_REGISTRATIONS'))
@@ -94,18 +102,24 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     with (Anthropic if api == 'messages' else OpenAI)(api_key='offline-only', max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(handle))) as client:
         def new_agent():
-            value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off'), client,
-                workspace_path=workspace, total_days=42, text_registration=mode != 'off',
+            value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off', mode == 'pf'), client,
+                workspace_path=workspace, total_days=42, text_registration=mode != 'off', pf=mode == 'pf',
                 reasoning_effort='low' if api == 'responses' else None,
                 usage_recorder=ModelUsage(None, 'agent', evidence_store=store))
             value._snapshot_path = workspace / 'conversation.json'
             return value
         first = new_agent()
         assert first.act('dashboard', 0, False, {'day': 0}).tool == 'read_file'
-        base = original_prompt(42) + (REGISTRATION_PROMPT if mode != 'off' else '')
-        expected = (base + '\n\n## Your MEMORY.md (auto-loaded)\n\n'
-            'The following is the contents of your MEMORY.md file. '
-            'This is automatically loaded into your context at the start of every day.\n\n' + memory[:40000] +
+        if mode == 'off':
+            header = ('\n\n## Your MEMORY.md (auto-loaded)\n\nThe following is the contents of your MEMORY.md '
+                      'file. This is automatically loaded into your context at the start of every day.\n\n')
+            base = original_prompt(42)
+        else:
+            # Registration groups: sections integrated in place, weekly wording, one history line.
+            history = '[pf: MEMORY.md@v1, written day 0 | 1 version: pf log MEMORY.md]\n' if mode == 'pf' else ''
+            header = MEMORY_HEADER + history + '\n'
+            base = integrate(original_prompt(42), pf=mode == 'pf')
+        expected = (base + header + memory[:40000] +
             '\n\n--- MEMORY.md TRUNCATED ---\n' + f'Showing first 40,000 of {len(memory):,} characters. '
             'Use the read_file tool to see the full contents if needed.')
         assert system(requests[0]).encode() == expected.encode()
@@ -115,6 +129,11 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             item.pop('type', None)
             if 'input_schema' in item:
                 item['parameters'] = item.pop('input_schema')
+        if mode == 'pf':
+            # PF adds only the optional note to the three tools that produce outputs and files.
+            for item in definitions[:6]:
+                assert ('note' in item['parameters']['properties']) == (item['name'] in NOTE_TOOLS)
+                item['parameters']['properties'].pop('note', None)
         assert definitions[:6] == ORIGINAL['tools']
         assert [t['name'] for t in definitions[6:]] == ([] if mode == 'off' else
             ['text_create', 'text_revise', 'text_retire', 'text_list'])
@@ -186,16 +205,19 @@ def test_memory_cannot_import_private_files_through_a_symlink(workspace, tmp_pat
 
 @pytest.mark.parametrize('delivery', ['missing', 'same', 'changed', 'partial'])
 def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypatch, delivery):
-    monkeypatch.setattr('saas_bench.text_registry.now', lambda: '2026-09-25T00:00:00Z')
     from saas_bench.text_registry import TextRegistry
     store, prefix, executor = captured(workspace, tmp_path, 'prefix')
+    # Bytes written by another program (not by the model's own tool call) followed by a
+    # Bash boundary, so only reads establish delivery.
     if delivery == 'partial':
-        executor.execute('write_file', {'path': 'evidence.json', 'content': '{\n"n":7,\n"other":8\n}'})
+        (workspace / 'evidence.json').write_text('{\n"n":7,\n"other":8\n}')
+        executor.execute('bash', {'command': 'true'})
         send(store, executor.execute('read_file', {'path': 'evidence.json', 'limit': 2}))
     elif delivery != 'missing':
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))
         if delivery == 'changed':
-            executor.execute('write_file', {'path': 'evidence.json', 'content': '{"n":9}'})
+            (workspace / 'evidence.json').write_text('{"n":9}')
+            executor.execute('bash', {'command': 'true'})
     twin = tmp_path / 'git-twin'
     shutil.copytree(workspace, twin)
     control = TextRegistry(twin, 'git', sim_day=lambda: 7)
@@ -215,17 +237,21 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
         left, right = prefix.execute(op, args), control.execute(op, args)
         assert left.encode() == right.encode()
         assert prefix.path.read_bytes() == control.path.read_bytes()
+        # The week-start check is part of what the Agent sees, so it must match too.
+        assert prefix.weekly_check(14) == control.weekly_check(14)
         outputs.append(dict(operation=op, output=left))
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert (workspace / '.git/index').read_bytes() == index
     binding = store.load_state('declaration:r1.1')['references'][0]
-    assert binding['status'] == ('unknown' if delivery in ('missing', 'partial') else 'resolved')
+    assert binding['status'] == ('unknown' if delivery == 'missing' else 'resolved')
+    if delivery == 'partial':
+        assert binding['reading_scope'] == 'partial'
     if delivery in ('same', 'changed'):
         assert (binding['version_id'] != binding['latest_version_id']) == (delivery == 'changed')
     for forbidden in ('delivered_in', 'version_id', 'git_content_matches', head):
         assert forbidden not in prefix.path.read_text()
         assert forbidden not in json.dumps(outputs)
-    assert not store.load_state('registration_handles:' + store.identity['branch_id'])
+    assert not store.load_state(HANDLES)
     # Once created, common list must not consult the evidence resolver at all.
     monkeypatch.setattr(prefix.resolver, 'resolve', lambda *a: pytest.fail('list resolved dependencies'))
     assert prefix.execute('list', {}) == control.execute('list', {})
@@ -251,12 +277,18 @@ def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspa
     assert '{"n":7}' not in registry.path.read_text()
     assert not re.search(r'\b[0-9a-f]{8,64}\b', registry.path.read_text())
     original = registry.path.read_bytes()
-    (workspace / 'new.json').write_text('{"n":1}')
     for evidence in ({'path': 'new.json'}, {'sql': 'SELECT 1'}, {'version': 'v1'},
-                     {'path': 'evidence.json', 'commit': 'f' * 40}):
+                     {'path': 'evidence.json', 'commit': 'f' * 40}, {'path': 'new.json@week-1'}):
         with pytest.raises(ValueError):
             registry.execute('create', declaration(evidence))
         assert registry.path.read_bytes() == original
+    # An uncommitted file binds the weekly commit label without committing or copying it.
+    (workspace / 'new.json').write_text('{"n":1}')
+    registry.execute('create', declaration({'path': 'new.json'}))
+    assert json.loads(registry.execute('list', {}))['records'][-1]['references'][0]['evidence'] == dict(
+        path='new.json', commit='week-1')
+    assert (workspace / '.git/index').read_bytes() == index and git(workspace, 'rev-parse', 'HEAD') == head
+    assert '{"n":1}' not in registry.path.read_text()
     executor = BashAgentToolExecutor(workspace, text_registry=registry)
     error = executor.execute('text_create', declaration({'version': 'a' * 64}))
     assert error.startswith('Error:') and 'a' * 64 not in error
@@ -269,7 +301,7 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
     prefix._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":7}'})
     prefix._git_commit_workspace('saved facts')
     send(prefix.evidence_store, prefix._execute_tool('read_file', {'path': 'facts.json'}))
-    assert json.loads(prefix._execute_tool('text_create', declaration({'path': 'facts.json'})))['id'] == 'r1'
+    assert receipt(prefix._execute_tool('text_create', declaration({'path': 'facts.json'})))['id'] == 'r1'
     prefix._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":8}'})
     # Reach the specified fork boundary: completed week, before the next model call.
     assert advance(prefix)['success']
@@ -291,14 +323,17 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
         assert not list(child.agent_workspace.rglob('*.sqlite'))
         assert not re.search(r'(?i)(evidence|provenance|bindings).*\.sqlite', child._git('ls-tree', '-r', '--name-only', 'HEAD').stdout)
         probes = {}
-        private_paths = [child.evidence_store.path, prefix.evidence_store.path,
-                         snapshot / 'sql-evidence.sqlite', child.workspace_dir / 'manifest.json']
+        if mode == 'git':
+            # The Git branch neither captures nor receives the prefix evidence database.
+            assert child.evidence_store is None and not list(child.workspace_dir.rglob('sql-evidence*'))
+        private_paths = [path for path in (child.evidence_store and child.evidence_store.path, prefix.evidence_store.path,
+                         snapshot / 'sql-evidence.sqlite', child.workspace_dir / 'manifest.json') if path]
         for i, path in enumerate(private_paths):
             probes[f'bash_read_{i}'] = child._execute_tool('bash', {'command': 'cat ' + shlex.quote(str(path))})
             assert '[exit code:' in probes[f'bash_read_{i}']
             assert binding['version_id'] not in probes[f'bash_read_{i}']
             assert child._execute_tool('read_file', {'path': str(path)}).startswith('Error: Path escapes workspace')
-        child._execute_tool('bash', {'command': 'ln -s ' + shlex.quote(str(child.evidence_store.path)) + ' private-link'})
+        child._execute_tool('bash', {'command': 'ln -s ' + shlex.quote(str(private_paths[0])) + ' private-link'})
         assert child._execute_tool('read_file', {'path': 'private-link'}).startswith('Error: Path escapes workspace')
         assert 'private-link:' not in child._execute_tool('search_files', {'pattern': '.', 'glob': 'private-link'})
         child._execute_tool('bash', {'command': 'rm private-link'})
@@ -308,27 +343,34 @@ base = 'http://127.0.0.1:' + os.environ['NOVAMIND_API_PORT']
 results = {}
 for path, payload in [('/checkpoint', {'expected_day': 7}), ('/pf/query', {}),
                       ('/evidence', None), ('/sql-evidence', None),
-                      ('/call', {'tool': 'pf_query', 'args': {}})]:
+                      ('/call', {'tool': 'pf_read', 'args': {}})]:
     request = urllib.request.Request(base + path, None if payload is None else json.dumps(payload).encode(), {'Content-Type':'application/json'})
     try: response = urllib.request.urlopen(request, timeout=5)
     except urllib.error.HTTPError as exc: response = exc
     with response: results[path] = {'status': response.status, 'body': json.load(response)}
 results['token_present'] = 'CEOBENCH_CHECKPOINT_TOKEN' in os.environ
 print(json.dumps(results))'''
-        probes['http'] = json.loads(child._execute_tool('bash', {'command': 'python -c ' + shlex.quote(code)}))
+        probes['http'] = json.loads(child._execute_tool('bash', {'command': 'python -c ' + shlex.quote(code)}).rsplit('\n[', 1)[0])
         assert probes['http']['/checkpoint'] == {'status': 403, 'body': {'error': 'Harness access required'}}
         assert not probes['http']['token_present']
         for path in ('/pf/query', '/evidence', '/sql-evidence'):
             assert probes['http'][path]['status'] == 404
         assert probes['http']['/call']['status'] == 200
         assert probes['http']['/call']['body']['success'] is False
-        assert 'Unknown tool: pf_query' in json.dumps(probes['http']['/call']['body'])
-        assert child._execute_tool('pf_query', {}).startswith('Error: Unknown tool')
-        result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
+        assert 'Unknown tool: pf_read' in json.dumps(probes['http']['/call']['body'])
+        history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})
         if mode == 'pf':
-            assert json.loads(result)['evidence'][0]['version'].startswith('v')
+            assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
         else:
-            assert 'evidence' not in json.loads(result)
+            assert history.startswith('Error: Unknown tool')
+        result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
+        structured = child.tool_executor.text_registry.last_result
+        assert result == 'Revised r1.2 (active).'
+        if mode == 'pf':
+            assert structured['evidence'][0]['version'] == 'facts.json@v2'
+            assert child.evidence_store.get_content(binding['version_id'])[1] == b'{"n":8}'
+        else:
+            assert 'evidence' not in structured
         assert not re.search(r'\b[0-9a-f]{8,64}\b', result)
         assert child._checkpoint_token not in json.dumps(probes)
         child._save_checkpoint(7)

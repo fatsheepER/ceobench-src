@@ -1,0 +1,225 @@
+[
+  {
+    "day": 28,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null || cd ~; pwd; ls; echo \"---\"; cat MEMORY.md | head -5; echo \"---pf---\"; pf log MEMORY.md",
+      "note": "Orient in workspace, list files and MEMORY versions"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 28,
+    "arguments": {
+      "command": "cd ~; ls -la; echo \"=== MEMORY versions ===\"; pf log MEMORY.md",
+      "note": "List workspace and MEMORY versions"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 28,
+    "arguments": {
+      "command": "pf log MEMORY.md",
+      "note": "List MEMORY.md versions"
+    },
+    "old_outcome": "succeeded"
+  },
+  {
+    "day": 35,
+    "arguments": {
+      "command": "ls -la; echo \"---SCRIPTS---\"; ls -la weekly_scripts/ scripts/ daily_scripts/ notes/ 2>/dev/null; echo \"---PF---\"; pf log MEMORY.md 2>/dev/null | head -30",
+      "note": "Survey working directory and file history"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 49,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null; pwd; ls; cat MEMORY.md | head -5; echo \"---PF---\"; pf log MEMORY.md 2>/dev/null | tail -20",
+      "note": "Orient at start of week 8; list working dir"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 63,
+    "arguments": {
+      "command": "cd . && pf | head -50; echo \"---MEMORY diff---\"; pf diff MEMORY.md | head -60",
+      "note": "Review recent history and MEMORY changes"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 84,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null || cd .; ls -la; echo \"---PF---\"; pf log MEMORY.md | head -40",
+      "note": "List working dir and MEMORY history"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 98,
+    "arguments": {
+      "command": "cd /tmp 2>/dev/null; cd - >/dev/null 2>&1; pwd; ls; echo \"---PF recent---\"; pf log MEMORY.md | tail -5",
+      "note": "Orient: list working dir and recent MEMORY versions"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 105,
+    "arguments": {
+      "command": "cd /home/user 2>/dev/null; pwd; ls -la; echo \"---\"; cat MEMORY.md | head -5; echo \"---PF LOG---\"; pf log MEMORY.md 2>/dev/null | tail -20",
+      "note": "Orient: list working dir and check MEMORY.md history"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 112,
+    "arguments": {
+      "command": "pf show w15_h.py.out@v1 2>/dev/null | head -40; echo \"=== r25 ===\"; ./novamind-operation python-c \"print(open('registrations.json').read()[:20])\" 2>/dev/null; grep -o '\"r25[^}]*' registrations.json | head -c 1200",
+      "note": "Check prior ad yield analysis and r25 text"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 168,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null || cd ~; pwd; ls -la; echo \"---SCRIPTS---\"; ls -la scripts/ 2>/dev/null | head -50; echo \"---WEEKLY---\"; ls -la weekly_scripts/ 2>/dev/null; echo \"---PF---\"; pf log MEMORY.md 2>/dev/null | tail -20",
+      "note": "Survey working directory and scripts at start of week 24 (day 168)"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 182,
+    "arguments": {
+      "command": "cd /workspace; pf log w27_state.py.out 2>/dev/null | tail; echo \"===\"; pf log w27_deep.py.out 2>/dev/null | tail; echo \"=== cmd ===\"; pf log cmd253 2>/dev/null | tail -3; pf log cmd254 2>/dev/null | tail -3",
+      "note": "Get correct pf handles for cite"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 182,
+    "arguments": {
+      "command": "cd /workspace; pf log w27_state.py.out",
+      "note": "pf handle for w27_state output"
+    },
+    "old_outcome": "succeeded"
+  },
+  {
+    "day": 182,
+    "arguments": {
+      "command": "cd /workspace; pf log w27_deep.py.out",
+      "note": "pf handle for w27_deep output"
+    },
+    "old_outcome": "succeeded"
+  },
+  {
+    "day": 189,
+    "arguments": {
+      "command": "ls -la; echo \"---\"; cat MEMORY.md | head -5; echo \"---pf log recent---\"; pf log 2>/dev/null | tail -40",
+      "note": "Survey working directory and file history at start of week 27 (day 189)"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 210,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null || cd ~; pwd; ls; echo \"---PF---\"; pf log MEMORY.md | tail -20"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 217,
+    "arguments": {
+      "command": "cd /workspace; grep -rn \"expected_completion\\|started t\\|start_research\" *.py scripts/*.py 2>/dev/null | head -40; echo \"=== pf search ===\"; pf search \"expected_completion\" 2>/dev/null | head -30",
+      "note": "Find R&D start records to see completion days"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 217,
+    "arguments": {
+      "command": "cd /workspace; ls -la *.out scripts/*.out 2>/dev/null | head; echo \"=== pf log w30_act ===\"; pf log w30_act.py.out 2>&1 | head",
+      "note": "Locate saved outputs"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 217,
+    "arguments": {
+      "command": "cd /workspace; pf show w30_act.py.out 2>&1 | head -20; echo \"===25===\"; pf show w25_act.py.out 2>&1 | head; echo \"===26===\"; pf show w26_act.py.out 2>&1 | head; echo \"===28===\"; pf show w28_act.py.out 2>&1 | head",
+      "note": "Read saved R&D start outputs"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 217,
+    "arguments": {
+      "command": "cd /workspace; pf show w30_act.py.out 2>&1 | head -20",
+      "note": "Read t11 start output"
+    },
+    "old_outcome": "succeeded"
+  },
+  {
+    "day": 217,
+    "arguments": {
+      "command": "cd /workspace; for f in w24_act w25_act w26_act w27_act w28_act; do echo \"=== $f ===\"; pf show $f.py.out 2>&1 | tail -6; done",
+      "note": "Read all R&D start outputs"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 245,
+    "arguments": {
+      "command": "cd /home/user 2>/dev/null; ls; echo \"---\"; ls scripts/ 2>/dev/null | tail -40; echo \"--- pf ---\"; pf log MEMORY.md 2>/dev/null | tail -5",
+      "note": "Orient: list working dir and recent scripts"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 252,
+    "arguments": {
+      "command": "cd /home 2>/dev/null; pwd; ls -la; echo \"---\"; ls scripts 2>/dev/null | tail -30; echo \"--- PF LOG MEMORY ---\"; pf log MEMORY.md 2>/dev/null | tail -5",
+      "note": "orient in working dir"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 259,
+    "arguments": {
+      "command": "cd /workspace 2>/dev/null || cd ~; pwd; ls; echo \"---PF---\"; pf log MEMORY.md 2>/dev/null | tail -5",
+      "note": "Orient: working dir and MEMORY versions"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 273,
+    "arguments": {
+      "command": "cd ~ 2>/dev/null; ls; echo \"---\"; cat MEMORY.md | head -5; echo \"---PF---\"; pf log MEMORY.md | tail -20",
+      "note": "Orient: list dir, confirm MEMORY.md loaded version"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 287,
+    "arguments": {
+      "command": "cd /home/user 2>/dev/null; ls; echo \"---PF---\"; pf log MEMORY.md | head -20",
+      "note": "orient: list dir and MEMORY history"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 301,
+    "arguments": {
+      "command": "cd /home/user 2>/dev/null; pwd; ls; echo \"---\"; ls scripts 2>/dev/null | tail -20; echo \"---MEMORY---\"; pf diff MEMORY.md 2>/dev/null | head -40",
+      "note": "Orient: list workspace, recent scripts, and MEMORY diff"
+    },
+    "old_outcome": "usage_error"
+  },
+  {
+    "day": 343,
+    "arguments": {
+      "command": "cd . && ls -la && echo \"---MEMORY---\" && tail -60 MEMORY.md && echo \"---PF LOG MEMORY---\" && pf log MEMORY.md | head -20",
+      "note": "Start of week 49: orient, read memory tail"
+    },
+    "old_outcome": "usage_error"
+  }
+]

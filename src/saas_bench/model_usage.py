@@ -30,8 +30,25 @@ def plain(value):
     return value
 
 
+def response_error(response, api=None):
+    """Provider errors can arrive with HTTP 200 and permissive SDK decoding."""
+    if not isinstance(response, dict):
+        return 'Model response must be an object' if api else None
+    if response.get('error'):
+        return 'Provider error: ' + json.dumps(response['error'], ensure_ascii=False)
+    if api:
+        field = {'chat': 'choices', 'responses': 'output', 'messages': 'content'}[api]
+        items = response.get(field)
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            return f'Model response {field} must be a list of objects'
+        if api == 'chat' and (not items or not isinstance(items[0].get('message'), dict)):
+            return 'Model response choices must contain an assistant message'
+    return None
+
+
 def usage_values(response, api):
-    raw = plain(response) or {}
+    raw = plain(response)
+    raw = raw if isinstance(raw, dict) else {}
     usage = raw.get('usage') or {}
     chat = api == 'chat'
     anthropic = api == 'messages'
@@ -52,6 +69,51 @@ def usage_values(response, api):
     return dict(zip(FIELDS, (input_tokens, output_tokens, read, write, reasoning)))
 
 
+def usage_delta(previous, current):
+    """Known subtotals and missing counts for calls made since a summary snapshot."""
+    calls = current['calls'] - previous['calls']
+    missing = {field: current['missing'][field] - previous['missing'][field] for field in FIELDS}
+    known = {field: None if calls and missing[field] == calls else
+             (current['known'][field] or 0) - (previous['known'][field] or 0) for field in FIELDS}
+    return dict(calls=calls, known=known, missing=missing)
+
+
+def summarize_usage_log(path, start_day=0, end_day=None):
+    """Sum every response by its request's day in [start_day, end_day).
+
+    Regenerations and failed calls count even when they produce no tool action.
+    Missing usage remains separate from the known subtotals.
+    """
+    summary = dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
+                   known_cost_usd=None, missing_cost=0, unreturned_requests=0)
+    pending = set()
+    with Path(path).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            call_id = row.get('call_id')
+            if row['event'] == 'request':
+                if row['day'] >= start_day and (end_day is None or row['day'] < end_day):
+                    pending.add(call_id)
+            elif row['event'] == 'response' and call_id in pending:
+                pending.remove(call_id)
+                summary['calls'] += 1
+                summary['errors'] += row.get('error') is not None
+                usage = row.get('usage') or {}
+                for field in FIELDS:
+                    value = usage.get(field)
+                    if value is None:
+                        summary['missing'][field] += 1
+                    else:
+                        summary['known'][field] = (summary['known'][field] or 0) + value
+                cost = row.get('cost_usd')
+                if cost is None:
+                    summary['missing_cost'] += 1
+                else:
+                    summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+    summary['unreturned_requests'] = len(pending)
+    return summary
+
+
 def load_pricing(path):
     """Load a sourced price table; the manifest stores its contents, not its path."""
     data = json.loads(Path(path).read_text())
@@ -65,10 +127,13 @@ def load_pricing(path):
         if not model or not isinstance(rates, dict) or not rates:
             raise ValueError('Invalid model pricing')
         for key, value in rates.items():
-            if key in ('valid_from', 'valid_until'):
+            if key == 'peak_schedule':
+                if value != 'weekday_01_04_06_10_utc':
+                    raise ValueError('Unsupported peak pricing schedule')
+            elif key in ('valid_from', 'valid_until'):
                 if datetime.fromisoformat(value).tzinfo is None:
                     raise ValueError('Price validity requires a timezone')
-            elif key not in ('input', 'output', 'cache_read', 'cache_write') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            elif key not in ('input', 'output', 'cache_read', 'cache_write', 'peak_multiplier') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError('Price must be a finite nonnegative USD/1k token rate')
         if 'valid_from' in rates and 'valid_until' in rates and datetime.fromisoformat(rates['valid_from']) >= datetime.fromisoformat(rates['valid_until']):
             raise ValueError('Invalid price validity interval')
@@ -89,14 +154,20 @@ def cost_usd(usage, api, rates, at=None):
               'output': usage['output_tokens'], 'cache_read': usage['cached_tokens'], 'cache_write': write}
     if any(n < 0 or (n and k not in rates) for k, n in counts.items()):
         return None
-    return sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
+    multiplier = 1
+    if rates.get('peak_schedule') == 'weekday_01_04_06_10_utc':
+        utc = at.astimezone(timezone.utc)
+        if utc.weekday() < 5 and (1 <= utc.hour < 4 or 6 <= utc.hour < 10):
+            multiplier = rates.get('peak_multiplier', 1)
+    return multiplier * sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
 
 
 class _Stream(httpx.SyncByteStream):
-    def __init__(self, source, finish):
+    def __init__(self, source, finish, require_done=False):
         self.source, self.finish = source, finish
         self.chunks = []
         self.finished = False
+        self.require_done = require_done
 
     def _finish(self, error=None):
         if not self.finished:
@@ -112,20 +183,27 @@ class _Stream(httpx.SyncByteStream):
             self._finish(type(exc).__name__)
             raise
         else:
+            if self.require_done and b'data: [DONE]' not in b''.join(self.chunks).splitlines():
+                self._finish('stream_closed_before_completion')
+                raise httpx.ReadError('Chat completion stream ended before [DONE]')
             self._finish()
 
     def close(self):
         try:
             self.source.close()
         finally:
-            self._finish('stream_closed_before_completion')
+            lines = b''.join(self.chunks).rstrip().splitlines()
+            completed = bool(lines and lines[-1] == b'data: [DONE]')
+            self._finish(None if completed else 'stream_closed_before_completion')
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None):
         self.evidence_store = evidence_store
+        self.token_counter = token_counter
         self.source_records = []
         self.context_id = uuid.uuid4().hex if evidence_store else None
+        self.last_request_event = None
         self.path = Path(path) if path else None
         self.role = role
         self.pricing = pricing or {}
@@ -187,11 +265,18 @@ class ModelUsage:
                 response = send(request, *args, **dict(kwargs, stream=True))
                 def finish(content, error):
                     nonlocal failure_recorded, capture_done
+                    try:
+                        reported = json.loads(content)
+                    except (ValueError, UnicodeError):
+                        reported = None
+                    error = error or response_error(reported)
                     if capture_event and not capture_done:
                         capture_done = True
                         try:
                             recorder.evidence_store.complete(capture_event, 'failed' if error or response.status_code >= 400 else 'succeeded',
                                 send_state='response_received', http_status=response.status_code, response_error=error)
+                            if not error and response.status_code < 400:
+                                recorder.last_request_event = capture_event
                         except Exception as exc:
                             recorder.evidence_store.fail(exc)
                     try:
@@ -199,13 +284,10 @@ class ModelUsage:
                     except UnicodeDecodeError:
                         body = {'base64': base64.b64encode(content).decode('ascii')}
                     if response.status_code >= 400 or error:
-                        try:
-                            reported = json.loads(content).get('usage')
-                        except (ValueError, AttributeError):
-                            reported = None
                         with recorder.lock:
                             recorder.summary['failed_http_attempts'] += 1
-                            recorder.summary['failed_attempts_without_usage'] += not bool(reported)
+                            recorder.summary['failed_attempts_without_usage'] += not bool(
+                                reported.get('usage') if isinstance(reported, dict) else None)
                         failure_recorded = True
                     recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
@@ -213,7 +295,9 @@ class ModelUsage:
                 if response.is_stream_consumed:
                     finish(response.content, None)
                 else:
-                    response.stream = _Stream(response.stream, finish)
+                    require_done = (streaming and request.url.path.endswith('/chat/completions')
+                                    and response.headers.get('content-type', '').startswith('text/event-stream'))
+                    response.stream = _Stream(response.stream, finish, require_done=require_done)
                     if not streaming:
                         response.read()
                 return response
@@ -235,8 +319,16 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        self.last_request_event = None
+        replacements = []
         if self.evidence_store:
             from .execution_capture import text_sources
+            from .pf_read import prepare_request
+            try:
+                replacements = prepare_request(self.evidence_store, request, self.context_id, self.token_counter)
+            except Exception as exc:
+                self.evidence_store.fail(exc)
+                raise
             self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
@@ -245,6 +337,8 @@ class ModelUsage:
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:
             response = invoke()
+            if message := response_error(plain(response), api):
+                raise ValueError(message)
             return response
         except BaseException as exc:
             error = type(exc).__name__
@@ -272,3 +366,6 @@ class ModelUsage:
                                error=error, cost_usd=cost, pricing=self.pricing.get(served_model))
             finally:
                 _CALL.reset(token)
+                if replacements:
+                    from .pf_read import restore_request
+                    restore_request(request, replacements)

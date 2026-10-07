@@ -1,9 +1,11 @@
 """Public SQL policy tests use synthetic worlds; no provider calls."""
+from contextlib import closing
 import hashlib
 import json
 import shutil
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -14,19 +16,23 @@ import urllib.request
 import pytest
 
 from saas_bench.api_server import NovaMindAPIServer
-from saas_bench.database import init_database
+from saas_bench.database import SharedMemoryConnection, init_database
 from saas_bench.public_sql import (
     PUBLIC_COLUMNS, PUBLIC_POLICY_VERSION, QueryDenied, SnapshotUnavailable,
-    execute_query, install_authorizer, query_snapshot,
+    execute_query, execute_snapshot, install_authorizer, query_snapshot,
 )
 
 
-@pytest.fixture
-def server(tmp_path, monkeypatch):
+@pytest.fixture(params=['file', 'memory'])
+def server(tmp_path, monkeypatch, request):
     monkeypatch.setattr('saas_bench.api_server._ORACLE_MODE', False)
-    initial = init_database(tmp_path / 'world.db')
-    initial.close()
-    conn = sqlite3.connect(tmp_path / 'world.db', check_same_thread=False)
+    if request.param == 'memory':
+        conn = init_database(':memory:')
+        conn.execute('PRAGMA foreign_keys=OFF')
+    else:
+        initial = init_database(tmp_path / 'world.db')
+        initial.close()
+        conn = sqlite3.connect(tmp_path / 'world.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES(0,'operations',42,NULL)")
     conn.execute("INSERT INTO group_insight_snapshots VALUES('S1',20,123,0.25,456)")
@@ -38,6 +44,33 @@ def server(tmp_path, monkeypatch):
     yield api
     api.stop()
     conn.close()
+
+
+def test_cohort_payment_join_fits_bounded_sql_work(server):
+    server.conn.executemany('''INSERT INTO subscriptions
+        (customer_id,plan,listed_price,effective_price,start_day,status,billing_day_mod30)
+        VALUES (?,'A',10,10,0,'subscribed',0)''', ((i,) for i in range(1, 1001)))
+    server.conn.executemany('INSERT INTO ledger(day,category,amount,note) VALUES (?,?,?,?)',
+        ((day, 'subscription_payment', 10 + day / 15, f'Subscription payment from customer {i}')
+         for day in (0, 30, 60, 90, 120) for i in range(1, 1001)))
+    server.conn.commit()
+    sql = '''SELECT s.start_day,l.day AS payday,ROUND(AVG(l.amount),2) AS avg_amt,COUNT(*) AS n
+        FROM subscriptions s JOIN ledger l
+          ON l.note=('Subscription payment from customer ' || s.customer_id)
+        WHERE s.plan='A' AND s.start_day BETWEEN 0 AND 7
+          AND l.day IN (s.start_day,s.start_day+30)
+        GROUP BY s.start_day,l.day ORDER BY s.start_day,l.day'''
+    deadline = time.monotonic() + 5
+    with query_snapshot(server, deadline) as (conn, metadata):
+        instructions = 0
+        def limit_work():
+            nonlocal instructions
+            instructions += 1000
+            return instructions > 100_000
+        conn.set_progress_handler(limit_work, 1000)
+        result = execute_snapshot(conn, sql, deadline, metadata)
+    assert result['rows'] == [dict(start_day=0, payday=0, avg_amt=10.0, n=1000),
+                              dict(start_day=0, payday=30, avg_amt=12.0, n=1000)]
 
 
 DENIED = [
@@ -108,28 +141,34 @@ def test_legal_sql_results_and_limits(server):
     assert execute_query(server, "SELECT json_extract('{\"n\":4}', '$.n') AS n, round(avg(amount)) AS a FROM ledger")['rows'] == [{'n': 4, 'a': 42.0}]
 
 
-def test_fresh_snapshot_cleanup_and_readonly_independently(server):
-    paths = []
-    for amount in (43,44):
-        server.conn.execute('UPDATE ledger SET amount=?', (amount,)); server.conn.commit()
+def test_fresh_reader_cleanup_and_readonly_independently(server):
+    references = set()
+    for amount in (43, 44):
+        server.conn.execute('UPDATE ledger SET amount=?', (amount,))
+        server.conn.commit()
         with query_snapshot(server, time.monotonic()+5) as (conn, metadata):
-            # Remove the authorizer to verify the independent read-only protection.
-            conn.set_authorizer(None)
-            path = Path(conn.execute('PRAGMA database_list').fetchone()[2]); paths.append(path)
-            assert path.exists() and not path.is_relative_to(server.script_workspace)
-            assert metadata['day'] == 0
+            assert conn is not server.conn
+            assert metadata['day'] == 0 and metadata['snapshot_bytes'] == 0
+            assert not metadata['snapshot_reused']
+            references.add(metadata['snapshot_ref'])
             assert conn.execute('SELECT amount FROM ledger').fetchone()[0] == amount
-            conn.execute('PRAGMA query_only=OFF')
+            conn.set_authorizer(None)
             with pytest.raises(sqlite3.OperationalError, match='readonly'):
                 conn.execute('UPDATE main.ledger SET amount=99')
-        assert not path.exists()
-    assert paths[0] != paths[1]
-    # Authorizer independently rejects writes on an otherwise writable connection.
-    conn = sqlite3.connect(':memory:')
-    conn.execute('CREATE TABLE ledger(amount)')
-    install_authorizer(conn)
-    with pytest.raises(sqlite3.DatabaseError): conn.execute('INSERT INTO ledger VALUES(1)')
-    conn.close()
+            conn.execute('PRAGMA query_only=OFF')
+            install_authorizer(conn)
+            with pytest.raises(sqlite3.DatabaseError, match='authorized'):
+                conn.execute('UPDATE main.ledger SET amount=99')
+            if not isinstance(server.conn, SharedMemoryConnection):
+                conn.set_authorizer(None)
+                with pytest.raises(sqlite3.OperationalError, match='readonly'):
+                    conn.execute('UPDATE main.ledger SET amount=99')
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            conn.execute('SELECT 1')
+        with query_snapshot(server, time.monotonic()+5) as (_, again):
+            assert not again['snapshot_reused']
+            references.add(again['snapshot_ref'])
+    assert len(references) == 4
 
 
 def test_timeout_transaction_and_unknown_world(server, monkeypatch):
@@ -162,8 +201,9 @@ def test_config_override_success_allows_immediate_public_query(server, tool, arg
     assert not server.conn.in_transaction
     # A successful configuration action must persist its history independently
     # of the next weekly advance or another tool's incidental commit.
-    db_path = server.conn.execute('PRAGMA database_list').fetchone()[2]
-    with sqlite3.connect(db_path) as independent:
+    db_path = (server.conn.query_uri if isinstance(server.conn, SharedMemoryConnection) else
+               server.conn.execute('PRAGMA database_list').fetchone()[2])
+    with closing(sqlite3.connect(db_path, uri=True)) as independent:
         assert independent.execute('SELECT tool_name FROM config_overrides').fetchall() == [(tool,)]
 
 
@@ -242,28 +282,37 @@ def test_queries_preserve_every_simulator_random_stream(make_initialized_sim, ma
     conn.close()
 
 
-def test_cleanup_on_query_and_backup_failure(server, monkeypatch, tmp_path):
+@pytest.mark.parametrize('failure', ['query', 'schema', 'open', 'close'])
+def test_reader_cleanup_and_unlock_on_failure(server, monkeypatch, failure):
     import saas_bench.public_sql as policy
-    import tempfile
-    real_temp = tempfile.TemporaryDirectory
-    directories = []
-    def temporary(**kwargs):
-        result = real_temp(dir=tmp_path, **kwargs)
-        directories.append(Path(result.name))
-        return result
-    monkeypatch.setattr(policy.tempfile, 'TemporaryDirectory', temporary)
-    with pytest.raises((QueryDenied, sqlite3.Error)):
-        execute_query(server, 'SELECT * FROM group_insight_snapshots')
-    source = server.conn
-    def failed_backup(target, **kwargs):
-        target.execute('CREATE TABLE partial(x)')
-        raise OSError('injected backup failure')
-    server.conn = SimpleNamespace(in_transaction=False, backup=failed_backup)
-    try:
-        with pytest.raises(OSError, match='backup failure'): execute_query(server, 'SELECT 1')
-    finally: server.conn = source
-    assert all(not d.exists() for d in directories)
-    assert execute_query(server, 'SELECT 1')['success']
+    readers = []
+    connect = sqlite3.connect
+    class Reader(sqlite3.Connection):
+        def close(self):
+            assert server._lock._is_owned()
+            super().close()
+            if failure == 'close':
+                raise OSError('injected close failure')
+    def open_reader(*args, **kwargs):
+        assert server._lock._is_owned()
+        if failure == 'open':
+            raise OSError('injected open failure')
+        conn = connect(*args, **kwargs, factory=Reader)
+        readers.append(conn)
+        return conn
+    monkeypatch.setattr(policy.sqlite3, 'connect', open_reader)
+    if failure == 'schema':
+        server.conn.execute('DROP TABLE research_projects')
+        server.conn.commit()
+    with pytest.raises((QueryDenied, SnapshotUnavailable, sqlite3.Error, OSError)):
+        execute_query(server, 'SELECT * FROM group_insight_snapshots' if failure == 'query' else 'SELECT 1')
+    assert not server._lock._is_owned()
+    for conn in readers:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            conn.execute('SELECT 1')
+    with server._lock:
+        server.conn.execute('UPDATE ledger SET amount=43')
+        server.conn.commit()
 
 
 def test_serialization_timeout_returns_504(server, monkeypatch):
@@ -330,15 +379,293 @@ def test_send_timeout_does_not_send_a_second_response(monkeypatch):
     assert statuses == [200, 200]
 
 
-@pytest.mark.skipif(sys.platform != 'linux', reason='Actual snapshot isolation requires Linux bubblewrap')
-def test_formal_sandbox_cannot_read_query_snapshot(server):
+@pytest.mark.skipif(sys.platform != 'linux', reason='Actual isolation requires Linux bubblewrap')
+def test_formal_sandbox_cannot_read_world(server):
     import shlex
     from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
     with query_snapshot(server, time.monotonic()+5) as (conn, _):
         conn.set_authorizer(None)
-        snapshot = Path(conn.execute('PRAGMA database_list').fetchone()[2])
-        assert snapshot.exists()
+        filename = conn.execute('PRAGMA database_list').fetchone()[2]
+        if filename:
+            command = 'test ! -r ' + shlex.quote(filename) + ' && echo world-inaccessible'
+        else:
+            probe = ('import sqlite3; c=sqlite3.connect(' + repr(server.conn.query_uri) +
+                     ',uri=True); assert not c.execute("SELECT name FROM sqlite_master").fetchall(); '
+                     'print("world-inaccessible")')
+            command = 'python -c ' + shlex.quote(probe)
         executor = BashAgentToolExecutor(server.script_workspace, require_sandbox=True)
         executor.verify_sandbox()
-        output = executor.execute('bash', {'command': 'test ! -r ' + shlex.quote(str(snapshot)) + ' && echo snapshot-inaccessible'})
-        assert output.strip() == 'snapshot-inaccessible'
+        output = executor.execute('bash', {'command': command})
+        assert output.strip() == 'world-inaccessible'
+
+
+def test_world_connection_policy_and_temp_state_are_untouched(server):
+    world = server.conn
+    world.execute('CREATE TEMP TABLE ledger(amount)')
+    world.execute('INSERT INTO temp.ledger VALUES(99)')
+    world.commit()
+    world.create_function('private_udf', 0, lambda: 73)
+    world.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, True)
+    world.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, True)
+    factory = lambda cursor, row: tuple(row)
+    world.row_factory = factory
+    before = world.serialize(), world.serialize(name='temp')
+    for sql in ('SELECT amount FROM ledger', 'SELECT private_udf()'):
+        if 'private_udf' in sql:
+            with pytest.raises(sqlite3.OperationalError, match='no such function'):
+                execute_query(server, sql)
+        else:
+            assert execute_query(server, sql)['rows'] == [{'amount': 42.0}]
+    assert (world.serialize(), world.serialize(name='temp')) == before
+    assert world.row_factory is factory
+    assert world.getconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML)
+    assert world.getconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL)
+    assert world.execute('SELECT amount,private_udf(),"missing" FROM ledger').fetchone() == (99, 73, 'missing')
+    assert world.execute('PRAGMA query_only').fetchone() == (0,)
+
+
+def test_world_lock_covers_fetch_and_reader_close(server, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    entered = threading.Event()
+    def writer():
+        entered.set()
+        with server._lock:
+            server.conn.execute('UPDATE ledger SET amount=43')
+            server.conn.commit()
+    connect = sqlite3.connect
+    class Reader(sqlite3.Connection):
+        def close(self):
+            assert server._lock._is_owned()
+            super().close()
+    monkeypatch.setattr(sqlite3, 'connect', lambda *args, **kwargs: connect(*args, **kwargs, factory=Reader))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with query_snapshot(server, time.monotonic()+5) as (conn, _):
+            cursor = conn.execute('SELECT amount FROM ledger')
+            writing = pool.submit(writer)
+            assert entered.wait(2)
+            assert not writing.done()
+            assert cursor.fetchone()[0] == 42
+        writing.result(timeout=2)
+    assert execute_query(server, 'SELECT amount FROM ledger')['rows'] == [{'amount': 43.0}]
+
+
+@pytest.mark.parametrize('kind', ['private_memory', 'workspace_file', 'workspace_symlink'])
+def test_unsupported_worlds_fail_explicitly(server, tmp_path, monkeypatch, kind):
+    if kind == 'private_memory':
+        conn = sqlite3.connect(':memory:')
+        message = 'named shared-memory'
+    else:
+        path = server.script_workspace / 'world.db'
+        if kind == 'workspace_symlink':
+            link = tmp_path / 'world-link.db'
+            link.symlink_to(path)
+            path = link
+        conn = init_database(path)
+        message = 'outside the agent workspace'
+    with closing(conn):
+        monkeypatch.setattr(server, 'conn', conn)
+        with pytest.raises(SnapshotUnavailable, match=message):
+            execute_query(server, 'SELECT 1')
+        assert not server._lock._is_owned()
+
+
+def test_encrypted_loads_have_independent_named_worlds(tmp_path, monkeypatch):
+    from saas_bench.db_protection import load_session_db, save_session_db
+    monkeypatch.setattr('saas_bench.db_protection._get_key', lambda: 'public-sql-test-key')
+    path = tmp_path / 'world.nmdb'
+    with closing(init_database(':memory:')) as initial:
+        initial.execute("INSERT INTO ledger(day,category,amount) VALUES(0,'operations',42)")
+        initial.commit()
+        save_session_db(initial, path)
+        with closing(init_database(':memory:')) as other:
+            assert initial.query_uri != other.query_uri
+            assert other.execute('SELECT count(*) FROM ledger').fetchone()[0] == 0
+    original = path.read_bytes()
+    with closing(load_session_db(path)) as first, closing(load_session_db(path)) as second:
+        assert isinstance(first, SharedMemoryConnection) and first.query_uri != second.query_uri
+        first.execute('UPDATE ledger SET amount=43')
+        first.commit()
+        api = NovaMindAPIServer(SimpleNamespace(workspace_path=tmp_path / 'agent', current_day=0), conn=first)
+        assert execute_query(api, 'SELECT amount FROM ledger')['rows'] == [{'amount': 43.0}]
+        assert second.execute('SELECT amount FROM ledger').fetchone()[0] == 42
+        with closing(load_session_db(path, in_memory=False)) as encrypted:
+            assert encrypted.execute('SELECT amount FROM ledger').fetchone()[0] == 42
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob('*.plain.tmp'))
+
+
+@pytest.mark.parametrize('failure', ['export', 'destination', 'backup', 'pragma', 'analyze'])
+def test_load_failure_closes_connections_and_removes_plaintext(tmp_path, monkeypatch, failure):
+    import saas_bench.db_protection as protection
+    monkeypatch.setattr(protection, '_get_key', lambda: 'test-key')
+    readers, destinations = [], []
+    connect = sqlite3.connect
+    class Source(sqlite3.Connection):
+        def backup(self, target, **kwargs):
+            if failure == 'backup':
+                raise RuntimeError('injected backup failure')
+            return super().backup(target, **kwargs)
+    class Destination(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if (failure == 'pragma' and sql.startswith('PRAGMA')) or (failure == 'analyze' and sql == 'ANALYZE'):
+                raise RuntimeError('injected configuration failure')
+            return super().execute(sql, *args)
+    def export(source, path, key):
+        with closing(connect(path)) as conn:
+            conn.execute('CREATE TABLE example(n)')
+        if failure == 'export':
+            raise RuntimeError('injected export failure')
+    def open_source(*args, **kwargs):
+        conn = connect(*args, **kwargs, factory=Source)
+        readers.append(conn)
+        return conn
+    def open_destination():
+        if failure == 'destination':
+            raise RuntimeError('injected connection failure')
+        conn = connect(':memory:', factory=Destination)
+        destinations.append(conn)
+        return conn
+    monkeypatch.setattr(protection, '_export_encrypted_to_plain', export)
+    monkeypatch.setattr(protection.sqlite3, 'connect', open_source)
+    monkeypatch.setattr(protection, 'connect_shared_memory', open_destination)
+    with pytest.raises(RuntimeError, match='injected'):
+        protection.load_session_db(tmp_path / 'world.nmdb')
+    assert not list(tmp_path.glob('*.plain.tmp'))
+    assert len(readers) == (failure != 'export')
+    assert len(destinations) == (failure not in ('export', 'destination'))
+    for conn in readers + destinations:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            conn.execute('SELECT 1')
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Uses Linux process file-size limit')
+def test_http_query_needs_no_world_copy(tmp_path):
+    probe = '''
+import json, resource, signal
+from pathlib import Path
+from types import SimpleNamespace
+from saas_bench.api_server import NovaMindAPIServer
+from saas_bench.database import init_database
+from test_public_sql import request
+world = init_database(':memory:')
+api = NovaMindAPIServer(SimpleNamespace(workspace_path=Path.cwd(), current_day=0), conn=world)
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+api.start()
+try:
+    for _ in range(2):
+        status, body = request(api, {'sql': 'SELECT 1 AS n'})
+        assert status == 200, (status, body)
+        assert body['rows'] == [{'n': 1}], body
+    assert world.execute('SELECT 1').fetchone()[0] == 1
+finally:
+    api.stop()
+    world.close()
+'''
+    import os
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    result = subprocess.run([sys.executable, '-c', probe], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('failure,stage,kind,code', [
+    ('setup_io', 'setup', 'service', sqlite3.SQLITE_IOERR_WRITE),
+    ('execute_io', 'execute', 'service', sqlite3.SQLITE_IOERR_WRITE),
+    ('setup_syntax', 'setup', 'service', sqlite3.SQLITE_ERROR),
+    ('setup_unexpected', 'setup', 'service', None),
+    ('syntax', 'execute', 'query', sqlite3.SQLITE_ERROR),
+    ('denied', 'execute', 'denied', sqlite3.SQLITE_AUTH),
+    ('readonly', 'execute', 'denied', sqlite3.SQLITE_READONLY),
+    ('readonly_lock', 'execute', 'service', sqlite3.SQLITE_READONLY_CANTLOCK),
+    ('timeout', 'execute', 'timeout', sqlite3.SQLITE_INTERRUPT),
+    ('unavailable', 'setup', 'service', None),
+])
+def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch, capfd,
+                                                        failure, stage, kind, code):
+    connect = sqlite3.connect
+    class Reader(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if ((failure in ('execute_io', 'readonly', 'readonly_lock') and sql == 'SELECT 1 AS n') or
+                    (failure == 'setup_syntax' and sql.startswith('PRAGMA main.table_info'))):
+                error = sqlite3.OperationalError('injected SQL failure')
+                error.sqlite_errorcode = code
+                error.sqlite_errorname = {sqlite3.SQLITE_IOERR_WRITE: 'SQLITE_IOERR_WRITE',
+                                          sqlite3.SQLITE_READONLY: 'SQLITE_READONLY',
+                                          sqlite3.SQLITE_READONLY_CANTLOCK: 'SQLITE_READONLY_CANTLOCK'}.get(code, 'SQLITE_ERROR')
+                raise error
+            return super().execute(sql, *args)
+    def open_reader(*args, **kwargs):
+        if failure == 'setup_io':
+            error = sqlite3.OperationalError('disk I/O error')
+            error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+            raise error
+        if failure == 'setup_unexpected':
+            raise OSError('injected reader failure')
+        return connect(*args, **kwargs, factory=Reader)
+    monkeypatch.setattr(sqlite3, 'connect', open_reader)
+    server._operation_failed = failure == 'unavailable'
+    server.QUERY_TIMEOUT_SECONDS = .02 if failure == 'timeout' else 5
+    sql = {'syntax': 'SELECT FROM ledger', 'denied': 'SELECT * FROM group_insight_snapshots',
+           'timeout': 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x'}.get(failure, 'SELECT 1 AS n')
+    server.start()
+    status, body = request(server, {'sql': sql})
+    assert status >= 400 and not body['success']
+    assert 'sqlite_errorcode' not in body and 'SQLITE_IOERR_WRITE' not in json.dumps(body)
+    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
+                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
+    record, = diagnostics
+    assert record['failure_stage'] == stage and record['error_kind'] == kind
+    assert record['sqlite_errorcode'] == code
+    assert record['permanent_error'] is (kind in ('query', 'denied'))
+    if code == sqlite3.SQLITE_IOERR_WRITE:
+        assert record['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'
+    if code == sqlite3.SQLITE_READONLY_CANTLOCK:
+        assert status == 500 and record['sqlite_errorname'] == 'SQLITE_READONLY_CANTLOCK'
+
+
+@pytest.mark.parametrize('failure', ['setup', 'setup_io', 'execute'])
+def test_pf_refresh_service_failure_has_private_diagnostics(server, tmp_path, monkeypatch, capfd, failure):
+    from saas_bench.pf_refresh import refresh
+    from saas_bench.sql_evidence import FORMAT, SQLEvidenceStore
+    from test_pf_stale import record_sql
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', dict(format=FORMAT, run_id='test', branch_id='test',
+                                                            data_source_id='test'))
+    server.sql_evidence = store
+    version = record_sql(store, 'SELECT 1 AS n', dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1))
+    parent = store.begin_event('pf_weekly_check', {'day': 0})
+    if failure == 'setup':
+        server._operation_failed = True
+    else:
+        connect = sqlite3.connect
+        class Reader(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'SELECT 1 AS n':
+                    error = sqlite3.OperationalError('disk I/O error')
+                    error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+                    raise error
+                return super().execute(sql, *args)
+        def open_reader(*args, **kwargs):
+            if failure == 'setup_io' and kwargs.get('uri'):
+                error = sqlite3.OperationalError('disk I/O error')
+                error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
+                raise error
+            return connect(*args, **kwargs, factory=Reader)
+        monkeypatch.setattr(sqlite3, 'connect', open_reader)
+    if failure == 'setup_io':
+        with pytest.raises(sqlite3.OperationalError, match='disk I/O error'):
+            refresh(server, [version], parent)
+    else:
+        result = refresh(server, [version], parent)
+        meta, raw = store.get_content(result[version])
+        assert 'sqlite_errorcode' not in json.loads(raw)
+        captured = store.read_event(meta['created_by_event'])['result']
+        assert captured['error_kind'] == 'service' and captured['failure_stage'] == failure
+    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
+                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
+    failed, = [row for row in diagnostics if row.get('error_kind') == 'service']
+    if failure == 'setup_io':
+        assert failed['failure_stage'] == 'setup' and failed['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
+    if failure == 'execute':
+        assert failed['sqlite_errorcode'] == captured['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
+        assert failed['sqlite_errorname'] == captured['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'

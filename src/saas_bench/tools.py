@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Any
 from pathlib import Path
@@ -193,13 +194,13 @@ TOOL_DOCS = {
         },
         "impact": {
             "operations": "CRITICAL: (1) REDUCES OUTAGE PROBABILITY - At $0: ~3% daily outage risk (~1/month). At $500: ~1.1% daily (~3/year). (2) Speeds up issue resolution. The global issue-resolution pool is partitioned by customer group: each group g draws Poisson((base_rate + scale_g × spend) × n_g / total_open_issues), where scale_g = 0.3 for individual groups (S*, D_S*) and 0.05 for enterprise groups (E*, D_E*). So $1 of ops spend resolves ~0.3 individual issues/day vs ~0.05 enterprise issues/day. WARNING: Without ops spending, frequent outages damage reputation and cause churn!",
-            "development": "Dev spending improves product quality (amplified by model tier). Global improvement = 0.006 × ln(1 + global_spend/5000) per day (applies to all groups). Targeted per-group improvement = 0.030 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier."
+            "development": "Dev spending improves product quality (amplified by model tier). Global improvement = 0.0045 × ln(1 + global_spend/5000) per day plus small random noise (applies to all groups). Targeted per-group improvement = 0.0225 × ln(1 + targeted_spend/5000) per day (5× coefficient, applies to that group only, stacks with global). delivered_quality = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier."
         },
         "example_call": {
             "tool": "set_daily_spend",
             "arguments": {"operations": 1200, "development": 600}
         },
-        "internal_notes": "Ops: outage_prob = 0.03 * exp(-0.002 * ops_spend). Issue resolution (global pool, partitioned by group): for each group g with n_g open issues, mean_g = (base_rate + scale_g * spend) * (n_g / total_open_issues); scale_g = 0.3 for individual groups (S*, D_S*), 0.05 for enterprise groups (E*, D_E*). Dev (global): quality_improvement = 0.006 * ln(1 + spend/5000). Dev (targeted per-group): group_improvement = 0.030 * ln(1 + spend/5000). Advertising is NOT a valid key here — use set_targeted_ad_spend.",
+        "internal_notes": "Ops: outage_prob = 0.03 * exp(-0.002 * ops_spend). Issue resolution (global pool, partitioned by group): for each group g with n_g open issues, mean_g = (base_rate + scale_g * spend) * (n_g / total_open_issues); scale_g = 0.3 for individual groups (S*, D_S*), 0.05 for enterprise groups (E*, D_E*). Dev (global): quality_improvement = 0.0045 * ln(1 + spend/5000) + N(0, quality_shared_noise_scale). Dev (targeted per-group): group_improvement = 0.0225 * ln(1 + spend/5000). Advertising is NOT a valid key here — use set_targeted_ad_spend.",
         "sample_io": {
             "success": [
                 {"label": "Set both budgets", "input": {"operations": 1200, "development": 600}, "output": "Daily spend updated: operations=$1200, development=$600"},
@@ -1130,19 +1131,23 @@ TOOL_DOCS = {
             "failure": "Market research complete ($25,000). No new segments discovered this time. Try again for another chance.",
             "no_funds": "Insufficient funds. Market research costs $25,000. Available: $12,000",
             "data_on_success": {
-                "discovered_group_id": "D_S01", "group_name": "Niche Creators", "segment": "Individual",
-                "info_level": 1, "cost": 25000
+                "discovered_group_id": "D_S01", "cost": 25000,
+                "status": "discovered", "remaining_undiscovered": 19
             },
-            "data_on_failure": {"cost": 25000}
+            "data_on_failure": {"cost": 25000, "status": "not_found", "remaining_undiscovered": 20},
+            "data_when_exhausted": {"cost": 25000, "status": "exhausted", "remaining_undiscovered": 0}
         },
         "what_happens": [
             "1. $25,000 deducted from cash",
             "2. 30% chance to discover one undiscovered group",
-            "3. If successful: group set to Info Level 1, initial parameter estimates returned",
+            "3. If successful: group set to Info Level 1; retrieve its estimates with get_group_insights()",
             "4. If unsuccessful: nothing discovered, money still spent"
         ],
         "output_schema": {
-            "discovered_group_id": "str|None — group ID if discovered (e.g., 'D_S01'), absent if no discovery",
+            "status": "str — 'discovered', 'not_found' (can retry), or 'exhausted' (all segments identified)",
+            "cost": "float — cost deducted for this attempt, including when exhausted",
+            "remaining_undiscovered": "int — segments still undiscovered after this attempt",
+            "discovered_group_id": "str — group ID if discovered (e.g., 'D_S01'), absent otherwise",
             "_access": "if 'discovered_group_id' in result: print('Found:', result['discovered_group_id'])"
         },
         "impact": "Costs $25,000 per attempt. On success, unlocks a new customer segment with initial parameter estimates.",
@@ -1245,13 +1250,15 @@ TOOL_DOCS = {
             "data": {
                 "known_groups": [{"group_id": "S1", "group_name": "Price-Sensitive Individuals", "segment": "Individual", "info_level": 1, "noise": "±65%"}],
                 "undiscovered_count": 14,
-                "macroeconomic": {"ism_pmi": 54.2, "change": 1.3, "phase": "expansion", "cycle": "recovering"}
+                "macroeconomic": {"measurement_day": 270, "publication_delay_days": 30,
+                    "pmi_value": 54.2, "pmi_trend": "expansion", "pmi_change": 1.3,
+                    "cycle_phase": "recovering", "description": "Period average"}
             }
         },
         "output_schema": {
             "known_groups": "List[Dict] — each: group_id (str), group_name (str), segment (str: 'Individual'|'Enterprise'), info_level (int 1-5), noise (str e.g. '±65%')",
             "undiscovered_count": "int — segments not yet discovered",
-            "macroeconomic": "Dict|None — keys: pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
+            "macroeconomic": "Dict|None — keys: measurement_day (int, when PMI was measured, not published), publication_delay_days (int, configured delay; not an exact publication timestamp), pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
             "_access": "for g in result['known_groups']: print(g['group_id'], g['group_name'])",
             "_warning": "Key is 'known_groups' NOT 'groups'"
         },
@@ -1290,14 +1297,13 @@ TOOL_DOCS = {
             "example": "=== Group Insights: Niche Creators (D_S01) ===\nSegment: Individual\nInfo Level: 2 (estimates accurate to \u00b140%)\n\nEstimated Parameters:\n  Willingness to pay:    ~$92/mo (max monthly budget)\n  Usage volume:          ~38 units/day\n  Quality floor (q_min): ~0.61 (minimum quality needed at $0)\n  Contract lock-in aversion: ~0.0072/month (satisfaction penalty per extra contract month)\n  Market cap:            ~185,000 (total addressable customers)\n  Market cap growth:     ~9.2%/year (annual market expansion)\n\n--- Network Influence (word-of-mouth referrals) ---\nUnit: leads per 1000 subscribers per day (at neutral reputation)\n  Self-referral rate: ~4.2 leads per 1000 subs/day\n\nOutgoing (this group's subs \u2192 leads in other groups):\n  \u2192 Music Producers (D_S10): ~1.8 leads per 1000 subs/day\n  \u2192 Indie Game Devs (D_S05): ~1.2 leads per 1000 subs/day\n  \u2192 S1: ~0.9 leads per 1000 subs/day\n\nIncoming (other groups' subs \u2192 leads in this group):\n  \u2190 S1: ~1.3 leads per 1000 subs/day\n  \u2190 Music Producers (D_S10): ~0.8 leads per 1000 subs/day\n\n--- Reputation Influence (cross-group sentiment spread) ---\nUnit: dimensionless weight (0-1, higher = stronger influence)\n\nOutgoing (this group's reputation events \u2192 other groups):\n  \u2192 S1: ~0.150\n  \u2192 Indie Game Devs (D_S05): ~0.120\n\nIncoming (other groups' events \u2192 this group):\n  \u2190 S1: ~0.150\n  \u2190 S3: ~0.120\n\nNote: All estimates have \u00b140% uncertainty at Level 2.\nUse research_group('D_S01') to upgrade to Level 3 (\u00b125%).",
             "data": {
                 "group_id": "S1", "group_name": "Price-Sensitive Individuals", "segment": "Individual",
-                "info_level": 1, "noise": "±65%",
+                "info_level": 1, "noise": "±65%", "snapshot_day": 0,
                 "estimates": {
                     "willingness_to_pay": 25.86, "usage_volume": 91.0, "quality_floor_q_min": 0.452,
                     "contract_lockin_aversion": 0.0045, "market_cap": 802000, "annual_market_cap_growth_rate": 0.035
                 },
-                "network_influence": {"self_referral": 0.0015, "outgoing": {"S3": 0.002}, "incoming": {"S2": 0.001}},
-                "reputation_influence": {"outgoing": {"E1": 0.36}, "incoming": {}},
-                "_enterprise_extra_fields": ["seat_range", "negotiation_rounds", "negotiation_pace_days"]
+                "network_influence": {"self_referral": 1.5, "outgoing": {"S3": 2.0}, "incoming": {"S2": 1.0}},
+                "reputation_influence": {"outgoing": {"E1": 0.36}, "incoming": {}}
             }
         },
         "parameter_explanations": {
@@ -1318,8 +1324,9 @@ TOOL_DOCS = {
         "output_schema": {
             "group_id": "str", "group_name": "str", "segment": "str ('Individual'|'Enterprise')",
             "info_level": "int (1-5)", "noise": "str (e.g. '±65%')",
+            "snapshot_day": "int — survey measurement day (0 is valid); only completed research_group updates it, not this read",
             "estimates": "Dict — keys: willingness_to_pay (float), usage_volume (float), quality_floor_q_min (float), contract_lockin_aversion (float), market_cap (int), annual_market_cap_growth_rate (float). Enterprise adds: seat_range (List[int]), decision_rounds (int), avg_response_days (float)",
-            "network_influence": "Dict — keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) — leads per 1000 subs/day",
+            "network_influence": "Dict — keys: self_referral (float), outgoing (Dict[str,float]), incoming (Dict[str,float]) — all rates in leads per 1000 subs/day",
             "reputation_influence": "Dict — keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) — influence weights 0-1",
             "_access": "result['estimates']['willingness_to_pay'] → group's WTP"
         },
@@ -1401,17 +1408,21 @@ TOOL_DOCS = {
     "list_research_projects": {
         "name": "list_research_projects",
         "category": "R&D Research Projects",
-        "description": "List all 10 R&D research tiers with their status. Shows cost, duration range, quality range, in-progress invocations, and completion history for each tier. Tiers are repeatable.",
+        "description": "List all 20 R&D research tiers with their status. Shows cost, duration and quality mean/standard deviation, in-progress and completed counts, and total quality boost for each tier. Tiers are repeatable. Query the public research_projects table for individual projects and their dates.",
         "inputSchema": {"type": "object", "properties": {}},
         "parameters": {},
         "returns": {
-            "output": "All 10 tiers with: cost, duration mean±std, quality mean±std, current status (not started / in progress / completed Nx with total quality)",
+            "output": "All 20 tiers with: cost, duration mean±std, quality mean±std, in-progress/completed counts and total quality boost",
             "data": {
-                "tiers": [{"tier": 1, "name": "Prompt Engineering Optimization", "cost": 100000, "mean_days": 35, "mean_quality_boost": 0.04, "in_progress": 0, "completed": 0, "total_quality_boost": 0}]
+                "tiers": [{"tier": 1, "name": RESEARCH_TIERS[0].name, "cost": RESEARCH_TIERS[0].cost,
+                    "mean_days": RESEARCH_TIERS[0].mean_days, "std_days": RESEARCH_TIERS[0].std_days,
+                    "mean_quality_boost": RESEARCH_TIERS[0].mean_quality_boost,
+                    "std_quality_boost": RESEARCH_TIERS[0].std_quality_boost,
+                    "in_progress": 0, "completed": 0, "total_quality_boost": 0}]
             }
         },
         "output_schema": {
-            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), mean_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float)",
+            "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), std_days (float), mean_quality_boost (float), std_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float). Tier summaries only; query research_projects for individual projects and their dates.",
             "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
         },
         "total_tiers": 20,
@@ -1898,6 +1909,14 @@ class AgentTools:
         """Update the current day."""
         self.current_day = day
 
+    def _record_config_override(self, tool_name, setting_type, settings):
+        try:
+            record_config_override(self.conn, self.current_day, tool_name, setting_type, settings)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def set_prices(self, prices: Dict[str, float]) -> ToolResult:
         """Set prices for plans A, B, C. Only provided keys are changed.
 
@@ -2136,15 +2155,8 @@ class AgentTools:
                     f"Valid groups: {sorted(valid_groups)}"
                 )
             for group_id, amount in groups.items():
-                if not isinstance(amount, (int, float)) or amount < 0:
+                if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
                     return ToolResult(False, f"Amount for ({channel_id}, {group_id}) must be a non-negative number")
-
-        # Store in config
-        self.config.targeted_ad_spend = targeted_spend
-
-        # Log to config_history (store as JSON in a comment-style approach —
-        # the actual config object holds the state, no DB column needed)
-        # The simulation reads from self.config.targeted_ad_spend directly
 
         # Calculate total daily ad cost
         total_per_day = sum(
@@ -2164,9 +2176,9 @@ class AgentTools:
         else:
             result_msg = "Ad spend cleared. No advertising spend."
 
-        record_config_override(self.conn, self.current_day, 'set_targeted_ad_spend', 'targeted_ad_spend',
-                               {'targeted_spend': targeted_spend})
-        self.conn.commit()
+        self._record_config_override('set_targeted_ad_spend', 'targeted_ad_spend',
+                                     {'targeted_spend': targeted_spend})
+        self.config.targeted_ad_spend = targeted_spend
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_per_day': total_per_day,
@@ -2211,6 +2223,10 @@ class AgentTools:
 
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_plans = {'A', 'B', 'C'}
+        g = self.config.targeted_ops_spend
+        p = self.config.targeted_ops_spend_by_plan
+        gp = self.config.targeted_ops_spend_by_group_plan
+        c = self.config.targeted_ops_spend_by_customer
 
         # ── by_group ──
         if by_group is not None:
@@ -2220,9 +2236,9 @@ class AgentTools:
             if invalid:
                 return ToolResult(False, f"Invalid group IDs: {invalid}. Valid: {sorted(valid_groups)}")
             for gid, amt in by_group.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for {gid} must be a non-negative number")
-            self.config.targeted_ops_spend = {k: float(v) for k, v in by_group.items()}
+            g = {k: float(v) for k, v in by_group.items()}
 
         # ── by_plan ──
         if by_plan is not None:
@@ -2232,9 +2248,9 @@ class AgentTools:
             if invalid_plans:
                 return ToolResult(False, f"Invalid plans: {invalid_plans}. Valid: {sorted(valid_plans)}")
             for plan, amt in by_plan.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for plan {plan} must be a non-negative number")
-            self.config.targeted_ops_spend_by_plan = {k: float(v) for k, v in by_plan.items()}
+            p = {k: float(v) for k, v in by_plan.items()}
 
         # ── by_group_plan ──
         if by_group_plan is not None:
@@ -2252,11 +2268,11 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plans for group {gid}: {bad_plans}. Valid: {sorted(valid_plans)}")
                 inner: Dict[str, float] = {}
                 for plan, amt in plans_dict.items():
-                    if not isinstance(amt, (int, float)) or amt < 0:
+                    if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                         return ToolResult(False, f"Amount for {gid}/{plan} must be a non-negative number")
                     inner[plan] = float(amt)
                 parsed_gp[gid] = inner
-            self.config.targeted_ops_spend_by_group_plan = parsed_gp
+            gp = parsed_gp
 
         # ── by_customer ──
         if by_customer is not None:
@@ -2268,16 +2284,12 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(amt, (int, float)) or amt < 0:
+                if type(amt) not in (int, float) or not math.isfinite(amt) or amt < 0:
                     return ToolResult(False, f"Amount for customer {k} must be a non-negative number")
                 parsed_c[cid] = float(amt)
-            self.config.targeted_ops_spend_by_customer = parsed_c
+            c = parsed_c
 
         # Summarise current state
-        g = self.config.targeted_ops_spend
-        p = self.config.targeted_ops_spend_by_plan
-        gp = self.config.targeted_ops_spend_by_group_plan
-        c = self.config.targeted_ops_spend_by_customer
         total_extra = (
             sum(g.values()) + sum(p.values())
             + sum(v for inner in gp.values() for v in inner.values())
@@ -2303,8 +2315,8 @@ class AgentTools:
                 "Pure-group pools collapse to scale_g × spend; mixed pools are composition-weighted."
             )
 
-        record_config_override(
-            self.conn, self.current_day, 'set_targeted_ops_spend', 'targeted_ops_spend',
+        self._record_config_override(
+            'set_targeted_ops_spend', 'targeted_ops_spend',
             {
                 'by_group': g,
                 'by_plan': p,
@@ -2312,7 +2324,10 @@ class AgentTools:
                 'by_customer': {str(k): v for k, v in c.items()},
             },
         )
-        self.conn.commit()
+        self.config.targeted_ops_spend = g
+        self.config.targeted_ops_spend_by_plan = p
+        self.config.targeted_ops_spend_by_group_plan = gp
+        self.config.targeted_ops_spend_by_customer = c
         return ToolResult(True, result_msg, {
             'by_group': g,
             'by_plan': p,
@@ -2347,10 +2362,8 @@ class AgentTools:
                 f"Valid groups: {sorted(valid_groups)}"
             )
         for group_id, amount in targeted_spend.items():
-            if not isinstance(amount, (int, float)) or amount < 0:
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
                 return ToolResult(False, f"Amount for {group_id} must be a non-negative number")
-
-        self.config.targeted_dev_spend = targeted_spend
 
         total_extra = sum(targeted_spend.values())
         summary_parts = [f"  • {gid}: +${amt:.0f}/day" for gid, amt in targeted_spend.items()]
@@ -2362,9 +2375,9 @@ class AgentTools:
         else:
             result_msg += "  (no targeted dev spend — all dev spend is global)"
 
-        record_config_override(self.conn, self.current_day, 'set_targeted_dev_spend', 'targeted_dev_spend',
-                               {'targeted_spend': targeted_spend})
-        self.conn.commit()
+        self._record_config_override('set_targeted_dev_spend', 'targeted_dev_spend',
+                                     {'targeted_spend': targeted_spend})
+        self.config.targeted_dev_spend = targeted_spend
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_extra_per_day': total_extra,
@@ -2382,14 +2395,15 @@ class AgentTools:
             by_customer: {customer_id_str: strength}. None = no change.
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
+        strength = self.config.ads_strength_global
+        groups = self.config.ads_strength_by_group
+        customers = self.config.ads_strength_by_customer
 
-        # Validate and apply global strength
         if global_strength is not None:
-            if not isinstance(global_strength, (int, float)) or global_strength < 0 or global_strength > 1:
+            if type(global_strength) not in (int, float) or not math.isfinite(global_strength) or global_strength < 0 or global_strength > 1:
                 return ToolResult(False, "Global ads strength must be between 0.0 and 1.0")
-            self.config.ads_strength_global = float(global_strength)
+            strength = float(global_strength)
 
-        # Validate and apply per-group strength
         if by_group is not None:
             if not isinstance(by_group, dict):
                 return ToolResult(False, "by_group must be a dict of {group_id: strength}")
@@ -2397,11 +2411,10 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0 or val > 1:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0 or val > 1:
                     return ToolResult(False, f"Strength for {gid} must be between 0.0 and 1.0")
-            self.config.ads_strength_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
-        # Validate and apply per-customer strength
         if by_customer is not None:
             if not isinstance(by_customer, dict):
                 return ToolResult(False, "by_customer must be a dict of {customer_id: strength}")
@@ -2411,23 +2424,19 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0 or v > 1:
+                if type(v) not in (int, float) or not math.isfinite(v) or v < 0 or v > 1:
                     return ToolResult(False, f"Strength for customer {k} must be between 0.0 and 1.0")
                 parsed[cid] = float(v)
-            self.config.ads_strength_by_customer = parsed
+            customers = parsed
 
-        # Build summary
-        parts = [f"Global: {self.config.ads_strength_global:.2f}"]
-        if self.config.ads_strength_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: {v:.2f}' for k, v in self.config.ads_strength_by_group.items())}}}")
-        if self.config.ads_strength_by_customer:
-            parts.append(f"Customers: {len(self.config.ads_strength_by_customer)} custom")
-        record_config_override(self.conn, self.current_day, 'set_ads_strength', 'ads_strength', {
-            'global': self.config.ads_strength_global,
-            'by_group': self.config.ads_strength_by_group,
-            'by_customer': {str(k): v for k, v in self.config.ads_strength_by_customer.items()},
+        self._record_config_override('set_ads_strength', 'ads_strength', {
+            'global': strength,
+            'by_group': groups,
+            'by_customer': {str(k): v for k, v in customers.items()},
         })
-        self.conn.commit()
+        self.config.ads_strength_global = strength
+        self.config.ads_strength_by_group = groups
+        self.config.ads_strength_by_customer = customers
         return ToolResult(True, "Ads strength updated.", {
             'global': self.config.ads_strength_global,
             'by_group': self.config.ads_strength_by_group,
@@ -2447,11 +2456,15 @@ class AgentTools:
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_channels = set(AD_CHANNELS.keys())
+        promotion = self.config.lead_promotion_global
+        groups = self.config.lead_promotion_by_group
+        channels = self.config.lead_promotion_by_channel
+        channel_groups = self.config.lead_promotion_by_channel_group
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if type(global_promotion) not in (int, float) or not math.isfinite(global_promotion) or global_promotion < 0:
                 return ToolResult(False, "Global lead promotion must be non-negative")
-            self.config.lead_promotion_global = float(global_promotion)
+            promotion = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2460,9 +2473,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.lead_promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
         if by_channel is not None:
             if not isinstance(by_channel, dict):
@@ -2471,9 +2484,9 @@ class AgentTools:
             if invalid_channels_found:
                 return ToolResult(False, f"Invalid channels: {invalid_channels_found}. Valid: {sorted(valid_channels)}")
             for ch_id, val in by_channel.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for channel '{ch_id}' must be non-negative")
-            self.config.lead_promotion_by_channel = {k: float(v) for k, v in by_channel.items()}
+            channels = {k: float(v) for k, v in by_channel.items()}
 
         if by_channel_group is not None:
             if not isinstance(by_channel_group, dict):
@@ -2489,29 +2502,21 @@ class AgentTools:
                 if invalid_groups:
                     return ToolResult(False, f"Invalid group IDs for channel '{ch_id}': {invalid_groups}. Valid: {sorted(valid_groups)}")
                 for gid, val in group_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                         return ToolResult(False, f"Promotion for channel '{ch_id}', group '{gid}' must be non-negative")
                 parsed[ch_id] = {k: float(v) for k, v in group_dict.items()}
-            self.config.lead_promotion_by_channel_group = parsed
+            channel_groups = parsed
 
-        parts = [f"Global: ${self.config.lead_promotion_global:.2f}/mo"]
-        if self.config.lead_promotion_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.lead_promotion_by_group.items())}}}")
-        if self.config.lead_promotion_by_channel:
-            parts.append(f"Channels: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.lead_promotion_by_channel.items())}}}")
-        if self.config.lead_promotion_by_channel_group:
-            ch_parts = []
-            for ch_id, grp_dict in self.config.lead_promotion_by_channel_group.items():
-                for gid, val in grp_dict.items():
-                    ch_parts.append(f"{ch_id}→{gid}: ${val:.2f}")
-            parts.append(f"Channel×Group: {{{', '.join(ch_parts)}}}")
-        record_config_override(self.conn, self.current_day, 'set_lead_promotion', 'lead_promotion', {
-            'global': self.config.lead_promotion_global,
-            'by_group': self.config.lead_promotion_by_group,
-            'by_channel': self.config.lead_promotion_by_channel,
-            'by_channel_group': self.config.lead_promotion_by_channel_group,
+        self._record_config_override('set_lead_promotion', 'lead_promotion', {
+            'global': promotion,
+            'by_group': groups,
+            'by_channel': channels,
+            'by_channel_group': channel_groups,
         })
-        self.conn.commit()
+        self.config.lead_promotion_global = promotion
+        self.config.lead_promotion_by_group = groups
+        self.config.lead_promotion_by_channel = channels
+        self.config.lead_promotion_by_channel_group = channel_groups
         return ToolResult(True, "Lead promotion updated.", {
             'global': self.config.lead_promotion_global,
             'by_group': self.config.lead_promotion_by_group,
@@ -2533,11 +2538,15 @@ class AgentTools:
         """
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_plans = {'A', 'B', 'C'}
+        promotion = self.config.promotion_global
+        groups = self.config.promotion_by_group
+        customers = self.config.promotion_by_customer
+        group_plans = self.config.promotion_by_group_plan
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if type(global_promotion) not in (int, float) or not math.isfinite(global_promotion) or global_promotion < 0:
                 return ToolResult(False, "Global promotion must be non-negative")
-            self.config.promotion_global = float(global_promotion)
+            promotion = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2546,9 +2555,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            groups = {k: float(v) for k, v in by_group.items()}
 
         if by_customer is not None:
             if not isinstance(by_customer, dict):
@@ -2559,10 +2568,10 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0:
+                if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
                     return ToolResult(False, f"Promotion for customer {k} must be non-negative")
                 parsed[cid] = float(v)
-            self.config.promotion_by_customer = parsed
+            customers = parsed
 
         if by_group_plan is not None:
             if not isinstance(by_group_plan, dict):
@@ -2579,30 +2588,22 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plan keys for group {gid}: {invalid_plans}. Valid: {sorted(valid_plans)}")
                 parsed_inner = {}
                 for plan, val in plans_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
                         return ToolResult(False, f"Promotion for {gid}/{plan} must be non-negative")
                     parsed_inner[plan] = float(val)
                 parsed_gp[gid] = parsed_inner
-            self.config.promotion_by_group_plan = parsed_gp
+            group_plans = parsed_gp
 
-        parts = [f"Global: ${self.config.promotion_global:.2f}/mo"]
-        if self.config.promotion_by_group:
-            parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.promotion_by_group.items())}}}")
-        if self.config.promotion_by_customer:
-            parts.append(f"Customers: {len(self.config.promotion_by_customer)} custom")
-        if self.config.promotion_by_group_plan:
-            gp_parts = []
-            for gid, plans in self.config.promotion_by_group_plan.items():
-                for plan, val in plans.items():
-                    gp_parts.append(f"{gid}/{plan}: ${val:.2f}")
-            parts.append(f"Group-Plans: {{{', '.join(gp_parts)}}}")
-        record_config_override(self.conn, self.current_day, 'set_promotion', 'promotion', {
-            'global': self.config.promotion_global,
-            'by_group': self.config.promotion_by_group,
-            'by_customer': {str(k): v for k, v in self.config.promotion_by_customer.items()},
-            'by_group_plan': self.config.promotion_by_group_plan,
+        self._record_config_override('set_promotion', 'promotion', {
+            'global': promotion,
+            'by_group': groups,
+            'by_customer': {str(k): v for k, v in customers.items()},
+            'by_group_plan': group_plans,
         })
-        self.conn.commit()
+        self.config.promotion_global = promotion
+        self.config.promotion_by_group = groups
+        self.config.promotion_by_customer = customers
+        self.config.promotion_by_group_plan = group_plans
         return ToolResult(True, "Promotion updated.", {
             'global': self.config.promotion_global,
             'by_group': self.config.promotion_by_group,
@@ -4180,7 +4181,7 @@ os.chdir('{self.workspace_path}')
             self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments to discover — all segments have been identified.",
-                data={'cost': cost})
+                data={'cost': cost, 'status': 'exhausted', 'remaining_undiscovered': 0})
 
         # Path-independent RNG: seeded by (global_seed, "market_research", attempt_number)
         # so discovery results depend only on how many times research_market was called, not on other RNG usage
@@ -4252,7 +4253,8 @@ os.chdir('{self.workspace_path}')
                 f"{preview_text}\n"
                 f"Use get_group_insights('{discovered_gid}') for full parameter estimates.\n"
                 f"Use research_group('{discovered_gid}') to improve accuracy.",
-                data={'discovered_group_id': discovered_gid}
+                data={'discovered_group_id': discovered_gid, 'cost': cost,
+                      'status': 'discovered', 'remaining_undiscovered': remaining}
             )
         else:
             remaining = len(undiscovered)
@@ -4264,7 +4266,7 @@ os.chdir('{self.workspace_path}')
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments discovered this time. "
                 f"Try again for another chance.",
-                data={'cost': cost}
+                data={'cost': cost, 'status': 'not_found', 'remaining_undiscovered': remaining}
             )
 
     def research_group(self, group_id: str, target_level: int = None) -> ToolResult:
@@ -4426,7 +4428,7 @@ os.chdir('{self.workspace_path}')
         macro_row = None
         try:
             macro_row = self.conn.execute(
-                "SELECT pmi_value, pmi_trend, pmi_change, cycle_phase, description "
+                "SELECT day, pmi_value, pmi_trend, pmi_change, cycle_phase, description "
                 "FROM macroeconomic_conditions ORDER BY day DESC LIMIT 1"
             ).fetchone()
             if macro_row:
@@ -4434,7 +4436,8 @@ os.chdir('{self.workspace_path}')
                 output += f"  ISM PMI: {macro_row['pmi_value']:.1f}  ({macro_row['pmi_trend'].replace('_', ' ')})\n"
                 output += f"  Change: {'+' if macro_row['pmi_change'] >= 0 else ''}{macro_row['pmi_change']:.1f}  |  Cycle: {macro_row['cycle_phase'].replace('_', ' ')}\n"
                 output += f"  {macro_row['description']}\n"
-                output += "NOTE: PMI data is published with ~30 day delay. This reading reflects past conditions.\n"
+                output += (f"Measurement day: {macro_row['day']}. PMI data is published with "
+                           f"~{self.config.macro_pmi_publication_delay_days} day delay. This reading reflects past conditions.\n")
                 output += "Query macroeconomic_conditions table for historical PMI data.\n"
         except Exception:
             pass  # Table may not exist in older databases
@@ -4460,6 +4463,8 @@ os.chdir('{self.workspace_path}')
         try:
             if macro_row:
                 macro_data = {
+                    'measurement_day': macro_row['day'],
+                    'publication_delay_days': self.config.macro_pmi_publication_delay_days,
                     'pmi_value': macro_row['pmi_value'],
                     'pmi_trend': macro_row['pmi_trend'],
                     'pmi_change': macro_row['pmi_change'],
@@ -4566,6 +4571,7 @@ os.chdir('{self.workspace_path}')
 
         data = {
             'group_id': group_id,
+            'snapshot_day': snapshot_day,
             'group_name': group_cfg.group_name,
             'segment': segment,
             'info_level': info_level,
@@ -4613,6 +4619,7 @@ os.chdir('{self.workspace_path}')
         incoming_net = []
         outgoing_rep = []
         incoming_rep = []
+        noised_self = 0.0
 
         if other_groups:
             output += "\n--- Network Influence (word-of-mouth referrals) ---\n"
@@ -4698,8 +4705,9 @@ os.chdir('{self.workspace_path}')
                 output += "  (negligible reputation influence from other groups)\n"
 
         data['network_influence'] = {
-            'outgoing': {gid: round(val, 4) for gid, _, val in outgoing_net},
-            'incoming': {gid: round(val, 4) for gid, _, val in incoming_net},
+            'self_referral': round(noised_self * 1000, 4),
+            'outgoing': {gid: round(val * 1000, 4) for gid, _, val in outgoing_net},
+            'incoming': {gid: round(val * 1000, 4) for gid, _, val in incoming_net},
         }
         data['reputation_influence'] = {
             'outgoing': {gid: round(val, 4) for gid, _, val in outgoing_rep},
@@ -4834,7 +4842,7 @@ os.chdir('{self.workspace_path}')
         )
 
     def list_research_projects(self) -> ToolResult:
-        """List all 10 R&D research tiers with their status."""
+        """List all R&D research tiers with their aggregate status."""
         # Get all invocations from DB
         rows = self.conn.execute("SELECT * FROM research_projects ORDER BY tier, started_day").fetchall()
 
@@ -4851,7 +4859,7 @@ os.chdir('{self.workspace_path}')
         output = "=== R&D Research Tiers ===\n"
         output += "Tiers are repeatable — same tier can be started again after completion.\n\n"
 
-        # Show all 10 tiers with their status
+        # Show all tiers with their status
         output += "ALL TIERS:\n"
         for rt in RESEARCH_TIERS:
             t = rt.tier
@@ -4885,7 +4893,9 @@ os.chdir('{self.workspace_path}')
                 'name': rt.name,
                 'cost': rt.cost,
                 'mean_days': rt.mean_days,
+                'std_days': rt.std_days,
                 'mean_quality_boost': rt.mean_quality_boost,
+                'std_quality_boost': rt.std_quality_boost,
                 'in_progress': len(in_prog),
                 'completed': len(done),
                 'total_quality_boost': round(total_q, 4),

@@ -52,9 +52,17 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
     monkeypatch.setattr(subprocess, 'Popen', launch)
     runners = []
     def create(restore=None, **options):
+        managed_checkpoints = options.pop('managed_checkpoints', True)
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
-                                total_days=42, workspace_base=tmp_path, continue_from=restore,
+                                total_days=options.pop('total_days', 42), workspace_base=tmp_path, continue_from=restore,
                                 run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
+        if not managed_checkpoints:
+            server_environment = runner._server_environment
+            def unmanaged_environment():
+                env = server_environment()
+                env.pop('CEOBENCH_CHECKPOINT_ROOT', None)
+                return env
+            monkeypatch.setattr(runner, '_server_environment', unmanaged_environment)
         runners.append(runner)
         runner.setup()
         if restore:
@@ -70,6 +78,113 @@ def advance(runner):
     return runner._http_post('/next-week', {'rationale': 'fixed offline action',
         'predictions': {h: {'point': 100000, 'lower': -100000, 'upper': 1000000}
                         for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}, timeout=120)
+
+
+def set_runtime_config(runner, values):
+    calls = [
+        ('set_targeted_ad_spend', {'targeted_spend': values['targeted_ad_spend']}),
+        ('set_targeted_ops_spend', {
+            'by_group': values['targeted_ops_spend'],
+            'by_plan': values['targeted_ops_spend_by_plan'],
+            'by_group_plan': values['targeted_ops_spend_by_group_plan'],
+            'by_customer': values['targeted_ops_spend_by_customer']}),
+        ('set_targeted_dev_spend', {'targeted_spend': values['targeted_dev_spend']}),
+        ('set_ads_strength', {'global_strength': values['ads_strength_global'],
+            'by_group': values['ads_strength_by_group'], 'by_customer': values['ads_strength_by_customer']}),
+        ('set_lead_promotion', {'global_promotion': values['lead_promotion_global'],
+            'by_group': values['lead_promotion_by_group'], 'by_channel': values['lead_promotion_by_channel'],
+            'by_channel_group': values['lead_promotion_by_channel_group']}),
+        ('set_promotion', {'global_promotion': values['promotion_global'],
+            'by_group': values['promotion_by_group'], 'by_customer': values['promotion_by_customer'],
+            'by_group_plan': values['promotion_by_group_plan']}),
+    ]
+    for tool, args in calls:
+        result = runner._http_post('/call', {'tool': tool, 'args': args})
+        assert result['success'], result
+
+
+def saved_runtime_config(path):
+    conn = load_session_db(path)
+    try:
+        state = json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])
+        assert state['version'] == 3
+        return state['runtime_config']
+    finally:
+        conn.close()
+
+
+def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_path):
+    from test_preflight_rng import runtime_values
+
+    first = offline_runner()
+    manifest = (first.workspace_dir / 'manifest.json').read_bytes()
+    expected = runtime_values()
+    set_runtime_config(first, expected)
+    expected['targeted_ad_spend'] = {'social_media': {'S1': 19.0}}
+    expected['targeted_ops_spend_by_plan'] = {}
+    expected['targeted_dev_spend'] = {}
+    expected['promotion_global'] = 15.0
+    set_runtime_config(first, expected)
+    first._save_checkpoint(0)
+    directory = checkpoint_directory(first.workspace_dir, first._load_checkpoint())
+    encoded = json.loads(json.dumps(expected))
+    assert len(encoded) == 17
+    assert saved_runtime_config(directory / 'world.nmdb') == encoded
+    restored = offline_runner(clone(first, tmp_path / 'runtime-restored'))
+    for _ in range(2):
+        assert advance(restored) == advance(first)
+    for runner in (first, restored):
+        runner._save_checkpoint(14)
+        directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
+        assert saved_runtime_config(directory / 'world.nmdb') == encoded
+        assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+    assert business_state(restored) == business_state(first)
+
+
+def test_packed_runtime_config_survives_ordinary_stop_start(offline_runner):
+    from test_preflight_rng import runtime_values
+
+    runner = offline_runner(managed_checkpoints=False)
+    manifest = (runner.workspace_dir / 'manifest.json').read_bytes()
+    expected = runtime_values()
+    set_runtime_config(runner, expected)
+    runner._stop_server()
+    directory = runner.agent_workspace / 'sessions' / runner._session_id
+    assert saved_runtime_config(directory / 'world.nmdb') == json.loads(json.dumps(expected))
+    assert json.loads((directory / 'session.json').read_text())['current_day'] == 0
+    runner._launch_server()
+    assert advance(runner)['success']
+    runner._stop_server()
+    assert saved_runtime_config(directory / 'world.nmdb') == json.loads(json.dumps(expected))
+    assert json.loads((directory / 'session.json').read_text())['current_day'] == 7
+    assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+
+
+@pytest.mark.parametrize('invalid', ['legacy', 'bad_runtime', 'missing_state'])
+def test_packed_start_refuses_legacy_or_invalid_runtime(offline_runner, invalid):
+    from saas_bench.db_protection import save_session_db
+
+    runner = offline_runner(managed_checkpoints=False)
+    runner._stop_server()
+    path = runner.agent_workspace / 'sessions' / runner._session_id / 'world.nmdb'
+    conn = load_session_db(path)
+    try:
+        if invalid == 'missing_state':
+            conn.execute('DROP TABLE _rng_states')
+        else:
+            state = json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])
+            if invalid == 'legacy':
+                state['version'] = 2
+                del state['runtime_config']
+            else:
+                state['runtime_config']['promotion_global'] = float('nan')
+            conn.execute("UPDATE _rng_states SET state_json=?", (json.dumps(state),))
+        conn.commit()
+        save_session_db(conn, path)
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match='version 3 required|runtime'):
+        runner._launch_server()
 
 
 def test_agent_zipapp_excludes_engine_and_survives_restore(offline_runner, packed_public):
@@ -250,13 +365,31 @@ def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, mo
     from openai import OpenAI
     from test_preflight_usage import reply
     runner = offline_runner(execution_capture=execution)
+    rejected = runner._execute_tool('bash', {'command':
+        "./novamind-operation next-week 'invalid forecast'" + ' 20.7 22.1 19.3' * 4})
+    assert '[exit code: 1]' in rejected and 'Error:' in rejected
+    assert 'Submitted cash forecasts' not in rejected
     requests = []
+    amounts = ' 20.7 19.3 22.1 20.7e6 19300000 22100000 -49.15 -50 -48 0.001 -0.002 0.004'
+    forecasts = [
+        '+7 days: point=USD 20.7, lower=USD 19.3, upper=USD 22.1',
+        '+28 days: point=USD 20700000.0, lower=USD 19300000.0, upper=USD 22100000.0',
+        '+84 days: point=USD -49.15, lower=USD -50.0, upper=USD -48.0',
+        '+182 days: point=USD 0.001, lower=USD -0.002, upper=USD 0.004',
+    ]
     def handle(request):
         requests.append(json.loads(request.content))
         if len(requests) > 6:
             raise KeyboardInterrupt('Harness failed to advance the week')
+        observation = '\n'.join(m['content'] for m in requests[-1]['messages'] if m['role'] == 'user')
+        assert observation.count('Forecast units:') == 1
+        assert 'All 12 cash forecast values for next-week are USD.' in observation
+        assert 'For 20.7 million USD, submit 20700000 or 20.7e6.' in observation
+        if len(requests) > 1:
+            assert f'Submitted cash forecasts at D{(len(requests) - 2) * 7} (USD; horizons from submission):' in observation
+            assert all(forecast in observation for forecast in forecasts)
         body = reply('chat')
-        command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+        command = "./novamind-operation next-week 'fixed offline action'" + amounts
         body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
             function=dict(name='bash', arguments=json.dumps({'command': command})))]
         return httpx.Response(200, json=body)
@@ -272,9 +405,80 @@ def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, mo
     assert all(not any(m['role'] == 'tool' for m in request['messages']) for request in requests)
     checkpoint = runner._load_checkpoint()
     assert checkpoint['total_turns'] == 6
+    tool_results = [json.loads(line) for line in (runner.logs_dir / f'tool_results_{runner.run_id}.jsonl').read_text().splitlines()]
+    submissions = [row['result'] for row in tool_results if row['tool'] == 'bash']
+    assert len(submissions) == 6
+    assert all(all(forecast in receipt for forecast in forecasts) for receipt in submissions)
+    conn = load_session_db(checkpoint_directory(runner.workspace_dir, checkpoint) / 'world.nmdb')
+    try:
+        stored = [tuple(row) for row in conn.execute('''SELECT submit_day,horizon_days,
+            predicted_value,predicted_lower,predicted_upper FROM predictions ORDER BY submit_day,horizon_days''')]
+    finally:
+        conn.close()
+    expected = [(7, 20.7, 19.3, 22.1), (28, 20700000.0, 19300000.0, 22100000.0),
+                (84, -49.15, -50.0, -48.0), (182, 0.001, -0.002, 0.004)]
+    assert stored == [(day, *forecast) for day in range(0, 42, 7) for forecast in expected]
     summary = json.loads((runner.workspace_dir / 'usage_summary.json').read_text())
     assert summary['agent']['calls'] == 6 and summary['agent']['known']['input_tokens'] == 60
     assert summary['simulator']['calls'] > 0
+
+
+@pytest.mark.parametrize('first_response', ['no_tool', 'invalid_json', 'http_error', 'missing_usage'])
+def test_harness_counts_every_response_when_act_regenerates(offline_runner, monkeypatch, first_response):
+    import httpx
+    from openai import OpenAI
+    from test_preflight_usage import reply
+    runner = offline_runner(stop_after_day=14)
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        assert len(requests) <= 4
+        body = reply('chat')
+        if len(requests) % 2:
+            if first_response == 'http_error':
+                return httpx.Response(503, json={'error': {'message': 'offline retry'}})
+            body['choices'][0]['finish_reason'] = 'length'
+            body['usage']['completion_tokens'] = 16384
+            if first_response == 'invalid_json':
+                body['choices'][0]['message']['tool_calls'] = [dict(id=f'bad-{len(requests)}', type='function',
+                    function=dict(name='bash', arguments='{invalid'))]
+            elif first_response == 'missing_usage':
+                body.pop('usage')
+        else:
+            body['usage']['prompt_tokens'] = 20
+            command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+            body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
+                function=dict(name='bash', arguments=json.dumps({'command': command})))]
+        return httpx.Response(200, json=body)
+    runner.client.close()
+    runner.client = OpenAI(api_key='offline-only', base_url='https://api.deepseek.com', max_retries=0,
+                           http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    runner.agent.client = runner.agent.usage_recorder.attach(runner.client)
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    result = runner.run(verbose=False)
+    assert result['days_run'] == 14 and result['outcome'] == 'stopped'
+    assert len(requests) == 4
+    timing = [json.loads(line) for line in runner.timing_log_file.read_text().splitlines()]
+    acts = [row for row in timing if row['event'] == 'llm_call']
+    days = [row for row in timing if row['event'] == 'day_summary']
+    assert len(acts) == len(days) == 2
+    first_known = first_response in ('no_tool', 'invalid_json')
+    expected = dict(input_tokens=30 if first_known else 20, output_tokens=16386 if first_known else 2,
+                    cached_tokens=6 if first_known else 3, reasoning_tokens=2 if first_known else 1)
+    for field, value in expected.items():
+        assert [row[field] for row in acts] == [value, value]
+        assert [row['day_' + field] for row in days] == [value, value]
+    assert [row['model_calls'] for row in acts] == [2, 2]
+    assert [row['day_model_calls'] for row in days] == [2, 2]
+    assert [row['usage_missing']['input_tokens'] for row in acts] == [int(not first_known)] * 2
+    assert [row['day_usage_missing']['input_tokens'] for row in days] == [int(not first_known)] * 2
+    assert all(row['cache_creation_tokens'] is None and row['usage_missing']['cache_creation_tokens'] == 2
+               for row in acts)
+    summary = json.loads((runner.workspace_dir / 'usage_summary.json').read_text())['agent']
+    assert summary['calls'] == 4 and summary['known']['input_tokens'] == 2 * expected['input_tokens']
+    for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'reasoning_tokens'):
+        assert sum(row[field] for row in acts) == sum(row['day_' + field] for row in days) == summary['known'][field]
 
 
 def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_runner, monkeypatch):
@@ -735,17 +939,34 @@ os._exit(77)
             'checkpoint_unchanged': True, 'restore_refused': True}, indent=2))
 
 
+def test_git_workspace_maintenance_is_synchronous(offline_runner):
+    runner = offline_runner(execution_capture=True)
+    for option in ('gc.autoDetach', 'maintenance.autoDetach'):
+        assert runner._git('config', '--get', option).stdout.strip() == 'false'
+        runner._git('config', option, 'true', check=True)
+    runner._git_init_workspace()  # Existing repositories need the same boundary rule.
+    for option in ('gc.autoDetach', 'maintenance.autoDetach'):
+        assert runner._git('config', '--get', option).stdout.strip() == 'false'
+    for i in range(3):
+        result = runner.tool_executor.execute('bash', {
+            'command': f'git commit --allow-empty -q -m "foreground maintenance {i}" && echo committed'})
+        assert 'committed' in result
+    assert getattr(runner.tool_executor, 'preserved_process', None) is None
+    runner.evidence_store.assert_healthy()
+
+
 def test_harness_preserves_unfinished_descendants_and_server(offline_runner, monkeypatch):
     import signal
     from saas_bench.environment import Action
     runner = offline_runner(execution_capture=True)
+    runner.tool_executor.bash_timeout = .3
     runner._save_checkpoint(0)
     pointer = (runner.workspace_dir / 'checkpoint.json').read_bytes()
     monkeypatch.setattr(runner, 'setup', lambda: None)
     monkeypatch.setattr(runner.agent, 'act', lambda *args: Action(tool='bash',
         arguments={'command': 'sleep 60 >/dev/null 2>&1 & echo parent-returned'}))
     try:
-        with pytest.raises(RuntimeError, match='unknown'):
+        with pytest.raises(RuntimeError, match='descendants did not finish before the command deadline'):
             runner.run(verbose=False)
         assert runner._server_proc.poll() is None
         assert runner.tool_executor.preserved_process.poll() is None

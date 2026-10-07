@@ -145,7 +145,14 @@ runs the full 500-day loop with checkpointing and logging. The full process:
 
 ```bash
 uv sync
+uv run python scripts/build_agent_runtime.py   # Linux: Python runtime for the agent sandbox
 ```
+
+On Linux the agent's commands run under bubblewrap. The sandbox shows the agent
+workspace at `/workspace`, read-only system directories, and the runtime built
+above at `/opt/python` (this interpreter plus numpy, pandas and scikit-learn at the
+installed versions). Host paths, `/proc` and the harness-owned `sessions/`
+directory are not visible. Rebuild the runtime after changing the environment.
 
 **2. Set provider credentials** in a `.env` file at the repo root. Which keys you
 need depends on the agent model; for a Bedrock run:
@@ -243,6 +250,7 @@ ceobench-src/
 │   └── examples/{autoplay_loop,basic_strategy}.py
 ├── scripts/
 │   ├── build_public.py                ← canonical public-repo builder
+│   ├── build_agent_runtime.py         ← agent sandbox Python runtime
 │   ├── start_fresh_sonnet_bash.sh     ← bash-agent launcher (Bedrock Sonnet)
 │   ├── start_fresh_gpt_bash.sh        ← bash-agent launcher (OpenAI GPT)
 │   └── resume_run.sh                  ← resume bash agent from checkpoint

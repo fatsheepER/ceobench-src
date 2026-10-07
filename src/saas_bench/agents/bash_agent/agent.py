@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, asdict
 from ..base import BaseAgent
 from ...environment import Action
 from ...model_usage import ModelUsage, usage_values
+from ...run_lifecycle import RunCancelled
 
 
 @dataclass
@@ -27,10 +28,68 @@ class Message:
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # DeepSeek thinking mode: returned reasoning must be sent back verbatim after tool calls.
+    reasoning_content: Optional[str] = None
 
+
+NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week with the rationale and "
+                    "12 dollar-valued forecasts specified in the system instructions.")
 
 # Regex to detect dashboard in bash output (day advancement)
 _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
+
+
+def _stream_chat_completion(client, request):
+    import httpx
+    from openai import APIConnectionError, LengthFinishReasonError
+    from openai.lib.streaming.chat import ChatCompletionStreamState
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
+    from pydantic import ValidationError
+
+    state = ChatCompletionStreamState()
+    received = False
+    with client.chat.completions.create(**request) as stream:
+        try:
+            for chunk in stream:
+                chunk = ChatCompletionChunk.model_validate(
+                    chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
+                received = True
+                for choice in chunk.choices:
+                    for tool in choice.delta.tool_calls or []:
+                        # Go uses null for unchanged metadata in continuation chunks.
+                        for field in ('id', 'type'):
+                            if getattr(tool, field) is None:
+                                tool.model_fields_set.discard(field)
+                        if tool.function is None:
+                            tool.function = ChoiceDeltaToolCallFunction()
+                        for field in ('name', 'arguments'):
+                            if getattr(tool.function, field) is None:
+                                tool.function.model_fields_set.discard(field)
+                state.handle_chunk(chunk)
+            if not received:
+                raise httpx.ReadError('Chat completion stream ended without an assistant chunk')
+            snapshot = state.current_completion_snapshot
+            if not snapshot.choices or any(not choice.finish_reason for choice in snapshot.choices):
+                raise httpx.ReadError('Chat completion stream ended without finish_reason')
+            for choice in snapshot.choices:
+                for tool in choice.message.tool_calls or []:
+                    if (not isinstance(tool.id, str) or not tool.id.strip() or tool.type != 'function'
+                            or tool.function is None or not isinstance(tool.function.name, str)
+                            or not tool.function.name.strip()):
+                        raise httpx.ReadError('Chat completion stream ended with incomplete tool metadata')
+                    try:
+                        arguments = json.loads(tool.function.arguments)
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise httpx.ReadError('Chat completion stream ended with invalid tool arguments') from exc
+                    if not isinstance(arguments, dict):
+                        raise httpx.ReadError('Chat completion tool arguments must be a JSON object')
+        except (httpx.TransportError, json.JSONDecodeError, ValidationError) as exc:
+            raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
+        try:
+            return state.get_final_completion()
+        except LengthFinishReasonError as exc:
+            return exc.completion
 
 
 class BashAgent(BaseAgent):
@@ -60,6 +119,7 @@ class BashAgent(BaseAgent):
         anthropic_fallback_model: Optional[str] = None,
         usage_recorder: Optional[ModelUsage] = None,
         text_registration: bool = False,
+        pf: bool = False,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -97,9 +157,13 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
+        if pf and not text_registration:
+            raise ValueError('PF requires text registration')
+        self.text_registration, self.pf = text_registration, pf
         if text_registration:
-            from saas_bench.registration_schema import REGISTRATION_PROMPT
-            self.system_prompt += REGISTRATION_PROMPT
+            # Registration groups integrate their sections into the original prompt.
+            from saas_bench.registration_prompt import integrate
+            self.system_prompt = integrate(self.system_prompt, pf)
 
         # Agent state
         self.conversation: List[Message] = []
@@ -197,7 +261,7 @@ class BashAgent(BaseAgent):
                 from saas_bench.execution_capture import ExecutionCapture, CapturedText, decoded, origin
                 memory_text = decoded(original_memory)
                 memory_content = memory_text.strip()
-                memory_origin = None
+                memory_origin = memory_version = None
                 if self.evidence_store:
                     capture = ExecutionCapture(self.evidence_store)
                     capture.begin('memory_read', {'path': 'MEMORY.md'})
@@ -215,12 +279,17 @@ class BashAgent(BaseAgent):
                             f"Showing first {max_memory_chars:,} of {len(memory_content):,} characters. "
                             "Use the read_file tool to see the full contents if needed."
                         )
-                    prompt += (
-                        "\n\n## Your MEMORY.md (auto-loaded)\n\n"
-                        "The following is the contents of your MEMORY.md file. "
-                        "This is automatically loaded into your context at the start of every day.\n\n"
-                        f"{memory_content}"
-                    )
+                    if getattr(self, 'text_registration', False):
+                        from saas_bench.registration_prompt import MEMORY_HEADER
+                        history = self._memory_history(memory_version)
+                        prompt += MEMORY_HEADER + (history + '\n' if history else '') + '\n' + memory_content
+                    else:
+                        prompt += (
+                            "\n\n## Your MEMORY.md (auto-loaded)\n\n"
+                            "The following is the contents of your MEMORY.md file. "
+                            "This is automatically loaded into your context at the start of every day.\n\n"
+                            f"{memory_content}"
+                        )
                     if memory_origin:
                         length = memory_origin['request_range'][1]
                         offset = len(prompt) - len(memory_content)
@@ -230,6 +299,14 @@ class BashAgent(BaseAgent):
                 if self.evidence_store:
                     self.evidence_store.fail(exc)
         return prompt
+
+    def _memory_history(self, version):
+        """The registration groups' line on MEMORY.md's history: PF names the loaded version,
+        Git the last weekly commit that changed the file."""
+        from saas_bench import registration_prompt
+        if self.pf:
+            return registration_prompt.pf_memory_line(self.evidence_store, version) if version else None
+        return registration_prompt.git_memory_line(self.workspace_path)
 
     def _context_system_prompt(self) -> str:
         """Reuse the frozen prompt, including its private source ranges."""
@@ -263,6 +340,7 @@ class BashAgent(BaseAgent):
         if self.evidence_store:
             import uuid
             self.usage_recorder.context_id = uuid.uuid4().hex
+            self.usage_recorder.last_request_event = None
         self._pending_tool_calls = []
         self._observation_recorded = False
 
@@ -340,8 +418,14 @@ class BashAgent(BaseAgent):
             self._observation_recorded = False
 
         # Call LLM
+        if self._pending_tool_calls:
+            raise RuntimeError('Finish the current tool batch before requesting another model response')
         self._llm_attempt = 0
-        action = self._call_llm()
+        try:
+            action = self._call_llm()
+        except RunCancelled:
+            self._observation_recorded = True
+            raise
         self.turns_today += 1
 
         # Persist conversation snapshot so a mid-day crash can be resumed
@@ -351,11 +435,34 @@ class BashAgent(BaseAgent):
 
         return action
 
+    def _retry_wait(self, seconds):
+        if getattr(self, '_llm_attempt', 0) >= 4:
+            raise RunCancelled('model_attempt_limit')
+        lifecycle = getattr(self, 'lifecycle', None)
+        if lifecycle:
+            lifecycle.sleep(seconds)
+        else:
+            time.sleep(seconds)
+
     def _request_model(self, api, request, invoke):
+        if getattr(self, '_llm_attempt', 0) >= 4:
+            raise RunCancelled('model_attempt_limit')
+        lifecycle = getattr(self, 'lifecycle', None)
+        if lifecycle:
+            lifecycle.check(retry=getattr(self, '_llm_attempt', 0) > 0)
+            original = invoke
+            def invoke():
+                with lifecycle.model_call():
+                    return original()
         self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
         try:
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
                                                 turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+        except Exception as exc:
+            status = getattr(exc, 'status_code', 0) or 0
+            if 400 <= status < 500 and status not in (408, 409, 429):
+                raise RunCancelled(f'model_request_rejected:{status}') from exc
+            raise
         finally:
             for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
                 setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)
@@ -363,37 +470,33 @@ class BashAgent(BaseAgent):
             setattr(self, 'last_' + field, value)
         return response
 
-    def record_tool_result(self, observation):
-        """Attach a completed result before making a resumable checkpoint."""
-        if self._pending_tool_calls:
-            if self.use_anthropic:
-                partial_results = self._pending_tool_calls[0].get('_partial_results', [])
-                tool_results = [{
-                    'type': 'tool_result',
-                    'tool_use_id': self._pending_tool_calls[0]['id'],
-                    'content': observation,
-                }]
-                tool_results.extend(partial_results)
-                self.conversation.append(Message(
-                    role='user',
-                    content=tool_results,
-                ))
-            else:
-                for tc in self._pending_tool_calls:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=observation,
-                        tool_call_id=tc['id'],
-                        name=tc['name']
-                    ))
-            self._pending_tool_calls = []
-        else:
-            # Add observation as user message (e.g., initial dashboard)
-            self.conversation.append(Message(
-                role='user',
-                content=observation
-            ))
+    def next_tool_action(self):
+        """Next call from the current response, in provider order; no new model request."""
+        if not self._pending_tool_calls:
+            return None
+        call = self._pending_tool_calls[0]
+        return Action(tool=call['name'], arguments=call.get('arguments', {}))
 
+    def record_tool_result(self, observation, call_id=None):
+        """Complete exactly one call; a batch must finish before checkpoint publication."""
+        if self._pending_tool_calls:
+            call = self._pending_tool_calls[0]
+            if call_id is not None and call_id != call['id']:
+                raise ValueError('Tool results must follow response order')
+            if self.use_anthropic:
+                result = dict(type='tool_result', tool_use_id=call['id'], content=observation)
+                if (self.conversation and self.conversation[-1].role == 'user'
+                        and isinstance(self.conversation[-1].content, list)
+                        and all(item.get('type') == 'tool_result' for item in self.conversation[-1].content)):
+                    self.conversation[-1].content.append(result)
+                else:
+                    self.conversation.append(Message(role='user', content=[result]))
+            else:
+                self.conversation.append(Message(role='tool', content=observation,
+                                                  tool_call_id=call['id'], name=call['name']))
+            self._pending_tool_calls.pop(0)
+        else:
+            self.conversation.append(Message(role='user', content=observation))
         self._last_observation = observation
         self._observation_recorded = True
 
@@ -421,13 +524,16 @@ class BashAgent(BaseAgent):
         content = m.content
         if isinstance(content, list):
             content = [self._serialize_content_item(x) for x in content]
-        return {
+        data = {
             "role": m.role,
             "content": content,
             "tool_calls": m.tool_calls,
             "tool_call_id": m.tool_call_id,
             "name": m.name,
         }
+        if m.reasoning_content is not None:
+            data["reasoning_content"] = m.reasoning_content
+        return data
 
     def _save_conversation_snapshot(self, strict=False) -> None:
         """Atomically write self.conversation + minimal turn state to disk.
@@ -502,6 +608,7 @@ class BashAgent(BaseAgent):
                     tool_calls=m.get("tool_calls"),
                     tool_call_id=m.get("tool_call_id"),
                     name=m.get("name"),
+                    reasoning_content=m.get("reasoning_content"),
                 ))
 
             if payload.get('pending_tool_calls'):
@@ -560,6 +667,9 @@ class BashAgent(BaseAgent):
                     m['name'] = msg.name
                 if msg.tool_calls:
                     m['tool_calls'] = msg.tool_calls
+                # Omitting returned reasoning after a tool call makes DeepSeek answer 400.
+                if msg.reasoning_content is not None:
+                    m['reasoning_content'] = msg.reasoning_content
                 messages.append(m)
 
             tools = [
@@ -578,8 +688,9 @@ class BashAgent(BaseAgent):
                 _base_url = str(getattr(self.client, 'base_url', '') or '')
                 _is_together = 'api.together.xyz' in _base_url
                 _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
+                _is_opencode = 'opencode.ai' in _base_url
                 _is_deepseek_compat = (
-                    'api.deepseek.com' in _base_url or 'opencode.ai' in _base_url
+                    'api.deepseek.com' in _base_url or _is_opencode
                 )
                 api_kwargs = {
                     'model': self.model,
@@ -615,8 +726,14 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
+                    if _is_opencode:
+                        api_kwargs.update(stream=True, stream_options={'include_usage': True})
+                    def invoke():
+                        if not _is_opencode:
+                            return self.client.chat.completions.create(**api_kwargs)
+                        return _stream_chat_completion(self.client, api_kwargs)
                     response = self._request_model('chat', api_kwargs,
-                                                   lambda: self.client.chat.completions.create(**api_kwargs))
+                                                   invoke)
                 finally:
                     signal.alarm(0)  # Cancel alarm
                     signal.signal(signal.SIGALRM, old_handler)  # Restore handler
@@ -633,11 +750,12 @@ class BashAgent(BaseAgent):
 
                 assistant_msg = response.choices[0].message
 
-                # Log reasoning_content if present (e.g. GLM-5 reasoning model)
                 reasoning_content = getattr(assistant_msg, 'reasoning_content', None)
                 if not reasoning_content:
                     extras = getattr(assistant_msg, 'model_extra', {}) or {}
-                    reasoning_content = extras.get('reasoning_content')
+                    reasoning_content = (extras.get('reasoning_content')
+                                         or getattr(assistant_msg, 'reasoning', None)
+                                         or extras.get('reasoning'))
                 if reasoning_content and self.tool_result_callback:
                     self.tool_result_callback(
                         self.total_turns, self.current_day, '_reasoning', {},
@@ -701,7 +819,9 @@ class BashAgent(BaseAgent):
                 self.conversation.append(Message(
                     role='assistant',
                     content=assistant_msg.content or '',
-                    tool_calls=tool_calls_data
+                    tool_calls=tool_calls_data,
+                    # DeepSeek-compatible thinking requires the field on every later assistant turn.
+                    reasoning_content=(reasoning_content or '') if (_is_deepseek_compat and self._wants_reasoning()) else None,
                 ))
 
                 if not assistant_msg.tool_calls:
@@ -709,29 +829,13 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no tool_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=(
-                            "You must call a tool to proceed. If you have nothing else to do this week, "
-                            "call `./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash to advance."
-                        )
+                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
                     ))
                     continue
 
-                # Handle tool calls — execute first, skip rest
-                first_tc = assistant_msg.tool_calls[0]
-                # Safe to parse — we already validated above.
-                args = json.loads(first_tc.function.arguments) if first_tc.function.arguments else {}
-
-                # Skip extra parallel tool calls
-                for extra_tc in assistant_msg.tool_calls[1:]:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=f"[Skipped - only one tool per turn. Call {extra_tc.function.name} again if needed.]",
-                        tool_call_id=extra_tc.id,
-                        name=extra_tc.function.name
-                    ))
-
-                self._pending_tool_calls = [{'id': first_tc.id, 'name': first_tc.function.name}]
-                return Action(tool=first_tc.function.name, arguments=args)
+                self._pending_tool_calls = [dict(id=tc.id, name=tc.function.name,
+                    arguments=json.loads(tc.function.arguments or '{}')) for tc in assistant_msg.tool_calls]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:
@@ -744,12 +848,10 @@ class BashAgent(BaseAgent):
                     is_retryable = any(code in str(e) for code in ('429', '500', '502', '503', '504', '529'))
                 print(f"OpenAI LLM call error (retryable={is_retryable}, status={status}): {e}")
                 if is_retryable:
-                    # Retry with exponential backoff — keep trying forever until
-                    # the endpoint comes back. Never fall back to next-week.
                     self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                     wait_time = min(120, 10 * (2 ** min(self._consecutive_errors - 1, 3)))
                     print(f"  Server error ({self._consecutive_errors}), retrying in {wait_time}s...")
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     # Free memory before retry (messages/tools rebuilt at top of loop)
                     del messages, tools
                     continue  # Loop back to retry
@@ -770,7 +872,7 @@ class BashAgent(BaseAgent):
                             f"If the error mentions context length, produce a shorter response."
                         )
                     ))
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del messages, tools
                     continue
 
@@ -913,29 +1015,13 @@ class BashAgent(BaseAgent):
                     print("  LLM returned no function_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
                         role='user',
-                        content=(
-                            "You must call a tool to proceed. If you have nothing else to do this week, "
-                            "call `./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash to advance."
-                        )
+                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
                     ))
                     continue
 
-                # Handle tool calls — execute first, skip rest
-                first_fc = function_calls[0]
-                # Safe to parse — we already validated above.
-                args = json.loads(first_fc.arguments) if first_fc.arguments else {}
-
-                # Skip extra parallel tool calls
-                for extra_fc in function_calls[1:]:
-                    self.conversation.append(Message(
-                        role='tool',
-                        content=f"[Skipped - only one tool per turn. Call {extra_fc.name} again if needed.]",
-                        tool_call_id=extra_fc.call_id,
-                        name=extra_fc.name
-                    ))
-
-                self._pending_tool_calls = [{'id': first_fc.call_id, 'name': first_fc.name}]
-                return Action(tool=first_fc.name, arguments=args)
+                self._pending_tool_calls = [dict(id=fc.call_id, name=fc.name,
+                    arguments=json.loads(fc.arguments or '{}')) for fc in function_calls]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:
@@ -951,7 +1037,7 @@ class BashAgent(BaseAgent):
                     self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                     wait_time = min(120, 10 * (2 ** min(self._consecutive_errors - 1, 3)))
                     print(f"  Server error ({self._consecutive_errors}), retrying in {wait_time}s...")
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del input_items, tools
                     continue  # Loop back to retry
                 else:
@@ -971,7 +1057,7 @@ class BashAgent(BaseAgent):
                             f"If the error mentions context length, produce a shorter response."
                         )
                     ))
-                    _time.sleep(wait_time)
+                    self._retry_wait(wait_time)
                     del input_items, tools
                     continue
 
@@ -1079,9 +1165,7 @@ class BashAgent(BaseAgent):
             preview = preview[:1200] + "..."
 
         return (
-            "You must call a tool to proceed. If you need context, use read_file, "
-            "search_files, or bash. If you have nothing else to do this week, call "
-            "`./novamind-operation next-week <cash_1wk> <cash_4wk> <cash_12wk>` via bash. "
+            getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK) + " "
             f"Previous non-tool response preview: {preview or '(no text)'}"
         )
 
@@ -1214,11 +1298,6 @@ class BashAgent(BaseAgent):
                             {'stop_reason': stop_reason, 'attempt': no_tool_retries},
                             self._anthropic_content_text(assistant_content),
                         )
-                    if no_tool_retries > 3:
-                        raise RuntimeError(
-                            "Anthropic response did not include a tool_use block after "
-                            f"{no_tool_retries} attempts (last stop_reason={stop_reason!r})."
-                        )
                     print(
                         f"  Anthropic returned no tool_use "
                         f"(stop_reason={stop_reason!r}); feeding feedback and regenerating."
@@ -1229,26 +1308,14 @@ class BashAgent(BaseAgent):
                     ))
                     continue
 
-                first_tool = tool_use_blocks[0]
-
-                # Skip extra parallel tool calls
-                partial_results = []
-                for extra in tool_use_blocks[1:]:
-                    partial_results.append({
-                        'type': 'tool_result',
-                        'tool_use_id': extra.id,
-                        'content': f"[Skipped - only one tool per turn. Call {extra.name} again if needed.]",
-                    })
-
-                self._pending_tool_calls = [{'id': first_tool.id, 'name': first_tool.name, '_partial_results': partial_results}]
-                return Action(tool=first_tool.name, arguments=first_tool.input or {})
+                self._pending_tool_calls = [dict(id=block.id, name=block.name,
+                    arguments=block.input or {}) for block in tool_use_blocks]
+                return self.next_tool_action()
 
             except Exception as e:
                 if self.evidence_store:
                     self.evidence_store.assert_healthy(quiescent=False)
                 import traceback
-                if str(e).startswith("Anthropic response did not include a tool_use block"):
-                    raise
                 error_msg = f"Anthropic LLM call error: {e}"
                 tb = traceback.format_exc()
                 print(f"\n{'='*60}")
@@ -1259,13 +1326,7 @@ class BashAgent(BaseAgent):
                 print(f"{'='*60}\n")
 
                 self._consecutive_errors += 1
-                if self._consecutive_errors <= 3:
-                    wait = 2 ** self._consecutive_errors
-                    print(f"  Retrying in {wait}s (attempt {self._consecutive_errors}/3)...")
-                    time.sleep(wait)
-                    return self._call_anthropic()
-
-                raise RuntimeError(
-                    f"LLM failed {self._consecutive_errors} consecutive times. "
-                    f"Last error: {e}"
-                ) from e
+                wait = 2 ** min(self._consecutive_errors, 3)
+                print(f"  Retrying in {wait}s...")
+                self._retry_wait(wait)
+                return self._call_anthropic()

@@ -7,8 +7,8 @@ from . import _client
 def start_research_project(tier: int) -> Dict:
     """Start an R&D research project.
 
-    20 independent tiers, no dependencies. Tiers 1-10: $100K per tier.
-    Tiers 11-20: frontier moonshots ($1.5M-$15M, longer timelines, higher variance, better quality/$).
+    20 independent tiers, no dependencies. Use list_research_projects for each
+    tier's cost, duration and quality distributions.
     Duration and quality boost are randomly sampled on start.
 
     Args:
@@ -24,6 +24,8 @@ def list_research_projects() -> Dict:
     """List all R&D research tiers and their status.
 
     Returns:
-        Dict with all research project details.
+        Dict with tiers: costs, mean_days/std_days, mean_quality_boost/
+        std_quality_boost, in_progress/completed counts and total_quality_boost.
+        Query the public research_projects table for individual projects and dates.
     """
     return _client.call('list_research_projects')

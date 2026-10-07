@@ -17,9 +17,13 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-# Oracle debug reads expose internal data but still execute on read-only snapshots.
+# Oracle debug reads expose internal data through the same read-only SQL policy.
 # Formal runs reject this startup setting.
 _ORACLE_MODE: bool = os.environ.get("ORACLE_MODE") == "1"
+
+READ_ONLY_TASK_TOOLS = frozenset(('get_social_posts', 'get_cost_info', 'get_market_overview',
+    'get_group_insights', 'list_research_projects', 'list_all_tables', 'describe_tables',
+    'get_tool_documentation', 'list_daily_calculations', 'list_scripts'))
 
 from .tools import AgentTools, ToolResult
 from .database import TABLE_DOCS
@@ -177,6 +181,10 @@ class _APIHandler(BaseHTTPRequestHandler):
     @public_handler
     def do_POST(self):
         try:
+            if (self.server._api_server.read_only_task and
+                    self.path not in ('/call', '/query', '/checkpoint', '/pf-refresh', '/run-metrics')):
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             if self.path == '/call':
                 self._handle_call()
             elif self.path == '/next-week':
@@ -185,7 +193,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
-            elif self.path == '/checkpoint':
+            elif self.path in ('/checkpoint', '/pf-refresh', '/run-metrics'):
                 import secrets
                 expected_token = self.server._api_server.checkpoint_token
                 supplied_token = self.headers.get('X-Harness-Token', '')
@@ -193,6 +201,25 @@ class _APIHandler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'Harness access required'}, 403)
                     return
                 body = self._read_body()
+                if self.path == '/run-metrics':
+                    api = self.server._api_server
+                    self._send_json({'day': api.tools.current_day,
+                                     'usage': api.simulator.customer_simulator.usage_recorder.summary})
+                    return
+                if self.path == '/pf-refresh':
+                    if (set(body) != {'versions', 'parent'} or not isinstance(body['parent'], str) or
+                            not isinstance(body['versions'], list) or
+                            not all(isinstance(v, str) for v in body['versions'])):
+                        self._send_json({'error': 'versions and parent are required'}, 400)
+                        return
+                    from .pf_refresh import refresh
+                    try:
+                        result = refresh(self.server._api_server, body['versions'], body['parent'])
+                    except (ValueError, KeyError, TimeoutError, SnapshotUnavailable) as exc:
+                        self._send_json({'error': type(exc).__name__}, 400)
+                        return
+                    self._send_json({'versions': result})
+                    return
                 if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
                     return
@@ -225,6 +252,9 @@ class _APIHandler(BaseHTTPRequestHandler):
     @public_handler
     def do_DELETE(self):
         try:
+            if self.server._api_server.read_only_task:
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             if self.path == '/daily-scripts':
                 self._handle_daily_scripts_delete()
             else:
@@ -342,6 +372,9 @@ class _APIHandler(BaseHTTPRequestHandler):
             args = body.get('args', {})
 
             server: NovaMindAPIServer = self.server._api_server
+            if server.read_only_task and tool_name not in READ_ONLY_TASK_TOOLS:
+                self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
+                return
             result = server.execute_tool(tool_name, args)
 
             if isinstance(result, ToolResult):
@@ -464,7 +497,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                 api._sql_lock.notify_all()
 
     def _handle_query_request(self):
-        """Execute SQL on a separately authorized, read-only world snapshot."""
         sql = ''
         try:
             raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -484,6 +516,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({'success': False, 'error': 'Invalid JSON body'}, 400)
         except QueryDenied as exc:
+            self._sql_execution.setdefault('permanent_error', True)
             self._send_json({'success': False, 'error': str(exc)}, 403)
         except SnapshotUnavailable as exc:
             self._send_json({'success': False, 'error': str(exc)}, 503)
@@ -491,6 +524,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             if not self._query_response_started:
                 self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
         except sqlite3.Error as exc:
+            self._sql_execution['permanent_error'] = self._sql_execution.get('permanent_error',
+                (getattr(exc, 'sqlite_errorcode', None) or 0) & 0xff == sqlite3.SQLITE_ERROR)
             self._send_json({'success': False, 'error': _get_helpful_query_error(exc, sql)}, 500)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -648,7 +683,14 @@ _TOOL_DISPATCH = {
     'research_group': lambda tools, args: tools.research_group(args.get('group_id', ''), args.get('target_level')),
     'get_market_overview': lambda tools, args: tools.get_market_overview(),
     'get_group_insights': lambda tools, args: tools.get_group_insights(args.get('group_id', '')),
-    'set_targeted_ops_spend': lambda tools, args: tools.set_targeted_ops_spend(args.get('targeted_spend', args)),
+    'set_targeted_ops_spend': lambda tools, args: tools.set_targeted_ops_spend(
+        targeted_spend=args.get('targeted_spend', None if any(key in args for key in
+            ('by_group', 'by_plan', 'by_group_plan', 'by_customer')) else args),
+        by_group=args.get('by_group'),
+        by_plan=args.get('by_plan'),
+        by_group_plan=args.get('by_group_plan'),
+        by_customer=args.get('by_customer'),
+    ),
     'set_targeted_dev_spend': lambda tools, args: tools.set_targeted_dev_spend(args.get('targeted_spend', args)),
     'set_ads_strength': lambda tools, args: tools.set_ads_strength(
         global_strength=args.get('global_strength'),
@@ -697,6 +739,7 @@ class NovaMindAPIServer:
             event_logger: Optional EventLogger for logging events
         """
         self.oracle_mode = _ORACLE_MODE
+        self.read_only_task = os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'
         self.sql_evidence = sql_evidence
         if sql_evidence is not None:
             if self.oracle_mode:
@@ -766,8 +809,8 @@ class NovaMindAPIServer:
     # Maximum allowed time for step_week before auto-quit (seconds)
     STEP_WEEK_TIMEOUT = 4200  # 7× longer than old per-day timeout
 
-    # Lock wait, snapshot backup and SQL share this deadline. SQL executes
-    # on a separate connection after releasing the world lock.
+    # Lock wait, reader setup and SQL share this deadline. The world lock stays
+    # held until the separate query connection closes.
     QUERY_TIMEOUT_SECONDS = 120
     QUERY_RESPONSE_TIMEOUT_SECONDS = 30
 
@@ -937,6 +980,9 @@ class NovaMindAPIServer:
                 "elapsed": elapsed,
                 "message": f"step_week exceeded {self.STEP_WEEK_TIMEOUT}s timeout ({elapsed:.1f}s elapsed). Save checkpoint and exit.",
             }
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
         executor.shutdown(wait=False)
 
         self._last_step_elapsed = _time.monotonic() - _step_start
@@ -963,7 +1009,21 @@ class NovaMindAPIServer:
             week = (new_day + 6) // 7
             dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
 
-        from .execution_capture import dashboard_version
+        from .execution_capture import CapturedText, dashboard_version
+        if predictions:
+            receipt = []
+            for horizon, metrics in predictions.items():
+                if 'cash' not in metrics:
+                    continue
+                cash = metrics['cash']
+                values = cash if isinstance(cash, dict) else {'point': cash}
+                amounts = ', '.join(f"{field}=USD {float(values[field])}"
+                    for field in ('point', 'lower', 'upper') if values.get(field) is not None)
+                receipt.append(f"  +{horizon} days: {amounts}")
+            if receipt:
+                receipt = f"\n\nSubmitted cash forecasts at D{old_day} (USD; horizons from submission):\n" + '\n'.join(receipt)
+                dashboard = CapturedText(dashboard + receipt, getattr(dashboard, 'origins', []))
+
         dashboard = dashboard_version(self, dashboard, new_day)
         with self._lock:
             self._last_dashboard = dashboard
@@ -995,8 +1055,9 @@ class NovaMindAPIServer:
         executor = BashAgentToolExecutor(workspace, bash_timeout=300,
             evidence_store=self.sql_evidence if self.sql_evidence and self.sql_evidence.execution_capture else None,
             require_sandbox=self.require_sandbox,
-            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0',
-                 'PYTHONPATH': os.pathsep.join((str(workspace / 'docs'), str(workspace)))})
+            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0'})
+        root = executor.guest_root
+        executor.extra_env['PYTHONPATH'] = os.pathsep.join((root + '/docs', root))
         results = {}
         self.last_script_results = []
         for name, code in self.get_daily_scripts().items():
@@ -1009,7 +1070,7 @@ class NovaMindAPIServer:
                 capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
                 token = CURRENT_EVENT.set(capture.event)
             try:
-                output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+                output = executor.execute('bash', {'command': shlex.quote(executor.python) + ' -c ' + shlex.quote(code)})
             except BaseException as exc:
                 if capture and capture.event:
                     capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)

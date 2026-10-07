@@ -768,59 +768,44 @@ Output JSON:
         enterprise_model = self.config.enterprise_llm_model
         enterprise_provider = self.config.enterprise_llm_provider
 
+        response_text, input_tokens, output_tokens = self.complete_text(
+            provider=enterprise_provider,
+            model=enterprise_model,
+            system=system_prompt,
+            user=user_prompt,
+            max_tokens=self.config.enterprise_llm_max_tokens,
+            temperature=self.config.enterprise_llm_temperature,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+        self._log_cost(day, 'customer_negotiation', input_tokens, output_tokens, model=enterprise_model)
+
+        # Try to parse JSON response
         try:
-            response_text, input_tokens, output_tokens = self.complete_text(
-                provider=enterprise_provider,
-                model=enterprise_model,
-                system=system_prompt,
-                user=user_prompt,
-                max_tokens=self.config.enterprise_llm_max_tokens,
-                temperature=self.config.enterprise_llm_temperature,
-                reasoning_effort=self.reasoning_effort,
-            )
+            # Handle potential markdown code blocks
+            if response_text.startswith('```'):
+                response_text = response_text.split('```')[1]
+                if response_text.startswith('json'):
+                    response_text = response_text[4:]
 
-            self._log_cost(day, 'customer_negotiation', input_tokens, output_tokens, model=enterprise_model)
-
-            # Try to parse JSON response
-            try:
-                # Handle potential markdown code blocks
-                if response_text.startswith('```'):
-                    response_text = response_text.split('```')[1]
-                    if response_text.startswith('json'):
-                        response_text = response_text[4:]
-
-                parsed = json.loads(response_text)
-                return CustomerLLMResponse(
-                    text=parsed.get('response', response_text),
-                    decision=parsed.get('decision', decision),
-                    offer_price=parsed.get('offer_price', final_offer_price),
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens
-                )
-            except json.JSONDecodeError:
-                # If not valid JSON, use the raw text
-                return CustomerLLMResponse(
-                    text=response_text,
-                    decision=decision,
-                    offer_price=final_offer_price,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens
-                )
-
-        except Exception as e:
-            # Fallback response
-            fallback_responses = {
-                'accept': f"That works for us. We'll proceed with ${final_offer_price:.2f}/seat.",
-                'counter': f"We can do ${final_offer_price:.2f}/seat. Can you meet us there?",
-                'reject': "I appreciate the offer, but it doesn't fit our budget constraints right now."
-            }
+            parsed = json.loads(response_text)
             return CustomerLLMResponse(
-                text=fallback_responses.get(decision, "Let me get back to you."),
-                decision=decision,
-                offer_price=final_offer_price if decision != 'reject' else None,
-                input_tokens=0,
-                output_tokens=0
+                text=parsed.get('response', response_text),
+                decision=parsed.get('decision', decision),
+                offer_price=parsed.get('offer_price', final_offer_price),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
             )
+        except json.JSONDecodeError:
+            # If not valid JSON, use the raw text
+            return CustomerLLMResponse(
+                text=response_text,
+                decision=decision,
+                offer_price=final_offer_price,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            )
+
 
     def generate_initial_outreach(
         self,
@@ -903,36 +888,24 @@ Output ONLY the message text."""
         enterprise_model = self.config.enterprise_llm_model
         enterprise_provider = self.config.enterprise_llm_provider
 
-        try:
-            text, input_tokens, output_tokens = self.complete_text(
-                provider=enterprise_provider,
-                model=enterprise_model,
-                system=system_prompt,
-                user="Write your initial outreach message.",
-                max_tokens=150,
-                temperature=self.config.enterprise_llm_temperature,
-                reasoning_effort=self.reasoning_effort,
-            )
+        text, input_tokens, output_tokens = self.complete_text(
+            provider=enterprise_provider,
+            model=enterprise_model,
+            system=system_prompt,
+            user="Write your initial outreach message.",
+            max_tokens=150,
+            temperature=self.config.enterprise_llm_temperature,
+            reasoning_effort=self.reasoning_effort,
+        )
 
-            self._log_cost(day, 'customer_initial_outreach', input_tokens, output_tokens, model=enterprise_model)
+        self._log_cost(day, 'customer_initial_outreach', input_tokens, output_tokens, model=enterprise_model)
 
-            return CustomerLLMResponse(
-                text=text,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens
-            )
+        return CustomerLLMResponse(
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens
+        )
 
-        except Exception as e:
-            fallback_messages = {
-                'new_lead': f"Hi, I'm interested in learning more about {product_name} for my organization. Can we schedule a call?",
-                'plan_change': f"We've been using {product_name} and would like to discuss changing our plan.",
-                'churn_prevention': f"I have some concerns about the service that I'd like to address."
-            }
-            return CustomerLLMResponse(
-                text=fallback_messages.get(thread_type, "I'd like to discuss our subscription."),
-                input_tokens=0,
-                output_tokens=0
-            )
 
 
 

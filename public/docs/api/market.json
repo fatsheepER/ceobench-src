@@ -15,17 +15,26 @@
       "no_funds": "Insufficient funds. Market research costs $25,000. Available: $12,000",
       "data_on_success": {
         "discovered_group_id": "D_S01",
-        "group_name": "Niche Creators",
-        "segment": "Individual",
-        "info_level": 1,
-        "cost": 25000
+        "cost": 25000,
+        "status": "discovered",
+        "remaining_undiscovered": 19
       },
       "data_on_failure": {
-        "cost": 25000
+        "cost": 25000,
+        "status": "not_found",
+        "remaining_undiscovered": 20
+      },
+      "data_when_exhausted": {
+        "cost": 25000,
+        "status": "exhausted",
+        "remaining_undiscovered": 0
       }
     },
     "output_schema": {
-      "discovered_group_id": "str|None \u2014 group ID if discovered (e.g., 'D_S01'), absent if no discovery",
+      "status": "str \u2014 'discovered', 'not_found' (can retry), or 'exhausted' (all segments identified)",
+      "cost": "float \u2014 cost deducted for this attempt, including when exhausted",
+      "remaining_undiscovered": "int \u2014 segments still undiscovered after this attempt",
+      "discovered_group_id": "str \u2014 group ID if discovered (e.g., 'D_S01'), absent otherwise",
       "_access": "if 'discovered_group_id' in result: print('Found:', result['discovered_group_id'])"
     },
     "impact": "Costs $25,000 per attempt. On success, unlocks a new customer segment with initial parameter estimates.",
@@ -119,17 +128,20 @@
         ],
         "undiscovered_count": 14,
         "macroeconomic": {
-          "ism_pmi": 54.2,
-          "change": 1.3,
-          "phase": "expansion",
-          "cycle": "recovering"
+          "measurement_day": 270,
+          "publication_delay_days": 30,
+          "pmi_value": 54.2,
+          "pmi_trend": "expansion",
+          "pmi_change": 1.3,
+          "cycle_phase": "recovering",
+          "description": "Period average"
         }
       }
     },
     "output_schema": {
       "known_groups": "List[Dict] \u2014 each: group_id (str), group_name (str), segment (str: 'Individual'|'Enterprise'), info_level (int 1-5), noise (str e.g. '\u00b165%')",
       "undiscovered_count": "int \u2014 segments not yet discovered",
-      "macroeconomic": "Dict|None \u2014 keys: pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
+      "macroeconomic": "Dict|None \u2014 keys: measurement_day (int, when PMI was measured, not published), publication_delay_days (int, configured delay; not an exact publication timestamp), pmi_value (float), pmi_trend (str), pmi_change (float), cycle_phase (str), description (str)",
       "_access": "for g in result['known_groups']: print(g['group_id'], g['group_name'])",
       "_warning": "Key is 'known_groups' NOT 'groups'"
     },
@@ -175,6 +187,7 @@
         "segment": "Individual",
         "info_level": 1,
         "noise": "\u00b165%",
+        "snapshot_day": 0,
         "estimates": {
           "willingness_to_pay": 25.86,
           "usage_volume": 91.0,
@@ -184,12 +197,12 @@
           "annual_market_cap_growth_rate": 0.035
         },
         "network_influence": {
-          "self_referral": 0.0015,
+          "self_referral": 1.5,
           "outgoing": {
-            "S3": 0.002
+            "S3": 2.0
           },
           "incoming": {
-            "S2": 0.001
+            "S2": 1.0
           }
         },
         "reputation_influence": {
@@ -197,12 +210,7 @@
             "E1": 0.36
           },
           "incoming": {}
-        },
-        "_enterprise_extra_fields": [
-          "seat_range",
-          "negotiation_rounds",
-          "negotiation_pace_days"
-        ]
+        }
       }
     },
     "output_schema": {
@@ -211,8 +219,9 @@
       "segment": "str ('Individual'|'Enterprise')",
       "info_level": "int (1-5)",
       "noise": "str (e.g. '\u00b165%')",
+      "snapshot_day": "int \u2014 survey measurement day (0 is valid); only completed research_group updates it, not this read",
       "estimates": "Dict \u2014 keys: willingness_to_pay (float), usage_volume (float), quality_floor_q_min (float), contract_lockin_aversion (float), market_cap (int), annual_market_cap_growth_rate (float). Enterprise adds: seat_range (List[int]), decision_rounds (int), avg_response_days (float)",
-      "network_influence": "Dict \u2014 keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) \u2014 leads per 1000 subs/day",
+      "network_influence": "Dict \u2014 keys: self_referral (float), outgoing (Dict[str,float]), incoming (Dict[str,float]) \u2014 all rates in leads per 1000 subs/day",
       "reputation_influence": "Dict \u2014 keys: outgoing (Dict[str,float]), incoming (Dict[str,float]) \u2014 influence weights 0-1",
       "_access": "result['estimates']['willingness_to_pay'] \u2192 group's WTP"
     },

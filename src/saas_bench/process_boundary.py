@@ -22,34 +22,40 @@ proc = subprocess.Popen(['bash', '-c', command])
 code = proc.wait()
 unknown = None
 children = []
+def report(phase):
+    channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
+        phase=phase, coverage='subreaper_wait' if linux else 'process_group')) + '\n').encode())
 try:
     if linux:
-        tree = {}
-        for item in os.listdir('/proc'):
-            if not item.isdigit():
-                continue
-            try:
-                fields = open('/proc/' + item + '/stat').read().rsplit(')', 1)[1].split()
-                tree[int(item)] = (int(fields[1]), fields[0])
-            except FileNotFoundError:
-                continue
-        parents = {os.getpid()}
+        # Adopt and reap orphaned descendants, including detached process groups.
+        # The host drains both output pipes and enforces the original deadline.
         while True:
-            found = {pid for pid, (ppid, state) in tree.items() if ppid in parents and state != 'Z'}
-            if found <= parents:
+            try:
+                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
                 break
-            parents |= found
-        children = sorted(parents - {os.getpid()})
+            if info is None:
+                children = ['running']
+                report('draining')
+                os.waitpid(-1, 0)
+                children = []
+                continue
+            os.waitpid(info.si_pid, 0)
     else:
-        probe = subprocess.Popen(['ps', '-axo', 'pid=,ppid=,pgid=,stat='], stdout=subprocess.PIPE, text=True)
-        rows = probe.communicate()[0]
-        children = [int(row.split()[0]) for row in rows.splitlines()
-                    if len(row.split()) == 4 and int(row.split()[2]) == os.getpgrp()
-                    and int(row.split()[0]) not in (os.getpid(), probe.pid) and not row.split()[3].startswith('Z')]
+        import time
+        while True:
+            probe = subprocess.Popen(['ps', '-axo', 'pid=,ppid=,pgid=,stat='], stdout=subprocess.PIPE, text=True)
+            rows = probe.communicate()[0]
+            children = [int(row.split()[0]) for row in rows.splitlines()
+                        if len(row.split()) == 4 and int(row.split()[2]) == os.getpgrp()
+                        and int(row.split()[0]) not in (os.getpid(), probe.pid) and not row.split()[3].startswith('Z')]
+            if not children:
+                break
+            report('draining')
+            time.sleep(.01)
 except Exception as exc:
     unknown = type(exc).__name__ + ': ' + str(exc)
-channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
-                                coverage='subreaper' if linux else 'process_group')) + '\n').encode())
+report('unknown' if unknown else 'closed')
 channel.close()
 if children or unknown:
     while True:
@@ -62,18 +68,19 @@ sys.exit(code)
 
 class BoundaryOpen(RuntimeError):
     def __init__(self, process, record, stdout, stderr):
-        super().__init__('Bash returned while descendants are unfinished; branch paused')
+        super().__init__('Bash descendants did not finish before the command deadline; branch paused'
+                         if record.get('timed_out') else 'Cannot verify Bash process completion; branch paused')
         self.process, self.record = process, record
         self.stdout, self.stderr = stdout, stderr
 
 
 class Boundary:
-    def __init__(self, command):
+    def __init__(self, command, python=sys.executable):
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.listener.listen(1)
         self.key = uuid.uuid4().hex
-        self.command = shlex.join([sys.executable, '-c', SUPERVISOR,
+        self.command = shlex.join([python, '-c', SUPERVISOR,
                                   str(self.listener.getsockname()[1]), self.key, command])
         self.channel = None
         self.record = None
@@ -110,44 +117,40 @@ class Boundary:
         data = b''
         stdout, stderr = b'', b''
         authenticated = False
+        def receive(chunk):
+            nonlocal data, authenticated
+            data += chunk
+            while b'\n' in data:
+                line, data = data.split(b'\n', 1)
+                if not authenticated:
+                    if line.decode() != self.key:
+                        raise RuntimeError('Invalid process boundary channel')
+                    authenticated = True
+                else:
+                    self.record = json.loads(line)
+                    if self.record['unknown']:
+                        raise BoundaryOpen(process, self.record, stdout, stderr)
         while True:
             try:
                 chunk = self.channel.recv(65536)
-                data += chunk
+                receive(chunk)
             except BlockingIOError:
                 chunk = None
-            if not authenticated and b'\n' in data:
-                key, data = data.split(b'\n', 1)
-                if key.decode() != self.key:
-                    raise RuntimeError('Invalid process boundary channel')
-                authenticated = True
-            if b'\n' in data:
-                self.record = json.loads(data.split(b'\n', 1)[0])
-                if self.record['children'] or self.record['unknown']:
-                    raise BoundaryOpen(process, self.record, stdout, stderr)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if self.record and self.record['children']:
+                    raise BoundaryOpen(process, dict(self.record, timed_out=True), stdout, stderr)
                 raise subprocess.TimeoutExpired(process.args, timeout, stdout, stderr)
             try:
                 stdout, stderr = process.communicate(timeout=min(0.05, remaining))
-                if self.record is None:
+                if self.record is None or self.record.get('phase') != 'closed':
                     # The supervisor sends the boundary before exiting. Drain its socket.
-                    self.channel.settimeout(1)
-                    while b'\n' not in data:
+                    self.channel.settimeout(max(.001, deadline - time.monotonic()))
+                    while self.record is None or self.record.get('phase') != 'closed':
                         chunk = self.channel.recv(65536)
                         if not chunk:
                             raise RuntimeError('Supervisor exited without a process boundary')
-                        data += chunk
-                    if not authenticated:
-                        key, data = data.split(b'\n', 1)
-                        if key.decode() != self.key:
-                            raise RuntimeError('Invalid process boundary channel')
-                    while b'\n' not in data:
-                        chunk = self.channel.recv(65536)
-                        if not chunk:
-                            raise RuntimeError('Missing process boundary')
-                        data += chunk
-                    self.record = json.loads(data.split(b'\n', 1)[0])
+                        receive(chunk)
                 return stdout, stderr
             except subprocess.TimeoutExpired as exc:
                 stdout, stderr = exc.output or b'', exc.stderr or b''

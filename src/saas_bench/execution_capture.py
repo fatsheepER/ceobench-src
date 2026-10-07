@@ -12,14 +12,26 @@ import uuid
 from .sql_evidence import digest, encoded, now
 
 CURRENT_EVENT = ContextVar('capture_event', default=None)
-EXCLUSIONS = ['sessions/*/world.nmdb', 'sessions/*/world.nmdb-*',
-              'sessions/*/*.plain.tmp*', 'sessions/*/*.nmdb.tmp*']
+EXCLUSIONS = ['sessions/']  # Reserved harness directory, hidden by the Bash sandbox.
+OBJECT_FIELDS = dict(project_id='research_project', customer_id='customer', group_id='customer_group',
+                     thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
+                     reply_to_post_id='social_post', discovered_group_id='customer_group',
+                     plan='plan', channel='ad_channel')
+READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
+                        'get_market_overview', 'get_group_insights'})
+
+
+def excluded(rel):
+    """Only harness-owned paths at the workspace root; nested business names are legal."""
+    from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
+    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS
 
 
 class CapturedText(str):
-    def __new__(cls, text, origins=()):
+    def __new__(cls, text, origins=(), pf_read=None):
         value = super().__new__(cls, text)
         value.origins = list(origins)
+        value.pf_read = pf_read
         return value
 
 
@@ -42,6 +54,7 @@ class ExecutionCapture:
         self.slots = 0
         self.origins = []
         self.facts = {}
+        self.before_stamps = {}
 
     def safe(self, fn, *args, **kwargs):
         try:
@@ -71,17 +84,27 @@ class ExecutionCapture:
 
     def snapshot(self, workspace, phase):
         started = time.monotonic()
+        with self.store.batch():
+            items = self._snapshot(workspace, phase)
+        self.facts[phase + '_scan_seconds'] = time.monotonic() - started
+        return items
+
+    def _snapshot(self, workspace, phase):
         items = {}
-        root = Path(workspace).resolve()
-        # ponytail: full boundary walk; replace with an index only after measuring scan cost.
+        reused = 0
+        root = str(Path(workspace).resolve())
+        # Read and hash every file (no mtime shortcut). Reuse unchanged observations,
+        # but retain a new acquisition for a write, even when its bytes are identical.
         for directory, dirs, files in os.walk(root, followlinks=False):
+            prefix = '' if directory == root else directory[len(root) + 1:] + '/'
+            dirs[:] = [name for name in dirs if not excluded(prefix + name)]
             for name in sorted(dirs + files):
-                path = Path(directory) / name
-                rel = path.relative_to(root).as_posix()
-                if any(Path(rel).match(pattern) for pattern in EXCLUSIONS):
+                path = directory + '/' + name
+                rel = prefix + name
+                if excluded(rel):
                     items[rel] = {'type': 'excluded', 'reason': 'simulator_private_state'}
                     continue
-                info = path.lstat()
+                info = os.lstat(path)
                 item = dict(mode=info.st_mode, size=info.st_size)
                 if stat.S_ISLNK(info.st_mode):
                     item.update(type='symlink', target=os.readlink(path))
@@ -95,21 +118,47 @@ class ExecutionCapture:
                         after = os.fstat(stream.fileno())
                     if (info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
                         raise RuntimeError('File changed during boundary capture: ' + rel)
-                    item.update(type='file', sha256=digest(raw), version=self.file(rel, raw, phase=phase))
+                    sha = digest(raw)
+                    version, latest_sha = self.store.latest_version(rel, 'file_bytes') if self.event else (None, None)
+                    stamp = (info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+                    if phase == 'before':
+                        self.before_stamps[rel] = stamp
+                    # A repeated write may leave the bytes unchanged. Keep its acquisition
+                    # so the latest call note survives content-based handle deduplication.
+                    written = phase == 'after' and (rel in self.facts.get('written_paths', []) or
+                                                    self.before_stamps.get(rel) != stamp)
+                    if version and latest_sha == sha and not written:
+                        reused += 1
+                    else:
+                        version = self.file(rel, raw, phase=phase)
+                    item.update(type='file', sha256=sha, version=version)
                 else:
                     item['type'] = 'directory' if stat.S_ISDIR(info.st_mode) else 'special'
                 items[rel] = item
-        self.blob('workspace_' + phase, encoded(items), 'workspace_boundary', exclusions=EXCLUSIONS)
-        self.facts[phase + '_scan_seconds'] = time.monotonic() - started
+        self.blob('workspace_' + phase, encoded(items), 'workspace_boundary', exclusions=EXCLUSIONS,
+                  reused_file_versions=reused)
         return items
 
-    def finish(self, text, status='succeeded', **facts):
-        version = self.blob('tool_return', text, 'tool_return', segments=self.origins) if text is not None else None
+    def finish(self, text, status='succeeded', read_key=None, read_complete=True, body=None, **facts):
+        # body is the return before PF appended handles; equal bodies keep one version number.
+        from .evidence_handles import body_digest
+        extra = dict(body_sha256=body_digest(body)) if body is not None else {}
+        if self.facts.get('pf_retrieval'):
+            extra['pf_retrieval'] = True
+        version = self.blob('tool_return', text, 'tool_return', segments=self.origins, **extra) if text is not None else None
+        pf_read = getattr(text, 'pf_read', None)
+        if read_key and version:
+            # The exact tool return is the read target; repeated identical calls in one
+            # request context can then be delivered as DELTA or UNCHANGED.
+            read = self.blob('read_full', text, 'pf_read_full', target=version, key=read_key, mode='content',
+                             read_range=[0, len(text)], complete=read_complete, force_full=False,
+                             read_kind='tool_call')
+            pf_read = {'id': read} if read else pf_read
         self.facts.update(facts)
         if self.event:
             self.safe(self.store.complete, self.event, status, **self.facts)
         origins = [origin(version, text)] if version else []
-        return CapturedText(text, origins + self.origins) if text is not None else None
+        return CapturedText(text, origins + self.origins, pf_read) if text is not None else None
 
 
 def capture_http(handler, raw):
@@ -132,12 +181,9 @@ def finish_http(store, event, status, headers, body, execution):
         value = {}
     request = store.read_event(event)['request']['request']
     tool = (request.get('parsed') or {}).get('tool') if isinstance(request.get('parsed'), dict) else None
-    reads = {'get_social_posts', 'get_cost_info', 'list_research_projects', 'get_market_overview', 'get_group_insights'}
-    classification = 'read' if request['method'] == 'GET' or tool in reads else 'write_receipt'
+    classification = 'read' if request['method'] == 'GET' or tool in READ_TOOLS else 'write_receipt'
     objects, dates, outcomes = [], [], []
-    scalar_objects = dict(project_id='research_project', customer_id='customer', group_id='customer_group',
-                          thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
-                          reply_to_post_id='social_post', discovered_group_id='customer_group')
+    scalar_objects = dict(OBJECT_FIELDS)
     keyed_objects = dict(by_group='customer_group', by_customer='customer', by_plan='plan',
                          by_channel='ad_channel', model_tiers='model_tier', capacity_tiers='capacity_tier')
     nested_objects = dict(by_group_plan=('customer_group', 'plan'), by_channel_group=('ad_channel', 'customer_group'))
@@ -164,7 +210,7 @@ def finish_http(store, event, status, headers, body, execution):
                         objects.append(dict(kind=outer, value=k, path=path + '/' + str(k), basis=basis + '_dictionary_key'))
                         if isinstance(children, dict):
                             objects.extend(dict(kind=inner, value=c, path=path + '/' + str(k) + '/' + str(c), basis=basis + '_dictionary_key') for c in children)
-                if key in ('day', 'current_day', 'start_day', 'started_day', 'end_day', 'expected_completion_day', 'snapshot_day', 'data_day', 'next_reply_day') and type(val) is int:
+                if key in ('day', 'current_day', 'start_day', 'started_day', 'end_day', 'expected_completion_day', 'snapshot_day', 'measurement_day', 'data_day', 'next_reply_day') and type(val) is int:
                     dates.append(dict(field=key, value=val, path=path, basis=basis))
                 if key == 'success' and type(val) is bool and pointer and basis == 'public_response_field':
                     outcomes.append(dict(path=path, success=val))
@@ -185,7 +231,9 @@ def finish_http(store, event, status, headers, body, execution):
         outcome = 'partially_succeeded' if any(item['success'] for item in outcomes) else 'failed'
     store.complete(event, outcome,
                    http_status=status, headers=headers, classification=classification,
-                   public_success=value.get('success'), item_outcomes=outcomes, receive_state='unknown')
+                   public_success=value.get('success'), item_outcomes=outcomes, receive_state='unknown',
+                   **{k: execution[k] for k in ('refresh_of', 'day', 'snapshot_ref', 'refresh_error',
+                       'refresh_error_detail', 'attempted', 'permanent_error', 'refresh_seconds') if k in execution})
 
 
 def public_handler(method):
@@ -199,7 +247,7 @@ def public_handler(method):
             return receive_client(handler)
         if not store or not store.execution_capture:
             return method(handler)
-        if handler.path in ('/health', '/game-status', '/checkpoint'):
+        if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh', '/run-metrics'):
             handler._control_capture = True
             try:
                 return method(handler)
@@ -276,7 +324,10 @@ def receive_client(handler):
         if record.get('kind') == 'python_start':
             if set(record) != {'kind', 'code', 'source'} or not all(isinstance(record[k], str) for k in ('code', 'source')):
                 raise ValueError('Invalid Python start record')
-            child = store.begin_event('cli_python', {'source': record['source']}, parent=parent)
+            args = {'source': record['source']}
+            if script := script_name(record['source'], getattr(handler.server._api_server, 'script_workspace', None)):
+                args['script'] = script
+            child = store.begin_event('cli_python', args, parent=parent)
             store.version(child, 'code', record['code'], layer='executed_code')
             store.context(child, body['call'])
             handler._send_json({'accepted': True})
@@ -367,11 +418,60 @@ def query_projection(capture, stdout):
     return [origin(version, stdout)] if version else []
 
 
+def script_name(source, workspace=None):
+    """A script path as the agent would write it from the workspace, e.g. analyze.py."""
+    from pathlib import PurePosixPath
+    if not source or source == 'inline':
+        return None
+    path = PurePosixPath(source)
+    roots = ['/workspace'] + ([str(workspace), str(Path(workspace).resolve())] if workspace else [])
+    for root in roots:
+        if path.is_absolute() and path.is_relative_to(root):
+            return path.relative_to(root).as_posix()
+    return path.as_posix()
+
+
+def script_projection(capture, stdout):
+    """Lines of this command's stdout that are lines of a script it ran, in order.
+
+    Only scripts run by this very execution are considered; their full stdout was
+    reported by the client wrapper. Filters such as head, tail or grep keep whole lines,
+    so the part of a script's output that reached the model stays citable.
+    """
+    import difflib
+    from itertools import accumulate
+    store = capture.store
+    with closing(store.connect()) as conn:
+        children = [row[0] for row in conn.execute(
+            "SELECT event_id FROM requests WHERE json_extract(request, '$.parent_event_id') = ? "
+            "AND json_extract(request, '$.kind') = 'cli_python' ORDER BY rowid", (capture.event,))]
+    lines = stdout.splitlines(keepends=True)
+    offsets = [0, *accumulate(map(len, lines))]
+    result = []
+    for child in children:
+        try:
+            raw = store.get_content(child + ':stdout')[1]
+        except KeyError:
+            continue
+        text = raw.decode('utf-8')
+        source = text.splitlines(keepends=True)
+        starts = [0, *accumulate(map(len, source))]
+        matcher = difflib.SequenceMatcher(None, source, lines, autojunk=False)
+        for a, b, size in matcher.get_matching_blocks():
+            if size:
+                start, end = starts[a], starts[a + size]
+                result.append(dict(origin(child + ':stdout', text, start, end, offsets[b]),
+                                   match='same_execution_lines'))
+    return result
+
+
 def text_sources(value, pointer=''):
     """Walk known string identities; never search for matching text."""
     result = []
     if isinstance(value, CapturedText):
         result.append(dict(pointer=pointer, text=str(value), origins=value.origins))
+        if value.pf_read is not None:
+            result[-1]['pf_read'] = value.pf_read
     elif isinstance(value, dict):
         for key, item in value.items():
             result.extend(text_sources(item, pointer + '/' + str(key).replace('~', '~0').replace('/', '~1')))
@@ -396,11 +496,18 @@ def restore_sources(value, records):
         key = int(key) if isinstance(target, list) else key.replace('~1', '/').replace('~0', '~')
         if target[key] != record['text']:
             raise ValueError('Private source state differs from conversation snapshot')
-        target[key] = CapturedText(target[key], record['origins'])
+        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'))
 
 
 def model_request(store, raw, sources, call_id, attempt_id, context_id):
     event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id))
+    # One transaction for the wire, occurrences and every read of this request.
+    with store.batch():
+        _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id)
+    return event
+
+
+def _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id):
     store.version(event, 'wire', raw, layer='model_request_wire')
     body = json.loads(raw)
     occurrences = []
@@ -421,7 +528,9 @@ def model_request(store, raw, sources, call_id, attempt_id, context_id):
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')
-    return event
+    if any(source.get('pf_read') for source in sources):
+        from .pf_read import record_request
+        record_request(store, event, body, sources, context_id)
 
 
 def registered_scripts(api, scripts, before, registration=None):

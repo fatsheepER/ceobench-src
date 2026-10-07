@@ -1,0 +1,289 @@
+"""The pf command in bash, call notes, integrated prompts and the round-three receipts."""
+import json
+import re
+
+import pytest
+
+from saas_bench import pf_cli
+from saas_bench.registration_prompt import git_memory_line, integrate, pf_memory_line
+from saas_bench.text_registry import TextRegistry
+from test_text_registry import workspace, captured, call, declaration, git, send
+from test_preflight_integration import offline_runner, packed_public
+from test_public_sql import server
+
+ROOTS = {'/workspace'}
+
+
+def test_pf_command_parsing_views_and_refusals():
+    assert pf_cli.parse('ls -la', ROOTS) is None
+    assert pf_cli.parse("cat > a.py <<'EOF'\npf = 3\nEOF\npython a.py", ROOTS) is None
+    assert pf_cli.parse('pf log MEMORY.md', ROOTS) == ('pf_log', {'target': {'path': 'MEMORY.md'}}, None)
+    assert pf_cli.parse('cd /workspace && pf show MEMORY.md@v8 2>&1 | head -20', ROOTS) == (
+        'pf_read', {'target': {'version': 'MEMORY.md@v8'}, 'mode': 'content', 'full': False}, ('head', 20))
+    assert pf_cli.parse('pf diff a.py.out@v1 a.py.out@v3', ROOTS)[1] == dict(
+        target={'version': 'a.py.out@v3'}, mode='diff', baseline={'version': 'a.py.out@v1'})
+    assert pf_cli.parse('pf diff MEMORY.md', ROOTS)[:2] == ('pf_diff', {'target': {'path': 'MEMORY.md'}})
+    assert pf_cli.parse('pf depend r4 --detail', ROOTS)[1] == dict(target={'record': 'r4'}, detail=True, purpose='current')
+    assert pf_cli.parse('pf rdepend query7@v2 --all', ROOTS)[1] == dict(
+        target={'version': 'query7@v2'}, detail=False, current_only=False)
+    assert pf_cli.parse('pf search S1 --kind customer_group', ROOTS)[1] == dict(
+        object={'id': 'S1', 'kind': 'customer_group'}, all=False)
+    assert pf_cli.parse('pf more c3 | tail -n 5', ROOTS) == ('pf_more', {'cursor': 'c3'}, ('tail', 5))
+    for command in ('pf', 'pf help', 'pf frobnicate x', 'pf log', 'pf log a b', 'pf depend r1 --bogus',
+                    'pf log MEMORY.md && ls', 'ls && pf log MEMORY.md', 'pf log MEMORY.md > out.txt',
+                    'pf log MEMORY.md | grep x', 'pf more 3'):
+        with pytest.raises(pf_cli.Usage) as error:
+            pf_cli.parse(command, ROOTS)
+        assert 'usage: pf <command>' in str(error.value), command
+
+
+def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    first = executor.execute('write_file', {'path': 'MEMORY.md', 'content': 'a\nb\n', 'note': 'first notes'})
+    assert first.endswith('\n[pf: wrote MEMORY.md@v1 | note saved]'), first
+    # The note is not part of the call: repeating the command keeps its handle.
+    executor.execute('bash', {'command': 'echo same', 'note': 'one'})
+    again = executor.execute('bash', {'command': 'echo same', 'note': 'two'})
+    assert 'cmd' not in again  # no captured evidence and no writes: no line at all
+    long_note = 'x' * 250
+    second = executor.execute('bash', {'command': "printf 'a\\nB\\nc\\n' > MEMORY.md", 'note': long_note})
+    assert second.endswith('| wrote MEMORY.md@v2 | note saved (truncated to 200 characters)]'), second
+    log = executor.execute('bash', {'command': 'cd /workspace && pf log MEMORY.md'})
+    lines = log.splitlines()
+    assert lines[0] == 'file MEMORY.md: 2 versions, newest first'
+    assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
+    assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
+    assert lines[3] == 'pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md'
+    assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
+    diff = executor.execute('bash', {'command': 'pf diff MEMORY.md'})
+    assert '--- MEMORY.md@v1\n+++ MEMORY.md@v2' in diff and '-b\n+B\n+c' in diff
+    assert executor.execute('bash', {'command': 'pf diff MEMORY.md@v1'}) == diff
+    blame = executor.execute('bash', {'command': 'pf blame MEMORY.md'}).splitlines()
+    assert blame[1:4] == ['v1 d0 | a', 'v2 d0 | B', '      | c']
+    assert blame[4].startswith('Notes: v1 (day 0): "first notes" · v2 (day 0): "xxx')
+    # A note is shown when its file comes back: read_file, or cat showing the whole file.
+    assert executor.execute('read_file', {'path': 'MEMORY.md'}).endswith('[pf: MEMORY.md@v2 note (day 0): "' + 'x' * 200 + '"]')
+    shown = executor.execute('bash', {'command': 'cat MEMORY.md'})
+    assert shown.endswith('[pf: MEMORY.md@v2 note (day 0): "' + 'x' * 200 + '"]'), shown
+    refused = executor.execute('bash', {'command': 'pf log MEMORY.md; ls'})
+    assert 'evidence.json' in refused and 'file MEMORY.md:' in refused
+    assert 'Error:' in executor.execute('bash', {'command': 'pf show nothing.txt'})
+    call(registry, 'create', **declaration(objects=[dict(kind='segment', id='S1')], text='S1 plan'))
+    search = executor.execute('bash', {'command': 'pf search S1'})
+    assert search.splitlines()[:3] == ['S1: 1 active text, 0 business writes, 0 outputs, newest first.', 'Active texts:',
+                                       '  r1.1 · day 7 · text r1.1 (active): "S1 plan"']
+    assert search.endswith('pf search S1 --all lists all 1 saved item.')
+    texts = executor.execute('bash', {'command': 'pf log r1'})
+    assert texts.splitlines()[:2] == ['text r1: 1 revision, newest first',
+                                      'r1.1 · day 7 · active: "S1 plan" · reason: Initial observation']
+    # The PF memory line names the loaded version, its day, its note and the history size.
+    version = store.latest_version('MEMORY.md', 'file_bytes')[0]
+    assert pf_memory_line(store, version) == ('[pf: MEMORY.md@v2, written day 0, note: "' + 'x' * 200 +
+                                              '" | 2 versions: pf log MEMORY.md]')
+
+
+def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(workspace):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    agent = BashAgent.__new__(BashAgent)
+    agent.total_days = 497
+    original = agent._default_system_prompt()
+    for pf in (False, True):
+        prompt = integrate(original, pf)
+        assert 'You have 10 tools:' in prompt and 'MEMORY.md is the ONLY way' not in prompt
+        assert prompt.index('## Registered Texts') < prompt.index('## Weekly Workflow')
+        assert ('## File and Output History (pf)' in prompt) == pf and ('## File History (git)' in prompt) != pf
+        assert ('pf search --text "market cap"' in prompt) == pf
+    with pytest.raises(ValueError, match='exactly once'):
+        integrate(original.replace('You have 6 tools:', ''), False)
+    assert git_memory_line(workspace) is None
+    (workspace / 'MEMORY.md').write_text('notes')
+    git(workspace, 'add', '.')
+    git(workspace, 'commit', '-qm', 'Week 3 (day 21) [week-3]')
+    head = git(workspace, 'rev-parse', 'HEAD')[:7]
+    assert git_memory_line(workspace) == f'[git: MEMORY.md last committed in week-3 ({head}) | git log -p -- MEMORY.md]'
+
+
+def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp_path):
+    registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
+    text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
+                                           reason='r', references=[dict(cite='evidence.json', note='why')]))
+    assert text == "Registered r1.1 (active).\nCited: evidence.json@week-2 (this week's closing commit)"
+    assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == 'Revised r1.2 (active).'
+    stored = json.loads(registry.path.read_text())['records']['r1'][-1]
+    assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
+    assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
+    call(registry, 'create', **declaration({'record': 'r1.2'}, text='Depends on the plan'))
+    assert registry.weekly_check(7).startswith('=== Check of your registered texts (day 7) ===\nChecked this week: 2 texts')
+    late = registry.weekly_check(14)
+    assert late.endswith('Not checked: 1 text past the applies window.'), late
+    with pytest.raises(ValueError, match='applies must be'):
+        registry.execute('create', dict(text='x', objects=[dict(kind='plan', id='B')], applies='soon',
+                                        reason='r', references=[]))
+
+
+def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
+    runner = offline_runner(text_registration='pf')
+    runner.agent.current_day = 0
+    output = runner._execute_tool('bash', {'command': './novamind-operation python-c "import novamind_api as nm; '
+                                           "nm.analytics.set_targeted_dev_spend(targeted_spend={'S1': 500})\""})
+    assert '[pf: cmd' in output, output
+    send(runner.evidence_store, output)
+    handle = re.search(r'\[pf: (cmd\d+@v\d+)', output).group(1)
+    created = runner._execute_tool('text_create', dict(
+        text='S1 dev 300 this week', objects=[dict(kind='customer_group', id='S1')], applies='0-',
+        reason='plan', references=[dict(cite=handle)]))
+    lines = created.splitlines()
+    assert lines[0] == 'Registered r1.1 (active).'
+    assert lines[1].startswith(f'Cited: {handle} (day 0) — output of ')
+    assert 'set_targeted_dev_spend' in lines[1]
+    assert lines[2].startswith('Business writes this week touching S1: day 0 set_targeted_dev_spend(') and '500' in lines[2]
+    other = runner._execute_tool('text_create', dict(text='About S2', objects=[dict(kind='customer_group', id='S2')],
+                                                     applies='0-', reason='plan', references=[]))
+    assert other == 'Registered r2.1 (active).'
+
+
+@pytest.mark.parametrize('mode', ['prefix', 'pf'])
+def test_next_weeks_memory_names_its_history(offline_runner, monkeypatch, mode):
+    from test_stage5_prep import fake_weeks
+    runner = offline_runner(text_registration=mode, stop_after_day=14)
+    runner.agent.current_day = 0
+    args = {'path': 'MEMORY.md', 'content': 'cap 272812\n'}
+    if mode == 'pf':
+        args['note'] = 'cap table kept here'
+    runner._execute_tool('write_file', args)
+    runner.agent.current_day = -1
+    requests = fake_weeks(runner, monkeypatch)
+    assert runner.run(verbose=False)['outcome'] == 'stopped'
+    system = requests[-1]['messages'][0]['content']
+    assert 'loaded into your context at the start of every week.\n' in system
+    if mode == 'pf':
+        assert '[pf: MEMORY.md@v1, written day 0, note: "cap table kept here" | 1 version: pf log MEMORY.md]' in system
+    else:
+        assert re.search(r'\[git: MEMORY\.md last committed in week-1 \([0-9a-f]{7}\) \| git log -p -- MEMORY\.md\]', system)
+    assert system.endswith('\n\ncap 272812')
+
+
+def test_diff_of_a_text_compares_its_revisions(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    call(registry, 'create', **declaration(text='Keep B at $99'))
+    call(registry, 'revise', record='r1', reason='New price', text='Keep B at $89')
+    diff = executor.execute('bash', {'command': 'pf diff r1'})
+    assert '"Keep B at $99"' in diff and '"Keep B at $89"' in diff and diff.index('-') < diff.index('+')
+    assert executor.execute('bash', {'command': 'pf diff r1.1'}) == diff
+    assert 'pf log rN' in executor.execute('bash', {'command': 'pf blame r1'})
+
+
+def test_single_diff_continues_the_same_pair_after_new_writes(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    for content in ('a' * 20000, 'b' * 20000):
+        executor.execute('write_file', dict(path='long.txt', content=content))
+    first = executor.execute('bash', {'command': 'pf diff long.txt'})
+    header, body = first.split('\n', 1)
+    header = json.loads(header)
+    assert header['next_cursor']
+    executor.execute('write_file', dict(path='long.txt', content='newer'))
+    more = executor.execute('bash', {'command': 'pf more ' + header['next_cursor']})
+    assert not more.startswith('Error:'), more
+    tail, rest = more.split('\n', 1)
+    tail = json.loads(tail)
+    assert tail['baseline']['version'] == header['baseline']['version'] == 'long.txt@v1'
+    assert tail['target']['version'] == header['target']['version'] == 'long.txt@v2'
+    assert tail['range'] == [24000, header['total_chars']] and tail['next_cursor'] is None
+    complete = body.rsplit('\n[', 1)[0] + rest
+    assert len(complete) == header['total_chars'] and 'newer' not in complete
+
+
+@pytest.mark.parametrize('kind', ['file', 'record'])
+def test_explicit_latest_diff_uses_itself_even_with_only_one_version(workspace, tmp_path, kind):
+    store, registry, executor = captured(workspace, tmp_path)
+    for i in (1, 2):
+        if kind == 'file':
+            executor.execute('write_file', dict(path='a.txt', content=str(i)))
+            target = f'a.txt@v{i}'
+        else:
+            call(registry, 'create', **declaration(text='one')) if i == 1 else call(
+                registry, 'revise', record='r1', reason='two', text='two')
+            target = f'r1.{i}'
+        result = executor.execute('bash', {'command': 'pf diff ' + target})
+        assert not result.startswith('Error:'), result
+        header, body = result.split('\n', 1)
+        assert json.loads(header)['raw_equal'] and body == ''
+
+
+def test_bare_command_query_and_read_names_resolve_latest(workspace, tmp_path, server):
+    from saas_bench.execution_capture import finish_http
+    from saas_bench.public_sql import execute_query
+    from test_pf_stale import record_sql
+    store, registry, executor = captured(workspace, tmp_path)
+    output = executor.execute('bash', {'command': 'echo x > out.txt'})
+    command = re.search(r'\[pf: (cmd\d+)@', output).group(1)
+    sql = 'SELECT amount FROM ledger'
+    version = record_sql(store, sql, execute_query(server, sql))
+    query = registry.resolver.handle(version).split('@')[0]
+    event = store.begin_event('public_http', dict(method='GET', path='/vars', parsed=None))
+    finish_http(store, event, 200, {}, b'{"day":7}', {})
+    read = registry.resolver.handle(event + ':public_response').split('@')[0]
+    for name in (command, query, read):
+        for verb in ('log', 'show', 'depend'):
+            result = executor.execute('bash', {'command': f'pf {verb} {name}'})
+            assert not result.startswith('Error:'), result
+            assert name + '@v1' in result
+
+
+def test_identical_writes_update_notes_but_reads_do_not(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    for note in ('first', 'second'):
+        executor.execute('write_file', dict(path='MEMORY.md', content='same', note=note))
+    result = executor.execute('read_file', {'path': 'MEMORY.md'})
+    assert 'MEMORY.md@v1' in result and 'second' in result and 'first' not in result
+    executor.execute('bash', dict(command='cat MEMORY.md', note='read only'))
+    executor.execute('write_file', dict(path='MEMORY.md', content='same'))
+    log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
+    assert '1 version,' in log and 'second' in log and 'read only' not in log
+    # A rebuilt index must agree with the incrementally refreshed one.
+    del store._handle_index
+    assert executor.execute('bash', {'command': 'pf log MEMORY.md'}) == log
+    executor.execute('bash', dict(command='printf same > MEMORY.md', note='third'))
+    log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
+    assert '1 version,' in log and 'third' in log and 'second' not in log
+
+
+def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from scripts.analyze_pf_run import analyze
+    store, registry, executor = captured(workspace, tmp_path)
+    run = tmp_path / 'run'
+    (run / 'logs').mkdir(parents=True)
+    logger = BashAgentRunner.__new__(BashAgentRunner)
+    logger.logs_dir, logger.run_id = run / 'logs', 'audit'
+    executor.execute('write_file', dict(path='MEMORY.md', content='a\nb\n'))
+    commands = ['pf log MEMORY.md', 'pf show missing | tail -1', 'pf log',
+                'ls && pf show MEMORY.md', 'pf help', "cat > data.py <<'EOF'\npf = 3\nEOF"]
+    for i, command in enumerate(commands):
+        args = dict(command=command, note='a purpose' if i == 0 else '')
+        logger._log_tool_result(i, 28, 'bash', args, executor.execute('bash', args))
+    store.snapshot(run / 'sql-evidence.sqlite')
+    request = dict(event='request', day=28, request=dict(messages=[dict(role='system', content=''),
+        dict(role='user', content='Dashboard\n\n=== Check of your registered texts (day 28) ===\n'
+                                  'Checked this week: 1 text; 1 with changed evidence:\nr1.1 (day 7): plan')]))
+    (run / 'logs/agent_requests.jsonl').write_text(json.dumps(request) + '\n')
+    (run / 'usage_summary.json').write_text('{}')
+    pointer = tmp_path / 'pointer.json'
+    pointer.write_text(json.dumps(dict(path=str(run), start_day=28, group='pf', run_id='audit', status='stopped')))
+    result = analyze(pointer)
+    week = result['weeks'][0]
+    assert week['digest_chars'] and week['flagged'] == ['r1.1']
+    assert len(week['pf_calls']) == 5  # The heredoc variable is not a command.
+    assert [c['outcome'] for c in week['pf_calls']] == [
+        'succeeded', 'execution_error', 'usage_error', 'succeeded', 'succeeded']
+    assert all(c['capture_match'] is True for c in week['pf_calls'])
+    assert week['note_calls'] == {'bash': 1}
+    # Older Bash logs have no metadata, but the same parser can recover their calls.
+    logfile = run / 'logs/tool_results_audit.jsonl'
+    entries = [json.loads(line) for line in logfile.read_text().splitlines()]
+    for entry in entries:
+        entry.pop('pf_call', None)
+        entry.pop('pf_calls', None)
+    logfile.write_text(''.join(json.dumps(e) + '\n' for e in entries))
+    recovered = analyze(pointer)['weeks'][0]['pf_calls']
+    assert len(recovered) == 5 and all(c['capture_match'] is None for c in recovered)
