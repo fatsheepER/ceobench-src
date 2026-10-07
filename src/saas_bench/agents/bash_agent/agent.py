@@ -10,6 +10,9 @@ import json
 import os
 import re
 import time
+import signal
+import threading
+from contextlib import contextmanager
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -19,6 +22,31 @@ from ..base import BaseAgent
 from ...environment import Action
 from ...model_usage import ModelUsage, usage_values
 from ...run_lifecycle import RunCancelled
+
+
+@dataclass(frozen=True)
+class FinalText:
+    text: str
+
+
+class LLMTimeoutError(Exception):
+    pass
+
+
+@contextmanager
+def _model_deadline(seconds=600):
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    def timeout(signum, frame):
+        raise LLMTimeoutError(f'LLM call exceeded {seconds}s wall-clock timeout')
+    old = signal.signal(signal.SIGALRM, timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 
 @dataclass
@@ -41,7 +69,7 @@ NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week 
 _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
 
 
-def _stream_chat_completion(client, request):
+def _stream_chat_completion(client, request, check=lambda: None):
     import httpx
     from openai import APIConnectionError, LengthFinishReasonError
     from openai.lib.streaming.chat import ChatCompletionStreamState
@@ -49,11 +77,15 @@ def _stream_chat_completion(client, request):
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
     from pydantic import ValidationError
 
+    deadline = time.monotonic() + 600
     state = ChatCompletionStreamState()
     received = False
     with client.chat.completions.create(**request) as stream:
         try:
             for chunk in stream:
+                check()
+                if time.monotonic() >= deadline:
+                    raise LLMTimeoutError('Chat stream exceeded 600s wall-clock timeout')
                 chunk = ChatCompletionChunk.model_validate(
                     chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
                 received = True
@@ -123,11 +155,13 @@ class BashAgent(BaseAgent):
         text_registration: bool = False,
         pf: bool = False,
         identity=None,
+        allow_final_text=False,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
         super().__init__(tool_descriptions)
         self.identity = identity
+        self.allow_final_text = allow_final_text
         self.role = identity.role if identity else "ceo"
         self.client = client
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
@@ -389,7 +423,7 @@ class BashAgent(BaseAgent):
         self._day_advanced = False
         self._new_dashboard = ""
 
-    def act(self, observation: str, reward: float, done: bool, info: Dict[str, Any]) -> Optional[Action]:
+    def act(self, observation: str, reward: float, done: bool, info: Dict[str, Any]) -> Optional[Action | FinalText]:
         """Choose an action based on the observation.
 
         The agent processes tool outputs and decides the next action.
@@ -464,8 +498,9 @@ class BashAgent(BaseAgent):
         self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
         try:
             self.usage_recorder.message_ids = [m.message_id for m in self.conversation]
-            response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
-                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+            with _model_deadline():
+                response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
+                                                    turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
         except Exception as exc:
             status = getattr(exc, 'status_code', 0) or 0
             if 400 <= status < 500 and status not in (408, 409, 429):
@@ -643,7 +678,7 @@ class BashAgent(BaseAgent):
         """True when a non-empty reasoning effort other than 'none' is set."""
         return bool(self.reasoning_effort) and self.reasoning_effort != 'none'
 
-    def _call_llm(self) -> Optional[Action]:
+    def _call_llm(self) -> Optional[Action | FinalText]:
         """Call the LLM and parse the response into an action."""
         if self.use_anthropic:
             return self._call_anthropic()
@@ -652,21 +687,11 @@ class BashAgent(BaseAgent):
         else:
             return self._call_openai()
 
-    def _call_openai(self) -> Optional[Action]:
+    def _call_openai(self) -> Optional[Action | FinalText]:
         """Call OpenAI-compatible API and parse the response."""
         self._context_system_prompt()
-        import time as _time
         import traceback
-        import signal
         import openai
-
-        LLM_WALL_CLOCK_TIMEOUT = 600  # 10min hard wall-clock limit per LLM call
-
-        class LLMTimeoutError(Exception):
-            pass
-
-        def _llm_timeout_handler(signum, frame):
-            raise LLMTimeoutError(f"LLM call exceeded {LLM_WALL_CLOCK_TIMEOUT}s wall-clock timeout")
 
         while True:
             messages = []
@@ -733,21 +758,16 @@ class BashAgent(BaseAgent):
                     if not self._wants_reasoning():
                         api_kwargs['reasoning_effort'] = 'none'
 
-                # Set hard wall-clock timeout via signal.alarm
-                old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
-                signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
-                try:
-                    if _is_opencode:
-                        api_kwargs.update(stream=True, stream_options={'include_usage': True})
-                    def invoke():
-                        if not _is_opencode:
-                            return self.client.chat.completions.create(**api_kwargs)
-                        return _stream_chat_completion(self.client, api_kwargs)
-                    response = self._request_model('chat', api_kwargs,
-                                                   invoke)
-                finally:
-                    signal.alarm(0)  # Cancel alarm
-                    signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+                api_kwargs['timeout'] = 60 if _is_opencode else 600
+                if _is_opencode:
+                    api_kwargs.update(stream=True, stream_options={'include_usage': True})
+                def invoke():
+                    if not _is_opencode:
+                        return self.client.chat.completions.create(**api_kwargs)
+                    lifecycle = getattr(self, 'lifecycle', None)
+                    return _stream_chat_completion(self.client, api_kwargs,
+                        lifecycle.check if lifecycle else lambda: None)
+                response = self._request_model('chat', api_kwargs, invoke)
                 self.total_turns += 1
                 self._consecutive_errors = 0
 
@@ -836,6 +856,9 @@ class BashAgent(BaseAgent):
                 ))
 
                 if not assistant_msg.tool_calls:
+                    if (self.allow_final_text and response.choices[0].finish_reason == 'stop'
+                            and isinstance(assistant_msg.content, str) and assistant_msg.content.strip()):
+                        return FinalText(assistant_msg.content)
                     # LLM emitted no tool_call — feed feedback and retry.
                     print("  LLM returned no tool_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
@@ -887,20 +910,10 @@ class BashAgent(BaseAgent):
                     del messages, tools
                     continue
 
-    def _call_openai_responses(self) -> Optional[Action]:
+    def _call_openai_responses(self) -> Optional[Action | FinalText]:
         """Call OpenAI Responses API (required for reasoning models with tools)."""
-        import time as _time
         import traceback
-        import signal
         import openai
-
-        LLM_WALL_CLOCK_TIMEOUT = 600
-
-        class LLMTimeoutError(Exception):
-            pass
-
-        def _llm_timeout_handler(signum, frame):
-            raise LLMTimeoutError(f"LLM call exceeded {LLM_WALL_CLOCK_TIMEOUT}s wall-clock timeout")
 
         while True:
             # Build input array from conversation
@@ -946,15 +959,9 @@ class BashAgent(BaseAgent):
                 if self.reasoning_effort:
                     api_kwargs['reasoning'] = {'effort': self.reasoning_effort, 'summary': 'auto'}
 
-                # Set hard wall-clock timeout via signal.alarm
-                old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
-                signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
-                try:
-                    response = self._request_model('responses', api_kwargs,
-                                                   lambda: self.client.responses.create(**api_kwargs))
-                finally:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
+                api_kwargs['timeout'] = 600
+                response = self._request_model('responses', api_kwargs,
+                    lambda: self.client.responses.create(**api_kwargs))
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
@@ -1022,6 +1029,9 @@ class BashAgent(BaseAgent):
                 ))
 
                 if not function_calls:
+                    text = getattr(response, 'output_text', '')
+                    if self.allow_final_text and getattr(response, 'status', '') == 'completed' and text.strip():
+                        return FinalText(text)
                     # LLM emitted no tool_call — feed feedback and retry.
                     print("  LLM returned no function_call. Feeding feedback and regenerating.")
                     self.conversation.append(Message(
@@ -1180,7 +1190,7 @@ class BashAgent(BaseAgent):
             f"Previous non-tool response preview: {preview or '(no text)'}"
         )
 
-    def _call_anthropic(self) -> Optional[Action]:
+    def _call_anthropic(self) -> Optional[Action | FinalText]:
         """Call Anthropic/Bedrock API and parse the response."""
         import copy
 
@@ -1259,9 +1269,17 @@ class BashAgent(BaseAgent):
                 use_streaming = True
 
             try:
+                api_kwargs['timeout'] = 60 if use_streaming else 600
                 def invoke():
                     if use_streaming:
+                        deadline = time.monotonic() + 600
                         with anthropic_messages.stream(**api_kwargs) as stream:
+                            if hasattr(stream, '__iter__'):
+                                for event in stream:
+                                    if lifecycle := getattr(self, 'lifecycle', None):
+                                        lifecycle.check()
+                                    if time.monotonic() >= deadline:
+                                        raise LLMTimeoutError('Anthropic stream exceeded 600s wall-clock timeout')
                             return stream.get_final_message()
                     return anthropic_messages.create(**api_kwargs)
                 response = self._request_model('messages', dict(api_kwargs, stream=use_streaming), invoke)
@@ -1299,6 +1317,9 @@ class BashAgent(BaseAgent):
 
                 tool_use_blocks = [block for block in assistant_content if block.type == 'tool_use']
                 if not tool_use_blocks:
+                    text = self._anthropic_content_text(assistant_content)
+                    if self.allow_final_text and getattr(response, 'stop_reason', '') == 'end_turn' and text.strip():
+                        return FinalText(text)
                     no_tool_retries += 1
                     stop_reason = getattr(response, 'stop_reason', '') or 'no_tool_use'
                     if self.tool_result_callback:

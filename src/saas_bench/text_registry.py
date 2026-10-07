@@ -51,7 +51,9 @@ class TextRegistry:
         if self.identity:
             for revisions in value['records'].values():
                 for record in revisions:
-                    if record.get('author') != self.role or any(record.get(k) != v for k, v in self.identity.fields().items()):
+                    owner = {k: v for k, v in self.identity.fields().items() if k != 'session_id'}
+                    if (record.get('author') != self.role or not isinstance(record.get('session_id'), str)
+                            or not record['session_id'] or any(record.get(k) != v for k, v in owner.items())):
                         raise ValueError('Registration identity differs from its workspace owner')
         return value
 

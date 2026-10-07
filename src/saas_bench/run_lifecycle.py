@@ -16,12 +16,12 @@ class WorkerLifecycle:
         self.hold = Path(hold) if hold else None
         self.parent_pid = parent_pid
         self.reason = None
-        self._in_model = False
+        self._model = threading.local()
         self._wake = threading.Event()
         self._thread = None
 
     def __enter__(self):
-        self._old_handler = signal.signal(signal.SIGUSR1, self._signal)
+        self._old_handler = signal.signal(signal.SIGUSR1, self._signal) if threading.current_thread() is threading.main_thread() else None
         if self.parent_pid is not None:
             try:
                 self._parent = os.pidfd_open(self.parent_pid)
@@ -31,7 +31,8 @@ class WorkerLifecycle:
                 self._thread = threading.Thread(target=self._watch, daemon=True)
                 self._thread.start()
             except BaseException:
-                signal.signal(signal.SIGUSR1, self._old_handler)
+                if self._old_handler is not None:
+                    signal.signal(signal.SIGUSR1, self._old_handler)
                 if hasattr(self, '_parent'):
                     os.close(self._parent)
                 raise
@@ -51,8 +52,12 @@ class WorkerLifecycle:
     def _signal(self, signum, frame):
         self.reason = self.reason or 'supervisor_cancelled'
         self._wake.set()
-        if self._in_model:
+        if getattr(self._model, 'active', False):
             raise RunCancelled(self.reason)
+
+    def cancel(self, reason='requested_pause'):
+        self.reason = self.reason or reason
+        self._wake.set()
 
     def check(self, *, retry=False):
         if self.parent_pid is not None and hasattr(self, '_parent'):
@@ -66,11 +71,11 @@ class WorkerLifecycle:
     @contextmanager
     def model_call(self):
         try:
-            self._in_model = True
+            self._model.active = True
             self.check()
             yield
         finally:
-            self._in_model = False
+            self._model.active = False
 
     def sleep(self, seconds):
         deadline = time.monotonic() + seconds
@@ -82,11 +87,12 @@ class WorkerLifecycle:
             self._wake.wait(min(remaining, .25))
 
     def __exit__(self, *exc):
-        self._in_model = False
+        self._model.active = False
         if self._thread:
             os.write(self._pipe[1], b'x')
             self._thread.join()
             for fd in (*self._pipe, self._parent):
                 os.close(fd)
             del self._parent
-        signal.signal(signal.SIGUSR1, self._old_handler)
+        if self._old_handler is not None:
+            signal.signal(signal.SIGUSR1, self._old_handler)

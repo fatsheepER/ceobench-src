@@ -257,7 +257,7 @@ NOTE_PARAMETER = {
 }
 
 
-def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
+def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
     if pf_queries:
@@ -268,6 +268,10 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) 
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
         definitions = definitions + tool_definitions(pf=pf_queries)
+    if ask_analyst:
+        definitions = definitions + [dict(name='ask_analyst', description="Ask an analyst a free-text question in this week's conversation.",
+            parameters=dict(type='object', properties=dict(role=dict(type='string', enum=['growth', 'ops_finance']),
+                message=dict(type='string')), required=['role', 'message'], additionalProperties=False))]
     return [
         {
             'type': 'function',
@@ -330,6 +334,7 @@ class BashAgentToolExecutor:
             self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh)
         self.capture = None
         self.world_status = None
+        self.authorize = None
         self.preserved_process = None
 
     def weekly_check(self, day):
@@ -372,6 +377,12 @@ class BashAgentToolExecutor:
     def execute(self, tool_name: str, args: Dict[str, Any], *, model_request_event=None, model_context_id=None) -> str:
         """Execute a tool and return the result string."""
         with self._execute_lock:
+            if self.authorize:
+                try:
+                    self.authorize(self.role, 'executor')
+                except PermissionError as exc:
+                    self.last_status = 'cancelled'
+                    return f'Error: {exc}'
             if self.preserved_process:
                 raise ProcessBoundaryError('Previous process boundary remains open')
             return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id)

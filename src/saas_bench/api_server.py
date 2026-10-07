@@ -428,6 +428,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             server: NovaMindAPIServer = self.server._api_server
             try:
                 require_advance(self.role)
+                with server._lock:
+                    server.authorize_team(self.role, 'advance')
             except PermissionError as e:
                 self._send_json({"success": False, "error": str(e)}, 403)
                 return
@@ -499,6 +501,8 @@ class _APIHandler(BaseHTTPRequestHandler):
 
             result = server.advance_week(predictions=parsed, rationale=rationale, role=self.role)
             self._send_json(result)
+        except PermissionError as e:
+            self._send_json({'success': False, 'error': str(e)}, 403)
         except Exception as e:
             self._send_internal_error(e, op="next-week")
 
@@ -617,7 +621,11 @@ class _APIHandler(BaseHTTPRequestHandler):
                 scripts = server.get_daily_scripts(self.role)
                 scripts[name] = content
                 server.set_daily_scripts(scripts, registration=name, role=self.role)
-            self._send_json({"success": True, "data": {"name": name, "registered": True}})
+            import hashlib
+            self._send_json({"success": True, "data": {"name": name, "registered": True,
+                "sha256": hashlib.sha256(content.encode()).hexdigest()}})
+        except PermissionError as e:
+            self._send_json({'success': False, 'error': str(e)}, 403)
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:post")
 
@@ -625,7 +633,9 @@ class _APIHandler(BaseHTTPRequestHandler):
         """List registered daily scripts: GET /daily-scripts."""
         server: NovaMindAPIServer = self.server._api_server
         with server._lock:
-            scripts = [{"name": n, "size": len(c)} for n, c in server.get_daily_scripts(self.role).items()]
+            import hashlib
+            scripts = [{"name": n, "size": len(c), "sha256": hashlib.sha256(c.encode()).hexdigest()}
+                       for n, c in server.get_daily_scripts(self.role).items()]
         self._send_json({"success": True, "data": {"scripts": scripts}})
 
     def _handle_daily_scripts_delete(self):
@@ -635,6 +645,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             name = body.get('name', '')
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
+                server.authorize_team(self.role, 'scripts')
                 if name not in server.get_daily_scripts(self.role):
                     self._send_json({"success": False, "error": f"Script not found: {name}"}, 404)
                     return
@@ -642,6 +653,8 @@ class _APIHandler(BaseHTTPRequestHandler):
                 del scripts[name]
                 server.set_daily_scripts(scripts, role=self.role)
             self._send_json({"success": True, "data": {"removed": name}})
+        except PermissionError as e:
+            self._send_json({'success': False, 'error': str(e)}, 403)
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:delete")
 
@@ -785,6 +798,8 @@ class NovaMindAPIServer:
         self.read_only_task = os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'
         self.role_sockets = dict(role_sockets or {})
         self.team_mode = bool(self.role_sockets)
+        self.team_phase = None
+        self.script_check = None
         if self.team_mode and set(self.role_sockets) != set(ROLES):
             raise ValueError('Team requires exactly three role listeners')
         self.role_stores = role_stores or {}
@@ -828,6 +843,7 @@ class NovaMindAPIServer:
         self.script_workspace = script_workspace or tools.workspace_path
         self.require_sandbox = require_sandbox
         self.last_script_results = []
+        self.role_script_results = {role: [] for role in ROLES}
         if conn is not None:
             conn.execute('CREATE TABLE IF NOT EXISTS _registered_scripts (position INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, content TEXT NOT NULL, sha256 TEXT NOT NULL)')
             saved_scripts = conn.execute('SELECT name, content, sha256 FROM _registered_scripts ORDER BY position').fetchall()
@@ -876,16 +892,44 @@ class NovaMindAPIServer:
     def evidence_for(self, role):
         return self.role_stores.get(role) if self.team_mode else self.sql_evidence
 
+    def authorize_team(self, role, operation):
+        if not self.team_mode or self.team_phase is None:
+            return
+        require_role(role)
+        phase = self.team_phase
+        if operation == 'read':
+            return
+        allowed = ('ceo_scripts', 'ceo') if role == 'ceo' else ('analysis', 'asking')
+        if phase not in allowed or (operation == 'advance' and phase != 'ceo'):
+            raise PermissionError(f'{role} {operation} is frozen during {phase}')
+
+    def public_dashboard(self):
+        with self._lock:
+            day = self.tools.current_day
+            if self.dashboard_callback:
+                dashboard = self.dashboard_callback(day, self._last_day_result)
+            elif self.conn:
+                dashboard = build_weekly_dashboard(self.conn, day, self._last_day_result)
+            else:
+                dashboard = f'=== Day {day} Dashboard ===\n(No dashboard data available)'
+            self._last_dashboard = str(dashboard)
+            return self._last_dashboard
+
     def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo') -> Any:
         """Execute a tool call with thread safety."""
         require_call(role, tool_name)
         with self._lock:
+            self.authorize_team(role, CALL_POLICY.get(tool_name, 'write'))
             dispatch_fn = _TOOL_DISPATCH.get(tool_name)
             if dispatch_fn is None:
                 return ToolResult(False, f"Unknown tool: {tool_name}")
             result = dispatch_fn(self.tools, args)
             if CALL_POLICY[tool_name] != 'read' and result.success:
                 self.world_state_id = uuid.uuid4().hex
+                if self.team_mode and self.team_phase is not None and self.conn is not None:
+                    from .database import get_cash
+                    if get_cash(self.conn) < 0:
+                        self.team_phase = 'boundary'
             return result
 
     # Maximum allowed time for step_week before auto-quit (seconds)
@@ -946,12 +990,16 @@ class NovaMindAPIServer:
 
     def advance_week(self, predictions=None, rationale=None, *, role="ceo"):
         require_advance(role)
+        with self._lock:
+            self.authorize_team(role, 'advance')
         if not self._advance_lock.acquire(blocking=False):
             raise RuntimeError('Week advancement already in progress')
         try:
             if self._operation_failed or self._step_day_timed_out:
                 raise RuntimeError('Previous operation outcome unknown; continuation refused')
             return self._advance_week(predictions, rationale)
+        except PermissionError:
+            raise
         except Exception:
             self._operation_failed = True
             raise
@@ -981,6 +1029,7 @@ class NovaMindAPIServer:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
         with self._lock:
+            self.authorize_team('ceo', 'advance')
             if self.simulator is None:
                 return {"success": False, "error": "No simulator configured"}
             old_day = self.tools.current_day
@@ -1043,6 +1092,8 @@ class NovaMindAPIServer:
                     self._last_day_result = result
                     self.tools.set_current_day(result.day)
                     self.world_state_id = uuid.uuid4().hex
+                    if self.team_mode and self.team_phase is not None:
+                        self.team_phase = 'boundary'
                     return result
                 except Exception:
                     # Readers must see the failure before this lock is released.
@@ -1083,7 +1134,7 @@ class NovaMindAPIServer:
 
         # Build dashboard OUTSIDE the lock so weekly scripts can call back
         # to the API server (e.g., nm.query()) without deadlocking.
-        calc_outputs = self._run_daily_scripts_internal()
+        calc_outputs = {} if self.team_mode else self._run_daily_scripts_internal()
         if self.dashboard_callback:
             dashboard = self.dashboard_callback(new_day, week_result)
         elif self.conn:
@@ -1147,8 +1198,14 @@ class NovaMindAPIServer:
         root = executor.guest_root
         executor.extra_env['PYTHONPATH'] = os.pathsep.join((root + '/docs', root))
         results = {}
-        self.last_script_results = []
+        records = []
+        with self._lock:
+            self.role_script_results[role] = records
+            if not self.team_mode:
+                self.last_script_results = records
         for name, code in self.get_daily_scripts(role).items():
+            if self.team_mode and self.team_phase is not None and self.script_check:
+                self.script_check()
             from .execution_capture import ExecutionCapture, CURRENT_EVENT
             capture = ExecutionCapture(executor.evidence_store) if executor.evidence_store else None
             token = None
@@ -1178,16 +1235,18 @@ class NovaMindAPIServer:
                 if token is not None:
                     CURRENT_EVENT.reset(token)
             if audit := self.role_audits.get(role):
-                audit.record('registered_script_execution', name=name, status=executor.last_status)
+                audit.record('registered_script_execution', name=name, status=executor.last_status,
+                    sha256=hashlib.sha256(code.encode()).hexdigest())
             results[name] = output
-            self.last_script_results.append(dict(name=name, role=role,
-                sha256=hashlib.sha256(code.encode()).hexdigest(), output=output))
+            records.append(dict(name=name, role=role,
+                sha256=hashlib.sha256(code.encode()).hexdigest(), output=output, status=executor.last_status))
         return results
 
     def set_daily_scripts(self, scripts: Dict[str, str], registration=None, *, role="ceo"):
         require_role(role)
         """Restore daily scripts from checkpoint."""
         with self._lock:
+            self.authorize_team(role, 'scripts')
             import hashlib
             if not isinstance(scripts, dict) or any(not isinstance(n, str) or not n or not isinstance(c, str)
                                                     for n, c in scripts.items()):
