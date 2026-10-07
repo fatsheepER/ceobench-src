@@ -8,6 +8,7 @@ import tempfile
 import threading
 
 from . import pf_cli
+from .evidence_handles import RAW_VERSION
 from .execution_capture import CapturedText, CURRENT_EVENT, ExecutionCapture
 
 
@@ -78,7 +79,7 @@ class ShellService:
             for key in ('target', 'baseline'):
                 target = args.get(key, {})
                 field = next((f for f in ('path', 'version') if f in target), None)
-                if field and relative.parts:
+                if field and relative.parts and not RAW_VERSION.fullmatch(target[field]) and target[field].split(':', 1)[0] not in ('ceo', 'growth', 'ops_finance'):
                     value = target[field]
                     # Numbered outputs/texts are global; file and script names follow cwd.
                     if not re.fullmatch(r'(?:r\d+(?:\.\d+)?|(?:cmd|query|read|receipt)\d+(?:@v\d+)?)', value):
@@ -99,7 +100,7 @@ class ShellService:
             else:
                 try:
                     result = self.executor.pf_queries.execute(operation, args)
-                except (ValueError, KeyError) as exc:
+                except (ValueError, KeyError, PermissionError) as exc:
                     result, code, outcome = 'Error: ' + str(exc), 1, 'execution_error'
             capture.origins.extend(getattr(result, 'origins', []))
             result = capture.finish(result, 'succeeded' if code == 0 else 'failed',

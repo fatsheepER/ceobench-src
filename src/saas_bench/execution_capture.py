@@ -24,7 +24,7 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
 def excluded(rel):
     """Only harness-owned paths at the workspace root; nested business names are legal."""
     from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
-    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS
+    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS or rel.split('/')[0] == '.git'
 
 
 class CapturedText(str):
@@ -73,13 +73,13 @@ class ExecutionCapture:
             return None
         return self.safe(self.store.version, self.event, slot, value, layer=layer, **metadata)
 
-    def file(self, path, raw, text=None, phase='read'):
+    def file(self, path, raw, text=None, phase='read', owner=None):
         self.slots += 1
-        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path))
+        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **({'owner_role': owner} if owner else {}))
         if text is None:
             return raw_version
         version = self.blob(f'file_{self.slots}_text', text, 'file_text', derived_from=raw_version,
-                            transformation='decode_universal_newlines')
+                            transformation='decode_universal_newlines', **({'owner_role': owner} if owner else {}))
         return version
 
     def snapshot(self, workspace, phase):
@@ -342,7 +342,9 @@ def receive_client(handler):
             if set(record) != {'kind', 'code', 'source'} or not all(isinstance(record[k], str) for k in ('code', 'source')):
                 raise ValueError('Invalid Python start record')
             args = {'source': record['source']}
-            if script := script_name(record['source'], getattr(handler.server._api_server, 'script_workspace', None)):
+            api = handler.server._api_server
+            workspace = api.role_executors[store.identity['role']].workspace_path if api.team_mode else api.script_workspace
+            if script := script_name(record['source'], workspace):
                 args['script'] = script
             child = store.begin_event('cli_python', args, parent=parent)
             store.version(child, 'code', record['code'], layer='executed_code')
@@ -432,7 +434,7 @@ def query_projection(capture, stdout):
     public, meta = matches[0]
     version = capture.blob('query_projection', stdout, 'query_model_projection',
                            object_id=meta['object_id'], derived_from=public,
-                           source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection')
+                           source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection', public_observation=True)
     return [origin(version, stdout)] if version else []
 
 
@@ -542,7 +544,7 @@ def _record_model_request(store, event, raw, sources, call_id, attempt_id, conte
             c, d = item['request_range']
             if not (0 <= a <= b <= len(original) and 0 <= c <= d <= len(text)) or original[a:b] != text[c:d]:
                 raise ValueError('Source occurrence range does not match final request')
-            occurrences.append(dict(item, reader=store.identity.get('role', 'ceo'), role=role, context_id=context_id, call_id=call_id,
+            occurrences.append(dict(item, reader=store.identity.get('role', 'ceo'), agent_id=store.identity.get('agent_id'), session_id=store.identity.get('session_id'), role=role, context_id=context_id, call_id=call_id,
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')

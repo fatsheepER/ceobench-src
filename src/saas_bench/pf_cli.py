@@ -2,7 +2,7 @@
 import re
 import shlex
 
-from .evidence_handles import RECORD, SINGLE, VERSIONED
+from .evidence_handles import RAW_VERSION, RECORD, SINGLE, VERSIONED
 from .pf_render import _HEREDOC
 
 USAGE = '''usage: pf <command> ...
@@ -34,7 +34,9 @@ def mentions_pf(command):
 def target(token):
     if RECORD.fullmatch(token):
         return {'record': token}
-    if VERSIONED.fullmatch(token) or (SINGLE.fullmatch(token) and not re.fullmatch(r'(cmd|query|read|call)[1-9][0-9]*', token)):
+    if RAW_VERSION.fullmatch(token):
+        return {'version': token}
+    if VERSIONED.fullmatch(token) or (SINGLE.fullmatch(token.split(':')[-1]) and not re.fullmatch(r'(cmd|query|read|call)[1-9][0-9]*', token.split(':')[-1])):
         return {'version': token}
     return {'path': token}
 

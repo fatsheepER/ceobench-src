@@ -61,7 +61,7 @@ CITE_FORMS = dict(
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
        'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
        'or "unknown: <reason>"')
-_RECORD = re.compile(r'r[1-9][0-9]*(\.[1-9][0-9]*)?')
+_RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 _SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')
 _COMMIT = re.compile(r'week-[1-9][0-9]*|[0-9a-fA-F]{1,40}')
 _UNKNOWN = re.compile(r'unknown(?:(?:\s*:|\s)(.*))?', re.I | re.S)
@@ -76,7 +76,7 @@ def parse_cite(cite, pf):
         return dict(unknown=m.group(1).strip())
     if _RECORD.fullmatch(cite):
         return dict(record=cite)
-    if pf and (VERSIONED.fullmatch(cite) or ('/' not in cite and '.' not in cite and _SINGLE.fullmatch(cite))):
+    if pf and (VERSIONED.fullmatch(cite) or ('/' not in cite and '.' not in cite and _SINGLE.fullmatch(cite.split(':')[-1]))):
         return dict(version=cite)
     if '@' in cite:
         path, commit = cite.rsplit('@', 1)
@@ -111,7 +111,7 @@ def cite_text(evidence):
     if 'sql' in evidence:
         return 'SQL: ' + evidence['sql']
     if 'path' in evidence:
-        return evidence['path'] + ('@' + evidence['commit'] if evidence.get('commit') else '')
+        return (evidence['owner'] + ':' if evidence.get('owner') else '') + evidence['path'] + ('@' + evidence['commit'] if evidence.get('commit') else '')
     return evidence.get('record') or evidence.get('version')
 
 
@@ -160,7 +160,7 @@ def _declaration_models(pf):
             if isinstance(data, dict) and isinstance(data.get('evidence'), dict):
                 given = [k for k in ('path', 'sql', 'record', 'version', 'unknown') if data['evidence'].get(k) is not None]
                 if len(given) != 1 or ('sql' in given and not pf) or ('version' in given and not pf) or \
-                        set(data['evidence']) - {'path', 'commit', 'sql', 'record', 'version', 'unknown'} or \
+                        set(data['evidence']) - {'path', 'commit', 'sql', 'record', 'version', 'unknown', 'owner'} or \
                         ('commit' in data['evidence'] and 'path' not in given) or \
                         not all(isinstance(v, str) and v for v in data['evidence'].values()):
                     raise ValueError('Specify exactly one of ' + ('path, sql, record, version, unknown' if pf

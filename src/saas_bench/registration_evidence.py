@@ -228,8 +228,10 @@ class EvidenceResolver:
         finally:
             self._cache = previous
 
-    def content(self, version, *, connection=None):
+    def content(self, version, *, connection=None, public=False, graph=False):
         try:
+            if public or graph:
+                return self.store.public_content(version, graph=graph, connection=connection)
             if self._cache is not None and version in self._cache:
                 self.read_stats['cache_hits'] += 1
                 return self._cache[version]
@@ -258,7 +260,7 @@ class EvidenceResolver:
             return version, meta['object_id'], body.decode('utf-8'), 'file'
         if meta['layer'] == 'registered_text':
             return version, meta['object_id'], body.decode(), 'record'
-        event = self.store.read_event(meta['created_by_event'])
+        event = self.store.read_event(meta['created_by_event'], evidence=True)
         if meta['layer'] == 'server_public_response' and event['query_definition']:
             return version, meta['object_id'], body.decode(), 'query'
         # Receipts and streams without a persistent object identity are immutable
@@ -296,8 +298,13 @@ class EvidenceResolver:
         # Offline callers and old captures lack batch origin facts. Stay in their
         # latest context; never look through earlier weeks for a better read.
         if not scope['request_event'] and not scope['context_id'] and handles.model_requests:
-            scope['context_id'] = handles.model_requests[-1][1]
-            for event, context in reversed(handles.model_requests):
+            requests = handles.model_requests
+            if self.store.identity.get('role'):
+                requests = [item for item in requests if self.store.read_event(item[0])['request'].get('session_id') == self.store.identity['session_id']]
+            if not requests:
+                return scope
+            scope['context_id'] = requests[-1][1]
+            for event, context in reversed(requests):
                 if context != scope['context_id']:
                     break
                 result = self.store.read_event(event)['result']
@@ -325,6 +332,10 @@ class EvidenceResolver:
     def _current_write(self, version, scope):
         handles = evidence_handles.index(self.store)
         meta, _ = self.content(version)
+        if self.store.identity.get('role'):
+            request = self.store.read_event(meta['created_by_event'], evidence=True)['request']
+            if meta.get('owner_role') != self.store.identity['role'] or request.get('role') != self.store.identity['role'] or request.get('session_id') != self.store.identity['session_id']:
+                return False
         kind, facts, day = handles.events[meta['created_by_event']]
         context = facts.get('model_context_id')
         outside = context != scope['context_id'] if context is not None else day != handles.day
@@ -333,7 +344,7 @@ class EvidenceResolver:
         # Only successful writes count; a before-snapshot is not authored evidence.
         if meta['layer'] != 'file_bytes' or not version.endswith('_after'):
             return False
-        event = self.store.read_event(meta['created_by_event'])
+        event = self.store.read_event(meta['created_by_event'], evidence=True)
         return (event['result'].get('status') == 'succeeded' and
                 meta.get('object_id') in event['result'].get('changed_paths',
                                                           event['result'].get('written_paths', [])))
@@ -354,13 +365,20 @@ class EvidenceResolver:
             groups = handles.versions(named[-1])
         elif 'path' in evidence:
             object_id, kind = evidence['path'], 'file'
-            groups = handles.groups.get(('file', object_id), [])
+            owner = evidence.get('owner')
+            if self.store.identity.get('role') and ':' in object_id and object_id.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance'):
+                owner, object_id = object_id.split(':', 1)
+            groups = handles.groups.get(handles.object_key('file', object_id, owner), [])
         elif 'record' in evidence:
-            object_id, kind = 'record:' + evidence['record'].split('.')[0], 'record'
+            requested = evidence['record']
+            owner = self.store.identity.get('role')
+            if owner and ':' in requested:
+                owner, requested = requested.split(':', 1)
+            object_id, kind = 'record:' + requested.split('.')[0], 'record'
             with closing(self.store.connect()) as conn:
                 candidates = [row[0] for row in conn.execute(
                     "SELECT version_id FROM versions WHERE json_extract(metadata, '$.object_id')=? ORDER BY rowid DESC",
-                    (object_id,)) if row[0] in handles.info]
+                    (object_id,)) if row[0] in handles.info and (not owner or self.content(row[0])[0].get('owner_role') == owner)]
             groups = []
         elif 'sql' in evidence:
             object_id, kind = None, 'query'
@@ -384,7 +402,7 @@ class EvidenceResolver:
         if kind == 'record':
             if not whole:
                 raise ValueError('Registered text supports whole-text equality only')
-            wanted = evidence.get('record', '')
+            wanted = evidence.get('record', '').split(':')[-1]
             for candidate in candidates:
                 if '.' in wanted and json.loads(self.content(candidate)[1])['version'] != wanted:
                     continue
@@ -468,7 +486,7 @@ class EvidenceResolver:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
             return False
-        event = self.store.read_event(meta['created_by_event'])
+        event = self.store.read_event(meta['created_by_event'], evidence=True)
         request = event['request']
         args = request.get('request') or {}
         if request['kind'] == 'edit_file':

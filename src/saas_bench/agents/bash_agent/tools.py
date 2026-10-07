@@ -5,6 +5,7 @@ and file manipulation (read, write, edit, search, glob).
 """
 
 import fnmatch
+import hashlib
 import json
 import os
 import platform
@@ -252,15 +253,15 @@ NOTE_TOOLS = ('bash', 'write_file', 'edit_file')
 NOTE_LIMIT = 200
 NOTE_PARAMETER = {
     'type': 'string',
-    'description': ('Optional. Why you ran this or what the change is for. PF keeps the note with the outputs '
-                    'and files of this call and shows it when you see them again. Up to 200 characters.'),
+    'description': ('Optional. Why you ran this or what the change is for. The note is saved with this call and its '
+                    'outputs and changed files in .tool-notes.jsonl. Up to 200 characters.'),
 }
 
 
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
-    if pf_queries:
+    if text_registration or pf_queries:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.
         definitions = [dict(t, parameters=dict(t['parameters'], properties=dict(
             t['parameters']['properties'], note=NOTE_PARAMETER))) if t['name'] in NOTE_TOOLS else t
@@ -407,14 +408,12 @@ class BashAgentToolExecutor:
         if self.pf_queries:
             from saas_bench.pf_queries import MODELS
             dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
-            if tool_name in NOTE_TOOLS and 'note' in args:
-                if not isinstance(args['note'], str):
-                    return 'Error: note must be a string'
-                if len(args['note']) > NOTE_LIMIT:
-                    args = dict(args, note=args['note'][:NOTE_LIMIT])
-                    facts['note_truncated'] = True
-        elif tool_name in NOTE_TOOLS and 'note' in args:
-            args = {k: v for k, v in args.items() if k != 'note'}  # Not offered outside PF.
+        if tool_name in NOTE_TOOLS and 'note' in args:
+            if not isinstance(args['note'], str):
+                return 'Error: note must be a string'
+            if len(args['note']) > NOTE_LIMIT:
+                args = dict(args, note=args['note'][:NOTE_LIMIT])
+                facts['note_truncated'] = True
         handler = dispatch.get(tool_name)
         if handler is None:
             return f"Error: Unknown tool '{tool_name}'"
@@ -426,6 +425,7 @@ class BashAgentToolExecutor:
         previous_env = dict(self.extra_env)
         token = None
         before = None
+        note_before = self._note_files() if tool_name in NOTE_TOOLS and args.get('note', '').strip() else None
         result, status = '', 'succeeded'
         try:
             if capture:
@@ -453,6 +453,15 @@ class BashAgentToolExecutor:
                 status = 'timed_out'
             elif self._exit_code:
                 status = 'failed'
+            if tool_name in NOTE_TOOLS and args.get('note', '').strip():
+                from saas_bench.workspace_io import open_file
+                note_after = self._note_files()
+                note = dict(tool=tool_name, note=args['note'], author=self.role, status=status,
+                            output_sha256=hashlib.sha256(str(result).encode()).hexdigest(),
+                            files=sorted(path for path in note_before.keys() | note_after.keys() if note_before.get(path) != note_after.get(path)),
+                            **(self.identity.fields() if self.identity else {}))
+                with open_file(self.workspace_path, self.workspace_path / '.tool-notes.jsonl', 'ab') as stream:
+                    stream.write((json.dumps(note, ensure_ascii=False) + '\n').encode())
         except NextDayTimeoutError:
             result = None
             status = 'result_unknown'
@@ -498,6 +507,11 @@ class BashAgentToolExecutor:
             result.pf_calls = capture.facts.get('pf_calls', [])
         return result
 
+    def _note_files(self):
+        return {str(path.relative_to(self.workspace_path)): (path.stat().st_size, path.stat().st_mtime_ns)
+                for path in self.workspace_path.rglob('*') if path.is_file() and not path.is_symlink()
+                and path.relative_to(self.workspace_path).parts[0] not in ('.git', '.tool-notes.jsonl', *HIDDEN_WORKSPACE_DIRS)}
+
     def _roots(self):
         """Paths by which the agent may name its workspace, e.g. in a leading cd."""
         return {str(self.workspace_path), str(self.workspace_path.resolve()), self.guest_root}
@@ -513,14 +527,14 @@ class BashAgentToolExecutor:
             # Plain reads of unchanged bytes observe the existing version (same path@vK handle);
             # edits keep their own read version as the observed edit input.
             latest, sha = self.capture.safe(self.capture.store.latest_version,
-                                            self._file_name(path), 'file_bytes') or (None, None)
+                                            self._file_name(path), 'file_bytes', self._file_owner(path)) or (None, None)
             if latest and sha == digest(raw):
                 self.capture.slots += 1
                 raw_version = latest
         if self.capture and raw_version is None:
-            raw_version = self.capture.file(self._file_name(path), raw)
+            raw_version = self.capture.file(self._file_name(path), raw, owner=self._file_owner(path))
         text = decoded(raw)
-        version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version) if self.capture else None
+        version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version, owner_role=self._file_owner(path)) if self.capture else None
         return text, version
 
     def _source(self, version, text, start, end, target):
@@ -533,7 +547,10 @@ class BashAgentToolExecutor:
                     if path.is_relative_to(root))
 
     def _file_name(self, path):
-        return str(path.relative_to(self.workspace_path)) if path.is_relative_to(self.workspace_path) else str(path)
+        return str(path.relative_to(self._read_root(path)))
+
+    def _file_owner(self, path):
+        return self._read_root(path).name if self.identity else self.role
 
     def _resolve_path(self, path_str: str, *, write=False) -> Path:
         """Resolve a workspace-relative or agent-visible absolute path, preventing escape."""

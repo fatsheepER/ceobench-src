@@ -292,7 +292,7 @@ def test_model_receipts_and_private_evidence_identity(team, role):
         assert 'tool_return' not in r.audit.path.read_text()
     else:
         with r.store.connect() as conn:
-            records = [json.loads(row[0]) for row in conn.execute('SELECT request FROM requests')]
+            records = [json.loads(row[0]) for row in conn.execute("SELECT request FROM requests WHERE json_extract(request,'$.role')=?", (role,))]
         assert records and all(item['author'] == item['role'] == role for item in records)
         assert all(item['event_id'].split('/')[1] == role for item in records)
         model = [item for item in records if item['kind'] == 'model_request'][-1]

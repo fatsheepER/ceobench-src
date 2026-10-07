@@ -129,8 +129,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             item.pop('type', None)
             if 'input_schema' in item:
                 item['parameters'] = item.pop('input_schema')
-        if mode == 'pf':
-            # PF adds only the optional note to the three tools that produce outputs and files.
+        if mode != 'off':
             for item in definitions[:6]:
                 assert ('note' in item['parameters']['properties']) == (item['name'] in NOTE_TOOLS)
                 item['parameters']['properties'].pop('note', None)

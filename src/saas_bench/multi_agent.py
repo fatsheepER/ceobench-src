@@ -51,17 +51,21 @@ class TeamMessage:
     receiver_session_id: str
     status: str = 'queued'
     reply: str | None = None
+    handoff_commit: str | None = None
 
 
 class MultiAgentRuntime:
     def __init__(self, root, tools, *, client_factory, mode='git', conn=None,
                  simulator=None, public_dir=None, run_id=None, world_id=None,
-                 model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, **server_options):
+                 model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
             raise ValueError('total_days must include at least one full week')
         self.total_days = total_days
+        if mode == 'pf' and token_counter is None:
+            from .payload_tokens import load_counter
+            token_counter = load_counter('opencode', model)
         self.effective_end = total_days // 7 * 7
         self._lifecycle = WorkerLifecycle()
         self._message_lock = threading.Lock()
@@ -89,7 +93,7 @@ class MultiAgentRuntime:
             role_private = private / role
             role_private.mkdir(mode=0o700)
             write_json(role_private / 'identity.json', identity.fields())
-            store = stores[role] = SQLEvidenceStore(role_private / 'evidence.sqlite', dict(
+            store = stores[role] = SQLEvidenceStore(private / 'evidence.sqlite', dict(
                 identity.fields(), branch_id=role, data_source_id=world_id, format=FORMAT,
                 capture_scope='execution')) if mode == 'pf' else None
             audit = audits[role] = RoleAudit(role_private / 'audit.jsonl', identity)
@@ -101,7 +105,7 @@ class MultiAgentRuntime:
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
             executor = BashAgentToolExecutor(**executor_options, text_registry=registry)
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)))
-            usage = ModelUsage(role_private / 'model-usage.jsonl', role, evidence_store=store, identity=identity)
+            usage = ModelUsage(role_private / 'model-usage.jsonl', role, evidence_store=store, identity=identity, token_counter=token_counter)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf', ask_analyst=role == 'ceo'),
                 client_factory(role), workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
@@ -140,6 +144,10 @@ class MultiAgentRuntime:
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
         self.server.script_check = self._check
+        for runtime in self.roles.values():
+            if runtime.executor.pf_queries:
+                from .pf_refresh import refresh
+                runtime.executor.pf_queries.refresh = lambda versions, parent, store=runtime.store: refresh(self.server, versions, parent, store=store)
         for store in [*stores.values(), *audits.values(), *(r.usage for r in runtimes.values())]:
             if store is not None:
                 store.world_state = lambda: self.server.world_state_id
@@ -150,9 +158,27 @@ class MultiAgentRuntime:
             self.server.start()
             for runtime in self.roles.values():
                 runtime.executor.verify_sandbox()
+                self._initialize_history(runtime)
         except BaseException:
             self.close()
             raise
+
+    def _git(self, runtime, *args, **kwargs):
+        return runtime.executor.run_private(['git', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null',
+            '-c', 'user.name=CEO Bench', '-c', 'user.email=ceobench@localhost', '-C', str(runtime.workspace), *args],
+            capture_output=True, check=True, timeout=30, **kwargs).stdout.decode().strip()
+
+    def _initialize_history(self, runtime):
+        self._git(runtime, 'init')
+        self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**')
+        tree = self._git(runtime, 'write-tree')
+        commit = self._git(runtime, 'commit-tree', tree, '-m', 'Initial workspace')
+        self._git(runtime, 'update-ref', '--no-deref', 'HEAD', commit)
+
+    def _snapshot_history(self, runtime, title):
+        self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**')
+        self._git(runtime, 'commit', '--allow-empty', '-m', title)
+        return self._git(runtime, 'rev-parse', 'HEAD')
 
     @property
     def phase(self):
@@ -265,6 +291,7 @@ class MultiAgentRuntime:
                     self._check()
                     answer = runtime.agent.act('', 0, False, {'day': request.day})
                 self._check()
+                request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {request.request_id[:7]} (day {request.day})')
                 self._transition(request, 'completed', answer.text)
             except BaseException:
                 self._transition(request, 'failed')
@@ -375,6 +402,10 @@ class MultiAgentRuntime:
                     observation = self._observation('ceo', dashboard, ceo_scripts)
                     observation += '\n\n' + '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests)
                     self._run_ceo(observation)
+                    closed_day = self.server.tools.current_day
+                    for runtime in self.roles.values():
+                        from .registration_evidence import week_commit_subject
+                        self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
         except RunCancelled as exc:
             self.failure = str(exc)
             self._set_phase('stopped' if str(exc) == 'natural_end' else 'paused')

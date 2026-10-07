@@ -19,6 +19,10 @@ import uuid
 
 FORMAT = 'ceobench.evidence-records.v1'
 
+PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registered_text',
+                 'registered_script', 'executed_code', 'stdout', 'stderr', 'dashboard',
+                 'query_model_projection', 'tool_return'}
+
 
 def encoded(value):
     return json.dumps(value, ensure_ascii=True, separators=(',', ':'), sort_keys=True).encode()
@@ -165,12 +169,12 @@ class SQLEvidenceStore:
                 return
             with closing(self.connect()) as conn:
                 pending = conn.execute('''SELECT event_id, event_id IN (SELECT event_id FROM results) FROM requests
-                    WHERE event_id NOT IN (SELECT event_id FROM results)
+                    WHERE (? IS NULL OR json_extract(request,'$.role')=?) AND (event_id NOT IN (SELECT event_id FROM results)
                        OR (coalesce(json_extract(request, '$.requires_delivery'), 1) = 1
-                           AND event_id NOT IN (SELECT event_id FROM deliveries))
-                    ORDER BY 2 LIMIT 1''').fetchone()
-                missing = conn.execute('SELECT token FROM client_calls WHERE received IS NULL LIMIT 1').fetchone()
-                unknown = conn.execute("SELECT event_id FROM results WHERE json_extract(record, '$.status') = 'result_unknown' LIMIT 1").fetchone()
+                           AND event_id NOT IN (SELECT event_id FROM deliveries)))
+                    ORDER BY 2 LIMIT 1''', (self.identity.get('role'), self.identity.get('role'))).fetchone()
+                missing = conn.execute("SELECT token FROM client_calls JOIN requests USING(event_id) WHERE received IS NULL AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
+                unknown = conn.execute("SELECT event_id FROM results JOIN requests USING(event_id) WHERE json_extract(record, '$.status') = 'result_unknown' AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
             # The response bytes reach the client before its handler records the send.
             if pending and pending[1] and time.monotonic() < deadline:
                 time.sleep(.01)
@@ -220,36 +224,41 @@ class SQLEvidenceStore:
         sha = digest(payload)
         with self._writer() as conn:
             self._visible(conn, event)
-            previous = self._latest(conn, object_id)[0] if object_id else None
+            owner = metadata.get('owner_role', self.identity.get('role', 'ceo'))
+            previous = self._latest(conn, object_id, owner=owner)[0] if object_id else None
             record = dict(layer=layer, object_id=object_id, created_by_event=event, extent='full',
                           source_truncated=False, acquired_at=now(),
                           content_time={'status': 'unknown', 'reason': 'not_declared'})
             record.update(metadata)
+            record['owner_role'] = owner
             conn.execute('INSERT OR IGNORE INTO blobs VALUES (?,?,?)', (sha, len(payload), payload))
             conn.execute('INSERT INTO versions VALUES (?,?,?,?,?)',
                          (version, event, previous, sha, encoded(record)))
         return version
 
-    def _latest(self, conn, object_id, layer=None):
+    def _latest(self, conn, object_id, layer=None, owner=None):
         # Indexed by versions_object_id; visibility follows the branch ancestry.
-        for row in conn.execute("SELECT version_id,event_id,content_hash FROM versions "
+        for row in conn.execute("SELECT version_id,event_id,content_hash,metadata FROM versions "
                                 "WHERE json_extract(metadata, '$.object_id')=? "
                                 "AND (? IS NULL OR json_extract(metadata, '$.layer')=?) ORDER BY rowid DESC",
                                 (object_id, layer, layer)):
             try:
-                self._visible(conn, row['event_id'])
+                meta = json.loads(row['metadata'])
+                if self.identity.get('role') and meta.get('owner_role', self.identity['role']) != (owner or self.identity['role']):
+                    continue
+                self.authorize_version(conn, row['event_id'], meta)
                 return row['version_id'], row['content_hash']
-            except KeyError:
+            except (KeyError, PermissionError):
                 continue
         return None, None
 
-    def latest_version(self, object_id, layer=None):
+    def latest_version(self, object_id, layer=None, owner=None):
         """The newest visible version of an object and its content hash."""
         conn = getattr(self._local, 'batch', None)
         if conn is not None:
-            return self._latest(conn, object_id, layer)
+            return self._latest(conn, object_id, layer, owner)
         with closing(self.connect()) as conn:
-            return self._latest(conn, object_id, layer)
+            return self._latest(conn, object_id, layer, owner)
 
     @contextmanager
     def _writer(self):
@@ -287,6 +296,7 @@ class SQLEvidenceStore:
         if hasattr(self, 'world_state'):
             record['world_state_id'] = self.world_state()
         with self._writer() as conn:
+            self._visible(conn, event)
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
 
     def context(self, event, token=None):
@@ -314,6 +324,7 @@ class SQLEvidenceStore:
         if not re.fullmatch('[a-f0-9]{32}', token or ''):
             raise ValueError('Invalid client call key')
         with closing(self.connect()) as conn, conn:
+            self._visible(conn, event)
             conn.execute('INSERT INTO client_calls VALUES (?,?,NULL)', (token, event))
 
     def received(self, token, payload):
@@ -331,11 +342,16 @@ class SQLEvidenceStore:
             conn.execute('UPDATE client_calls SET received=? WHERE token=? AND received IS NULL',
                          (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
 
+    def _state_name(self, name):
+        return self.identity['role'] + ':' + name if self.identity.get('role') and name != 'admission_paused' else name
+
     def save_state(self, name, value):
+        name = self._state_name(name)
         with self._writer() as conn:
             conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(value)))
 
     def load_state(self, name):
+        name = self._state_name(name)
         with closing(self.connect()) as conn:
             row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -353,6 +369,8 @@ class SQLEvidenceStore:
         query = digest(encoded(definition)) if isinstance(sql, str) and sql.strip() else None
         with closing(self.connect()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
+            if parent:
+                self._visible(conn, parent)
             seq = self.sequence(conn) + 1
             event = f"{self.identity['run_id']}/{self.identity['branch_id']}/{seq}"
             if query:
@@ -378,6 +396,7 @@ class SQLEvidenceStore:
                       comparison=comparison, receive_state='unknown')
         with closing(self.connect()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
+            self._visible(conn, event)
             request = conn.execute('SELECT query_id FROM requests WHERE event_id=?', (event,)).fetchone()
             previous = conn.execute('''SELECT v.version_id FROM versions v JOIN requests r USING(event_id)
                 WHERE r.query_id=? AND v.version_id LIKE '%:public_response'
@@ -387,7 +406,7 @@ class SQLEvidenceStore:
                     continue
                 sha = digest(payload)
                 conn.execute('INSERT OR IGNORE INTO blobs VALUES (?,?,?)', (sha, len(payload), payload))
-                metadata = dict(layer='server_public_response' if slot == 'public_response' else 'comparison',
+                metadata = dict(owner_role=self.identity.get('role', 'ceo'), layer='server_public_response' if slot == 'public_response' else 'comparison',
                                 object_id=request[0], created_by_event=event,
                                 extent='full', source_truncated=bool(result.get('truncated')),
                                 acquired_at=record['completed_at'],
@@ -403,6 +422,7 @@ class SQLEvidenceStore:
 
     def delivered(self, event, state):
         with closing(self.connect()) as conn, conn:
+            self._visible(conn, event)
             conn.execute('INSERT INTO deliveries VALUES (?,?)',
                          (event, encoded(dict(send_state=state, receive_state='unknown', time=now()))))
 
@@ -417,9 +437,12 @@ class SQLEvidenceStore:
                 branch, limit = ancestry
         raise KeyError('Evidence is outside this branch: ' + event)
 
-    def read_event(self, event):
+    def read_event(self, event, *, evidence=False):
         with closing(self.connect()) as conn:
-            self._visible(conn, event)
+            if evidence:
+                self.readable_event(conn, event)
+            else:
+                self._visible(conn, event)
             request = json.loads(conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()[0])
             result = conn.execute('SELECT record FROM results WHERE event_id=?', (event,)).fetchone()
             delivery = conn.execute('SELECT record FROM deliveries WHERE event_id=?', (event,)).fetchone()
@@ -434,18 +457,64 @@ class SQLEvidenceStore:
                         delivery=json.loads(delivery[0]) if delivery else
                         dict(send_state='unknown', receive_state='unknown'))
 
-    def get_content(self, version, *, connection=None):
+    def get_content(self, version, *, connection=None, public=False, graph=False):
         from contextlib import nullcontext
         with closing(self.connect()) if connection is None else nullcontext(connection) as conn:
             row = conn.execute('SELECT * FROM versions WHERE version_id=?', (version,)).fetchone()
             if row is None:
                 raise KeyError(version)
-            self._visible(conn, row['event_id'])
+            meta = json.loads(row['metadata'])
+            self.authorize_version(conn, row['event_id'], meta, public=public, graph=graph)
             blob = conn.execute('SELECT content,size_bytes FROM blobs WHERE content_hash=?', (row['content_hash'],)).fetchone()
             if blob is None or len(blob[0]) != blob[1] or digest(blob[0]) != row['content_hash']:
                 raise ValueError('Evidence blob checksum mismatch')
             return dict(version_id=version, previous_version=row['previous_version'],
                         blob_sha256=row['content_hash'], **json.loads(row['metadata'])), bytes(blob[0])
+
+    def readable_event(self, conn, event):
+        if not self.identity.get('role'):
+            return self._visible(conn, event)
+        rows = conn.execute('SELECT metadata FROM versions WHERE event_id=?', (event,)).fetchall()
+        for row in rows:
+            try:
+                self.authorize_version(conn, event, json.loads(row[0]), public=True)
+                return
+            except PermissionError:
+                pass
+        raise PermissionError('Evidence is inaccessible')
+
+    def authorize_version(self, conn, event, meta, *, public=False, graph=False):
+        if not self.identity.get('role'):
+            self._visible(conn, event)
+            if public:
+                if meta['layer'] not in PUBLIC_LAYERS:
+                    raise PermissionError('Evidence is inaccessible')
+            return
+        from .role_policy import READABLE_ROLES
+        row = conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()
+        if row is None:
+            raise KeyError(event)
+        request = json.loads(row[0])
+        owner = meta.get('owner_role', request.get('role', request.get('author', 'ceo')))
+        layer = meta['layer']
+        shared = layer in ('server_public_response', 'dashboard') or meta.get('public_observation') is True
+        allowed = owner in READABLE_ROLES[self.identity['role']] or shared
+        if layer not in PUBLIC_LAYERS:
+            if graph and layer == 'comparison':
+                sibling = conn.execute("SELECT metadata FROM versions WHERE event_id=? AND json_extract(metadata,'$.layer')='server_public_response'", (event,)).fetchone()
+                if sibling:
+                    self.authorize_version(conn, event, json.loads(sibling[0]), public=True)
+                    return
+            if graph and layer == 'agent_declaration' and allowed:
+                return
+            if public or request.get('role') != self.identity['role']:
+                raise PermissionError('Evidence is inaccessible')
+            return self._visible(conn, event)
+        if not allowed:
+            raise PermissionError('Evidence is inaccessible')
+
+    def public_content(self, version, *, graph=False, connection=None):
+        return self.get_content(version, connection=connection, public=not graph, graph=graph)
 
     def snapshot(self, target, *, checksum=True):
         self.assert_healthy()

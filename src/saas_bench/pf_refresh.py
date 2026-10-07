@@ -18,16 +18,16 @@ def replayable(event):
                  (request.get('parsed') or {}).get('tool') in READ_TOOLS))
 
 
-def refresh(server, versions, parent):
-    store = server.sql_evidence
+def refresh(server, versions, parent, *, store=None):
+    store = store or server.sql_evidence
     if not store or server.oracle_mode:
         raise ValueError('Public evidence capture is required')
     if store.read_event(parent)['request']['kind'] not in ('pf_dependencies', 'pf_weekly_check'):
         raise ValueError('Refresh requires a forward query or weekly check event')
     sources = {}
     for version in dict.fromkeys(versions):
-        meta, _ = store.get_content(version)
-        event = store.read_event(meta['created_by_event'])
+        meta, _ = store.public_content(version)
+        event = store.read_event(meta['created_by_event'], evidence=True)
         definition = event['query_definition']
         if meta['layer'] != 'server_public_response' or not replayable(event):
             raise ValueError('Only captured SQL and approved public reads can be refreshed')

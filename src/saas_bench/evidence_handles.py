@@ -18,6 +18,7 @@ import re
 import threading
 
 from .sql_evidence import digest, encoded
+from .role_policy import READABLE_ROLES
 
 
 # Private state name of the per-kind object number table, e.g. {"query": {key: 7}}.
@@ -29,10 +30,11 @@ STREAMS = {'stdout': 'out', 'stderr': 'err', 'executed_code': 'code'}
 # Calls that may carry an agent note (design 3.2); mirrors bash_agent.tools.NOTE_TOOLS.
 NOTE_KINDS = frozenset({'bash', 'write_file', 'edit_file'})
 VERSIONED = re.compile(r'(.+)@v([1-9][0-9]*)')
+RAW_VERSION = re.compile(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*:.+')
 SINGLE = re.compile(r'([a-z_]+?)([1-9][0-9]*)')
 # Accepted wherever the agent may write a handle; registered texts keep rN / rN.M.
-HANDLE_PATTERN = r'^(.+@v[1-9][0-9]*|[a-z_]+[1-9][0-9]*|r[1-9][0-9]*(\.[1-9][0-9]*)?)$'
-RECORD = re.compile(r'r[1-9][0-9]*(\.[1-9][0-9]*)?')
+HANDLE_PATTERN = r'^((?:(?:ceo|growth|ops_finance):)?(?:.+@v[1-9][0-9]*|[a-z_]+[1-9][0-9]*|r[1-9][0-9]*(\.[1-9][0-9]*)?)|[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*:.+)$'
+RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 
 
 def body_digest(text):
@@ -78,20 +80,21 @@ class HandleIndex:
 
     def refresh(self):
         with self.lock, closing(self.store.connect()) as conn:
+            conn.execute('BEGIN')
             if self.chain is None:
                 self.chain = self._ancestry(conn)
             for row in conn.execute('SELECT rowid,event_id,branch,seq,request FROM requests WHERE rowid>? '
                                     'ORDER BY rowid', (self.request_rowid,)):
                 self.request_rowid = row['rowid']
-                if row['branch'] not in self.chain or (self.chain[row['branch']] is not None
-                                                       and row['seq'] > self.chain[row['branch']]):
+                if not self.store.identity.get('role') and (row['branch'] not in self.chain or
+                        (self.chain[row['branch']] is not None and row['seq'] > self.chain[row['branch']])):
                     continue
                 record = json.loads(row['request'])
                 if record['kind'] == 'dashboard_generation':
                     # Later events happen on the simulated day of the latest weekly dashboard.
                     self.day = (record.get('request') or {}).get('day', self.day)
                 args = record.get('request') if isinstance(record.get('request'), dict) else {}
-                if record['kind'] == 'model_request':
+                if record['kind'] == 'model_request' and record.get('role') == self.store.identity.get('role') and record.get('session_id') == self.store.identity.get('session_id'):
                     self.model_requests.append((row['event_id'], args.get('context_id')))
                 # Keep only what names an object; commands and wire bodies stay in the store.
                 self.events[row['event_id']] = (record['kind'], dict(
@@ -99,9 +102,10 @@ class HandleIndex:
                     call=record.get('call'), request={k: args[k] for k in ('method', 'path', 'parsed', 'script', 'name')
                                                       if k in args}), self.day)
                 # A note on a call covers what it ran, e.g. the scripts of a bash command.
-                if record['kind'] in NOTE_KINDS and isinstance(args.get('note'), str) and args['note'].strip():
+                allowed_note = not self.store.identity.get('role') or record.get('role', record.get('author')) in READABLE_ROLES[self.store.identity['role']]
+                if allowed_note and record['kind'] in NOTE_KINDS and isinstance(args.get('note'), str) and args['note'].strip():
                     self.notes[row['event_id']] = (self.day, args['note'].strip())
-                elif record.get('parent_event_id') in self.notes and record['kind'] == 'cli_python':
+                elif allowed_note and record.get('parent_event_id') in self.notes and record['kind'] == 'cli_python':
                     self.notes[row['event_id']] = self.notes[record['parent_event_id']]
             rows = conn.execute('''SELECT v.rowid,v.version_id,v.event_id,v.content_hash,v.metadata,q.definition
                 FROM versions v JOIN requests r USING(event_id) LEFT JOIN queries q ON r.query_id=q.id
@@ -113,7 +117,14 @@ class HandleIndex:
             for row in rows:
                 self.version_rowid = max(self.version_rowid, row['rowid'])
                 if row['event_id'] in self.events:
-                    self._add(row, json.loads(row['metadata']), comparisons)
+                    meta = json.loads(row['metadata'])
+                    if self.store.identity.get('role'):
+                        try:
+                            with closing(self.store.connect()) as conn:
+                                self.store.authorize_version(conn, row['event_id'], meta, public=True)
+                        except PermissionError:
+                            continue
+                    self._add(row, meta, comparisons)
 
     def _add(self, row, meta, comparisons):
         version, event_id = row['version_id'], row['event_id']
@@ -127,6 +138,8 @@ class HandleIndex:
                 self.info[version] = self.info[meta['derived_from']]
             return
         key = self._object(version, event_id, kind, record, layer, meta, row['definition'])
+        if self.store.identity.get('role'):
+            key = (*key, meta.get('owner_role', event_id.split('/')[1]))
         signature = (comparisons.get(event_id) or row['content_hash'] if key[0] == 'query' else
                      meta.get('body_sha256') or row['content_hash'])
         groups = self.groups[key]
@@ -179,20 +192,35 @@ class HandleIndex:
 
     # --- names ----------------------------------------------------------------
 
-    def _numbers(self):
-        return self.store.load_state(HANDLES) or {}
+    def _numbers(self, owner=None):
+        name = (owner or self.store.identity['role']) + ':' + HANDLES if self.store.identity.get('role') else HANDLES
+        with closing(self.store.connect()) as conn:
+            row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
+        return json.loads(row[0]) if row else {}
 
-    def _number(self, kind, key, allocate):
-        table = self._numbers()
-        numbers = table.setdefault(kind, {})
-        if key not in numbers:
-            if not allocate:
-                return len(numbers) + 1
-            numbers[key] = len(numbers) + 1
-            self.store.save_state(HANDLES, table)
-        return numbers[key]
+    def _number(self, kind, key, allocate, owner=None):
+        name = (owner or self.store.identity['role']) + ':' + HANDLES if self.store.identity.get('role') else HANDLES
+        with self.store._writer() as conn:
+            row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
+            table = json.loads(row[0]) if row else {}
+            numbers = table.setdefault(kind, {})
+            if key not in numbers:
+                if not allocate:
+                    return len(numbers) + 1
+                numbers[key] = len(numbers) + 1
+                conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(table)))
+            return numbers[key]
+
+    def object_key(self, kind, name, owner=None):
+        key = (kind, name)
+        return (*key, owner or self.store.identity['role']) if self.store.identity.get('role') else key
 
     def base(self, key, allocate=True):
+        if self.store.identity.get('role'):
+            return key[-1] + ':' + self._base(key[:-1], allocate, key[-1])
+        return self._base(key, allocate)
+
+    def _base(self, key, allocate=True, owner=None):
         """The object part of a handle, e.g. forecast.json, query7 or analyze.py.out."""
         kind = key[0]
         if kind == 'file':
@@ -206,12 +234,12 @@ class HandleIndex:
         if kind == 'script':
             return key[1] + '.' + key[2]
         if kind == 'inline':
-            return f"inline{self._number('inline', key[1], allocate)}.{key[2]}"
+            return f"inline{self._number('inline', key[1], allocate, owner)}.{key[2]}"
         if kind == 'cmd_stream':
-            return f"cmd{self._number('cmd', key[1], allocate)}.{key[2]}"
+            return f"cmd{self._number('cmd', key[1], allocate, owner)}.{key[2]}"
         if kind == 'node':
-            return f"{key[1]}{self._number('node', key[2], allocate)}"
-        return f"{kind}{self._number(kind, key[1], allocate)}"
+            return f"{key[1]}{self._number('node', key[2], allocate, owner)}"
+        return f"{kind}{self._number(kind, key[1], allocate, owner)}"
 
     def name(self, version, allocate=True):
         with self.lock:
@@ -221,7 +249,8 @@ class HandleIndex:
                 raise KeyError(version)
             key, group = self.info[version]
             if key[0] == 'record':
-                return json.loads(self.store.get_content(version)[1])['version']
+                name = json.loads(self.store.get_content(version)[1])['version']
+                return key[-1] + ':' + name if self.store.identity.get('role') else name
             if key[0] in ('receipt', 'node'):
                 return self.base(key, allocate)  # A single immutable observation.
             return f"{self.base(key, allocate)}@v{group['k']}"
@@ -231,7 +260,7 @@ class HandleIndex:
         its identical content was first returned (None if the content is new)."""
         with self.lock:
             self.refresh()
-            key = (kind, encoded(call).decode())
+            key = self.object_key(kind, encoded(call).decode())
             groups = self.groups.get(key, [])
             same = bool(groups) and groups[-1]['signature'] == signature
             k = groups[-1]['k'] if same else len(groups) + 1
@@ -293,7 +322,10 @@ class HandleIndex:
     # --- resolution -----------------------------------------------------------
 
     def _key_for(self, base):
-        numbers = self._numbers()
+        owner = self.store.identity.get('role')
+        if owner and ':' in base and base.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance'):
+            owner, base = base.split(':', 1)
+        numbers = self._numbers(owner)
         def numbered(kind, n, *rest):
             key = next((k for k, v in numbers.get(kind, {}).items() if v == int(n)), None)
             return (kind if not rest else rest[0], key, *rest[1:]) if key is not None else None
@@ -314,6 +346,8 @@ class HandleIndex:
         if m := re.fullmatch(r'(.+)\.(out|err|code)', base):
             candidates.append(('script', m.group(1), m.group(2)))
         candidates.append(('file', base))
+        if owner:
+            candidates = [(*k, owner) if k else None for k in candidates]
         return next((k for k in candidates if k and k in self.groups), None)
 
     def lookup(self, handle):
@@ -325,8 +359,10 @@ class HandleIndex:
                 groups = self.groups.get(key, []) if key else []
                 k = int(m.group(2))
                 return list(groups[k - 1]['members']) if k <= len(groups) else None
-            if m := SINGLE.fullmatch(handle):
-                numbers = self._numbers()
+            single = handle.split(':', 1)[-1] if self.store.identity.get('role') else handle
+            if m := SINGLE.fullmatch(single):
+                owner = handle.split(':', 1)[0] if ':' in handle and self.store.identity.get('role') else None
+                numbers = self._numbers(owner)
                 for kind in ('receipt', 'node'):
                     version = next((k for k, v in numbers.get(kind, {}).items() if v == int(m.group(2))), None)
                     if version in self.info and self.name(version, allocate=False) == handle:

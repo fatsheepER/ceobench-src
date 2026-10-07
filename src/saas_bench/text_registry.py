@@ -212,7 +212,7 @@ class TextRegistry:
             raw = self._git_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
             handles = evidence_handles.index(self.store)
             handles.refresh()
-            candidates = [v for group in reversed(handles.groups.get(('file', evidence['path']), []))
+            candidates = [v for group in reversed(handles.groups.get(handles.object_key('file', evidence['path'], evidence.get('owner')), []))
                           for v in reversed(group['members'])]
             matches = [v for v in candidates if self.resolver.content(v)[1] == raw]
             if not matches:
@@ -259,7 +259,7 @@ class TextRegistry:
         group = handles.group(binding['version_id'])
         text = shown['version'] + (f" (day {group['day']})" if group else '')
         meta, _ = self.resolver.content(binding['version_id'])
-        event = self.store.read_event(meta['created_by_event'])
+        event = self.store.read_event(meta['created_by_event'], evidence=True)
         record, result = event['request'], event['result']
         definition = event['query_definition'] if meta['layer'] == 'server_public_response' else None
         text += ' — ' + pf_render.label(meta['layer'], record['kind'], record.get('request'),
@@ -323,24 +323,32 @@ class TextRegistry:
 
     def _git_change(self, evidence, records):
         if 'record' in evidence:
-            latest = records[evidence['record'].split('.')[0]][-1]
-            if latest['version'] == evidence['record']:
+            requested = evidence['record']
+            if self.identity and ':' in requested:
+                owner, requested = requested.split(':', 1)
+                peer = self.repository(owner)
+                from .workspace_io import open_file
+                with open_file(peer, peer / 'registrations.json') as stream:
+                    records = json.load(stream)['records']
+            latest = records[requested.split('.')[0]][-1]
+            if latest['version'] == requested:
                 return None
             return f"text {evidence['record']}: " + ('retired' if latest['status'] == 'retired' else
                                                       'revised to ' + latest['version'])
-        cited = evidence['path'] + '@' + evidence['commit']
+        workspace = self.repository(evidence.get('owner'))
+        cited = (evidence.get('owner', '') + ':' if self.identity else '') + evidence['path'] + '@' + evidence['commit']
         try:
-            _, full = git_reference(self.workspace, evidence, run=self.git_run)
-            old = self.git_run(['git', '-C', str(self.workspace), 'show', f"{full}:{evidence['path']}"],
+            _, full = git_reference(workspace, evidence, run=self.git_run)
+            old = self.git_run(['git', '-C', str(workspace), 'show', f"{full}:{evidence['path']}"],
                                  capture_output=True, timeout=10, check=True).stdout
         except (ValueError, subprocess.SubprocessError) as exc:
             return f'{cited}: cannot check ({exc})'
-        current = self.workspace / evidence['path']
+        current = workspace / evidence['path']
         if current.is_symlink() or not current.is_file():
             return f'{cited}: the file no longer exists'
         from .workspace_io import open_file
         try:
-            with open_file(self.workspace, current) as stream:
+            with open_file(workspace, current) as stream:
                 new = stream.read()
         except (OSError, ValueError):
             return f'{cited}: the file no longer exists inside the workspace'
@@ -350,8 +358,34 @@ class TextRegistry:
         return (f"{cited}: the current file differs ({pf_render.change(kind, old, new)}); "
                 f"git diff {full[:7]} -- {evidence['path']}")
 
+    def repository(self, owner=None):
+        if not self.identity:
+            return self.workspace
+        from .role_policy import READABLE_ROLES
+        owner = owner or self.role
+        if owner not in READABLE_ROLES[self.role]:
+            raise PermissionError('Evidence is inaccessible')
+        return self.workspace.parent / owner
+
+    def _reference_owner(self, evidence):
+        owner = evidence.get('owner', self.role)
+        if self.identity and 'path' in evidence:
+            value = evidence['path']
+            if value.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in value:
+                owner, evidence['path'] = value.split(':', 1)
+            elif Path(value).is_absolute():
+                for candidate in self.workspace.parent.iterdir():
+                    if Path(value).is_relative_to(candidate):
+                        owner, evidence['path'] = candidate.name, str(Path(value).relative_to(candidate))
+                        break
+            self.repository(owner)
+            evidence['owner'] = owner
+        return owner
+
     def _bind(self, ref, records):
         evidence = ref['evidence']
+        owner = self._reference_owner(evidence)
+        workspace = self.repository(owner)
         if 'unknown' in evidence:
             return dict(status='unknown', reason=evidence['unknown'])
         full = label = None
@@ -362,16 +396,26 @@ class TextRegistry:
             evidence = ref['evidence'] = {'record': evidence['version']}
         if 'record' in evidence:
             requested = evidence['record']
-            history = records.get(requested.split('.')[0], [])
+            record_owner = self.role
+            record_store = records
+            if self.identity and ':' in requested:
+                record_owner, requested = requested.split(':', 1)
+                from .workspace_io import open_file
+                peer = self.repository(record_owner)
+                with open_file(peer, peer / 'registrations.json') as stream:
+                    record_store = json.load(stream)['records']
+            history = record_store.get(requested.split('.')[0], [])
             target = (next((r for r in history if r['version'] == requested), None)
                       if '.' in requested else history[-1] if history else None)
             if target is None:
                 raise ValueError('Unknown registered text revision; use unknown with a reason')
-            evidence['record'] = target['version']
+            evidence['record'] = (record_owner + ':' if self.identity else '') + target['version']
         elif self.mode in ('git', 'prefix') and 'path' in evidence and 'commit' not in evidence \
                 and '@' not in evidence['path']:
-            ref['evidence'] = weekly_reference(self.workspace, evidence['path'], week_label(self.sim_day()), run=self.git_run)
+            ref['evidence'] = weekly_reference(workspace, evidence['path'], week_label(self.sim_day()), run=self.git_run)
             label = ref['evidence']['commit']
+            if self.identity:
+                ref['evidence']['owner'] = owner
             if (ref.get('select') or ref.get('predicate')) and not evidence['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
         elif self.mode in ('git', 'prefix') or (
@@ -379,7 +423,9 @@ class TextRegistry:
             # PF keeps the Git group's committed-file references (design 4.1).
             if 'path' not in evidence:
                 raise ValueError('Evidence must be a workspace file path or a registered text rN.M; otherwise use unknown with a reason')
-            ref['evidence'], full = git_reference(self.workspace, evidence, run=self.git_run)
+            ref['evidence'], full = git_reference(workspace, evidence, run=self.git_run)
+            if self.identity:
+                ref['evidence']['owner'] = owner
             if (ref.get('select') or ref.get('predicate')) and not ref['evidence']['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
         elif 'path' in evidence:
@@ -396,11 +442,11 @@ class TextRegistry:
         if full:
             # Keep the Git identity distinct from the delivered PF version. Bind only a
             # delivered capture whose bytes hash to that committed blob.
-            blob = self._git_output(['git', '-C', str(self.workspace), 'rev-parse',
+            blob = self._git_output(['git', '-C', str(workspace), 'rev-parse',
                 full + ':' + ref['evidence']['path']], text=True).strip()
             def accept(version):
                 raw = self.store.get_content(version)[1]
-                return blob == self._git_output(['git', '-C', str(self.workspace), 'hash-object', '--stdin'],
+                return blob == self._git_output(['git', '-C', str(workspace), 'hash-object', '--stdin'],
                                                        input=raw).decode().strip()
         try:
             try:

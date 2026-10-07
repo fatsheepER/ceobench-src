@@ -15,13 +15,13 @@ from . import evidence_handles, pf_render
 from .registration_evidence import covered
 from .registration_schema import Input, Text
 from .text_registry import applies_ended
-from .sql_evidence import encoded
+from .sql_evidence import PUBLIC_LAYERS, encoded
 
 
 class Target(Input):
     path: Text | None = None
     sql: Text | None = None
-    record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
+    record: Annotated[str, Field(pattern=r'^(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
     version: Annotated[str, Field(pattern=evidence_handles.HANDLE_PATTERN)] | None = None
 
     @model_validator(mode='after')
@@ -127,13 +127,6 @@ def _about(content_time):
     return f'day {low}' if low == high else f'days {low}-{high}'
 
 
-# Private request wires, declarations, comparison blobs and workspace manifests
-# are never addressable through the agent's historical reader.
-PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registered_text',
-                 'registered_script', 'executed_code', 'stdout', 'stderr', 'dashboard',
-                 'query_model_projection', 'tool_return'}
-
-
 def evidence_key(version, meta, query, result, request, record=None):
     """The object whose versions are listed, diffed and checked together."""
     record = record or {}
@@ -155,7 +148,7 @@ def evidence_key(version, meta, query, result, request, record=None):
 def noise(path):
     """Interpreter caches and CLI session logs are captured but never shown as handles."""
     parts = path.split('/')
-    return '__pycache__' in parts or parts[0] == 'sessions'
+    return '__pycache__' in parts or parts[0] in ('sessions', '.tool-notes.jsonl')
 
 
 class PFQueries:
@@ -627,10 +620,11 @@ class PFQueries:
                     WHERE r.rowid>? OR r.event_id IN ({placeholders}) ORDER BY r.rowid''',
                     [self._event_cutoff, *pending]):
                 self._event_cutoff = max(self._event_cutoff, row['event_row'])
-                try:
-                    self.store._visible(conn, row['event_id'])
-                except KeyError:
-                    continue
+                if not self.store.identity.get('role'):
+                    try:
+                        self.store._visible(conn, row['event_id'])
+                    except KeyError:
+                        continue
                 request = json.loads(row['request'])
                 # The server records each weekly dashboard with its simulated day; later
                 # events happen on that day. Agents reason in simulated days, not clock time.
@@ -654,6 +648,11 @@ class PFQueries:
             if row['event_id'] not in self.events:
                 continue
             meta = json.loads(row['metadata'])
+            try:
+                with closing(self.store.connect()) as conn:
+                    self.store.authorize_version(conn, row['event_id'], meta, public=meta['layer'] in PUBLIC_LAYERS, graph=True)
+            except PermissionError:
+                continue
             event = self.events[row['event_id']]
             retrieval = (meta['layer'] in ('stdout', 'stderr', 'tool_return')
                          and event['result'].get('pf_retrieval', bool(event['result'].get('pf_calls'))))
@@ -691,7 +690,7 @@ class PFQueries:
                     self._edge(version, segment['version_id'], 'public_field_range',
                                source_range=segment['source_range'], field=field['pointer'])
             if meta['layer'] == 'file_bytes':
-                key = meta['object_id']
+                key = (meta.get('owner_role'), meta['object_id'])
                 previous = files.get(key)
                 if previous and self.nodes[previous]['content_hash'] == row['content_hash']:
                     self._edge(version, previous, 'same_content_observation')
@@ -718,7 +717,7 @@ class PFQueries:
         for version, (event_id, layer) in list(self._private_pending.items()):
             if not self.events[event_id]['result']:
                 continue
-            value = json.loads(self.resolver.content(version)[1])
+            value = json.loads(self.resolver.content(version, graph=True)[1])
             if layer == 'agent_declaration' and value['version_id'] in self.records:
                 source = value['version_id']
                 refs = self.records[source]['references']
@@ -726,12 +725,15 @@ class PFQueries:
                     binding = value['references'][i] if i < len(value['references']) else {}
                     resolved = binding.get('status') == 'resolved' and binding.get('git_content_matches') is not False
                     target = binding.get('version_id') if resolved else None
-                    reason = (None if resolved else 'git_content_mismatch' if binding.get('git_content_matches') is False
+                    reason = ('inaccessible' if resolved and target not in self.nodes else None if resolved else 'git_content_mismatch' if binding.get('git_content_matches') is False
                               else binding.get('reason', 'not_captured_in_prefix'))
                     self._edge(source, target, 'reference', origin='agent_declaration',
-                               reference=ref, reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
+                               reference=({k: v for k, v in ref.items() if k in ('purpose',)} if reason == 'inaccessible' else ref), reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
                                missing=target not in self.nodes)
             elif layer in ('model_source_occurrences', 'model_reconstructions'):
+                if self.store.identity.get('role') and (self.events[event_id]['request'].get('role') != self.store.identity['role'] or self.events[event_id]['request'].get('session_id') != self.store.identity['session_id']):
+                    del self._private_pending[version]
+                    continue
                 event = self.events[event_id]
                 if event['result'].get('send_state') == 'response_received' and event['result'].get('status') == 'succeeded':
                     for item in value:
@@ -765,8 +767,8 @@ class PFQueries:
     def _key(self, version):
         row = self.nodes[version]
         meta, event = row['meta'], self.events[row['event_id']]
-        return evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'),
-                            event['request'])
+        key = evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'), event['request'])
+        return (*key, meta.get('owner_role')) if self.store.identity.get('role') else key
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
         if target not in self.nodes and origin != 'agent_declaration':
@@ -791,13 +793,23 @@ class PFQueries:
                 for o in self.nodes[version]['meta'].get('objects', [])]
 
     def _target(self, target):
+        if 'version' in target and evidence_handles.RAW_VERSION.fullmatch(target['version']):
+            self.store.public_content(target['version'])
+            if target['version'] not in self.nodes:
+                raise ValueError('Captured version is unavailable in this cursor')
+            return target['version']
+        owner = self.store.identity.get('role')
+        target = dict(target)
+        for field in ('path', 'record'):
+            if owner and field in target and target[field].split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in target[field]:
+                owner, target[field] = target[field].split(':', 1)
         if 'path' in target and evidence_handles.VERSIONED.fullmatch(target['path']) and not any(
                 row['meta'].get('object_id') == target['path'] for row in self.nodes.values()):
-            target = {'version': target['path']}  # forecast.json@v3 written as a path
+            target = {'version': (owner + ':' if owner else '') + target['path']}  # forecast.json@v3 written as a path
         if 'path' in target and not any(row['meta']['layer'] == 'file_bytes' and row['meta']['object_id'] == target['path']
                                         for row in self.nodes.values()):
             # An output or query named without its version, e.g. analyze.py.out or query7: the latest.
-            members = [v for v in evidence_handles.index(self.store).latest(target['path']) or [] if v in self.nodes]
+            members = [v for v in evidence_handles.index(self.store).latest((owner + ':' if owner else '') + target['path']) or [] if v in self.nodes]
             if members:
                 return members[-1]
         if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
@@ -810,15 +822,19 @@ class PFQueries:
         matches = []
         for version, row in self.nodes.items():
             meta, event = row['meta'], self.events[row['event_id']]
-            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path']:
+            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path'] and (not owner or meta.get('owner_role') == owner):
                 matches.append(version)
             elif 'sql' in target and meta['layer'] == 'server_public_response' and event['query'] and event['query'][5] == target['sql']:
                 matches.append(version)
             elif 'record' in target and version in self.records:
                 record = self.records[version]
-                if target['record'] in (record['id'], record['version']):
+                if target['record'] in (record['id'], record['version']) and (not owner or meta.get('owner_role') == owner):
                     matches.append(version)
         if not matches:
+            if owner and self.store.identity.get('role'):
+                from .role_policy import READABLE_ROLES
+                if owner not in READABLE_ROLES[self.store.identity['role']]:
+                    raise PermissionError('Evidence is inaccessible')
             raise ValueError('No captured version matches; use another path, SQL or registered text')
         return matches[-1]
 
@@ -835,7 +851,7 @@ class PFQueries:
             day=record['sim_day'] if record and record.get('sim_day') is not None else self.event_day.get(row['event_id']),
             layer=meta['layer'], operation=event['request']['kind'],
             status=event['result'].get('status', 'result_unknown'), objects=self._objects(version),
-            relation_origin='agent_declaration' if record else 'automatic_capture')
+            relation_origin='agent_declaration' if record else 'automatic_capture', owner=meta.get('owner_role', 'ceo'))
         if meta['source_truncated']:
             result['truncated'] = True
         if meta['extent'] != 'full':
@@ -885,7 +901,7 @@ class PFQueries:
 
     def _brief(self, version):
         full = self._describe(version)
-        return {k: full[k] for k in ('version', 'day', 'what', 'truncated', 'extent',
+        return {k: full[k] for k in ('version', 'day', 'what', 'owner', 'truncated', 'extent',
                                     'snapshot_day', 'checked_day', 'refresh_hint') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
@@ -1181,7 +1197,7 @@ class PFQueries:
             remaining=len(rows) - end, total=len(rows), detail=self.values['detail'], **extra)
 
     def _read(self, target, offset, baseline=None):
-        meta, raw = self.resolver.content(target)
+        meta, raw = self.resolver.content(target, public=True)
         try:
             content = raw.decode('utf-8')
         except UnicodeDecodeError as exc:
@@ -1193,7 +1209,7 @@ class PFQueries:
             if key != self._key(baseline) or not (key[0] in ('query', 'file_bytes', 'registered_text', 'registered_script',
                                                               'dashboard') or key[0].startswith(('script_', 'command_'))):
                 raise ValueError('Diff requires two versions of the same captured object')
-            old_meta, old = self.resolver.content(baseline)
+            old_meta, old = self.resolver.content(baseline, public=True)
             try:
                 before = old.decode('utf-8')
             except UnicodeDecodeError as exc:
@@ -1205,7 +1221,7 @@ class PFQueries:
                 # Rows compared after canonical sorting; null when either result lacks a comparison.
                 header['rows_equal'] = None
                 if all(c.get('status') == 'available' for c in comparison):
-                    contents = [self.resolver.content(self.nodes[v]['event_id'] + ':comparison')[1] for v in (baseline, target)]
+                    contents = [self.resolver.content(self.nodes[v]['event_id'] + ':comparison', graph=True)[1] for v in (baseline, target)]
                     header['rows_equal'] = contents[0] == contents[1]
                     if meta['source_truncated'] or old_meta['source_truncated']:
                         header['rows_scope'] = 'returned_subset'

@@ -70,7 +70,7 @@ def compare(resolver, before, after, reference, kind, events=None):
     for meta, failure in ((old_meta, 'original_execution_failed'), (new_meta, 'refresh_failed')):
         event_id = meta['created_by_event']
         if event_id not in cached:
-            cached[event_id] = resolver.store.read_event(event_id)
+            cached[event_id] = resolver.store.read_event(event_id, evidence=True)
         event = cached[event_id]
         if event['result'].get('status') != 'succeeded':
             raise ValueError(failure + ":" + event['result'].get('status', 'unknown'))
@@ -148,9 +148,9 @@ class StaleCheck:
         remote = {}
         for key, version in representatives.items():
             meta = self.q.nodes[version]['meta']
-            event = self.store.read_event(meta['created_by_event'])
+            event = self.store.read_event(meta['created_by_event'], evidence=True)
             if meta['layer'] == 'file_bytes':
-                current[key], failures[key] = self._file(meta['object_id'])
+                current[key], failures[key] = self._file(meta['object_id'], meta.get('owner_role'))
             elif meta['layer'] == 'server_public_response' and replayable(event):
                 retry_key = encoded(key).decode()
                 previous = retry.get(retry_key, {})
@@ -182,7 +182,7 @@ class StaleCheck:
                 for version, key in remote.items():
                     current[key] = refreshed[version]
                     meta, _ = self.resolver.content(current[key])
-                    receipt = self.store.read_event(meta['created_by_event'])
+                    receipt = self.store.read_event(meta['created_by_event'], evidence=True)
                     events[meta['created_by_event']] = receipt
                     result = receipt['result']
                     self.q._check_day = max(self.q._check_day, result.get('day') or 0)
@@ -264,15 +264,16 @@ class StaleCheck:
             remote_sources=len(remote), shared_sources=len(representatives), unique_comparisons=len(compared))
         return rows
 
-    def _file(self, name):
+    def _file(self, name, owner=None):
         event = self.store.begin_event('stale_file_read', {'path': name}, parent=CURRENT_EVENT.get())
         version = None
         try:
-            path = (self.q.workspace / name).resolve()
-            if not path.is_relative_to(self.q.workspace):
+            workspace = self.q.registry.repository(owner)
+            path = workspace / name
+            if path.is_symlink() or not path.resolve().is_relative_to(workspace):
                 raise ValueError('file_outside_workspace')
             from .workspace_io import open_file
-            with open_file(self.q.workspace, path) as stream:
+            with open_file(workspace, path) as stream:
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode):
                     raise ValueError('not_regular_file')
@@ -284,7 +285,7 @@ class StaleCheck:
             reason = 'file_missing' if isinstance(exc, FileNotFoundError) else 'file_unavailable'
             self.store.complete(event, 'failed', reason=reason)
             return None, reason
-        version = self.store.version(event, 'file', raw, layer='file_bytes', object_id=name)
+        version = self.store.version(event, 'file', raw, layer='file_bytes', object_id=name, **({'owner_role': owner} if owner else {}))
         self.store.complete(event)
         return version, None
 
