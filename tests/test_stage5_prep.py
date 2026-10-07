@@ -139,12 +139,15 @@ def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
     pf_text = integrate(base, pf=True) + json.dumps(get_bash_agent_tool_descriptions(True, True))
     for word in ('PF', 'pf ', 'pf_', '@v1', '[pf:', '"compare"', 'delivered', 'last saw', 'keeps the note'):
         assert word not in git_text, word
-    for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'keeps the note',
+    for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'PF keeps it',
                  'path@week-N', 'this request'):
         assert word in pf_text, word
-    # The function tools are those of Git; PF adds only the optional note on three of them.
     names = lambda pf: [t['name'] for t in get_bash_agent_tool_descriptions(True, pf)]
     assert names(True) == names(False)
+    tools = {pf: {tool['name']: tool for tool in get_bash_agent_tool_descriptions(True, pf)}
+        for pf in (False, True)}
+    for name in ('bash', 'write_file', 'edit_file'):
+        assert tools[False][name]['parameters']['properties']['note'] == tools[True][name]['parameters']['properties']['note']
     assert MODELS['prefix'] is MODELS['git']
     with pytest.raises(Exception):
         MODELS['git']['create'].model_validate(declaration({'sql': 'SELECT 1'}))

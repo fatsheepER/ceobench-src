@@ -699,7 +699,7 @@ def test_six_week_execution_capture_matches_uncaptured_run(offline_runner, tmp_p
         'server_state.json').read_bytes() == (checkpoint_directory(runners[1].workspace_dir,
         runners[1]._load_checkpoint()) / 'server_state.json').read_bytes()
     store = runners[1].evidence_store
-    store.assert_healthy()
+    store.assert_healthy(settle=5)
     kinds = {store.read_event(event)['request']['kind'] for event in event_ids(store)}
     assert {'bash', 'sql_query', 'registered_script_execution', 'public_http'} <= kinds
     destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')

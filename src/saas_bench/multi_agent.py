@@ -14,7 +14,7 @@ from .agents.bash_agent.agent import BashAgent, FinalText
 from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
 from .api_server import NovaMindAPIServer
 from .model_usage import ModelUsage
-from .role_policy import AgentIdentity, READABLE_ROLES, ROLES, RoleAudit
+from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit
 from .run_state import write_json
 from .run_lifecycle import RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
@@ -57,12 +57,15 @@ class TeamMessage:
 class MultiAgentRuntime:
     def __init__(self, root, tools, *, client_factory, mode='git', conn=None,
                  simulator=None, public_dir=None, run_id=None, world_id=None,
-                 model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None, **server_options):
+                 model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
+                 model_pricing=None, _restored_state=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
             raise ValueError('total_days must include at least one full week')
         self.total_days = total_days
+        self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
+            total_days=total_days, model_pricing=model_pricing)
         if mode == 'pf' and token_counter is None:
             from .payload_tokens import load_counter
             token_counter = load_counter('opencode', model)
@@ -72,26 +75,43 @@ class MultiAgentRuntime:
         self.messages = []
         self.failure = None
         self._pool = None
+        self._checkpoint_lock = threading.RLock()
+        self._safe_point = False
+        self._stage = 'boundary'
+        self._week = {}
+        self.checkpoint_callback = None
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         private = self.root / 'private'
-        private.mkdir(mode=0o700)
+        private.mkdir(mode=0o700, exist_ok=bool(_restored_state))
         self.message_path = private / 'messages.jsonl'
-        run_id, world_id = run_id or uuid.uuid4().hex, world_id or uuid.uuid4().hex
+        if _restored_state:
+            identities = [_restored_state['roles'][role]['identity'] for role in ROLES]
+            saved_run, saved_world = identities[0]['run_id'], identities[0]['world_id']
+            if any((item['run_id'], item['world_id']) != (saved_run, saved_world) for item in identities):
+                raise ValueError('Restored roles disagree on run or world identity')
+            if run_id not in (None, saved_run) or world_id not in (None, saved_world):
+                raise ValueError('Recovery run or world identity changed')
+            run_id, world_id = saved_run, saved_world
+        else:
+            run_id, world_id = run_id or uuid.uuid4().hex, world_id or uuid.uuid4().hex
         self._sockets = tempfile.TemporaryDirectory(prefix='ceobench-team-')
         public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
+        self._public_dir = public
         workspaces = {role: self.root / 'roles' / role for role in ROLES}
         sockets = {role: Path(self._sockets.name) / role / 'api.sock' for role in ROLES}
         stores, runtimes, script_executors, audits = {}, {}, {}, {}
         for role in ROLES:
             workspace = workspaces[role]
-            workspace.mkdir(parents=True)
-            shutil.copytree(public / 'docs', workspace / 'docs')
-            shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
-            (workspace / 'MEMORY.md').write_text('')
-            identity = AgentIdentity(run_id, world_id, role, uuid.uuid4().hex, uuid.uuid4().hex)
+            workspace.mkdir(parents=True, exist_ok=bool(_restored_state))
+            if not _restored_state:
+                shutil.copytree(public / 'docs', workspace / 'docs')
+                shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
+                (workspace / 'MEMORY.md').write_text('')
+            identity = (AgentIdentity(**_restored_state['roles'][role]['identity']) if _restored_state else
+                AgentIdentity(run_id, world_id, role, uuid.uuid4().hex, uuid.uuid4().hex))
             role_private = private / role
-            role_private.mkdir(mode=0o700)
+            role_private.mkdir(mode=0o700, exist_ok=bool(_restored_state))
             write_json(role_private / 'identity.json', identity.fields())
             store = stores[role] = SQLEvidenceStore(private / 'evidence.sqlite', dict(
                 identity.fields(), branch_id=role, data_source_id=world_id, format=FORMAT,
@@ -105,7 +125,8 @@ class MultiAgentRuntime:
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
             executor = BashAgentToolExecutor(**executor_options, text_registry=registry)
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)))
-            usage = ModelUsage(role_private / 'model-usage.jsonl', role, evidence_store=store, identity=identity, token_counter=token_counter)
+            usage = ModelUsage(role_private / 'model-usage.jsonl', role,
+                pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf', ask_analyst=role == 'ceo'),
                 client_factory(role), workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
@@ -144,6 +165,7 @@ class MultiAgentRuntime:
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
         self.server.script_check = self._check
+        self._guard_business_operations()
         for runtime in self.roles.values():
             if runtime.executor.pf_queries:
                 from .pf_refresh import refresh
@@ -158,7 +180,11 @@ class MultiAgentRuntime:
             self.server.start()
             for runtime in self.roles.values():
                 runtime.executor.verify_sandbox()
-                self._initialize_history(runtime)
+                if not _restored_state:
+                    self._initialize_history(runtime)
+            if _restored_state:
+                from .team_checkpoint import restore_runtime_state
+                restore_runtime_state(self, _restored_state)
         except BaseException:
             self.close()
             raise
@@ -199,6 +225,64 @@ class MultiAgentRuntime:
                         raise RuntimeError('CEO process boundary remains open')
             with self.server._lock:
                 self.server.team_phase = phase
+
+    def checkpoint(self, destination=None):
+        from .team_checkpoint import checkpoint
+        return checkpoint(self, destination)
+
+    @classmethod
+    def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_counter=None,
+                simulator_factory=None, **options):
+        from .team_checkpoint import restore
+        return restore(cls, snapshot, root, client_factory=client_factory, public_dir=public_dir,
+            token_counter=token_counter, simulator_factory=simulator_factory, **options)
+
+    def _boundary(self, name):
+        self._safe_point = True
+        try:
+            if self.checkpoint_callback:
+                self.checkpoint_callback(self, name)
+        finally:
+            self._safe_point = False
+
+    def _begin_operation(self, kind):
+        path = self.root / 'private' / 'operations' / (uuid.uuid4().hex + '.json')
+        write_json(path, dict(kind=kind, day=self.server.tools.current_day, status='running'))
+        return path
+
+    def _finish_operation(self, path, executor=None):
+        if (self.server._operation_failed or self.server._step_day_timed_out or
+                executor and (executor.preserved_process or getattr(executor, 'last_status', None) == 'result_unknown')):
+            raise RuntimeError('Business operation outcome unknown; continuation refused')
+        state = json.loads(path.read_text())
+        write_json(path, dict(state, status='completed'))
+
+    def _guard_business_operations(self):
+        server = self.server
+        execute, advance = server.execute_tool, server.advance_week
+        def guarded_execute(tool, args, *, role='ceo'):
+            if role != 'ceo' or CALL_POLICY.get(tool) == 'read':
+                return execute(tool, args, role=role)
+            with server._lock:
+                server.authorize_team(role, CALL_POLICY.get(tool, 'write'))
+                operation = self._begin_operation('api:' + tool)
+                try:
+                    result = execute(tool, args, role=role)
+                except BaseException:
+                    server._operation_failed = True
+                    raise
+                self._finish_operation(operation)
+                return result
+        def guarded_advance(*args, role='ceo', **kwargs):
+            if role != 'ceo':
+                return advance(*args, role=role, **kwargs)
+            with server._lock:
+                server.authorize_team(role, 'advance')
+                operation = self._begin_operation('api:advance')
+            result = advance(*args, role=role, **kwargs)
+            self._finish_operation(operation)
+            return result
+        server.execute_tool, server.advance_week = guarded_execute, guarded_advance
 
     def request_pause(self):
         self._lifecycle.cancel()
@@ -255,7 +339,11 @@ class MultiAgentRuntime:
         return message
 
     def _script_output(self, role):
+        if role == 'ceo':
+            operation = self._begin_operation('ceo_scripts')
         outputs = self.server._run_daily_scripts_internal(role)
+        if role == 'ceo':
+            self._finish_operation(operation, self.server.role_executors[role])
         if any(r['status'] != 'succeeded' for r in self.server.role_script_results[role]):
             raise RunCancelled('registered_script_failed')
         return '\n'.join(f'{name}\n{output}' for name, output in outputs.items())
@@ -342,7 +430,9 @@ class MultiAgentRuntime:
         runtime = self.roles['ceo']
         day = self.server.tools.current_day
         self._check()
-        action = runtime.agent.act(observation, 0, False, {'day': day})
+        action = runtime.agent.act('' if self._week.get('ceo_started') else observation,
+            0, False, {'day': day})
+        self._week['ceo_started'] = True
         while self.server.tools.current_day == day:
             self._check()
             if action is None or isinstance(action, FinalText):
@@ -357,11 +447,15 @@ class MultiAgentRuntime:
                         calls.append(call)
                     for result in self._ask_batch(calls):
                         runtime.agent.record_tool_result(result)
+                    if not runtime.agent._pending_tool_calls:
+                        self._boundary('ask_completed')
                 else:
+                    operation = self._begin_operation('ceo_tool:' + action.tool)
                     result = runtime.executor.execute(action.tool, action.arguments,
                         model_request_event=runtime.usage.last_request_event,
                         model_context_id=runtime.usage.context_id)
                     runtime.agent.record_tool_result(result)
+                    self._finish_operation(operation, runtime.executor)
                 if self.server.tools.current_day != day:
                     while runtime.agent._pending_tool_calls:
                         runtime.agent.record_tool_result('Cancelled because this tool batch crossed a week boundary.')
@@ -376,7 +470,7 @@ class MultiAgentRuntime:
         if self._pool is not None:
             raise RuntimeError('Team run is already active')
         self._lifecycle.hold = Path(hold) if hold else None
-        self._set_phase('boundary')
+        self._set_phase(self._stage)
         try:
             with self._lifecycle, ThreadPoolExecutor(max_workers=2) as pool:
                 self._pool = pool
@@ -387,25 +481,37 @@ class MultiAgentRuntime:
                         self._set_phase('stopped')
                         return RunOutcome(day, 'natural_end' if natural_end else 'observation_end')
                     self._check()
-                    self._rotate_sessions()
-                    self._set_phase('ceo_scripts')
-                    ceo_scripts = self._script_output('ceo')
-                    self._check()
-                    self._set_phase('analysis')
-                    dashboard = self.server.public_dashboard()
-                    requests = [self._message(role, 'Analyze the current business week and give the CEO useful advice in final prose.')
-                                for role in ROLES[1:]]
-                    self._parallel(requests, dashboard)
-                    for request in requests:
-                        self._transition(request, 'delivered')
-                    self._set_phase('ceo')
-                    observation = self._observation('ceo', dashboard, ceo_scripts)
-                    observation += '\n\n' + '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests)
-                    self._run_ceo(observation)
+                    if self._stage == 'boundary':
+                        self._rotate_sessions()
+                        self._stage = 'ceo_scripts'
+                        self._set_phase('ceo_scripts')
+                        ceo_scripts = self._script_output('ceo')
+                        self._check()
+                        self._stage = 'analysis'
+                        self._set_phase('analysis')
+                        dashboard = self.server.public_dashboard()
+                        requests = [self._message(role, 'Analyze the current business week and give the CEO useful advice in final prose.')
+                                    for role in ROLES[1:]]
+                        self._parallel(requests, dashboard)
+                        for request in requests:
+                            self._transition(request, 'delivered')
+                        observation = self._observation('ceo', dashboard, ceo_scripts)
+                        observation += '\n\n' + '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests)
+                        self._week = dict(observation=observation, ceo_started=False)
+                        self._stage = 'ceo'
+                        self._set_phase('ceo')
+                        self._boundary('answers_ready')
+                    elif self._stage != 'ceo':
+                        raise RuntimeError('Team interrupted outside a recoverable boundary')
+                    self._run_ceo(self._week['observation'])
                     closed_day = self.server.tools.current_day
                     for runtime in self.roles.values():
                         from .registration_evidence import week_commit_subject
                         self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
+                    self._stage = 'boundary'
+                    self._week = {}
+                    self._set_phase('boundary')
+                    self._boundary('week_boundary')
         except RunCancelled as exc:
             self.failure = str(exc)
             self._set_phase('stopped' if str(exc) == 'natural_end' else 'paused')

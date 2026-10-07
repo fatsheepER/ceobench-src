@@ -79,7 +79,8 @@ def test_compact_lines_carry_day_what_and_value_without_clock_time(workspace, tm
         assert not CLOCK.search(text), text
     header = json.loads(executor.execute('pf_read', {'target': {'record': 'r1'}}).split('\n', 1)[0])
     assert set(header) == {'delivery', 'next_cursor', 'range', 'target', 'total_chars'}
-    assert set(header['target']) == {'version', 'day', 'what'}
+    assert set(header['target']) == {'version', 'day', 'what', 'owner'}
+    assert header['target']['owner'] == 'ceo'
 
 
 def test_search_and_history_are_newest_first_with_one_optional_detail_line(workspace, tmp_path):

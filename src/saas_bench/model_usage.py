@@ -198,8 +198,9 @@ class _Stream(httpx.SyncByteStream):
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None, expected_model=None):
         self.identity = identity
+        self.expected_model = expected_model
         self.message_ids = []
         self.world_state = lambda: None
         self.call_world_state = None
@@ -212,6 +213,7 @@ class ModelUsage:
         self.role = role
         self.pricing = pricing or {}
         self.lock = threading.RLock()
+        self.call_lock = threading.RLock()
         self.summary = {'calls': 0, 'errors': 0, 'known': {k: None for k in FIELDS},
                         'missing': {k: 0 for k in FIELDS}, 'known_cost_usd': None, 'missing_cost': 0,
                         'http_attempts': 0, 'failed_http_attempts': 0, 'failed_attempts_without_usage': 0}
@@ -326,6 +328,10 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        with self.call_lock:
+            return self._call(api, request, invoke, **context)
+
+    def _call(self, api, request, invoke, **context):
         self.last_request_event = None
         self.call_world_state = self.world_state()
         replacements = []
@@ -345,8 +351,11 @@ class ModelUsage:
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:
             response = invoke()
-            if message := response_error(plain(response), api):
+            raw = plain(response)
+            if message := response_error(raw, api):
                 raise ValueError(message)
+            if self.expected_model is not None and raw.get('model') != self.expected_model:
+                raise ValueError('Returned model differs from frozen configuration')
             return response
         except BaseException as exc:
             error = type(exc).__name__
