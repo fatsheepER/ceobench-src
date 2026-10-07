@@ -290,18 +290,20 @@ def compact_schema(node):
 
 def tool_definitions(pf=False):
     group = 'pf' if pf else 'git'
-    predicates = ('Optional select and predicate on a reference make the weekly check test a condition instead '
-                  'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
-                  'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
-                  'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}' +
-                  (', or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
-                   'result; query handles are listed by pf depend <output> --detail.' if pf else '.') +
-                  ' Script outputs and plain text support whole-content equality only.')
+    checks = ('Optional select and predicate on a reference make the weekly check test a condition instead '
+              'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
+              'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
+              'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}, '
+              'or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
+              'result; query handles are listed by pf depend <output> --detail. '
+              'Script outputs and plain text support whole-content equality only.') if pf else (
+              'The weekly check compares whole cited files and registered texts with their current versions. '
+              'Optional select and predicate fields are stored but do not affect this check.')
     descriptions = {
         'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence (see Registered Texts). '
                   'Each reference is {"cite": ..., "purpose": "current" or "historical_only" (default current), '
                   '"note": what you use it for}; cite is ' + CITE_FORMS[group] + '. applies is "49", "49-55", '
-                  '"49-" (until revised or retired) or "unknown: <reason>". ' + predicates +
+                  '"49-" (until revised or retired) or "unknown: <reason>". ' + checks +
                   ' Notes over 200 characters are truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
                   'supplied references replace the whole list. Earlier revisions remain in registrations.json.',
