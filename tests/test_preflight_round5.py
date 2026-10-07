@@ -59,8 +59,9 @@ def test_incremental_receipts_do_not_lose_partial_lines(tmp_path):
     assert round5.read_increment(path, next_cursor) == ([], next_cursor)
 
 
-def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_runner, tmp_path):
-    source = offline_runner(execution_capture=True, text_registration='prefix')
+@pytest.mark.parametrize('seed', [42, 43])
+def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_runner, tmp_path, seed):
+    source = offline_runner(execution_capture=True, text_registration='prefix', seed=seed)
     source._execute_tool('write_file', {'path': 'MEMORY.md', 'content': 'Offline prefix memory, fixed at D28'})
     for day in (7, 14, 21, 28):
         assert advance(source)['success']
@@ -69,7 +70,7 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     cp = source._load_checkpoint()
     snapshot = checkpoint_directory(source.workspace_dir, cp)
     original = tree_hash(snapshot)
-    sealed = tmp_path / 'A28'
+    sealed = tmp_path / (round5.SEEDS[seed] + '28')
     receipt = round5.seal_state(source.workspace_dir, sealed, cp['snapshot_id'])
     assert receipt['day'] == 28 and receipt['capture_cutoff'] == cp['sql_evidence']['cutoff']
     assert sealed.stat().st_mode & 0o222 == 0
@@ -79,7 +80,7 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     copies = {}
     for group in ('git', 'pf'):
         path = round5.fork_state(sealed, tmp_path / group, group, 'round5-offline-' + group)
-        assert round5.validate_start(group, 42, 35, path) == 28
+        assert round5.validate_start(group, seed, 35, path) == 28
         fork = offline_runner(path)
         copies[group] = fork
         assert fork._get_game_status()['day'] == 28
@@ -92,11 +93,11 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     assert (copies['pf'].agent_workspace / 'MEMORY.md').read_bytes() == right
     assert tree_hash(snapshot) == original
     assert tree_hash(checkpoint_directory(sealed, cp)) == original
-    assert round5.validate_start('prefix', 42, 84, sealed) == 28
+    assert round5.validate_start('prefix', seed, 84, sealed) == 28
     with pytest.raises(ValueError, match='seed mismatch'):
-        round5.validate_start('prefix', 43, 84, sealed)
+        round5.validate_start('prefix', 44, 84, sealed)
     with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', 42, 112, copies['git'].workspace_dir)
+        round5.validate_start('git', seed, 112, copies['git'].workspace_dir)
     with pytest.raises(ValueError, match='starts fresh'):
         round5.validate_start('prefix', 43, 28, sealed)
     git = copies['git']
@@ -106,18 +107,18 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     git._save_checkpoint(42)
     output = tmp_path / 'continuation'
     output.mkdir()
-    previous = round5.stage_pointer(output, 'git', 42, 112)
+    previous = round5.stage_pointer(output, 'git', seed, 112)
     previous.write_text(json.dumps(dict(path=str(git.workspace_dir.resolve()), status='stopped',
         reached_stop=False, result={'days_run': 42})))
     (git.workspace_dir / 'pause-receipt.json').write_text(json.dumps({'day': 42}))
-    assert round5.validate_start('git', 42, 112, git.workspace_dir, 2, output) == 42
-    assert round5.stage_pointer(output, 'git', 42, 112, 2).name == 'git-A-to112-attempt2.json'
+    assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
+    assert round5.stage_pointer(output, 'git', seed, 112, 2).name == f'git-{round5.SEEDS[seed]}-to112-attempt2.json'
     with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', 42, 112, git.workspace_dir)
+        round5.validate_start('git', seed, 112, git.workspace_dir)
     previous.write_text(json.dumps(dict(path=str(git.workspace_dir.resolve()), status='running',
         reached_stop=False, result={'days_run': 42})))
     with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', 42, 112, git.workspace_dir, 2, output)
+        round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
     for boundary in ('new_week', 'same_week'):
         git.agent.current_day = 42 if boundary == 'same_week' else 35
         git._save_checkpoint(42)
@@ -129,11 +130,11 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
             reached_stop=False, result=dict(days_run=42, snapshot_id=checkpoint['snapshot_id']))))
         pause = git.workspace_dir / 'pause-receipt.json'
         pause.write_text(json.dumps(receipt))
-        assert round5.validate_start('git', 42, 112, git.workspace_dir, 2, output) == 42
+        assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
         for field, wrong in [('day', 35), ('snapshot_id', 'wrong'), ('context_boundary', 'wrong')]:
             pause.write_text(json.dumps(dict(receipt, **{field: wrong})))
             with pytest.raises(ValueError, match='complete week boundary'):
-                round5.validate_start('git', 42, 112, git.workspace_dir, 2, output)
+                round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
 
 
 def test_receipt_audit_preserves_unknown_attempts_and_rejects_pending_or_changed_routes(tmp_path):

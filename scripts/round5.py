@@ -89,8 +89,8 @@ def validate_start(mode, seed, stop, source, attempt=1, output=None):
     if mode == 'prefix':
         if stop not in (28, 84) or bool(source) != (stop == 84):
             raise ValueError('Prefix starts fresh to D28, or continues its D28 state to D84')
-    elif seed != 42 or stop not in (35, 112, 497) or source is None:
-        raise ValueError('First long pair uses A28, then gates D35/D112 and end D497')
+    elif seed not in SEEDS or stop not in (35, 112, 497) or source is None:
+        raise ValueError('Long pairs use a sealed D28 prefix, then gates D35/D112 and end D497')
     if source is None:
         if attempt != 1:
             raise ValueError('An engineering continuation needs its saved source')
@@ -117,7 +117,7 @@ def validate_start(mode, seed, stop, source, attempt=1, output=None):
     if manifest.get('text_registration') != mode or manifest['configuration']['seed'] != seed:
         raise ValueError('Resume source group or seed mismatch')
     if mode != 'prefix' and not (manifest.get('fork_source') or manifest.get('sql_evidence', {})).get('source_manifest_sha256'):
-        raise ValueError('Long pair must use a fork of the sealed A28 state')
+        raise ValueError('Long pair must use a fork of the sealed D28 state')
     return cp['day']
 
 
@@ -207,9 +207,9 @@ def fork_state(source, destination, group, identity):
     receipt = read(source / 'seal.json')
     snapshot = checkpoint_directory(source, cp)
     if cp['day'] != 28 or not receipt or tree_hash(snapshot) != receipt['snapshot_sha256']:
-        raise ValueError('Long pair must fork an intact sealed A28 prefix')
-    if read(source / 'manifest.json')['configuration']['seed'] != 42:
-        raise ValueError('First long pair must use family A, seed 42')
+        raise ValueError('Long pair must fork an intact sealed D28 prefix')
+    if read(source / 'manifest.json')['configuration']['seed'] not in SEEDS:
+        raise ValueError('Long pair must use a configured prefix seed')
     result = clone_sql_run(source, destination, identity, text_registration=group)
     # Copying the seal preserves its read-only modes. Independent run copies must be writable.
     for p in [destination, *destination.rglob('*')]:
