@@ -1,8 +1,10 @@
 """Immutable, private snapshots at quiescent team handoffs."""
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
+import fcntl
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -11,6 +13,76 @@ import uuid
 import httpx
 
 from .run_state import artifact_hashes, copy_workspace, file_hash, tree_hash, write_json
+
+
+@contextmanager
+def retention_lock(parent, *, create=False):
+    parent = Path(parent).absolute()
+    if any(path.is_symlink() for path in (parent, *parent.parents)):
+        raise ValueError('Checkpoint retention parent cannot contain symlinks')
+    if create:
+        parent.mkdir(parents=True, exist_ok=True)
+    path = parent / '.retention.lock'
+    created = False
+    if create:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            created = True
+        except FileExistsError:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield created
+
+
+def managed_snapshot(parent, value, checksum):
+    snapshot = Path(value)
+    if (not isinstance(value, str) or str(snapshot) != value or snapshot.parent != parent or
+            len(snapshot.name) != 32 or any(c not in '0123456789abcdef' for c in snapshot.name) or
+            snapshot.is_symlink() or snapshot.resolve() != snapshot or not snapshot.is_dir() or
+            (snapshot / 'checkpoint.json').is_symlink() or
+            not isinstance(checksum, str) or len(checksum) != 64 or
+            any(c not in '0123456789abcdef' for c in checksum) or
+            file_hash(snapshot / 'checkpoint.json') != checksum):
+        raise ValueError('Invalid managed checkpoint path or receipt')
+    return snapshot
+
+
+def _pin_snapshot(snapshot):
+    snapshot = Path(snapshot).resolve()
+    parent = snapshot.parent
+    signal = parent / '.retention.lock'
+    if not signal.exists() and not signal.is_symlink():
+        return
+    with retention_lock(parent):
+        ledger_path = parent / '.retention.json'
+        if ledger_path.is_symlink():
+            raise ValueError('Checkpoint retention ledger cannot be a symlink')
+        ledger = json.loads(ledger_path.read_text())
+        if (not isinstance(ledger, dict) or set(ledger) != {'version', 'snapshots'} or
+                ledger['version'] != 1 or not isinstance(ledger['snapshots'], list)):
+            raise ValueError('Invalid checkpoint retention ledger')
+        entries = {}
+        for item in ledger['snapshots']:
+            if (not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or
+                    not isinstance(item['snapshot'], str) or not isinstance(item['sha256'], str) or
+                    item['snapshot'] in entries):
+                raise ValueError('Invalid checkpoint retention entry')
+            entries[item['snapshot']] = item['sha256']
+        if str(snapshot) not in entries:
+            return
+        checksum = entries[str(snapshot)]
+        managed_snapshot(parent, str(snapshot), checksum)
+        path = parent / '.retention-pins.json'
+        if path.is_symlink():
+            raise ValueError('Checkpoint retention pins cannot be a symlink')
+        pins = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(pins, dict):
+            raise ValueError('Invalid checkpoint retention pins')
+        pins[str(snapshot)] = checksum
+        write_json(path, pins)
 
 
 def _known_operation(root):
@@ -86,7 +158,7 @@ def checkpoint(runtime, destination=None):
             write_json(runtime.root / 'checkpoint.json', dict(snapshot=str(target), sha256=file_hash(target / 'checkpoint.json')))
             return target
         except BaseException:
-            shutil.rmtree(temporary)
+            shutil.rmtree(temporary, ignore_errors=True)
             raise
 
 
@@ -181,6 +253,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .simulation import Simulator
     from .shocks import ShockManager
     from .tools import AgentTools
+    _pin_snapshot(snapshot)
     snapshot, state = validate_snapshot(snapshot)
     root = Path(root).resolve()
     source = Path(state['source_root'])

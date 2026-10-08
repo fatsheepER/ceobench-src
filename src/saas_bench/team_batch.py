@@ -1,7 +1,7 @@
 """Frozen D0 team batches with model-free manifest validation."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import fcntl
@@ -31,6 +31,7 @@ from .run_state import file_hash, tree_hash, verify_build, write_json
 from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
+from .team_checkpoint import managed_snapshot, retention_lock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -418,6 +419,96 @@ def register_attempt(path, manifest, entry, *, resume=False):
     return directory, record, source
 
 
+def prune_checkpoints(parent, ledger, directory):
+    if (set(ledger) != {'version', 'snapshots'} or ledger['version'] != 1 or
+            not isinstance(ledger['snapshots'], list) or not ledger['snapshots']):
+        raise ValueError('Invalid checkpoint retention ledger')
+    snapshots = {}
+    for item in ledger['snapshots']:
+        if not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or item['snapshot'] in snapshots:
+            raise ValueError('Invalid checkpoint retention entry')
+        snapshots[item['snapshot']] = managed_snapshot(parent, item['snapshot'], item['sha256'])
+    protected = {item['snapshot'] for item in ledger['snapshots'][-2:]}
+    pins_path = parent / '.retention-pins.json'
+    if pins_path.is_symlink():
+        raise ValueError('Checkpoint retention pins cannot be a symlink')
+    pins = read(pins_path) if pins_path.exists() else {}
+    if not isinstance(pins, dict):
+        raise ValueError('Invalid checkpoint retention pins')
+    for value, checksum in pins.items():
+        managed_snapshot(parent, value, checksum)
+        protected.add(value)
+    history = sorted(directory.parent.glob('attempt-*'))
+    for attempt in history:
+        if attempt.is_symlink() or (attempt / 'attempt.json').is_symlink():
+            raise ValueError('Checkpoint retention attempt cannot be a symlink')
+        saved = read(attempt / 'attempt.json')
+        for key in ('checkpoint', 'source_checkpoint'):
+            value = saved[key]
+            if value is not None:
+                if (not isinstance(value, str) or not Path(value).is_absolute() or str(Path(value)) != value or
+                        Path(value).parent not in {p / 'runtime' / 'checkpoints' for p in history} or
+                        not Path(value).is_dir() or any(p.is_symlink() for p in (Path(value), *Path(value).parents))):
+                    raise ValueError('Invalid attempt checkpoint reference')
+                protected.add(value)
+        pointer = attempt / 'runtime' / 'checkpoint.json'
+        if pointer.is_symlink() or any(p.is_symlink() for p in pointer.parents):
+            raise ValueError('Checkpoint retention pointer cannot contain symlinks')
+        if pointer.exists():
+            saved = read(pointer)
+            if set(saved) != {'snapshot', 'sha256'}:
+                raise ValueError('Invalid runtime checkpoint pointer')
+            value = saved['snapshot']
+            if not isinstance(value, str) or not Path(value).is_absolute() or str(Path(value)) != value:
+                raise ValueError('Invalid runtime checkpoint reference')
+            managed_snapshot(attempt / 'runtime' / 'checkpoints', value, saved['sha256'])
+            protected.add(value)
+    discarded = [value for value in snapshots if value not in protected]
+    for value in discarded:
+        shutil.rmtree(snapshots[value])
+    if discarded:
+        ledger['snapshots'] = [item for item in ledger['snapshots'] if item['snapshot'] not in discarded]
+        write_json(parent / '.retention.json', ledger)
+
+
+def save_checkpoint(team, directory, record, boundary):
+    parent = team.root / 'checkpoints'
+    with ExitStack() as stack:
+        lock_error = None
+        try:
+            created = stack.enter_context(retention_lock(parent, create=True))
+        except Exception as exc:
+            lock_error = exc
+        snapshot = team.checkpoint()
+        record.update(checkpoint=str(snapshot), boundary=boundary)
+        write_json(directory / 'attempt.json', record)
+        try:
+            if lock_error:
+                raise lock_error
+            path = parent / '.retention.json'
+            if path.is_symlink():
+                raise ValueError('Checkpoint retention ledger cannot be a symlink')
+            if path.exists():
+                ledger = read(path)
+                if (not isinstance(ledger, dict) or set(ledger) != {'version', 'snapshots'} or
+                        ledger['version'] != 1 or not isinstance(ledger['snapshots'], list)):
+                    raise ValueError('Invalid checkpoint retention ledger')
+            elif created:
+                ledger = dict(version=1, snapshots=[])
+            else:
+                raise ValueError('Checkpoint retention ledger is missing')
+            ledger['snapshots'].append(dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json')))
+            write_json(path, ledger)
+            prune_checkpoints(parent, ledger, directory)
+        except Exception as exc:
+            record.setdefault('checkpoint_retention_errors', []).append(dict(error_type=type(exc).__name__, error=str(exc)))
+            try:
+                write_json(directory / 'attempt.json', record)
+            except OSError:
+                pass
+        return snapshot
+
+
 def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simulator_factory=None):
     path = Path(path).resolve()
     manifest = validate_manifest(path)
@@ -454,8 +545,8 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             for runtime in team.roles.values():
                 runtime.usage.expected_model = MODEL
             write_json(team.root / 'private' / 'frozen-run.json', dict(entry=entry, manifest_sha256=file_hash(path)))
-            record.update(status='ready', checkpoint=str(team.checkpoint()))
-            write_json(directory / 'attempt.json', record)
+            record['status'] = 'ready'
+            save_checkpoint(team, directory, record, 'ready')
             if not live:
                 return record
             return execute(team, manifest, entry, directory, record, path.parent / 'HOLD')
@@ -474,19 +565,35 @@ def execute(team, manifest, entry, directory, record, hold):
     start = time.monotonic()
     record.update(status='running', execution_started=True)
     write_json(directory / 'attempt.json', record)
+    last_boundary = None
     def checkpoint(runtime, boundary):
-        record['checkpoint'] = str(runtime.checkpoint())
-        record['boundary'] = boundary
-        write_json(directory / 'attempt.json', record)
+        nonlocal last_boundary
+        snapshot = save_checkpoint(runtime, directory, record, boundary)
+        last_boundary = dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json'),
+            boundary=boundary, day=runtime.server.tools.current_day, stage=runtime._stage, failure=runtime.failure)
     team.checkpoint_callback = checkpoint
     outcome = team.run(stop_after_day=entry['stop_after_day'], hold=hold)
     reason = outcome.reason
     if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled'):
         reason = 'failed'
-    try:
-        record['checkpoint'] = str(team.checkpoint())
-    except (ValueError, RuntimeError) as exc:
-        record['checkpoint_error'] = str(exc)
+    reuse = (last_boundary is not None and reason == 'observation_end' and
+        outcome.day == entry['stop_after_day'] == team.server.tools.current_day and
+        last_boundary['boundary'] == 'week_boundary' and last_boundary['day'] == outcome.day and
+        last_boundary['stage'] == team._stage == 'boundary' and last_boundary['failure'] is None and team.failure is None and
+        record['checkpoint'] == last_boundary['snapshot'])
+    if reuse:
+        try:
+            reuse = (read(team.root / 'checkpoint.json') == {key: last_boundary[key] for key in ('snapshot', 'sha256')} and
+                read(directory / 'attempt.json').get('checkpoint') == last_boundary['snapshot'] and
+                file_hash(Path(last_boundary['snapshot']) / 'checkpoint.json') == last_boundary['sha256'])
+        except (OSError, ValueError):
+            reuse = False
+    if not reuse:
+        try:
+            save_checkpoint(team, directory, record, 'final')
+        except (ValueError, RuntimeError) as exc:
+            record['checkpoint_error'] = str(exc)
+    record['checkpoint_reused_at_stop'] = reuse
     logs = {entry['category']: [], 'simulator': []}
     for previous in attempts(entry):
         logs[entry['category']].extend(previous.glob('runtime/private/*/model-usage.jsonl'))
@@ -503,6 +610,7 @@ def execute(team, manifest, entry, directory, record, hold):
     write_json(directory / 'result.json', result)
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
         day=outcome.day, reason=reason, runtime_failure=team.failure, result=result,
+        runtime_phase=team.phase,
         wall_seconds=elapsed,
         finished_at=datetime.now(timezone.utc).isoformat())
     write_json(directory / 'attempt.json', record)

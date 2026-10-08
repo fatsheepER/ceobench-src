@@ -13,7 +13,9 @@ import pytest
 
 from saas_bench import team_batch as batch
 from saas_bench.role_policy import ROLES
-from saas_bench.run_state import build_manifest, file_hash, write_json
+from saas_bench.run_state import build_manifest, file_hash, tree_hash, write_json
+from saas_bench.team_checkpoint import validate_snapshot
+from saas_bench.team_usage import aggregate
 from test_preflight_team_flow import ADVANCE, calls, completion, final
 
 
@@ -221,7 +223,7 @@ def test_returned_model_mismatch_keeps_known_raw_receipts(tmp_path):
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_path, group):
+def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_path, group, monkeypatch):
     base, _, engineering, _ = frozen
     copied = copy.deepcopy(engineering)
     for entry in copied['runs']:
@@ -231,6 +233,19 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
     run_id = next(entry['run_id'] for entry in copied['runs'] if entry['group'] == group)
     wire = []
+    cleanup_checks = []
+    prune = batch.prune_checkpoints
+    def checked_prune(parent, ledger, directory):
+        latest = Path(ledger['snapshots'][-1]['snapshot'])
+        logs = list(parent.parent.glob('private/*/model-usage.jsonl'))
+        def analysis():
+            return (tree_hash(parent.parent / 'roles'), tree_hash(parent.parent / 'private'),
+                tree_hash(latest), aggregate(logs, PRICES, category='engineering'))
+        before = analysis()
+        prune(parent, ledger, directory)
+        assert analysis() == before
+        cleanup_checks.append(str(latest))
+    monkeypatch.setattr(batch, 'prune_checkpoints', checked_prune)
     pause_once = [True]
     def client(role):
         def respond(request):
@@ -248,11 +263,45 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     (tmp_path / 'HOLD').unlink()
     resumed = batch.prepare(path, run_id, live=True, resume=True, client_factory=client, simulator_factory=batch.simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28
+    assert resumed['checkpoint_reused_at_stop'] is True and resumed['runtime_phase'] == 'stopped'
     assert resumed['result']['status'] == 'reached_stop_day'
     assert first['manifest_sha256'] == resumed['manifest_sha256'] == file_hash(path)
     assert len(batch.attempts(batch.selected(copied, run_id))) == 2
     assert all(r['body']['model'] == batch.MODEL and r['body']['reasoning_effort'] == 'high' for r in wire)
     assert all('D497' in r['body']['messages'][0]['content'] and 'D28' not in r['body']['messages'][0]['content'] for r in wire)
+    entry = batch.selected(copied, run_id)
+    history = batch.attempts(entry)
+    snapshot = Path(resumed['checkpoint'])
+    snapshots = list(snapshot.parent.glob('*/checkpoint.json'))
+    assert len(snapshots) == 2 and len(cleanup_checks) == 10
+    states = [batch.read(p.parent / 'team.json') for p in snapshots]
+    assert sum(s['day'] == 28 for s in states) == 1
+    _, terminal = validate_snapshot(snapshot)
+    assert terminal['day'] == 28 and terminal['stage'] == terminal['phase'] == 'boundary'
+    messages = [json.loads(line) for line in (snapshot / 'private/messages.jsonl').read_text().splitlines()]
+    assert [m['status'] for m in terminal['messages']].count('delivered') == 8
+    assert sum(m['status'] == 'delivered' for m in messages) == 8
+    logs = [p for attempt in history for p in attempt.glob('runtime/private/*/model-usage.jsonl')]
+    assert aggregate(dict(engineering=logs, simulator=[]), PRICES, category='engineering') == resumed['result']['usage']
+    raw = [json.loads(line) for p in logs for line in p.read_text().splitlines()]
+    assert len({row['attempt_id'] for row in raw if row['event'] == 'http_request'}) == len(wire)
+    if group == 'pf':
+        assert (snapshot / 'private/evidence.sqlite').stat().st_size > 0
+        assert terminal['evidence']
+    source = Path(first['checkpoint'])
+    assert batch.read(source.parent / '.retention-pins.json')[str(source)] == file_hash(source / 'checkpoint.json')
+    before = tree_hash(snapshot)
+    calls_before = len(wire)
+    resumed['status'] = 'paused'
+    write_json(history[-1] / 'attempt.json', resumed)
+    terminal_resume = batch.prepare(path, run_id, live=True, resume=True,
+        client_factory=client, simulator_factory=batch.simulator)
+    assert terminal_resume['status'] == 'finished' and terminal_resume['day'] == 28
+    assert terminal_resume['checkpoint_reused_at_stop'] is False
+    assert batch.read(Path(terminal_resume['checkpoint']) / 'team.json')['phase'] == 'stopped'
+    assert len(wire) == calls_before and tree_hash(snapshot) == before
+    assert {key: value for key, value in terminal_resume['result']['usage'].items() if key != 'duplicates'} == {
+        key: value for key, value in resumed['result']['usage'].items() if key != 'duplicates'}
     write_json(base / f'offline-batch-wire-{group}.json', wire)
 
 
@@ -389,3 +438,155 @@ batch.prepare(sys.argv[1], sys.argv[2], live=True, client_factory=client, simula
     assert batch.read(first / 'attempt.json')['status'] == 'failed'
     assert batch.read(second / 'attempt.json')['status'] == 'failed'
     assert Path(checkpoint).is_dir()
+
+
+@pytest.fixture
+def managed_team(frozen, tmp_path):
+    path = changed_manifest(frozen, tmp_path, lambda manifest: None)
+    manifest = batch.validate_manifest(path)
+    entry = next(row for row in manifest['runs'] if row['group'] == 'git')
+    with batch.run_lock(Path(entry['output_dir'])):
+        directory, record, _ = batch.register_attempt(path, manifest, entry)
+        team = batch.make_team(manifest, entry, directory)
+        try:
+            record['status'] = 'ready'
+            batch.save_checkpoint(team, directory, record, 'ready')
+            yield team, directory, record, manifest, entry
+        finally:
+            batch.close_team(team)
+
+
+def test_external_restore_permanently_pins_managed_source_before_reading(managed_team, tmp_path, monkeypatch):
+    from saas_bench import team_checkpoint
+    team, directory, record, manifest, _ = managed_team
+    source = Path(record['checkpoint'])
+    before = tree_hash(source)
+    validate = team_checkpoint.validate_snapshot
+    def pinned_validate(snapshot):
+        assert batch.read(source.parent / '.retention-pins.json')[str(source)] == file_hash(source / 'checkpoint.json')
+        return validate(snapshot)
+    monkeypatch.setattr(team_checkpoint, 'validate_snapshot', pinned_validate)
+    external_alias = tmp_path / 'external-snapshot-alias'
+    external_alias.symlink_to(source, target_is_directory=True)
+    restored = batch.MultiAgentRuntime.restore(external_alias, tmp_path / 'external-restore',
+        client_factory=lambda role: batch.checked_client(role, 'offline', no_models=True), public_dir=manifest['public_dir'])
+    batch.close_team(restored)
+    manual = team.checkpoint(source.parent / 'manual-snapshot')
+    source.parent.chmod(0o555)
+    (source.parent / '.retention.lock').chmod(0o400)
+    try:
+        restored = batch.MultiAgentRuntime.restore(manual, tmp_path / 'manual-restore',
+            client_factory=lambda role: batch.checked_client(role, 'offline', no_models=True), public_dir=manifest['public_dir'])
+        batch.close_team(restored)
+        assert str(manual) not in batch.read(source.parent / '.retention-pins.json')
+    finally:
+        source.parent.chmod(0o700)
+        (source.parent / '.retention.lock').chmod(0o600)
+    alias = source.parent / ('a' * 32)
+    alias.symlink_to(manual, target_is_directory=True)
+    for _ in range(4):
+        batch.save_checkpoint(team, directory, record, 'week_boundary')
+    ledger = batch.read(source.parent / '.retention.json')
+    assert len(ledger['snapshots']) == 3 and str(source) in {item['snapshot'] for item in ledger['snapshots']}
+    assert tree_hash(source) == before and manual.is_dir() and alias.is_symlink()
+    assert not record.get('checkpoint_retention_errors')
+
+
+@pytest.mark.parametrize('fault', ['bad_json', 'missing', 'unknown', 'outside', 'receipt',
+    'candidate_symlink', 'parent_symlink', 'ledger_symlink', 'bad_pins', 'bad_attempt', 'partial_delete'])
+def test_retention_errors_preserve_current_analysis_and_continue(managed_team, tmp_path, monkeypatch, fault):
+    team, directory, record, manifest, entry = managed_team
+    first = Path(record['checkpoint'])
+    second = batch.save_checkpoint(team, directory, record, 'week_boundary')
+    second_hash = tree_hash(second)
+    logs = {p: file_hash(p) for p in (team.root / 'private').rglob('*.jsonl')}
+    roles_hash = tree_hash(team.root / 'roles')
+    parent, path = first.parent, first.parent / '.retention.json'
+    ledger = batch.read(path)
+    if fault == 'bad_json':
+        path.write_text('{')
+    elif fault == 'missing':
+        path.unlink()
+    elif fault == 'unknown':
+        write_json(path, dict(ledger, version=99))
+    elif fault == 'outside':
+        ledger['snapshots'][0]['snapshot'] = str(tmp_path / 'outside')
+        write_json(path, ledger)
+    elif fault == 'receipt':
+        (first / 'checkpoint.json').write_text('{}')
+    elif fault == 'candidate_symlink':
+        first.rename(tmp_path / 'moved-source')
+        first.symlink_to(tmp_path / 'moved-source', target_is_directory=True)
+    elif fault == 'parent_symlink':
+        parent.rename(tmp_path / 'moved-parent')
+        parent.symlink_to(tmp_path / 'moved-parent', target_is_directory=True)
+    elif fault == 'ledger_symlink':
+        path.rename(tmp_path / 'moved-ledger.json')
+        path.symlink_to(tmp_path / 'moved-ledger.json')
+    elif fault == 'bad_pins':
+        write_json(parent / '.retention-pins.json', {str(first): 'wrong'})
+    elif fault == 'bad_attempt':
+        other = directory.parent / 'attempt-002'
+        other.mkdir()
+        (other / 'attempt.json').write_text('{')
+    else:
+        remove = shutil.rmtree
+        def failed_remove(path, *args, **kwargs):
+            if Path(path) == first:
+                (first / 'world.nmdb').unlink(missing_ok=True)
+                raise OSError('injected partial deletion failure')
+            return remove(path, *args, **kwargs)
+        monkeypatch.setattr(shutil, 'rmtree', failed_remove)
+    third = batch.save_checkpoint(team, directory, record, 'week_boundary')
+    assert second.is_dir() and tree_hash(second) == second_hash
+    assert {p: file_hash(p) for p in logs} == logs and tree_hash(team.root / 'roles') == roles_hash
+    assert third.is_dir() and record['checkpoint_retention_errors']
+    assert first.exists()
+    assert not record.get('checkpoint_error')
+    if fault == 'bad_attempt':
+        write_json(other / 'attempt.json', dict(checkpoint=None, source_checkpoint=None, wall_seconds=0))
+    monkeypatch.setattr(team, 'run', lambda **options: type('Outcome', (), dict(day=0, reason='paused'))())
+    team.failure = 'requested_pause'
+    team._set_phase('paused')
+    completed = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
+    assert completed['status'] == 'paused' and completed['result']['status'] == 'paused'
+    assert completed['checkpoint_reused_at_stop'] is False
+    assert completed['checkpoint_retention_errors']
+    assert batch.read(Path(completed['checkpoint']) / 'team.json')['phase'] == 'paused'
+
+
+@pytest.mark.parametrize('publication', ['pointer', 'attempt'])
+def test_checkpoint_publication_failure_preserves_previous_snapshots_and_original_error(managed_team, monkeypatch, publication):
+    from saas_bench import team_checkpoint
+    team, directory, record, _, _ = managed_team
+    first = Path(record['checkpoint'])
+    second = batch.save_checkpoint(team, directory, record, 'week_boundary')
+    before = {p: tree_hash(p) for p in (first, second)}
+    ledger = batch.read(first.parent / '.retention.json')
+    module = team_checkpoint if publication == 'pointer' else batch
+    write = module.write_json
+    failed_path = team.root / 'checkpoint.json' if publication == 'pointer' else directory / 'attempt.json'
+    def failed_publish(path, value):
+        if Path(path) == failed_path:
+            raise OSError('injected publication failure')
+        write(path, value)
+    monkeypatch.setattr(module, 'write_json', failed_publish)
+    with pytest.raises(OSError, match='injected publication failure'):
+        batch.save_checkpoint(team, directory, record, 'week_boundary')
+    assert {p: tree_hash(p) for p in before} == before
+    assert batch.read(first.parent / '.retention.json') == ledger
+    assert len(list(first.parent.glob('*/checkpoint.json'))) == 3
+
+
+@pytest.mark.parametrize('reason,failure', [('paused', 'requested_pause'), ('failed', 'offline business failure')])
+def test_paused_and_failed_outcomes_still_freeze_final_state(managed_team, tmp_path, monkeypatch, reason, failure):
+    team, directory, record, manifest, entry = managed_team
+    previous = record['checkpoint']
+    monkeypatch.setattr(team, 'run', lambda **options: type('Outcome', (), dict(day=0, reason=reason))())
+    team.failure = failure
+    team._set_phase('paused')
+    result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
+    assert result['status'] == reason and result['checkpoint'] != previous
+    assert result['checkpoint_reused_at_stop'] is False
+    state = batch.read(Path(result['checkpoint']) / 'team.json')
+    assert state['phase'] == 'paused' and state['failure'] == failure
