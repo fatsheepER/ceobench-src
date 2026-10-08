@@ -91,6 +91,23 @@ def _known_operation(root):
             raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
 
 
+def validate_recovery_source(snapshot, state, *, current_root=None):
+    """Reject rollback across operations that the stored world does not contain."""
+    snapshot = Path(snapshot)
+    frozen = {p.name: file_hash(p) for p in (snapshot / 'private' / 'operations').glob('*.json')}
+    roots = {Path(state['source_root'])}
+    if current_root is not None:
+        roots.add(Path(current_root))
+    for root in roots:
+        if not root.is_dir():
+            raise RuntimeError('Recovery source is unavailable; operation coverage cannot be verified')
+        _known_operation(root)
+        current = {p.name: file_hash(p) for p in (root / 'private' / 'operations').glob('*.json')}
+        # A completed receipt identifies a known outcome, not a snapshotted outcome.
+        if current != frozen:
+            raise RuntimeError('Business operations changed after checkpoint; recovery refused')
+
+
 def _client_configuration(client):
     return dict(endpoint=str(client.base_url.copy_with(username='', password='', query=None)),
         max_retries=client.max_retries, timeout=httpx.Timeout(client.timeout).as_dict())
@@ -255,6 +272,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .tools import AgentTools
     _pin_snapshot(snapshot)
     snapshot, state = validate_snapshot(snapshot)
+    validate_recovery_source(snapshot, state)
     root = Path(root).resolve()
     source = Path(state['source_root'])
     if root.is_relative_to(source) or source.is_relative_to(root) or root.is_relative_to(snapshot):

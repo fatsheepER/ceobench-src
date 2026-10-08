@@ -132,10 +132,13 @@ def behavior(runtime):
 @pytest.mark.parametrize('boundary', ['answers_ready', 'ask_completed', 'week_boundary'])
 def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boundary):
     continuous = make_team(tmp_path / 'continuous', mode)
-    snapshots = []
+    snapshots, forks = [], []
     def save(runtime, current):
         if current == boundary and not snapshots:
             snapshots.append(runtime.checkpoint())
+            # Fork while the source is still at this handoff, before it advances.
+            forks.append(MultiAgentRuntime.restore(snapshots[0], tmp_path / 'restored',
+                client_factory=clients(), simulator_factory=fast_simulator))
     continuous.checkpoint_callback = save
     try:
         outcome = continuous.run(stop_after_day=14)
@@ -143,8 +146,7 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
         expected = behavior(continuous)
         snapshot = snapshots[0]
         checksum = hashlib.sha256((snapshot / 'world.nmdb').read_bytes()).hexdigest()
-        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
-            client_factory=clients(), simulator_factory=fast_simulator)
+        restored = forks[0]
         try:
             saved = json.loads((snapshot / 'team.json').read_text())
             assert all(restored.roles[role].identity.session_id == saved['roles'][role]['identity']['session_id']
@@ -169,7 +171,10 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             assert all(role.usage.pricing == PRICING['rates'] for role in restored.roles.values())
         finally:
             dispose(restored)
+            forks.clear()
     finally:
+        for fork in forks:
+            dispose(fork)
         dispose(continuous)
 
 

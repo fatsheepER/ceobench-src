@@ -395,8 +395,12 @@ def register_attempt(path, manifest, entry, *, resume=False):
                 raise ValueError('Resume checkpoint belongs to another run')
             if file_hash(owner / 'manifest.json') != file_hash(path):
                 raise ValueError('Resume must retain the checkpoint original manifest')
-            from .team_checkpoint import validate_snapshot
+            from .team_checkpoint import validate_recovery_source, validate_snapshot
             _, state = validate_snapshot(source)
+            latest_root = history[-1] / 'runtime'
+            # Preparation can fail before creating a runtime; no execution started there.
+            current_root = latest_root if latest_root.exists() or previous.get('execution_started') is not False else None
+            validate_recovery_source(source, state, current_root=current_root)
             if state['roles']['ceo']['identity']['run_id'] != entry['run_id']:
                 raise ValueError('Resume checkpoint belongs to another run')
         elif previous.get('execution_started') is not False:
