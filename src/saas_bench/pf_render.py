@@ -432,7 +432,8 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if ended:
         lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
     if flagged:
-        lines.append('Details: pf depend rN.' if pf else 'Details: run the git diff shown on each line.')
+        example = flagged[0]['text']['record'].split('.')[0]
+        lines.append(f'Details: pf depend {example}.' if pf else 'Details: run the git diff shown on each line.')
     return '\n'.join(lines)
 
 

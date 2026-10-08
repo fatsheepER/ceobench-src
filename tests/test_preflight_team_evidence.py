@@ -6,12 +6,12 @@ import pytest
 
 from saas_bench import evidence_handles
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
-from saas_bench.execution_capture import CapturedText
+from saas_bench.execution_capture import CapturedText, restore_sources, text_sources
 from saas_bench.pf_read import apply_delta
 from saas_bench.role_policy import READABLE_ROLES, ROLES
 from saas_bench.sql_evidence import SQLEvidenceStore
 from saas_bench.text_registry import TextRegistry
-from test_preflight_team_flow import ADVANCE, calls, final, make_team
+from test_preflight_team_flow import ADVANCE, calls, final, make_team, register
 
 
 def write(team, role, content, path='same.txt', **extra):
@@ -45,6 +45,74 @@ def send(team, role, texts):
     assert wire == team.test_wire[-1]['body']
     ledger = json.loads(runtime.store.get_content(event + ':pf_reads')[1])
     return wire, ledger
+
+
+def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wires():
+    seen = {role: 0 for role in ROLES}
+    codes = {role: 'print(' + repr(role + '\n' + ''.join(
+        f'row {i:03d}: a useful business observation\n' for i in range(100))) + ')' for role in ROLES}
+    def responder(team, role, body):
+        seen[role] += 1
+        if seen[role] == 1:
+            python = team.roles[role].executor.python
+            return calls(('bash', dict(command=shlex.quote(python) + ' -c ' + shlex.quote(codes[role]))))
+        return calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final(role + ' answer')
+    with make_team('pf', responder, 'automatic-input-sources') as team:
+        for role in ROLES:
+            register(team, role, 'report.py', codes[role])
+            write(team, role, 'cash source')
+            declare(team, role, 'Use the cash source.', ['same.txt@v1'])
+        assert team.run(stop_after_day=7).reason == 'observation_end', team.failure
+        for role, runtime in team.roles.items():
+            with closing(runtime.store.connect()) as conn:
+                events = [r[0] for r in conn.execute("SELECT event_id FROM requests WHERE branch=? "
+                    "AND json_extract(request,'$.kind')='model_request' ORDER BY seq", (role,))]
+            wire = json.loads(runtime.store.get_content(events[0] + ':wire')[1])
+            assert wire == next(r['body'] for r in team.test_wire if r['role'] == role)
+            index, user = next((i, m) for i, m in enumerate(wire['messages']) if m['role'] == 'user')
+            pointer = f'/messages/{index}/content'
+            occurrences = json.loads(runtime.store.get_content(events[0] + ':occurrences')[1])
+            occurrences = [o for o in occurrences if o['json_pointer'] == pointer]
+            layers = set()
+            for item in occurrences:
+                meta, raw = runtime.store.get_content(item['version_id'])
+                layers.add(meta['layer'])
+                a, b = item['source_range']
+                c, d = item['request_range']
+                assert user['content'][c:d] == raw.decode()[a:b]
+                assert (item['reader'], item['session_id'], item['context_id']) == (
+                    role, runtime.identity.session_id, runtime.usage.context_id)
+            assert {'dashboard', 'weekly_check', 'tool_return'} <= layers
+            ledger = json.loads(runtime.store.get_content(events[0] + ':pf_reads')[1])
+            assert len(ledger) == 1 and ledger[0]['mode'] == 'FULL'
+            read = ledger[0]
+            a, b = read['request_range']
+            assert user['content'][a:b] == runtime.store.get_content(read['full_version'])[1].decode()
+            expected = role + '\n' + ''.join(
+                f'row {i:03d}: a useful business observation\n' for i in range(100)) + '\n'
+            assert user['content'][a:b] == expected
+            assert runtime.store.get_content(read['actual_version'])[1].decode() == user['content'][a:b]
+            assert (read['reader'], read['session_id'], read['context_id']) == (
+                role, runtime.identity.session_id, runtime.usage.context_id)
+            next_reads = json.loads(runtime.store.get_content(events[1] + ':pf_reads')[1])
+            assert next_reads[0]['mode'] == 'FULL' and next_reads[-1]['mode'] in ('UNCHANGED', 'DELTA')
+            assert next_reads[-1]['chain'][0]['range'] == [a, b]
+            original = runtime.store.get_content(read['target'])[1].decode()
+            repeated = runtime.store.get_content(next_reads[-1]['target'])[1].decode()
+            assert apply_delta(original, next_reads[-1]['edits']) == repeated
+            saved = text_sources({'observation': runtime.agent._last_observation})
+            restored = json.loads(json.dumps({'observation': runtime.agent._last_observation}))
+            restore_sources(restored, saved)
+            assert text_sources(restored) == saved
+            fresh_id = next_reads[-1]['read_id']
+            fresh = CapturedText(runtime.store.get_content(fresh_id)[1].decode(), pf_read={'id': fresh_id})
+            runtime.usage.context_id = 'new-context-' + role
+            _, fresh_reads = send(team, role, [fresh])
+            assert fresh_reads[-1]['mode'] == 'FULL' and fresh_reads[-1]['reason'] == 'no_complete_base'
+            runtime.store.identity['session_id'] = 'new-session-' + role
+            _, fresh_reads = send(team, role, [fresh])
+            assert fresh_reads[-1]['mode'] == 'FULL'
+            assert fresh_reads[-1]['session_id'] == 'new-session-' + role
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -158,6 +226,58 @@ def test_ceo_copy_traversal_stops_without_ops_body_summary_or_snippet():
         assert 'growth' in result and 'CEO composite decision' in result
         result = pf(team, 'ceo', 'pf depend ceo:r1 --history --detail')
         assert 'growth-ORIGINAL-CLAIM' in result and 'ops_finance-ORIGINAL-CLAIM' in result
+        for runtime in team.roles.values():
+            runtime.store.assert_healthy()
+
+
+def test_weekly_registration_roots_and_review_hints_keep_role_identity():
+    with make_team('pf', lambda *args: final('done'), 'weekly-role-scope') as team:
+        for role in ROLES:
+            write(team, role, role + '-before')
+            declare(team, role, role + ' decision', [role + ':same.txt@v1'])
+            write(team, role, role + '-after')
+        ceo = team.roles['ceo']
+        first = ceo.executor.weekly_check(7)
+        assert 'Registered texts: 1 active; 1 within their applies window.' in first, first
+        assert 'Checked this week: 1 text; 1 with changed evidence:' in first
+        assert 'ceo:r1.1 (day 0)' in first and 'growth decision' not in first
+        assert 'Details: pf depend ceo:r1.' in first
+        assert 'pf depend ceo:r1 rechecks one text.' in first
+        pending = ceo.store.load_state('pf_review')['pending']
+        assert len(pending) == 1 and {v.split('/')[1] for v in pending} == {'ceo'}
+        listed = json.loads(ceo.executor.execute('text_list', {'review': 'pending'}))
+        assert [r['version'] for r in listed['records']] == ['r1.1']
+        assert list(listed['checks']) == ['r1.1']
+        foreign = team.roles['growth'].store.load_state('declaration:r1.1')['version_id']
+        ceo.store.save_state('pf_review', dict(pending={**pending, foreign: next(iter(pending.values()))}, ended=[]))
+        second = ceo.executor.weekly_check(14)
+        assert 'ceo:r1.1 (last verified day 7)' in second and 'growth decision' not in second
+        assert {v.split('/')[1] for v in ceo.store.load_state('pf_review')['pending']} == {'ceo'}
+        query = ceo.executor.pf_queries
+        searched = query.answer('pf_search', dict(text='growth decision'))
+        assert any(item['version'] == 'growth:r1.1' for item in searched['items'])
+        for target in ({'record': 'growth:r1.1'}, {'version': 'growth:r1.1'}):
+            peer = ceo.executor.execute('pf_dependencies', dict(target=target, detail=True))
+            assert peer.startswith('growth:r1.1 · day 0 · text growth:r1.1'), peer
+            assert 'growth:same.txt@v1' in peer and 'changed' in peer
+        declare(team, 'ceo', 'ceo follows growth', ['growth:r1.1'])
+        third = ceo.executor.weekly_check(21)
+        assert 'Registered texts: 2 active; 2 within their applies window.' in third, third
+        assert 'ceo:r2.1 (day 0)' in third and 'text growth:r1.1' in third
+        assert '1 of 1 underlying sources changed' in third
+        pending = ceo.store.load_state('pf_review')['pending']
+        assert len(pending) == 2 and {v.split('/')[1] for v in pending} == {'ceo'}
+        listed = json.loads(ceo.executor.execute('text_list', {'review': 'pending'}))
+        assert [r['version'] for r in listed['records']] == ['r1.1', 'r2.1']
+        assert set(listed['checks']) == {'r1.1', 'r2.1'}
+        for command in ('pf depend ceo:r1', 'pf depend ceo:r2'):
+            assert pf(team, 'ceo', command).startswith(command.split()[-1] + '.1 ·')
+        for role in ROLES[1:]:
+            own = team.roles[role].executor.weekly_check(7)
+            assert 'Registered texts: 1 active; 1 within their applies window.' in own
+            assert role + ':r1.1 (day 0)' in own and 'ceo decision' not in own
+        denied = pf(team, 'growth', 'pf depend ops_finance:r1 --detail')
+        assert 'inaccessible' in denied.lower() and 'ops_finance-before' not in denied
         for runtime in team.roles.values():
             runtime.store.assert_healthy()
 

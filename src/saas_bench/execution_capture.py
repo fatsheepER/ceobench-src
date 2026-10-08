@@ -28,11 +28,31 @@ def excluded(rel):
 
 
 class CapturedText(str):
-    def __new__(cls, text, origins=(), pf_read=None):
+    def __new__(cls, text, origins=(), pf_read=None, pf_read_spans=()):
         value = super().__new__(cls, text)
         value.origins = list(origins)
         value.pf_read = pf_read
+        value.pf_read_spans = list(pf_read_spans)
         return value
+
+
+def join_text(first, separator, second):
+    """Concatenate texts, retaining the evidence ranges of both parts."""
+    text = first + separator + second
+    origins = list(getattr(first, 'origins', []))
+    origins += slice_origins(getattr(second, 'origins', []), 0, len(second),
+                             target=len(first) + len(separator))
+    reads = []
+    for value, offset in ((first, 0), (second, len(first) + len(separator))):
+        reads.extend(slice_read_spans(getattr(value, 'pf_read_spans', []), 0, len(value), offset))
+        if read := getattr(value, 'pf_read', None):
+            reads.append(dict(id=read['id'], request_range=[offset, offset + len(value)]))
+    return CapturedText(text, origins, pf_read_spans=reads) if origins or reads else text
+
+
+def slice_read_spans(spans, start, end, target=0):
+    return [dict(item, request_range=[target + a - start, target + b - start])
+            for item in spans for a, b in [item['request_range']] if start <= a <= b <= end]
 
 
 def origin(version, text, start=0, end=None, target=0):
@@ -492,6 +512,8 @@ def text_sources(value, pointer=''):
         result.append(dict(pointer=pointer, text=str(value), origins=value.origins))
         if value.pf_read is not None:
             result[-1]['pf_read'] = value.pf_read
+        if value.pf_read_spans:
+            result[-1]['pf_read_spans'] = value.pf_read_spans
     elif isinstance(value, dict):
         for key, item in value.items():
             result.extend(text_sources(item, pointer + '/' + str(key).replace('~', '~0').replace('/', '~1')))
@@ -516,7 +538,8 @@ def restore_sources(value, records):
         key = int(key) if isinstance(target, list) else key.replace('~1', '/').replace('~0', '~')
         if target[key] != record['text']:
             raise ValueError('Private source state differs from conversation snapshot')
-        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'))
+        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'),
+                                  record.get('pf_read_spans', []))
 
 
 def model_request(store, raw, sources, call_id, attempt_id, context_id, message_ids=()):
@@ -548,7 +571,7 @@ def _record_model_request(store, event, raw, sources, call_id, attempt_id, conte
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')
-    if any(source.get('pf_read') for source in sources):
+    if any(source.get('pf_read') or source.get('pf_read_spans') for source in sources):
         from .pf_read import record_request
         record_request(store, event, body, sources, context_id)
 

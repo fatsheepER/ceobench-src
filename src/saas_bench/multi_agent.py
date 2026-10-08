@@ -13,6 +13,7 @@ import uuid
 from .agents.bash_agent.agent import BashAgent, FinalText
 from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
 from .api_server import NovaMindAPIServer
+from .execution_capture import join_text
 from .model_usage import ModelUsage
 from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit
 from .run_state import write_json
@@ -346,13 +347,17 @@ class MultiAgentRuntime:
             self._finish_operation(operation, self.server.role_executors[role])
         if any(r['status'] != 'succeeded' for r in self.server.role_script_results[role]):
             raise RunCancelled('registered_script_failed')
-        return '\n'.join(f'{name}\n{output}' for name, output in outputs.items())
+        text = ''
+        for name, output in outputs.items():
+            text = join_text(text, '\n' if text else '', join_text(name, '\n', output))
+        return text
 
     def _observation(self, role, dashboard, scripts):
         runtime = self.roles[role]
         check = runtime.executor.weekly_check(self.server.tools.current_day)
-        return dashboard + ('\n\nYour private registered-script output\n' + scripts if scripts else '') + (
-            '\n\n' + check if check else '')
+        observation = (join_text(dashboard, '\n\nYour private registered-script output\n', scripts)
+                       if scripts else dashboard)
+        return join_text(observation, '\n\n', check) if check else observation
 
     def _run_analyst(self, role, requests, dashboard=None):
         runtime = self.roles[role]
@@ -362,7 +367,7 @@ class MultiAgentRuntime:
             try:
                 self._check()
                 self._transition(request, 'running')
-                answer = runtime.agent.act(observation + '\n\n' + request.text if observation is not None else request.text,
+                answer = runtime.agent.act(join_text(observation, '\n\n', request.text) if observation is not None else request.text,
                     0, False, {'day': request.day})
                 observation = None
                 while not isinstance(answer, FinalText):
@@ -496,7 +501,8 @@ class MultiAgentRuntime:
                         for request in requests:
                             self._transition(request, 'delivered')
                         observation = self._observation('ceo', dashboard, ceo_scripts)
-                        observation += '\n\n' + '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests)
+                        observation = join_text(observation, '\n\n',
+                            '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests))
                         self._week = dict(observation=observation, ceo_started=False)
                         self._stage = 'ceo'
                         self._set_phase('ceo')

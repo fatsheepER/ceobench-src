@@ -191,13 +191,14 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                 if usage['input_tokens'] is not None and usage['output_tokens'] is not None else None),
                 uniform_cost_usd=fee, raw_billed_cost_usd=_raw_cost(http or logical or {}, body),
                 recorded_cost_usd=_number((logical or {}).get('cost_usd')))
+            receipt = http or attempt.get('http_error') or logical or {}
             records.append(dict(call_id=call_id, attempt_id=attempt_id, role=role,
                 category=call['category'], day=day, model=model, api=api, metrics=metrics,
                 failed_http_attempt=failed, unreturned=response is None,
                 no_response=response is None or response.get('response') is None,
                 request_receipt=dict(path=request.get('receipt_path'), line=request.get('receipt_line')),
-                response_receipt=dict(path=(http or logical or {}).get('receipt_path'),
-                    line=(http or logical or {}).get('receipt_line'))))
+                response_receipt=dict(path=receipt.get('receipt_path'),
+                    line=receipt.get('receipt_line'))))
     team_records = [r for r in records if r['category'] == category and r['role'] in ROLES]
     return dict(pricing=prices, primary_category=category, team=_summary(team_records),
         roles={role: _summary([r for r in team_records if r['role'] == role]) for role in ROLES},

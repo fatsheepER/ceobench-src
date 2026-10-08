@@ -130,7 +130,7 @@ def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, t
     assert 'Checked this week: 2 texts; 2 with changed evidence:' in loud and 'r1.1 (day 7): "Keep the plan"' in loud
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39 \(was 42\)', loud), loud
     # r2 cites r1, whose predicate failed: the failure reaches it through the declared chain.
-    assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend rN.')
+    assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend r2.')
     assert not CLOCK.search(loud)
     # The digest is saved with its own origin so request source mappings stay complete.
     assert loud.origins and store.get_content(loud.origins[0]['version_id'])[1].decode() == str(loud)

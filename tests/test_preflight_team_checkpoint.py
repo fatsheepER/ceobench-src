@@ -14,6 +14,7 @@ import pytest
 
 from saas_bench.config import BenchmarkConfig
 from saas_bench.database import init_database
+from saas_bench.execution_capture import text_sources
 from saas_bench.multi_agent import MultiAgentRuntime
 from saas_bench.role_policy import ROLES
 from saas_bench.run_state import write_json
@@ -148,6 +149,10 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             saved = json.loads((snapshot / 'team.json').read_text())
             assert all(restored.roles[role].identity.session_id == saved['roles'][role]['identity']['session_id']
                 for role in ROLES)
+            assert text_sources(dict(week=restored._week, dashboard=restored.server._last_dashboard,
+                script_results=restored.server.role_script_results)) == saved['sources']
+            if mode == 'pf' and boundary == 'answers_ready':
+                assert any(s.get('pf_read_spans') for s in saved['sources'])
             assert restored.run(stop_after_day=14).reason == 'observation_end', restored.failure
             actual = behavior(restored)
             write_json(tmp_path / 'comparison.json', dict(mode=mode, boundary=boundary,
@@ -285,3 +290,8 @@ def test_relocated_prompt_preserves_memory_source_spans():
     a, b = relocated.origins[0]['request_range']
     assert relocated[a:b] == memory
     assert relocated.origins[0]['source_range'] == [0, len(memory)]
+    only_read = CapturedText(prefix + memory, pf_read_spans=[dict(id='read',
+        request_range=[len(prefix), len(prefix) + len(memory)])])
+    moved = _relocate_prompt(only_read, original, destination)
+    a, b = moved.pf_read_spans[0]['request_range']
+    assert moved[a:b] == memory and a == len(prefix.replace(original, destination))

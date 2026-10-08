@@ -232,24 +232,26 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
 
 
 def _relocate_prompt(text, original, destination):
-    from .execution_capture import CapturedText, slice_origins
+    from .execution_capture import CapturedText, slice_origins, slice_read_spans
     if not isinstance(text, CapturedText):
         return text.replace(original, destination)
-    parts, origins, start, target = [], [], 0, 0
+    parts, origins, reads, start, target = [], [], [], 0, 0
     position = text.find(original)
     while position >= 0:
         end = position + len(original)
         if not any(a < end and b > position for a, b in
-                (item['request_range'] for item in text.origins)):
+                (item['request_range'] for item in [*text.origins, *text.pf_read_spans])):
             piece = text[start:position]
             parts.extend((piece, destination))
             origins.extend(slice_origins(text.origins, start, position, target))
+            reads.extend(slice_read_spans(text.pf_read_spans, start, position, target))
             target += len(piece) + len(destination)
             start = end
         position = text.find(original, end)
     parts.append(text[start:])
     origins.extend(slice_origins(text.origins, start, len(text), target))
-    return CapturedText(''.join(parts), origins, text.pf_read)
+    reads.extend(slice_read_spans(text.pf_read_spans, start, len(text), target))
+    return CapturedText(''.join(parts), origins, text.pf_read, reads)
 
 
 def restore_runtime_state(runtime, state):

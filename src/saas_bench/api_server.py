@@ -912,7 +912,8 @@ class NovaMindAPIServer:
                 dashboard = build_weekly_dashboard(self.conn, day, self._last_day_result)
             else:
                 dashboard = f'=== Day {day} Dashboard ===\n(No dashboard data available)'
-            self._last_dashboard = str(dashboard)
+            from .execution_capture import dashboard_version
+            self._last_dashboard = dashboard_version(self, dashboard, day)
             return self._last_dashboard
 
     def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo') -> Any:
@@ -1220,7 +1221,8 @@ class NovaMindAPIServer:
                 capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
                 token = CURRENT_EVENT.set(capture.event)
             try:
-                output = executor.execute('bash', {'command': shlex.quote(executor.python) + ' -c ' + shlex.quote(code)})
+                command = shlex.quote(executor.python) + ' -c ' + shlex.quote(code)
+                output = executor.execute('bash', {'command': command})
             except BaseException as exc:
                 if capture and capture.event:
                     capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)
@@ -1230,6 +1232,17 @@ class NovaMindAPIServer:
                     child = output.origins[0]['version_id'].rsplit(':', 1)[0] if getattr(output, 'origins', []) else None
                     child_record = capture.safe(capture.store.read_event, child) if child else None
                     status = child_record['result']['status'] if child_record else 'result_unknown'
+                    if child_record and not getattr(output, 'pf_read', None):
+                        from .agents.bash_agent.tools import read_identity
+                        from .execution_capture import CapturedText
+                        key = capture.safe(read_identity, capture.store, child, executor.workspace_path,
+                                           'bash', {'command': command}, executor.guest_root)
+                        read = capture.blob('read_full', output, 'pf_read_full',
+                            target=output.origins[0]['version_id'], key=key, mode='content',
+                            read_range=[0, len(output)], complete=not child_record['result'].get('output_truncated'),
+                            force_full=False, read_kind='tool_call')
+                        if read:
+                            output = CapturedText(output, output.origins, {'id': read})
                     capture.safe(capture.store.complete, capture.event, status, child_event_id=child)
             finally:
                 if token is not None:

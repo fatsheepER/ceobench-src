@@ -33,6 +33,7 @@ if str(package_root) not in sys.path:
 
 from openai import OpenAI
 from saas_bench.config import BenchmarkConfig
+from saas_bench.execution_capture import join_text as _joined
 from saas_bench.model_usage import usage_delta
 
 try:
@@ -66,16 +67,6 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 ANTHROPIC_FABLE_FALLBACK_MODEL = "claude-opus-4-8"
-
-
-def _joined(first, separator, second):
-    """Concatenate texts, keeping the evidence source ranges of both parts."""
-    from saas_bench.execution_capture import CapturedText, slice_origins
-    text = first + separator + second
-    origins = list(getattr(first, 'origins', []))
-    if getattr(second, 'origins', None):
-        origins += slice_origins(second.origins, 0, len(second), target=len(first) + len(separator))
-    return CapturedText(text, origins) if origins else text
 
 
 class BashAgentRunner:

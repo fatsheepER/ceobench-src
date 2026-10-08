@@ -415,8 +415,10 @@ class PFQueries:
         self.follow_execution = True
         state = self.store.load_state('pf_review') or {'pending': {}, 'ended': []}
         self.review_pending = state['pending']
+        owner = self.store.identity.get('role')
         active = sorted((v for v, record in self.records.items()
-                         if record['status'] == 'active' and self.latest[self._key(v)] == v),
+                         if (not owner or self.nodes[v]['meta'].get('owner_role') == owner)
+                         and record['status'] == 'active' and self.latest[self._key(v)] == v),
                         key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
         traced, ended, continuing = {}, [], set()
         eligible = set()
@@ -467,7 +469,7 @@ class PFQueries:
                 entries.append(dict(text=self._describe(version), total=len(tops), changed=direct))
                 if not direct and any(t['check'].get('below_changed') or
                                       t['check'].get('change_kind') == 'append_only' for t in tops):
-                    underlying.append(self.records[version]['version'])
+                    underlying.append(self.resolver.handle(version))
                 if version not in continuing:
                     ordinary = self._ordinary_changes(rows)
                     if ordinary:
@@ -481,13 +483,14 @@ class PFQueries:
                                           condition_only=len(continuing), pending=len(self.review_pending),
                                           active=len(active), eligible=len(eligible))
             if self.review_pending:
+                example = self.resolver.handle(next(iter(self.review_pending))).split('.')[0]
                 text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "active text")}; '
                          f'{pf_render.plural(skipped_pending, "earlier finding")} '
                          f'{"was" if skipped_pending == 1 else "were"} not rechecked this week. '
                          'Use text_list with review="pending" for dated findings; '
-                         'pf depend rN rechecks one text. Pending does not retire a text.')
+                         f'pf depend {example} rechecks one text. Pending does not retire a text.')
                 text += pf_render.render_pending([
-                    dict(record=self.records[v]['version'], **p) for v, p in self.review_pending.items()], day)
+                    dict(record=self.resolver.handle(v), **p) for v, p in self.review_pending.items()], day)
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
             self.store.complete(event, index=self.index_stats, check=self.check_stats,
@@ -800,6 +803,8 @@ class PFQueries:
             return target['version']
         owner = self.store.identity.get('role')
         target = dict(target)
+        if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
+            target = {'record': target['version']}
         for field in ('path', 'record'):
             if owner and field in target and target[field].split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in target[field]:
                 owner, target[field] = target[field].split(':', 1)
@@ -812,8 +817,6 @@ class PFQueries:
             members = [v for v in evidence_handles.index(self.store).latest((owner + ':' if owner else '') + target['path']) or [] if v in self.nodes]
             if members:
                 return members[-1]
-        if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
-            target = {'record': target['version']}
         if 'version' in target:
             members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
             if not members:
@@ -879,7 +882,8 @@ class PFQueries:
         if 'classification' in event['result']:
             result['classification'] = event['result']['classification']
         if record:
-            result.update(record=record['version'], text=record['text'], text_status=record['status'],
+            result.update(record=result['version'], what='text ' + result['version'],
+                          text=record['text'], text_status=record['status'],
                           reason=record['reason'], applies_at=record['applies_at'],
                           current_revision=self.latest[self._key(version)] == version)
         handles = evidence_handles.index(self.store)
@@ -909,7 +913,7 @@ class PFQueries:
         """How the current version of a dependency differs from the cited one."""
         if after in self.records:
             record = self.records[after]
-            return 'retired as ' + record['version'] if record['status'] == 'retired' else 'revised to ' + record['version']
+            return ('retired as ' if record['status'] == 'retired' else 'revised to ') + self.resolver.handle(after)
         meta = self.resolver.content(before)[0]
         kind = ('query' if meta['layer'] == 'server_public_response' and self.events[meta['created_by_event']]['query']
                 else 'public' if meta['layer'] == 'server_public_response'

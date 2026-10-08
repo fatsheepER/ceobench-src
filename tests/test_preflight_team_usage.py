@@ -164,6 +164,27 @@ def test_interleaved_recovery_paths_do_not_choose_final_attempt_by_file_order(tm
         assert result['failed_attempt_usage']['known']['recorded_cost_usd'] is None
 
 
+@pytest.mark.parametrize('outcome', ['success', 'failed', 'unreturned'])
+def test_transport_failure_points_to_its_physical_error_receipt(tmp_path, outcome):
+    attempts = [('transport-failed', None, 'ConnectError', None)]
+    if outcome == 'success':
+        attempts.append(('retry-success', body(), None, 200))
+    rows = receipts('transport', 'growth', body() if outcome == 'success' else None,
+                    attempts=attempts, returned=outcome != 'unreturned')
+    path = log(tmp_path / 'transport.jsonl', rows)
+    copied = log(tmp_path / 'copied.jsonl', rows)
+    result = aggregate([path, copied], PRICES)
+    failed = next(row for row in result['records'] if row['attempt_id'] == 'transport-failed')
+    assert failed['failed_http_attempt']
+    assert failed['response_receipt'] == dict(path=str(path.resolve()), line=3)
+    receipt = json.loads(path.read_text().splitlines()[failed['response_receipt']['line'] - 1])
+    assert receipt['event'] == 'http_error' and receipt['attempt_id'] == failed['attempt_id']
+    assert result['duplicates'] == len(rows)
+    if outcome == 'success':
+        success = next(row for row in result['records'] if row['attempt_id'] == 'retry-success')
+        assert success['response_receipt'] == dict(path=str(path.resolve()), line=5)
+
+
 def test_partial_stream_usage_and_no_http_return_remain_visible(tmp_path):
     raw = ('event: message_start\ndata: ' + json.dumps({'type': 'message_start',
         'message': {'model': 'test-model', 'usage': {'input_tokens': 5,
@@ -185,6 +206,8 @@ def test_partial_stream_usage_and_no_http_return_remain_visible(tmp_path):
     assert result['team']['unreturned_requests'] == 1
     assert result['team']['missing']['raw_billed_cost_usd'] == 2
     assert any(gap['reason'] == 'unreturned_http_request' for gap in result['missing_receipts'])
+    stream = next(row for row in result['records'] if row['attempt_id'] == 'stream')
+    assert stream['response_receipt'] == dict(path=str((tmp_path / 'stream.jsonl').resolve()), line=3)
 
 
 def test_conflicting_copied_receipts_and_invalid_counts_are_rejected(tmp_path):
