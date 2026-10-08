@@ -47,6 +47,80 @@ def send(team, role, texts):
     return wire, ledger
 
 
+def test_weekly_observations_allow_public_registration_without_exposing_private_sources():
+    with make_team('pf', lambda *args: final('done'), 'weekly-registration-sources') as team:
+        for role in ROLES:
+            write(team, role, role + '-FILE-EVIDENCE')
+            declare(team, role, role + ' original decision', ['same.txt@v1'])
+            register(team, role, 'report.py', 'print(' + repr(role + '-SCRIPT-EVIDENCE') + ')')
+        observations = {}
+        for role, runtime in team.roles.items():
+            observation = observations[role] = team._observation(
+                role, CapturedText('Weekly dashboard'), team._script_output(role))
+            weekly = next(o['version_id'] for o in observation.origins
+                          if runtime.store.get_content(o['version_id'])[0]['layer'] == 'weekly_check')
+            script = next(o['version_id'] for o in observation.origins
+                          if runtime.store.get_content(o['version_id'])[0]['layer'] == 'tool_return')
+            assert role + '-SCRIPT-EVIDENCE' in observation
+            code = "import json; open('facts.json', 'w').write(json.dumps(dict(cash=100, padding='x' * 5000), indent=2))"
+            assert '[exit code:' not in pf(team, role, shlex.quote(runtime.executor.python) + ' -c ' + shlex.quote(code))
+            file_read = pf(team, role, 'pf show same.txt')
+            json_read = pf(team, role, 'pf show facts.json')
+            send(team, role, [observation, file_read, json_read])
+            wire, ledger = send(team, role, [observation, file_read, json_read,
+                pf(team, role, 'pf show same.txt'), pf(team, role, 'pf show facts.json')])
+            assert ledger[-1]['mode'] == 'UNCHANGED', ledger
+            assert role + '-SCRIPT-EVIDENCE' in wire['messages'][0]['content']
+            request = runtime.usage.last_request_event
+            slots = [request + suffix for suffix in (':wire', ':occurrences', ':pf_reads', ':reconstructed')]
+            captured = {slot: runtime.store.get_content(slot) for slot in slots}
+            assert weekly in {o['version_id'] for o in json.loads(captured[request + ':occurrences'][1])}
+            assert version(team, role, 'facts.json') in {
+                o['version_id'] for o in json.loads(captured[request + ':reconstructed'][1])}
+            declare(team, role, role + ' decision after weekly check',
+                    ['same.txt', evidence_handles.index(runtime.store).name(script), 'r1.1'])
+            bindings = runtime.store.load_state('declaration:r2.1')['references']
+            assert [b['status'] for b in bindings] == ['resolved'] * 3
+            assert [b['version_id'] for b in bindings] == [version(team, role), script,
+                runtime.store.load_state('declaration:r1.1')['version_id']]
+            assert bindings[0]['reading_scope'] == bindings[1]['reading_scope'] == 'full'
+            assert all(d['request_event'] == request for b in bindings[:2] for d in b['delivered_in'])
+            args = dict(text=role + ' cash decision', objects=[dict(kind='metric', id='cash')],
+                references=[dict(cite='facts.json', select={'path': '/cash'})], applies='0-', reason='decision')
+            selected = runtime.executor.execute('text_create', args)
+            assert selected.startswith('Registered r3.1'), selected
+            selection = runtime.store.load_state('declaration:r3.1')['references'][0]
+            assert selection['version_id'] == version(team, role, 'facts.json')
+            content = runtime.store.get_content(selection['version_id'])[1].decode()
+            key_start, cash_start = content.index('"cash"'), content.index('100')
+            assert selection['selected_ranges'] == [[key_start, key_start + 6], [cash_start, cash_start + 3]]
+            assert {slot: runtime.store.get_content(slot) for slot in slots} == captured
+            assert 'inaccessible' in runtime.executor.execute('pf_read', dict(target={'version': weekly})).lower()
+            assert '[exit code: 1]' in pf(team, role, 'pf show ' + weekly)
+            saved = runtime.registry.path.read_bytes()
+            partial = runtime.executor.execute('read_file', dict(path='facts.json', limit=1))
+            send(team, role, [observation, partial])
+            denied = runtime.executor.execute('text_create', args)
+            assert denied.startswith('Error:') and 'not fully delivered' in denied, denied
+            assert runtime.registry.path.read_bytes() == saved
+        for reader, owner in [('ceo', 'growth'), ('growth', 'ops_finance')]:
+            runtime = team.roles[reader]
+            output = runtime.executor.execute('pf_read', dict(target={'path': owner + ':same.txt'}))
+            send(team, reader, [observations[reader], output])
+            saved = runtime.registry.path.read_bytes()
+            result = runtime.executor.execute('text_create', dict(text='Peer decision',
+                objects=[dict(kind='metric', id='cash')], references=[dict(cite=owner + ':same.txt@v1')],
+                applies='0-', reason='decision'))
+            if owner in READABLE_ROLES[reader]:
+                assert not output.startswith('Error:') and result.startswith('Registered'), (output, result)
+            else:
+                assert 'inaccessible' in output.lower() and result.startswith('Error:'), (output, result)
+                assert owner + '-FILE-EVIDENCE' not in output + result
+                assert runtime.registry.path.read_bytes() == saved
+        for runtime in team.roles.values():
+            runtime.store.assert_healthy()
+
+
 def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wires():
     seen = {role: 0 for role in ROLES}
     codes = {role: 'print(' + repr(role + '\n' + ''.join(

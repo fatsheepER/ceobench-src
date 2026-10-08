@@ -9,6 +9,7 @@ import subprocess
 
 from . import evidence_handles
 from .evidence_handles import HANDLES  # noqa: F401  (re-exported for callers)
+from .sql_evidence import PUBLIC_LAYERS
 
 
 WEEK_LABEL = re.compile('week-[1-9][0-9]*')
@@ -325,6 +326,8 @@ class EvidenceResolver:
                 if version not in event['outputs']:
                     continue
                 for item in json.loads(self.content(version)[1]):
+                    if self.content(item['version_id'])[0]['layer'] not in PUBLIC_LAYERS:
+                        continue
                     source, _, content, kind = self.identity(item['version_id'])
                     scope['sources'].setdefault(source, []).append((item, content, kind))
         return scope
@@ -455,7 +458,6 @@ class EvidenceResolver:
                          'read it first, cite an explicit whole version, or use unknown with a reason')
 
     def _whole_binding(self, version, latest, delivered, basis, fully_known=False):
-        from .pf_queries import PUBLIC_LAYERS
         meta, raw = self.content(version)
         if meta['layer'] not in PUBLIC_LAYERS or meta.get('pf_retrieval'):
             raise ValueError('Only public captured evidence can be cited')
