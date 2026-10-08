@@ -131,6 +131,7 @@ tests/*
 !tests/test_ceobench_segment_discovery.py
 !tests/test_public_sql.py
 !tests/test_sql_evidence.py
+!tests/test_team_sql_monitor.py
 !tests/test_execution_capture.py
 !tests/test_text_registry.py
 !tests/test_pf_queries.py

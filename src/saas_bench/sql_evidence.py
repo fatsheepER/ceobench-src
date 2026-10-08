@@ -7,6 +7,7 @@ every execution has its own version, including identical responses.
 
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ import re
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 
 FORMAT = 'ceobench.evidence-records.v1'
@@ -130,7 +132,7 @@ class SQLEvidenceStore:
                 conn.execute('INSERT INTO branches VALUES (?,?,?)', (branch, parent, cutoff))
 
     def connect(self):
-        conn = sqlite3.connect(self.path, timeout=1)
+        conn = sqlite3.connect(self.path, timeout=3)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA journal_mode=WAL')
@@ -141,17 +143,24 @@ class SQLEvidenceStore:
         return conn.execute('SELECT coalesce(max(seq),0) FROM requests WHERE branch=?',
                             (branch or self.identity['branch_id'],)).fetchone()[0]
 
-    def fail(self, exc):
+    def fail(self, exc, **facts):
         from .run_state import write_json
-        previous = self.fault or {}
-        if self.fault_path.exists():
-            try:
-                previous = json.loads(self.fault_path.read_bytes())
-            except (OSError, ValueError):
-                pass
-        self.fault = dict(previous, reason=str(exc), time=now(), capture_status='missing')
+        first = self.fault or dict(reason=str(exc), time=now(), capture_status='missing',
+            exception_type=type(exc).__name__,
+            traceback=[dict(filename=frame.filename, function=frame.name, line=frame.lineno)
+                       for frame in traceback.extract_tb(getattr(exc, '__traceback__', None))],
+            **{key: getattr(exc, key) for key in ('sqlite_errorcode', 'sqlite_errorname') if hasattr(exc, key)})
+        self.fault = dict(facts, **first)
         try:
-            write_json(self.fault_path, self.fault)
+            with self.fault_path.with_suffix('.json.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if self.fault_path.exists():
+                    try:
+                        first = json.loads(self.fault_path.read_bytes())
+                    except (OSError, ValueError):
+                        pass
+                self.fault = dict(facts, **first)
+                write_json(self.fault_path, self.fault)
         except OSError:
             pass  # The server's in-memory fault also blocks checkpoint publication.
 
@@ -328,17 +337,16 @@ class SQLEvidenceStore:
             conn.execute('INSERT INTO client_calls VALUES (?,?,NULL)', (token, event))
 
     def received(self, token, payload):
-        with closing(self.connect()) as conn, conn:
+        with self.batch(), self._writer() as conn:
             row = conn.execute('SELECT event_id,received FROM client_calls WHERE token=?', (token,)).fetchone()
             if row is None or row['received'] is not None:
                 raise ValueError('Unknown or already recorded client call')
             event = row['event_id']
             self._visible(conn, event)
-        # All fields are client observations, never server-authored facts.
-        for slot, value in payload.items():
-            self.version(event, 'client_' + slot, bytes.fromhex(value) if slot == 'body' else encoded(value),
-                         layer='program_' + slot, origin='standard_client_observation')
-        with closing(self.connect()) as conn, conn:
+            # All fields are client observations, never server-authored facts.
+            for slot, value in payload.items():
+                self.version(event, 'client_' + slot, bytes.fromhex(value) if slot == 'body' else encoded(value),
+                             layer='program_' + slot, origin='standard_client_observation')
             conn.execute('UPDATE client_calls SET received=? WHERE token=? AND received IS NULL',
                          (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
 

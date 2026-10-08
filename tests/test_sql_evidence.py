@@ -313,3 +313,97 @@ def test_private_store_is_inaccessible(captured):
     executor = BashAgentToolExecutor(api.script_workspace, require_sandbox=True)
     executor.verify_sandbox()
     assert executor.execute('bash', {'command': 'test ! -r ' + shlex.quote(str(store.path)) + ' && echo private'}).strip() == 'private'
+
+
+def test_shared_writer_wait_keeps_http_archive(captured, monkeypatch):
+    api, store = captured
+    other = SQLEvidenceStore(store.path, identity('growth'))
+    locked = threading.Event()
+    threads = []
+    finish = store.finish
+
+    def writer():
+        with other.batch():
+            other.save_state('competing_capture', True)
+            locked.set()
+            time.sleep(1.3)
+
+    def contested_finish(*args):
+        thread = threading.Thread(target=writer)
+        threads.append(thread)
+        thread.start()
+        assert locked.wait(5)
+        return finish(*args)
+
+    monkeypatch.setattr(store, 'finish', contested_finish)
+    try:
+        status, body = request(api, 'SELECT amount FROM ledger WHERE 0')
+        settled(api)
+        assert status == 200 and json.loads(body)['rows'] == []
+        event, = event_ids(store)
+        assert store.read_event(event)['result']['capture_status'] == 'complete'
+        assert store.read_event(event)['delivery']['send_state'] == 'sent'
+        store.assert_healthy()
+    finally:
+        for thread in threads:
+            thread.join(5)
+
+
+def test_client_receipt_is_atomic_and_rejects_duplicates(tmp_path):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    event = store.begin_event('bash')
+    token = 'a' * 32
+    store.bind_client(event, token)
+    with pytest.raises(ValueError):
+        store.received(token, {'state': 'received', 'body': 'not hexadecimal'})
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT count(*) FROM versions').fetchone()[0] == 0
+        assert conn.execute('SELECT received FROM client_calls').fetchone()[0] is None
+    store.received(token, {'state': 'received', 'body': b'{}'.hex(), 'parsed': {}})
+    assert store.get_content(event + ':client_body')[1] == b'{}'
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT count(*) FROM versions').fetchone()[0] == 3
+        assert json.loads(conn.execute('SELECT received FROM client_calls').fetchone()[0])['receive_state'] == 'received'
+    with pytest.raises(ValueError, match='already recorded'):
+        store.received(token, {'state': 'received'})
+
+
+def test_fault_keeps_first_cause_across_stores_and_preservation(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    other = SQLEvidenceStore(store.path, identity('growth'))
+    try:
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('SELECT * FROM missing')
+    except sqlite3.OperationalError as exc:
+        store.fail(exc)
+    original = json.loads(store.fault_path.read_text())
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(lambda s: s.fail(RuntimeError('collection stopped')), (store, other)))
+    executor = SimpleNamespace(capture=SimpleNamespace(store=other, facts={}))
+    BashAgentToolExecutor._preserve_process(executor, SimpleNamespace(pid=123), {'unknown': 'still running'})
+    saved = json.loads(store.fault_path.read_text())
+    assert all(saved[key] == value for key, value in original.items())
+    assert saved['exception_type'] == 'OperationalError'
+    assert saved['sqlite_errorcode'] == sqlite3.SQLITE_ERROR
+    assert saved['sqlite_errorname'] == 'SQLITE_ERROR'
+    assert saved['traceback'] and all(set(frame) == {'filename', 'function', 'line'} for frame in saved['traceback'])
+    assert saved['preserve_scene'] and saved['supervisor_pid'] == 123
+
+
+def test_fault_keeps_in_memory_cause_when_disk_write_fails(tmp_path, monkeypatch):
+    from saas_bench import run_state
+
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    def full_disk(*args):
+        raise OSError('disk full')
+    monkeypatch.setattr(run_state, 'write_json', full_disk)
+    store.fail('original archive failure')
+    first = dict(store.fault)
+    store.fail(RuntimeError('collection stopped'))
+    assert store.fault == first
+    with pytest.raises(RuntimeError, match='collection stopped'):
+        store.assert_healthy()

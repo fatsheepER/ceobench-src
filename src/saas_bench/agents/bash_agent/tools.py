@@ -936,10 +936,8 @@ class BashAgentToolExecutor:
         self.preserved_process = proc
         if self.capture:
             self.capture.facts.update(process_boundary=record, boundary_closed=False, preserved_pid=proc.pid)
-            self.capture.store.fail('Process boundary unresolved; branch paused')
-            self.capture.store.fault.update(preserve_scene=True, supervisor_pid=proc.pid, process_boundary=record)
-            from saas_bench.run_state import write_json
-            write_json(self.capture.store.fault_path, self.capture.store.fault)
+            self.capture.store.fail('Process boundary unresolved; branch paused',
+                                    preserve_scene=True, supervisor_pid=proc.pid, process_boundary=record)
 
     def _streams(self, stdout, stderr, exit_code, partial=False):
         self._exit_code = exit_code
