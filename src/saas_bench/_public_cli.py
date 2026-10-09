@@ -310,18 +310,31 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
     env.pop("NOVAMIND_SERVER_MODE", None)
 
     captured = script_start(code, source, env)
+    timeout_error = None
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, env=env,
-            cwd=str(_base_dir()), timeout=300,
-        )
-    except subprocess.TimeoutExpired as exc:
-        script_end(captured, exc.stdout or b'', exc.stderr or b'', None, 'timeout')
-        raise
+        with subprocess.Popen(
+            [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, cwd=str(_base_dir()),
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=300)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
+                # Descendants may still own the pipes; retain the bytes already collected.
+                stdout, stderr = exc.stdout or b'', exc.stderr or b''
+                timeout_error = exc
+            except BaseException:
+                process.kill()
+                raise
+            result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     except BaseException as exc:
         script_end(captured, b'', b'', None, type(exc).__name__)
         raise
-    script_end(captured, result.stdout, result.stderr, result.returncode)
+    script_end(captured, result.stdout, result.stderr, result.returncode,
+               'timeout' if timeout_error is not None else None)
+    if timeout_error is not None:
+        raise timeout_error
     result.stdout, result.stderr = decode_output(result.stdout), decode_output(result.stderr)
 
     if result.stdout:

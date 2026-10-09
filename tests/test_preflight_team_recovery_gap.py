@@ -6,6 +6,55 @@ from saas_bench.team_checkpoint import validate_snapshot, validate_recovery_sour
 from test_preflight_team_checkpoint import make_team, dispose, clients, fast_simulator
 from test_preflight_team_flow import raw
 
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_empty_ceo_script_pass_clears_results_and_preserves_recovery(tmp_path, mode):
+    source = make_team(tmp_path / 'source', mode)
+    restored = None
+    try:
+        status, response = raw(source, 'ceo', '/daily-scripts', {'name': 'same.py'}, 'DELETE')
+        assert status == 200 and response['success']
+        snapshot = source.checkpoint()
+        operations = source.root / 'private/operations'
+        before = {path.name: path.read_bytes() for path in operations.glob('*.json')}
+        source.server.role_script_results['ceo'] = [{'status': 'failed'}]
+        assert source._script_output('ceo') == ''
+        assert source.server.role_script_results['ceo'] == []
+        assert {path.name: path.read_bytes() for path in operations.glob('*.json')} == before
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert restored.server.tools.current_day == source.server.tools.current_day == 0
+        assert restored.server.get_daily_scripts('ceo') == {}
+        for runtime in (source, restored):
+            assert runtime.run(stop_after_day=7).reason == 'observation_end', runtime.failure
+        assert restored.server.tools.current_day == source.server.tools.current_day == 7
+        sql = 'SELECT day,category,amount,note FROM ledger ORDER BY rowid'
+        assert [tuple(row) for row in restored.server.conn.execute(sql)] == [
+            tuple(row) for row in source.server.conn.execute(sql)]
+    finally:
+        if restored:
+            dispose(restored)
+        dispose(source)
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_nonempty_ceo_script_pass_keeps_receipt_and_blocks_old_restore(tmp_path, mode):
+    source = make_team(tmp_path / 'source', mode)
+    try:
+        snapshot = source.checkpoint()
+        assert 'same.py' in source._script_output('ceo')
+        operations = [json.loads(path.read_text()) for path in
+            (source.root / 'private/operations').glob('*.json')]
+        assert [op for op in operations if op['kind'] == 'ceo_scripts'] == [
+            dict(kind='ceo_scripts', day=0, status='completed')]
+        with pytest.raises(RuntimeError, match='after checkpoint'):
+            MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+                client_factory=clients(), simulator_factory=fast_simulator)
+        assert not (tmp_path / 'restored').exists()
+    finally:
+        dispose(source)
+
+
 @pytest.mark.parametrize("mode", ["git", "pf"])
 def test_completed_post_checkpoint_write_cannot_be_replayed(tmp_path, mode):
     source = make_team(tmp_path / "source", mode)

@@ -384,7 +384,8 @@ def receive_client(handler):
                     store.version(child, name, decoded(raw), layer=name, derived_from=child + ':' + name + '_bytes')
                 except UnicodeError:
                     pass  # Raw bytes survive a client-visible decode failure.
-            status = 'result_unknown' if record['exit_code'] is None else 'failed' if record['exit_code'] else 'succeeded'
+            status = ('result_unknown' if record['exit_code'] is None else
+                      'failed' if record['exit_code'] or record['error'] else 'succeeded')
             store.complete(child, status, exit_code=record['exit_code'], error=record['error'])
             if status == 'result_unknown':
                 store.fail('Python child outcome unknown')

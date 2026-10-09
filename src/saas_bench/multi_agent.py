@@ -320,10 +320,11 @@ class MultiAgentRuntime:
         return message
 
     def _script_output(self, role):
-        if role == 'ceo':
+        operation = None
+        if role == 'ceo' and self.server.get_daily_scripts(role):
             operation = self._begin_operation('ceo_scripts')
         outputs = self.server._run_daily_scripts_internal(role)
-        if role == 'ceo':
+        if operation is not None:
             self._finish_operation(operation, self.server.role_executors[role])
         if any(r['status'] != 'succeeded' for r in self.server.role_script_results[role]):
             raise RunCancelled('registered_script_failed')

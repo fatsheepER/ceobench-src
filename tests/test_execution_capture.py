@@ -33,6 +33,96 @@ def records(store):
     return [store.read_event(e) for e in event_ids(store)]
 
 
+@pytest.mark.parametrize('inherited_pipe', [False, True])
+def test_public_cli_timeout_has_known_failed_child_and_allows_next_tool(captured, inherited_pipe):
+    api, store, executor = captured
+    source = Path(__file__).parents[1] / 'src/saas_bench'
+    shutil.copy(source / '_public_cli.py', executor.workspace_path / 'cli.py')
+    shutil.copy(source / 'novamind_api/_capture.py', executor.workspace_path / '_client_capture.py')
+    code = "import sys;sys.stdout.buffer.write(b'partial-out\\xff');sys.stdout.flush();sys.stderr.write('partial-err');sys.stderr.flush();"
+    code += ("import subprocess;subprocess.Popen([sys.executable,'-c','import time;time.sleep(.5)'])"
+             if inherited_pipe else "\nwhile True: pass")
+    driver = '''import os, subprocess
+import cli
+children = []
+communicate = subprocess.Popen.communicate
+def shortened(self, *args, **kwargs):
+    if kwargs.get('timeout') == 300:
+        children.append(self)
+        kwargs['timeout'] = .2
+    return communicate(self, *args, **kwargs)
+subprocess.Popen.communicate = shortened
+try:
+    cli._execute_python('__env__', int(os.environ['NOVAMIND_API_PORT']), CODE, 'timeout.py')
+except subprocess.TimeoutExpired as exc:
+    child, = children
+    assert child.returncode == EXPECTED
+    assert exc.stdout == b'partial-out\\xff' and exc.stderr == b'partial-err'
+    try:
+        os.kill(child.pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError('Python child was not reaped')
+    raise
+'''.replace('CODE', repr(code)).replace('EXPECTED', '0' if inherited_pipe else '-9')
+    (executor.workspace_path / 'driver.py').write_text(driver)
+    executor.bash_timeout = 5
+    result = executor.execute('bash', {'command': 'python driver.py'})
+    assert 'TimeoutExpired' in result and '[exit code: 1]' in result, result
+    assert 'AssertionError' not in result, result
+    settled(api)
+    rows = records(store)
+    child = next(row for row in rows if row['request']['kind'] == 'cli_python')
+    assert child['result']['status'] == 'failed'
+    assert child['result']['exit_code'] == (0 if inherited_pipe else -9)
+    assert child['result']['error'] == 'timeout'
+    event = child['request']['event_id']
+    assert store.get_content(event + ':stdout_bytes')[1] == b'partial-out\xff'
+    assert store.get_content(event + ':stderr_bytes')[1] == b'partial-err'
+    assert rows[0]['result']['process_boundary']['children'] == []
+    assert executor.preserved_process is None
+    store.assert_healthy()
+    assert executor.execute('bash', {'command': 'echo next-tool'}) == 'next-tool\n'
+
+
+def test_public_cli_cleanup_failure_keeps_child_outcome_unknown(captured, monkeypatch):
+    import subprocess
+    from saas_bench import _public_cli
+    api, store, executor = captured
+    parent = store.begin_event('bash', {})
+    monkeypatch.setenv('NOVAMIND_API_PORT', str(api.port))
+    monkeypatch.setenv('NOVAMIND_CAPTURE_CONTEXT', store.context(parent))
+    monkeypatch.delenv('NOVAMIND_API_SOCKET', raising=False)
+    monkeypatch.setattr(_public_cli, '_base_dir', lambda: executor.workspace_path)
+    communicate, wait = subprocess.Popen.communicate, subprocess.Popen.wait
+    children = []
+    def shortened(self, *args, **kwargs):
+        assert kwargs['timeout'] == 300
+        children.append(self)
+        return communicate(self, *args, **dict(kwargs, timeout=.1))
+    failed = False
+    def failed_wait(self, *args, **kwargs):
+        nonlocal failed
+        result = wait(self, *args, **kwargs)
+        if not failed:
+            failed = True
+            raise OSError('injected cleanup failure')
+        return result
+    monkeypatch.setattr(subprocess.Popen, 'communicate', shortened)
+    monkeypatch.setattr(subprocess.Popen, 'wait', failed_wait)
+    with pytest.raises(OSError, match='injected cleanup failure'):
+        _public_cli._execute_python('__env__', api.port, 'while True: pass')
+    assert children[0].returncode == -9
+    settled(api)
+    child = next(row for row in records(store) if row['request']['kind'] == 'cli_python')
+    assert child['result']['status'] == 'result_unknown'
+    assert child['result']['exit_code'] is None
+    assert child['result']['error'] == 'OSError'
+    with pytest.raises(RuntimeError, match='capture failed'):
+        store.assert_healthy()
+
+
 def test_bash_sdk_receipts_files_and_model_occurrences(captured, monkeypatch):
     api, store, executor = captured
     import time
