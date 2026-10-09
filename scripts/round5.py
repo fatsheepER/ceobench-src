@@ -218,7 +218,7 @@ def fork_state(source, destination, group, identity):
     return result
 
 
-def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
+def read_increment(path, cursor, *, prefix=b'', max_bytes=None, end_offset=None, strict=False):
     if not path.exists():
         return [], cursor
     with path.open('rb') as stream:
@@ -227,7 +227,9 @@ def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
         # ponytail: budget between records; chunk individual lines if diagnostics exceed 1 MiB.
         while max_bytes is None or stream.tell() - cursor < max_bytes:
             offset = stream.tell()
-            line = stream.readline()
+            if end_offset is not None and offset >= end_offset:
+                break
+            line = stream.readline() if end_offset is None else stream.readline(end_offset - offset)
             if not line or not line.endswith(b'\n'):
                 stream.seek(offset)
                 break
@@ -236,7 +238,7 @@ def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
             try:
                 rows.append(json.loads(line[len(prefix):]))
             except (ValueError, UnicodeDecodeError):
-                if not prefix:
+                if not prefix or strict:
                     raise
         return rows, stream.tell()
 
