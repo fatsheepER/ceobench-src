@@ -47,6 +47,40 @@ def send(team, role, texts):
     return wire, ledger
 
 
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_shareable_text_receipts_locate_author_and_revision(mode):
+    with make_team(mode, lambda *args: final('done'), 'shareable-texts') as team:
+        for role in ROLES:
+            receipt = declare(team, role, role + ' original claim', ['unknown: fixture'])
+            assert receipt.startswith('Registered r1.1 (active).')
+            assert 'Shareable reference: ' + role + ':r1.1' in receipt
+        growth = team.roles['growth']
+        listing = growth.registry.execute('list', {})
+        assert json.loads(listing)['shareable_references'] == {'r1.1': 'growth:r1.1'}
+        if mode == 'pf':
+            for source in listing.origins:
+                a, b = source['request_range']
+                c, d = source['source_range']
+                assert listing[a:b] == growth.store.get_content(source['version_id'])[1].decode()[c:d]
+            assert listing.origins
+            assert 'growth original claim' in pf(team, 'ceo', 'pf show growth:r1.1')
+            assert 'ceo original claim' in pf(team, 'ceo', 'pf show r1.1')
+        declare(team, 'ceo', 'decision uses growth', [json.loads(listing)['shareable_references']['r1.1']])
+        ceo_record = team.roles['ceo'].registry._load()['records']['r2'][-1]
+        assert ceo_record['references'][0]['evidence'] == {'record': 'growth:r1.1'}
+        revised = growth.executor.execute('text_revise', dict(record='r1', text='growth revised claim', reason='changed'))
+        assert 'Shareable reference: growth:r1.2' in revised
+        assert json.loads(growth.registry.execute('list', {}))['shareable_references'] == {'r1.2': 'growth:r1.2'}
+        assert json.loads(growth.registry.execute('list', dict(after=1)))['shareable_references'] == {}
+        if mode == 'pf':
+            assert 'growth original claim' in pf(team, 'ceo', 'pf show growth:r1.1')
+            assert 'growth revised claim' in pf(team, 'ceo', 'pf show growth:r1')
+        assert growth.registry._load()['records']['r1'][0]['text'] == 'growth original claim'
+        retired = growth.executor.execute('text_retire', dict(record='r1', reason='finished'))
+        assert 'Shareable reference: growth:r1.3' in retired
+        assert json.loads(growth.registry.execute('list', {}))['shareable_references'] == {}
+
+
 def test_weekly_observations_allow_public_registration_without_exposing_private_sources():
     with make_team('pf', lambda *args: final('done'), 'weekly-registration-sources') as team:
         for role in ROLES:
@@ -196,6 +230,10 @@ def test_independent_detached_history_handoffs_weeks_and_git_authority(mode):
         seen[role] += 1
         if role != 'ceo':
             return calls(('write_file', dict(path='same.txt', content=f'{role}-{seen[role]}'))) if seen[role] % 2 else final(role + ' answer')
+        rendered = '\n'.join(message.get('content') or '' for message in body['messages'])
+        for request in team.messages:
+            if request.status == 'delivered':
+                assert team._handoff(request) in rendered
         if seen[role] == 1:
             return calls(('write_file', dict(path='same.txt', content='ceo-own')), ('ask_analyst', dict(role='growth', message='follow up')))
         return calls(('bash', dict(command=ADVANCE)))
@@ -215,6 +253,9 @@ def test_independent_detached_history_handoffs_weeks_and_git_authority(mode):
             assert message.handoff_commit
             runtime = team.roles[message.receiver]
             assert team._git(runtime, 'show', message.handoff_commit + ':same.txt').startswith(message.receiver)
+        growth_handoffs = [m for m in team.messages if m.receiver == 'growth']
+        assert team._git(team.roles['growth'], 'show', growth_handoffs[0].handoff_commit + ':same.txt') == 'growth-1'
+        assert team._git(team.roles['growth'], 'show', growth_handoffs[1].handoff_commit + ':same.txt') == 'growth-3'
         assert len([r for r in team.messages if r.receiver == 'growth']) == 2
         for role, runtime in team.roles.items():
             for peer in ROLES:

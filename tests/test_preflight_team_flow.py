@@ -205,6 +205,16 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode):
         if role != 'ceo':
             if n == 1:
                 assert 'REQUIRED' not in system or 'advance to the next week' not in system.lower()
+                assert "Each week resets your conversation" in system
+                assert "Only the CEO can change the business" in system
+                assert '## Weekly Workflow' not in system
+                if role == 'growth':
+                    assert 'by customer group and channel' in system
+                    assert 'pending enterprise deals' in messages[-1]['content']
+                else:
+                    assert 'Keep MRR separate from actual cash receipts' in system
+                    assert 'baseline under current settings' in messages[-1]['content']
+                    assert '+7, +28, +84 and +182 days' in system
                 initial_barriers[day].wait(timeout=10)
                 team.test_event('analyst_initial_overlap', role=role)
                 assert counters.get(('ceo', day), 0) == 0
@@ -230,6 +240,9 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode):
                 assert f'REPLY-growth-D{day}-3' in rendered
             return final(f'REPLY-{role}-D{day}-{n}. Answer to {question}')
         assert completed.get(('growth', day)) and completed.get(('ops_finance', day))
+        assert '## Team decisions' in system and '## Weekly Workflow' not in system
+        assert '**CRITICAL:** `next-week` now requires' in system
+        assert 'Independent public queries' in system
         assert f'REPORT-growth-D{day}' in rendered and f'REPORT-ops_finance-D{day}' in rendered
         if n == 1:
             return calls(('ask_analyst', dict(role='growth', message=f'QUESTION-D{day} first')),

@@ -20,6 +20,7 @@ from .run_state import write_json
 from .run_lifecycle import RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
 from .text_registry import TextRegistry
+from .team_prompts import WEEKLY_TASKS, system_prompt
 
 
 @dataclass
@@ -128,34 +129,13 @@ class MultiAgentRuntime:
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)))
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
-            agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf', ask_analyst=role == 'ceo'),
+            agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf', ask_analyst=role == 'ceo', team=True),
                 client_factory(role), workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
                 text_registration=True, pf=mode == 'pf', identity=identity,
                 allow_final_text=role != 'ceo')
-            if role != 'ceo':
-                from .registration_prompt import REGISTERED_TEXTS, PF_HISTORY, GIT_HISTORY
-                history = PF_HISTORY if mode == 'pf' else GIT_HISTORY
-                cite = 'analysis.py.out@v1' if mode == 'pf' else 'notes.md'
-                focus = ('demand, acquisition, conversion, retention and revenue' if role == 'growth'
-                    else 'cash, costs, capacity, quality, development and cash forecasts')
-                agent.system_prompt = (f'You are the {role} analyst for the NovaMind SaaS business. '
-                    f'The shared business objective is to maximize final cash over about {total_days} days. '
-                    f'Investigate {focus}.')
-                agent.system_prompt += ('\nUse bash, read_file, search_files and glob_files to inspect public data and files. '
-                    'Read-only SQL is available through novamind_api.query. Read docs/ for API and table details. '
-                    'Write useful notes and MEMORY.md only in your workspace. Return a final free-text answer when finished. '
-                    'Do not call business mutation, paid research or time advancement APIs. '
-                    'Your advice is optional input for the CEO.\n' + REGISTERED_TEXTS.format(cite=cite) + history)
-            agent.system_prompt += (f'\nThe effective simulation endpoint is D{self.effective_end}. '
-                f'Your fixed role is {role}. Your workspace is {workspace}. '
-                + ('You alone can change the business, purchase research, and advance time.' if role == 'ceo'
-                   else 'Business changes, paid research, and time advancement belong to CEO.')
-                + '\nReadable workspaces: ' + ', '.join(str(workspaces[r]) for r in READABLE_ROLES[role]))
-            if role == 'ceo':
-                agent.system_prompt += ('\nTwo analysts supply initial advice automatically each week. Use their existing analysis first. '
-                    'Read their files, ask_analyst(role, message), investigate independently, or act as useful. '
-                    'Save your artifacts and submit the weekly rationale and 12 USD cash forecasts before advancing.')
+            agent.system_prompt = system_prompt(agent.system_prompt, role, mode, total_days,
+                self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]])
             agent.lifecycle = self._lifecycle
             registry.git_run = executor.run_private
             agent.git_run = executor.run_private
@@ -391,6 +371,13 @@ class MultiAgentRuntime:
                 raise
         return requests
 
+    def _handoff(self, request):
+        header = (f'Analyst handoff | role={request.receiver} | day={request.day} | '
+                  f'world_state_id={request.world_state_id} | request_id={request.request_id}\n'
+                  f'Workspace: {self.roles[request.receiver].workspace}\n'
+                  f'Snapshot commit: {request.handoff_commit}\n')
+        return join_text(header, '\n', request.reply)
+
     def _parallel(self, requests, dashboard=None):
         groups = {role: [r for r in requests if r.receiver == role] for role in ROLES[1:]}
         futures = [self._pool.submit(self._run_analyst, role, group, dashboard)
@@ -429,7 +416,7 @@ class MultiAgentRuntime:
         for request in requests:
             self._transition(request, 'delivered')
         self._set_phase('ceo')
-        return [r.reply if isinstance(r, TeamMessage) else r for r in results]
+        return [self._handoff(r) if isinstance(r, TeamMessage) else r for r in results]
 
     def _run_ceo(self, observation):
         runtime = self.roles['ceo']
@@ -495,14 +482,14 @@ class MultiAgentRuntime:
                         self._stage = 'analysis'
                         self._set_phase('analysis')
                         dashboard = self.server.public_dashboard()
-                        requests = [self._message(role, 'Analyze the current business week and give the CEO useful advice in final prose.')
+                        requests = [self._message(role, WEEKLY_TASKS[role])
                                     for role in ROLES[1:]]
                         self._parallel(requests, dashboard)
                         for request in requests:
                             self._transition(request, 'delivered')
                         observation = self._observation('ceo', dashboard, ceo_scripts)
-                        observation = join_text(observation, '\n\n',
-                            '\n\n'.join(f'{r.receiver} analyst\n{r.reply}' for r in requests))
+                        for request in requests:
+                            observation = join_text(observation, '\n\n', self._handoff(request))
                         self._week = dict(observation=observation, ceo_started=False)
                         self._stage = 'ceo'
                         self._set_phase('ceo')

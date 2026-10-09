@@ -33,6 +33,24 @@ class LLMTimeoutError(Exception):
     pass
 
 
+_MODEL_CLOCK = threading.local()
+
+
+@contextmanager
+def _pause_model_deadline():
+    started = time.monotonic()
+    timer = (signal.getitimer(signal.ITIMER_REAL) if getattr(_MODEL_CLOCK, 'active', False)
+             and threading.current_thread() is threading.main_thread() else None)
+    if timer:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        yield
+    finally:
+        _MODEL_CLOCK.paused = getattr(_MODEL_CLOCK, 'paused', 0) + time.monotonic() - started
+        if timer:
+            signal.setitimer(signal.ITIMER_REAL, *timer)
+
+
 @contextmanager
 def _model_deadline(seconds=600):
     if threading.current_thread() is not threading.main_thread():
@@ -42,9 +60,11 @@ def _model_deadline(seconds=600):
         raise LLMTimeoutError(f'LLM call exceeded {seconds}s wall-clock timeout')
     old = signal.signal(signal.SIGALRM, timeout)
     signal.alarm(seconds)
+    _MODEL_CLOCK.active = True
     try:
         yield
     finally:
+        _MODEL_CLOCK.active = False
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
 
@@ -78,13 +98,14 @@ def _stream_chat_completion(client, request, check=lambda: None):
     from pydantic import ValidationError
 
     deadline = time.monotonic() + 600
+    paused = getattr(_MODEL_CLOCK, 'paused', 0)
     state = ChatCompletionStreamState()
     received = False
     with client.chat.completions.create(**request) as stream:
         try:
             for chunk in stream:
                 check()
-                if time.monotonic() >= deadline:
+                if time.monotonic() - (getattr(_MODEL_CLOCK, 'paused', 0) - paused) >= deadline:
                     raise LLMTimeoutError('Chat stream exceeded 600s wall-clock timeout')
                 chunk = ChatCompletionChunk.model_validate(
                     chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
@@ -758,7 +779,8 @@ class BashAgent(BaseAgent):
                     if not self._wants_reasoning():
                         api_kwargs['reasoning_effort'] = 'none'
 
-                api_kwargs['timeout'] = 60 if _is_opencode else 600
+                if not (_is_opencode and self.identity):
+                    api_kwargs['timeout'] = 60 if _is_opencode else 600
                 if _is_opencode:
                     api_kwargs.update(stream=True, stream_options={'include_usage': True})
                 def invoke():

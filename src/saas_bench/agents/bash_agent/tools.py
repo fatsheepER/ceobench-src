@@ -258,7 +258,7 @@ NOTE_PARAMETER = {
 }
 
 
-def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False) -> List[Dict[str, Any]]:
+def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False, team=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
     if text_registration or pf_queries:
@@ -268,9 +268,13 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
             for t in definitions]
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
-        definitions = definitions + tool_definitions(pf=pf_queries)
+        definitions = definitions + tool_definitions(pf=pf_queries, team=team or ask_analyst)
     if ask_analyst:
-        definitions = definitions + [dict(name='ask_analyst', description="Ask an analyst a free-text question in this week's conversation.",
+        definitions = definitions + [dict(name='ask_analyst', description=
+            "Ask growth or ops_finance a focused question in this week's existing conversation. "
+            "Include relevant evidence references, candidate actions and settings already changed. "
+            "The analyst answers the new question without a fresh dashboard or weekly script run. "
+            "Returns a host handoff header with author, day, world state, request ID, workspace and snapshot commit, followed by free text.",
             parameters=dict(type='object', properties=dict(role=dict(type='string', enum=['growth', 'ops_finance']),
                 message=dict(type='string')), required=['role', 'message'], additionalProperties=False))]
     return [

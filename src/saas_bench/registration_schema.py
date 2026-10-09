@@ -288,7 +288,7 @@ def compact_schema(node):
     return result
 
 
-def tool_definitions(pf=False):
+def tool_definitions(pf=False, team=False):
     group = 'pf' if pf else 'git'
     checks = ('Optional select and predicate on a reference make the weekly check test a condition instead '
               'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
@@ -317,5 +317,14 @@ def tool_definitions(pf=False):
                                    'is absent from this request; reading scope is recorded separately. '
                                    'Selected fields require coverage in this request or your own current-context file write.')
         descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
+    if team:
+        descriptions['create'] += (' Team receipts include a Shareable reference such as growth:r4.2. '
+            'Copy the exact role and version for cross-role citations. Git handoff files use '
+            'growth:notes.md@<handoff commit>; a bare path binds the weekly closing commit. '
+            'In PF, copy the returned file or output handle exactly. pf show reads saved evidence; '
+            'pf depend checks dependencies by replaying permitted SQL or public read-only API calls, not analyst scripts.')
+        for operation in ('revise', 'retire'):
+            descriptions[operation] += ' Use your local record ID rN; the receipt includes the new role-qualified version.'
+        descriptions['list'] += ' shareable_references maps local versions to exact role-qualified citations.'
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
             for name, model in models.items()]

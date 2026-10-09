@@ -324,6 +324,12 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
 
 def _relocate_prompt(text, original, destination):
     from .execution_capture import CapturedText, slice_origins, slice_read_spans
+    if isinstance(text, list):
+        return [_relocate_prompt(item, original, destination) for item in text]
+    if isinstance(text, dict):
+        return {key: _relocate_prompt(value, original, destination) for key, value in text.items()}
+    if not isinstance(text, str):
+        return text
     if not isinstance(text, CapturedText):
         return text.replace(original, destination)
     parts, origins, reads, start, target = [], [], [], 0, 0
@@ -351,6 +357,7 @@ def restore_runtime_state(runtime, state):
     from .simulation import DayResult
     server = runtime.server
     original = state['source_root']
+    old_workspace, new_workspace = 'Workspace: ' + original + '/roles/', 'Workspace: ' + str(runtime.root) + '/roles/'
     runtime._stage, runtime._week = state['stage'], state['week']
     server.team_phase = state['phase']
     server.world_state_id = state['world_state_id']
@@ -359,6 +366,8 @@ def restore_runtime_state(runtime, state):
     captured = dict(week=runtime._week, dashboard=state['dashboard'], script_results=state['script_results'])
     restore_sources(captured, state['sources'])
     runtime._week = captured['week']
+    if 'observation' in runtime._week:
+        runtime._week['observation'] = _relocate_prompt(runtime._week['observation'], old_workspace, new_workspace)
     server._last_dashboard = captured['dashboard']
     server.role_script_results = captured['script_results']
     server._last_day_result = DayResult(**state['day_result']) if state['day_result'] else None
@@ -380,8 +389,9 @@ def restore_runtime_state(runtime, state):
         if not role.agent.load_conversation_snapshot(role.agent._snapshot_path):
             raise ValueError('Cannot restore ' + name + ' role conversation')
         for message in role.agent.conversation:
-            if message.role == 'system' and isinstance(message.content, str):
-                message.content = _relocate_prompt(message.content, original, str(runtime.root))
+            before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
+            message.content = _relocate_prompt(message.content, before, after)
+        role.agent._last_observation = _relocate_prompt(role.agent._last_observation, old_workspace, new_workspace)
         role.agent.total_turns = saved['total_turns']
     customer = server.simulator.customer_simulator
     if 'simulator_usage' in state:

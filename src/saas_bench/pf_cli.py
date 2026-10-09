@@ -16,7 +16,11 @@ USAGE = '''usage: pf <command> ...
   pf search --text "term"              literal text in public captured history, newest first
   pf more <cursor>                     the next page of an earlier result
 Objects: a handle (MEMORY.md@v8, scripts/a.py.out@v2, query7@v1), a file path or output name
-(the latest version) or a text (r4, r4.2). Shell combinations, pipes and redirection work normally.'''
+(the latest version) or a text (r4, r4.2). In a team, copy exact role-qualified references
+such as growth:r4.2 or returned file/output handles. Bare r4 is local; growth:r4 is latest.
+pf show reads saved content. pf depend replays permitted SQL and public read-only APIs;
+it does not execute analyst scripts. Refresh when verification is needed, not after every handoff.
+Shell combinations, pipes and redirection work normally.'''
 
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS) + r')\b|\s*$)', re.M)

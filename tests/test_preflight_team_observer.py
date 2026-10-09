@@ -407,6 +407,51 @@ def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(o
     assert [row['issue'] for row in health['route_errors']] == ['model_route_changed']
 
 
+def formal_pair(observer):
+    observer.manifest['category'] = 'formal'
+    for run, group in zip(observer.manifest['runs'], ('git', 'pf')):
+        run.update(pair_id='s101-r1', group=group)
+    observer.expected['runs'] = [{key: run[key] for key in ('run_id', 'output_dir')}
+                                 for run in observer.manifest['runs']]
+    observer.manifest['runs'].extend([
+        dict(run_id=group + '-unselected', pair_id='s101-r2', group=group,
+             output_dir=str(observer.host_logs.parent / 'runs' / (group + '-unselected')))
+        for group in ('git', 'pf')])
+
+
+def test_formal_selected_pair_monitors_only_anchored_run_paths(observer):
+    formal_pair(observer)
+    selected = observer.log()
+    append(selected, dict(event='request', call_id='selected'))
+    excluded = observer.log(role='git-unselected')
+    append(excluded, request(observer, endpoint='https://wrong.example/chat/completions'))
+    health = observer.poll()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
+    assert health['runs'] == observer.expected['runs']
+    assert set(health['progress']) == {'git', 'pf'}
+    assert set(health['coverage']) == {str(selected)}
+
+
+@pytest.mark.parametrize('change', ['absent', 'output', 'other_pair', 'duplicate', 'changed_policy'])
+def test_formal_identity_rejects_wrong_selection_and_changed_policy(observer, change):
+    formal_pair(observer)
+    if change == 'changed_policy':
+        assert observer.poll()['status'] == 'healthy'
+        observer.expected['host_logs'] = str(observer.host_logs.parent / 'elsewhere')
+    elif change == 'absent':
+        del observer.expected['runs']
+    elif change == 'output':
+        observer.expected['runs'][0]['output_dir'] = str(observer.host_logs)
+    elif change == 'other_pair':
+        run = observer.manifest['runs'][3]
+        observer.expected['runs'][1] = {key: run[key] for key in ('run_id', 'output_dir')}
+    else:
+        observer.expected['runs'][1] = dict(observer.expected['runs'][0])
+    health = observer.poll()
+    assert health['status'] == 'hold' and observer.hold.exists()
+    assert any(check.startswith('freeze:') for check in health['checks'])
+
+
 def test_attempt_missing_status_still_holds(observer):
     path = observer.log()
     path.write_bytes(b'')
@@ -416,18 +461,22 @@ def test_attempt_missing_status_still_holds(observer):
     assert health['checks'] == ['run_progress:git:KeyError']
 
 
-def test_fault_hold_and_freeze_and_quota_checks_are_preserved(observer):
+def test_run_fault_scope_and_freeze_and_quota_checks_are_preserved(observer):
     path = observer.log()
     path.write_bytes(b'')
     fault = path.parent.parent / 'evidence.fault.json'
     fault.write_text('{}')
-    assert observer.poll()['status'] == 'hold'
+    health = observer.poll()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
+    assert health['run_faults'] == [dict(run_id='git', path=str(fault))]
+    assert (Path(observer.manifest['runs'][0]['output_dir']) / 'attempt-001/STOP').exists()
+    assert not (Path(observer.manifest['runs'][1]['output_dir']) / 'attempt-001/STOP').exists()
     assert events(observer)[0]['new_faults'] == [str(fault)]
     restarted = json.loads((observer.output / 'state.json').read_text())
-    assert observer.poll(state=restarted)['status'] == 'hold'
+    assert observer.poll(state=restarted)['status'] == 'healthy'
     assert len(events(observer)) == 1
     fault.unlink()
-    assert observer.poll()['status'] == 'hold'
+    assert observer.poll()['status'] == 'healthy'
     observer.manifest_path.write_text('{"changed":true}')
     health = observer.poll()
     assert health['checks'] == ['freeze:Manifest anchor mismatch']

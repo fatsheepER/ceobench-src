@@ -79,6 +79,72 @@ def test_model_free_validation_enumerates_exact_formal_pairs_and_engineering(fro
     assert all('D497' in p['system'] and 'D112' not in p['system'] for prompts in manifest['prompts'].values() for p in prompts.values())
 
 
+def test_formal_observer_selects_pair_from_real_frozen_manifest(frozen, tmp_path, monkeypatch):
+    import importlib.util
+    base, manifest, _, _ = frozen
+    scripts = batch.ROOT / 'scripts'
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location('team_observer', scripts / 'team_observer.py')
+    observer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(observer)
+    first = manifest['runs'][0]
+    runs = [run for run in manifest['runs'] if run['pair_id'] == first['pair_id']]
+    path = base / 'formal/manifest.json'
+    expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
+    expected.update(manifest=str(path), manifest_sha256=file_hash(path), host_logs=str(tmp_path / 'host-logs'),
+        runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in runs])
+    Path(expected['host_logs']).mkdir()
+    selected = observer.identity(path, expected)
+    assert selected['runs'] == runs and len(manifest['runs']) == 12
+    health = observer.poll(path, tmp_path / 'observer', expected, {},
+        quota_fn=lambda: {window: dict(status='ok', percent=1) for window in ('rolling', 'weekly', 'monthly')})
+    assert health['status'] == 'healthy'
+    assert set(health['progress']) == {run['run_id'] for run in runs}
+    assert health['runs'] == expected['runs'] and health['manifest_sha256'] == file_hash(path)
+
+
+def test_explicit_safe_resume_ignores_historical_run_fault_stop(frozen, tmp_path, monkeypatch):
+    import importlib.util
+    _, _, engineering, _ = frozen
+    manifest = copy.deepcopy(engineering)
+    for entry in manifest['runs']:
+        entry['output_dir'] = str(tmp_path / 'runs' / entry['run_id'])
+    path = tmp_path / 'manifest.json'
+    write_json(path, manifest)
+    write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
+    run = next(entry for entry in manifest['runs'] if entry['group'] == 'pf')
+    first = batch.prepare(path, run['run_id'])
+    attempt = batch.attempts(run)[0]
+    fault = attempt / 'runtime/private/evidence.fault.json'
+    write_json(fault, dict(reason='offline capture fault after the safe checkpoint'))
+    first['status'] = 'failed'
+    write_json(attempt / 'attempt.json', first)
+    scripts = batch.ROOT / 'scripts'
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location('team_observer', scripts / 'team_observer.py')
+    observer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(observer)
+    expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
+    expected.update(manifest=str(path), manifest_sha256=file_hash(path), host_logs=str(tmp_path / 'host-logs'))
+    Path(expected['host_logs']).mkdir()
+    state = {}
+
+    def poll():
+        return observer.poll(path, tmp_path / 'observer', expected, state,
+            quota_fn=lambda: {window: dict(status='ok', percent=1) for window in ('rolling', 'weekly', 'monthly')})
+
+    assert poll()['status'] == 'healthy'
+    assert (attempt / 'STOP').exists() and not (path.parent / 'HOLD').exists()
+    resumed = batch.prepare(path, run['run_id'], resume=True)
+    assert resumed['status'] == 'ready' and resumed['attempt'] == 2
+    assert resumed['source_checkpoint'] == first['checkpoint']
+    health = poll()
+    assert health['status'] == 'healthy'
+    assert health['run_faults'] == [dict(run_id=run['run_id'], path=str(fault))]
+    assert (attempt / 'STOP').exists()
+    assert not (batch.attempts(run)[-1] / 'STOP').exists()
+
+
 @pytest.mark.parametrize('change', [
     lambda m: m['runs'][0].update(group='prefix'),
     lambda m: m['runs'][0].update(seed=42),
@@ -89,6 +155,8 @@ def test_model_free_validation_enumerates_exact_formal_pairs_and_engineering(fro
     lambda m: m.update(build=dict(m['build'], source_sha256='changed')),
     lambda m: m['runs'][0].update(output_dir=m['runs'][1]['output_dir']),
     lambda m: m['runs'][0].update(stop_after_day=28),
+    lambda m: m['controller_sha256'].update({'scripts/team_controller.py': 'changed'}),
+    lambda m: m.pop('controller_sha256'),
 ])
 def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):
     path = changed_manifest(frozen, tmp_path, change)

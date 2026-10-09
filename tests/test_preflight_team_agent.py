@@ -10,6 +10,7 @@ from saas_bench.agents.bash_agent.agent import BashAgent, FinalText
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
+from test_preflight_team_flow import completion, final
 
 
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
@@ -66,6 +67,30 @@ def test_text_with_tools_remains_action(tmp_path):
         assert result.tool == 'read_file'
         assert agent.conversation[-1].content == 'hello'
         assert agent._pending_tool_calls[0]['id'] == 'c1'
+
+
+@pytest.mark.parametrize('team', [False, True])
+def test_real_opencode_act_uses_team_phase_timeouts_and_preserves_single_agent(tmp_path, team):
+    from types import SimpleNamespace
+    from saas_bench import team_batch as batch
+    timeouts = []
+
+    def handle(request):
+        timeouts.append(request.extensions['timeout'])
+        return completion(final('offline advice'), stream=True)
+
+    transport = httpx.MockTransport(handle)
+    client = (batch.checked_client('growth', 'offline', transport=transport) if team else
+        OpenAI(api_key='offline', base_url=batch.ENDPOINT, max_retries=0,
+            http_client=httpx.Client(transport=transport)))
+    try:
+        agent = BashAgent(get_bash_agent_tool_descriptions(), client, model=batch.MODEL,
+            system_prompt='Give business advice.', workspace_path=tmp_path, reasoning_effort='high',
+            identity=SimpleNamespace(role='growth') if team else None, allow_final_text=True)
+        assert agent.act('dashboard', 0, False, {'day': 0}) == FinalText('offline advice')
+        assert timeouts == [dict(connect=60, read=180 if team else 60, write=60, pool=60)]
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize('previous_success', [False, True])

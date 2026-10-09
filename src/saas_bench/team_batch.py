@@ -37,6 +37,8 @@ from .team_checkpoint import managed_snapshot, retention_lock
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
+CONTROLLER_SCRIPTS = ('scripts/team_batch.py', 'scripts/team_controller.py',
+                      'scripts/team_observer.py', 'scripts/round5.py')
 PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
     total_days=500, effective_end=497, sdk_max_retries=2, logical_request_attempts=4,
@@ -80,8 +82,9 @@ def check_prices(prices, source):
     canonical(prices)
 
 
-def checked_client(role, session, *, transport=None, no_models=False, config=None):
-    def request_check(request):
+def checked_client(role, session, *, transport=None, no_models=False, config=None,
+                   request_guard=None, response_guard=None, hold=None):
+    def check_frozen(request):
         if no_models:
             raise AssertionError('Preparation must not request a model')
         body = json.loads(request.content)
@@ -104,13 +107,30 @@ def checked_client(role, session, *, transport=None, no_models=False, config=Non
             if (body.get('max_tokens'), body.get('temperature')) not in allowed:
                 raise ValueError('Frozen simulator request parameters changed')
 
+    def request_check(request):
+        if request_guard:
+            from .agents.bash_agent.agent import _pause_model_deadline
+            with _pause_model_deadline():
+                request_guard(request)
+        try:
+            check_frozen(request)
+            if request.extensions.get('timeout') != PARAMETERS['timeout_seconds']:
+                raise ValueError('Frozen phase timeouts changed')
+        except ValueError:
+            if hold:
+                from .run_lifecycle import RunCancelled
+                Path(hold).touch()
+                raise RunCancelled('frozen_identity_changed')
+            raise
+
     key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get('OPENCODE_API_KEY')
     if not key:
         raise ValueError('OPENCODE_API_KEY is required only for live execution')
     return OpenAI(api_key=key, base_url=ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'],
         timeout=httpx.Timeout(**PARAMETERS['timeout_seconds']),
         default_headers={'User-Agent': 'CEO-Bench/1.0', 'x-opencode-session': session + ':' + role},
-        http_client=httpx.Client(transport=transport, event_hooks={'request': [request_check]}))
+        http_client=httpx.Client(transport=transport, event_hooks={'request': [request_check],
+            'response': [response_guard] if response_guard else []}))
 
 
 def simulator(conn, config, rng, *, client=None):
@@ -273,6 +293,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         order=dict(method='python.Random.shuffle pairs then groups', seed=order_seed),
         source_root=str(root), source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
+        controller_sha256={name: file_hash(root / name) for name in CONTROLLER_SCRIPTS},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
         price_source=price_source, max_attempts=max_attempts, d0=d0, runs=runs)
     counter = token_counter or load_counter('opencode', MODEL)
@@ -310,6 +331,8 @@ def validate_manifest(path):
         raise ValueError('Frozen source or public build changed')
     if file_hash(root / 'scripts' / 'team_batch.py') != manifest['host_script_sha256']:
         raise ValueError('Frozen batch entry changed')
+    if manifest.get('controller_sha256') != {name: file_hash(root / name) for name in CONTROLLER_SCRIPTS}:
+        raise ValueError('Frozen controller or observer changed')
     check_prices(manifest['pricing'], manifest['price_source'])
     category, seeds = manifest['category'], manifest['seeds']
     if any(type(seed) is not int or seed < 0 for seed in seeds):
@@ -515,7 +538,8 @@ def save_checkpoint(team, directory, record, boundary):
         return snapshot
 
 
-def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simulator_factory=None):
+def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simulator_factory=None,
+            request_guard=None, response_guard=None, parent_pid=None):
     path = Path(path).resolve()
     manifest = validate_manifest(path)
     if live and (os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1'
@@ -531,9 +555,14 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             if canonical(counter.metadata if counter else None) != manifest['tokenizer']:
                 raise ValueError('Frozen tokenizer changed')
             session = record['attempt_id']
-            factory = client_factory or (lambda role: checked_client(role, session, no_models=not live))
+            def guarded_request(request):
+                request_guard(request, check=team._lifecycle.check if team else lambda: None)
+            guard_options = dict(request_guard=guarded_request if request_guard else None, response_guard=response_guard,
+                hold=path.parent / 'HOLD' if request_guard else None)
+            factory = client_factory or (lambda role: checked_client(role, session, no_models=not live,
+                **guard_options))
             def world_factory(conn, config, rng):
-                client = checked_client('simulator', session, no_models=not live, config=config)
+                client = checked_client('simulator', session, no_models=not live, config=config, **guard_options)
                 sim = simulator(conn, config, rng, client=client)
                 sim.customer_simulator.usage_recorder.path = directory / 'runtime' / 'private' / 'simulator-model-usage.jsonl'
                 sim.customer_simulator.usage_recorder.expected_model = MODEL
@@ -548,6 +577,7 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
                                  simulator_factory=sim_factory, token_counter=counter)
             if canonical(prompt_templates(team)) != manifest['prompts'][entry['group']]:
                 raise ValueError('Frozen role prompts or tools changed')
+            team._lifecycle.parent_pid = parent_pid
             for runtime in team.roles.values():
                 runtime.usage.expected_model = MODEL
             write_json(team.root / 'private' / 'frozen-run.json', dict(entry=entry, manifest_sha256=file_hash(path)))

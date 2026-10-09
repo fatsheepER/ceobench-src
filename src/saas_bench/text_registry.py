@@ -163,6 +163,8 @@ class TextRegistry:
             cited = [self._git_cited(ref['evidence']) for ref in record['references']]
         verb = dict(create='Registered', revise='Revised', retire='Retired')[operation]
         lines = [f"{verb} {record['version']} ({record['status']})."]
+        if self.identity:
+            lines.append(f"Shareable reference: {self.role}:{record['version']}")
         if shown and cited:
             lines.append('Cited: ' + ' · '.join(cited))
         if self.mode == 'pf' and operation != 'retire' and (writes := self._week_writes(record)):
@@ -508,4 +510,7 @@ class TextRegistry:
         result += '],"next_after":' + json.dumps(next_after) + '}'
         if self.mode == 'pf':
             result = result[:-1] + ',"checks":' + json.dumps({r['version']: checks.get(r['version']) for r in page}) + '}'
+        if self.identity:
+            result = result[:-1] + ',"shareable_references":' + json.dumps({
+                r['version']: self.role + ':' + r['version'] for r in page}) + '}'
         return CapturedText(result, origins)

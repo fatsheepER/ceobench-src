@@ -36,12 +36,28 @@ def identity(path, expected):
     if file_hash(path) != expected['manifest_sha256']:
         raise ValueError('Manifest anchor mismatch')
     manifest = batch.validate_manifest(path)
+    if manifest.get('controller_sha256'):
+        root = Path(manifest['source_root'])
+        if (Path(__file__).resolve() != root / 'scripts/team_observer.py' or
+                Path(round5.__file__).resolve() != root / 'scripts/round5.py'):
+            raise ValueError('Observer is outside the frozen source root')
     for key in ('batch_id', 'source_root', 'public_dir', 'source_commit'):
         if manifest[key] != expected[key]:
             raise ValueError('Wrong frozen ' + key)
-    if manifest['category'] != 'engineering' or len(manifest['runs']) != 2:
-        raise ValueError('Not the seed42 paired engineering batch')
-    return manifest
+    selection = expected.get('runs')
+    if selection is None:
+        if manifest['category'] != 'engineering' or len(manifest['runs']) != 2:
+            raise ValueError('Formal monitoring requires an explicit frozen pair')
+        return manifest
+    if (not isinstance(selection, list) or len(selection) != 2 or
+            any(not isinstance(run, dict) or set(run) != {'run_id', 'output_dir'} for run in selection)):
+        raise ValueError('Monitoring requires two anchored run IDs and output paths')
+    runs = [batch.selected(manifest, run['run_id']) for run in selection]
+    if any(run['output_dir'] != anchor['output_dir'] for run, anchor in zip(runs, selection)):
+        raise ValueError('Wrong monitored run output path')
+    if len({run['pair_id'] for run in runs}) != 1 or {run['group'] for run in runs} != {'git', 'pf'}:
+        raise ValueError('Monitoring requires the git and PF runs from one frozen pair')
+    return dict(manifest, runs=runs)
 
 
 def _capture_logs(manifest, expected, cursors, checks, progress, faults):
@@ -75,7 +91,9 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
             try:
                 for root, _, files in private.walk(on_error=raise_error):
                     if root == private and 'evidence.fault.json' in files:
-                        faults.add(str(private / 'evidence.fault.json'))
+                        faults[str(private / 'evidence.fault.json')] = run['run_id']
+                        if attempt == history[-1]:
+                            (attempt / 'STOP').touch()
                     for name in files:
                         if name.endswith('model-usage.jsonl'):
                             paths[str(root / name)] = b''
@@ -119,6 +137,9 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     hold = Path(hold_path or Path(manifest_path).parent / 'HOLD')
     checks, sql, routes, transient = [], [], [], []
     quota, manifest, quota_error = None, None, None
+    if state.get('monitor_identity', expected) != expected:
+        checks.append('freeze:Monitored identity changed')
+    state.setdefault('monitor_identity', batch.canonical(expected))
     try:
         manifest = identity(manifest_path, expected)
     except Exception as exc:
@@ -145,7 +166,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     known = set(state.get('known_faults', []))
     previous = state.get('active_checks', [])
     oldprogress = state.get('progress', {})
-    faults, progress, coverage = set(), {}, {}
+    faults, progress, coverage = {}, {}, {}
     pending = quota_error is not None
 
     def event(*, new_checks=(), sql_errors=(), route_errors=(), new_faults=(),
@@ -159,7 +180,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     targets = _capture_logs(manifest, expected, cursors, checks, progress, faults) if manifest else {}
     while manifest:
         coverage = {key: target for key, (_, target) in targets.items()}
-        if checks or faults:
+        if checks:
             hold.touch()
         for key, (prefix, target) in targets.items():
             if target['reason']:
@@ -230,7 +251,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                 except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                     target['reason'] = 'log_read:' + type(exc).__name__ + ':' + str(exc)
                     checks.append(target['reason'] + ':' + key)
-                if checks or sql or routes or faults:
+                if checks or sql or routes:
                     hold.touch()
                 if (len(sql), len(routes), len(transient)) != (sql_start, route_start, transient_start):
                     event(sql_errors=sql[sql_start:], route_errors=routes[route_start:],
@@ -257,19 +278,22 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         targets = latest
 
     checks = list(dict.fromkeys(checks))
-    newfaults = sorted(faults - known)
-    if checks or sql or routes or faults:
+    newfaults = sorted(set(faults) - known)
+    if checks or sql or routes:
         hold.touch()
     newchecks = [check for check in checks if check not in previous]
     completed = [key for key, value in progress.items() if value.get('status') in (
         'finished', 'paused', 'failed') and oldprogress.get(key) != value]
     if newchecks or newfaults or completed:
         event(new_checks=newchecks, new_faults=newfaults, completed=completed)
-    state.update(active_checks=checks, known_faults=sorted(known | faults), progress=progress)
+    state.update(active_checks=checks, known_faults=sorted(known | set(faults)), progress=progress)
     write_json(output / 'state.json', state)
     health = dict(time=datetime.now(timezone.utc).isoformat(), manifest=expected['manifest'],
+        manifest_sha256=expected['manifest_sha256'],
+        runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']] if manifest else [],
         batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
+        run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],
         progress=progress, coverage=coverage, state=state)
     write_json(output / 'health.json', health)
     with (output / 'health.jsonl').open('a') as stream:

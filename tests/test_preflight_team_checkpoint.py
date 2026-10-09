@@ -103,6 +103,19 @@ def behavior(runtime):
     (runtime.root / 'private' / 'final-world.json').write_text(business)
     root = str(runtime.root)
     state = {}
+    worlds = list(dict.fromkeys(message.world_state_id for message in runtime.messages))
+    header = re.compile(r'Analyst handoff \| role=(\w+) \| day=(\d+) \| world_state_id=(\w+) \| request_id=(\w+)\n'
+                        r'Workspace: ([^\n]+)\nSnapshot commit: ([0-9a-f]+)\n')
+
+    def normalize_handoff(match):
+        role, day, world, request_id, workspace, commit = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
+        assert (role, int(day), world, commit) == (request.receiver, request.day, request.world_state_id, request.handoff_commit)
+        assert workspace == '<ROOT>/roles/' + role
+        tree = runtime._git(runtime.roles[role], 'rev-parse', commit + '^{tree}')
+        return (f'Analyst handoff | role={role} | day={day} | world_state_id=state-{worlds.index(world)} | request_id=request-{index}\n'
+                f'Workspace: {workspace}\nSnapshot commit: tree-{tree}\n')
+
     for role, item in runtime.roles.items():
         conversation = [dict(role=message.role, content=message.content,
             name=message.name, reasoning_content=message.reasoning_content)
@@ -110,6 +123,7 @@ def behavior(runtime):
         conversation = json.loads(json.dumps(conversation).replace(root, '<ROOT>'))
         for message in conversation:
             if isinstance(message['content'], str):
+                message['content'] = header.sub(normalize_handoff, message['content'])
                 message['content'] = re.sub(r'(\[git: MEMORY\.md last committed in (?:week-\d+ \()?)([0-9a-f]{7})',
                     lambda match: match[1] + 'tree:' + runtime._git(item, 'rev-parse', match[2] + '^{tree}'),
                     message['content'])
@@ -151,8 +165,23 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             saved = json.loads((snapshot / 'team.json').read_text())
             assert all(restored.roles[role].identity.session_id == saved['roles'][role]['identity']['session_id']
                 for role in ROLES)
-            assert text_sources(dict(week=restored._week, dashboard=restored.server._last_dashboard,
-                script_results=restored.server.role_script_results)) == saved['sources']
+            relocated_sources = text_sources(dict(week=restored._week, dashboard=restored.server._last_dashboard,
+                script_results=restored.server.role_script_results))
+            assert len(relocated_sources) == len(saved['sources'])
+            for old, new in zip(saved['sources'], relocated_sources):
+                assert old['pointer'] == new['pointer']
+                assert len(old['origins']) == len(new['origins'])
+                for before, after in zip(old['origins'], new['origins']):
+                    assert {k: v for k, v in before.items() if k != 'request_range'} == {
+                        k: v for k, v in after.items() if k != 'request_range'}
+                    a, b = before['request_range']
+                    c, d = after['request_range']
+                    assert old['text'][a:b] == new['text'][c:d]
+            if boundary != 'week_boundary':
+                for request in restored.messages:
+                    assert restored._handoff(request) in restored._week['observation'] or any(
+                        restored._handoff(request) in m.content for m in restored.roles['ceo'].agent.conversation
+                        if isinstance(m.content, str))
             if mode == 'pf' and boundary == 'answers_ready':
                 assert any(s.get('pf_read_spans') for s in saved['sources'])
             assert restored.run(stop_after_day=14).reason == 'observation_end', restored.failure
@@ -300,3 +329,9 @@ def test_relocated_prompt_preserves_memory_source_spans():
     moved = _relocate_prompt(only_read, original, destination)
     a, b = moved.pf_read_spans[0]['request_range']
     assert moved[a:b] == memory and a == len(prefix.replace(original, destination))
+    nested = _relocate_prompt([dict(type='tool_result', tool_use_id='ask', content=text)], original, destination)
+    assert nested[0]['content'] == relocated
+    assert nested[0]['content'].origins == relocated.origins
+    git_reply = 'Workspace: /old/run/roles/growth\nEvidence contains /old/run/notes.txt'
+    moved_git = _relocate_prompt(git_reply, 'Workspace: /old/run/roles/', 'Workspace: /new/run/roles/')
+    assert moved_git == 'Workspace: /new/run/roles/growth\nEvidence contains /old/run/notes.txt'
