@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import brotli
+import httpx
 import pytest
 
 
@@ -319,6 +320,100 @@ def test_compressed_physical_receipt_retains_served_model_and_usage_checks(obser
     health = observer.poll()
     assert health['status'] == 'hold'
     assert [row['issue'] for row in health['route_errors']] == ['served_model_changed']
+
+
+@pytest.mark.parametrize('error', [httpx.ConnectError, httpx.ReadTimeout])
+def test_quota_failure_waits_for_consecutive_polls_and_survives_restart(observer, error):
+    calls = []
+
+    def unavailable():
+        calls.append(True)
+        raise error('temporary quota failure')
+
+    first = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                 observer.state, quota_fn=unavailable)
+    assert first['status'] == 'pending'
+    assert first['checks'] == [] and not observer.hold.exists()
+    assert first['quota_error'] == 'quota_unavailable:' + error.__name__
+    assert first['quota'] is None
+    restarted = json.loads((observer.output / 'state.json').read_text())
+    second = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                  restarted, quota_fn=unavailable)
+    assert second['status'] == 'hold' and observer.hold.exists()
+    assert second['checks'] == ['quota_unavailable:' + error.__name__]
+    assert restarted['quota_failures'] == 2 and len(calls) == 2
+
+
+def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer):
+    def unavailable():
+        raise httpx.ConnectError('temporary quota failure')
+
+    def failed_poll():
+        return observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                    observer.state, quota_fn=unavailable)
+
+    assert failed_poll()['status'] == 'pending'
+    healthy = observer.poll()
+    assert healthy['status'] == 'healthy' and healthy['quota_error'] is None
+    assert observer.state['quota_failures'] == 0
+    assert failed_poll()['status'] == 'pending'
+    assert not observer.hold.exists()
+    quota = observer.quota()
+    quota['rolling']['percent'] = 100
+    calls = []
+
+    def exhausted():
+        calls.append(True)
+        return quota
+
+    health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                  observer.state, quota_fn=exhausted)
+    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['checks'] == ['quota_exhausted'] and len(calls) == 1
+    assert observer.state['quota_failures'] == 0
+
+
+def test_invalid_quota_response_still_holds_immediately(observer):
+    def invalid():
+        raise ValueError('Quota response windows changed')
+
+    health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                  observer.state, quota_fn=invalid)
+    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['checks'] == ['quota_unavailable:ValueError']
+
+
+def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(observer):
+    failed = observer.log(role='git')
+    append(failed, dict(event='http_error', call_id='call', attempt_id='attempt'))
+    observer.log(role='pf').write_bytes(b'')
+    attempt = failed.parents[3] / 'attempt.json'
+    attempt.write_text(json.dumps(dict(status='failed', attempt='001', day=14,
+                                      reason='model_attempt_limit', runtime_phase='ceo')))
+    health = observer.poll()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
+    assert health['checks'] == []
+    assert health['progress']['git']['status'] == 'failed'
+    assert health['progress']['git']['reason'] == 'model_attempt_limit'
+    assert health['progress']['pf']['status'] == 'running'
+    assert events(observer)[-1]['completed'] == ['git']
+    assert [row['issue'] for row in events(observer)[0]['transient_receipt_failures']] == ['transport_error']
+    restarted = json.loads((observer.output / 'state.json').read_text())
+    assert observer.poll(state=restarted)['status'] == 'healthy'
+    assert len(events(observer)) == 2
+    append(failed, request(observer, endpoint='https://wrong.example/chat/completions'))
+    health = observer.poll(state=restarted)
+    assert health['status'] == 'hold' and observer.hold.exists()
+    assert [row['issue'] for row in health['route_errors']] == ['model_route_changed']
+
+
+def test_attempt_missing_status_still_holds(observer):
+    path = observer.log()
+    path.write_bytes(b'')
+    (path.parents[3] / 'attempt.json').write_text('{}')
+    health = observer.poll()
+    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['checks'] == ['run_progress:git:KeyError']
 
 
 def test_fault_hold_and_freeze_and_quota_checks_are_preserved(observer):

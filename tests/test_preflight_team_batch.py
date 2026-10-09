@@ -96,6 +96,12 @@ def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):
         batch.validate_manifest(path)
 
 
+def test_validation_rejects_legacy_scalar_timeout(frozen, tmp_path):
+    path = changed_manifest(frozen, tmp_path, lambda m: m['parameters'].update(timeout_seconds=60))
+    with pytest.raises(ValueError, match='Frozen model parameters'):
+        batch.validate_manifest(path)
+
+
 def test_manifest_anchor_rejects_prompt_change_and_original_sources_are_sealed(frozen, tmp_path):
     _, _, _, sources = frozen
     path = changed_manifest(frozen, tmp_path, lambda m: m['prompts']['git']['ceo'].update(system='modified'), reanchor=False)
@@ -193,6 +199,30 @@ def test_checked_provider_parameters_and_receipts(tmp_path):
         for changes in (dict(temperature=99), dict(max_tokens=999)):
             with pytest.raises(APIConnectionError):
                 client.chat.completions.create(**dict(kwargs, **changes))
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('role', [*ROLES, 'simulator'])
+def test_checked_client_uses_frozen_phase_timeouts(frozen, role):
+    _, manifest, _, _ = frozen
+    timeouts = []
+    def respond(request):
+        timeouts.append(request.extensions['timeout'])
+        return completion(final('offline'), json.loads(request.content).get('stream', False))
+    client = batch.checked_client(role, 'offline', transport=httpx.MockTransport(respond))
+    kwargs = dict(model=batch.MODEL, reasoning_effort='high', max_tokens=16384, temperature=1.0,
+                  messages=[dict(role='user', content='offline')], stream=True,
+                  stream_options={'include_usage': True}, extra_body={'thinking': {'type': 'enabled'}})
+    if role == 'simulator':
+        kwargs.update(reasoning_effort='none', max_tokens=100, temperature=0.3,
+                      extra_body={'thinking': {'type': 'disabled'}})
+    try:
+        with client.chat.completions.create(**kwargs) as response:
+            list(response)
+        expected = dict(connect=60, read=180, write=60, pool=60)
+        assert timeouts == [expected]
+        assert manifest['parameters']['timeout_seconds'] == expected
     finally:
         client.close()
 

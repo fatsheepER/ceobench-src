@@ -180,3 +180,5 @@ core.*
 
 # Agent sandbox Python runtime (scripts/build_agent_runtime.py)
 agent-runtime/
+
+AGENTS.md

@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 
 import brotli
+import httpx
 
 import round5
 from saas_bench import team_batch as batch
@@ -57,10 +58,8 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
         try:
             if history:
                 saved = json.loads((history[-1] / 'attempt.json').read_text())
-                progress[run['run_id']] = {key: saved.get(key) for key in (
-                    'status', 'attempt', 'day', 'reason', 'checkpoint_reused_at_stop', 'runtime_phase')}
-                if saved['status'] == 'failed':
-                    checks.append('run_failed:' + run['run_id'])
+                progress[run['run_id']] = dict(status=saved['status'], **{key: saved.get(key) for key in (
+                    'attempt', 'day', 'reason', 'checkpoint_reused_at_stop', 'runtime_phase')})
             else:
                 progress[run['run_id']] = {'status': 'not_started'}
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -119,7 +118,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     output.mkdir(parents=True, exist_ok=True)
     hold = Path(hold_path or Path(manifest_path).parent / 'HOLD')
     checks, sql, routes, transient = [], [], [], []
-    quota, manifest = None, None
+    quota, manifest, quota_error = None, None, None
     try:
         manifest = identity(manifest_path, expected)
     except Exception as exc:
@@ -130,8 +129,16 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
             checks.append('quota_windows_changed')
         if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
             checks.append('quota_exhausted')
+    except httpx.HTTPError as exc:
+        quota_error = 'quota_unavailable:' + type(exc).__name__
+        state['quota_failures'] = state.get('quota_failures', 0) + 1
+        if state['quota_failures'] >= 2:
+            checks.append(quota_error)
     except Exception as exc:
-        checks.append('quota_unavailable:' + type(exc).__name__)
+        quota_error = 'quota_unavailable:' + type(exc).__name__
+        checks.append(quota_error)
+    else:
+        state['quota_failures'] = 0
     physical_requests = state.setdefault('physical_request_meta', {})
     cursors = state.setdefault('cursors', {})
     seen = state.setdefault('receipt_hashes', {})
@@ -139,7 +146,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     previous = state.get('active_checks', [])
     oldprogress = state.get('progress', {})
     faults, progress, coverage = set(), {}, {}
-    pending = False
+    pending = quota_error is not None
 
     def event(*, new_checks=(), sql_errors=(), route_errors=(), new_faults=(),
               transient_errors=(), completed=()):
@@ -262,7 +269,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     write_json(output / 'state.json', state)
     health = dict(time=datetime.now(timezone.utc).isoformat(), manifest=expected['manifest'],
         batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
-        quota=quota, checks=checks, sql_service_errors=sql, route_errors=routes,
+        quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
         progress=progress, coverage=coverage, state=state)
     write_json(output / 'health.json', health)
     with (output / 'health.jsonl').open('a') as stream:

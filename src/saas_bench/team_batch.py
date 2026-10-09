@@ -40,7 +40,8 @@ ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
     total_days=500, effective_end=497, sdk_max_retries=2, logical_request_attempts=4,
-    timeout_seconds=60, simulator_thinking='disabled', simulator_reasoning_effort='none')
+    timeout_seconds=dict(connect=60, read=180, write=60, pool=60),
+    simulator_thinking='disabled', simulator_reasoning_effort='none')
 
 
 def read(path):
@@ -106,7 +107,8 @@ def checked_client(role, session, *, transport=None, no_models=False, config=Non
     key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get('OPENCODE_API_KEY')
     if not key:
         raise ValueError('OPENCODE_API_KEY is required only for live execution')
-    return OpenAI(api_key=key, base_url=ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'], timeout=PARAMETERS['timeout_seconds'],
+    return OpenAI(api_key=key, base_url=ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'],
+        timeout=httpx.Timeout(**PARAMETERS['timeout_seconds']),
         default_headers={'User-Agent': 'CEO-Bench/1.0', 'x-opencode-session': session + ':' + role},
         http_client=httpx.Client(transport=transport, event_hooks={'request': [request_check]}))
 
