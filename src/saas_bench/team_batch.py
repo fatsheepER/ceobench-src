@@ -327,6 +327,10 @@ def validate_manifest(path):
     if type(manifest.get('max_attempts')) is not int or manifest['max_attempts'] < 1:
         raise ValueError('Frozen finite attempt limit is invalid')
     root, public = Path(manifest['source_root']), Path(manifest['public_dir'])
+    from .team_recovery import approval
+    revision = approval(path)
+    if ROOT != root and not revision:
+        raise ValueError('Executing batch is outside the frozen source root')
     if verify_build(public, root=root) != manifest['build'] or tree_hash(root / 'src') != manifest['source_sha256']:
         raise ValueError('Frozen source or public build changed')
     if file_hash(root / 'scripts' / 'team_batch.py') != manifest['host_script_sha256']:
@@ -399,7 +403,8 @@ def mark_interrupted(directory, record):
 
 
 def register_attempt(path, manifest, entry, *, resume=False):
-    if (path.parent / 'HOLD').exists():
+    from .team_recovery import hold_path, recovery_source
+    if hold_path(path).exists():
         raise ValueError('Batch HOLD marker is active')
     history = attempts(entry)
     source = None
@@ -407,13 +412,15 @@ def register_attempt(path, manifest, entry, *, resume=False):
         previous = read(history[-1] / 'attempt.json')
         if not resume:
             raise ValueError('Run already registered; use explicit resume for paused or failed attempts')
-        previous = mark_interrupted(history[-1], previous)
-        if previous['status'] not in ('paused', 'failed'):
+        audited = recovery_source(path, entry, previous, history[-1])
+        if not audited:
+            previous = mark_interrupted(history[-1], previous)
+        if not audited and previous['status'] not in ('paused', 'failed'):
             raise ValueError('Resume requires a paused or failed attempt with a safe checkpoint')
         if previous['manifest_sha256'] != file_hash(path) or file_hash(history[-1] / 'manifest.json') != file_hash(path):
             raise ValueError('Resume must retain the original immutable manifest')
         if previous.get('checkpoint'):
-            source = Path(previous['checkpoint'])
+            source = audited or Path(previous['checkpoint'])
             owner = next((directory for directory in history
                 if source.is_relative_to(directory / 'runtime' / 'checkpoints')), None)
             if owner is None:
@@ -545,6 +552,7 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
     if live and (os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1'
             or os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'):
         raise ValueError('Frozen team execution cannot enable replay, oracle or read-only overrides')
+    from .team_recovery import hold_path
     entry = selected(manifest, run_id)
     output = Path(entry['output_dir'])
     with run_lock(output):
@@ -558,7 +566,7 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             def guarded_request(request):
                 request_guard(request, check=team._lifecycle.check if team else lambda: None)
             guard_options = dict(request_guard=guarded_request if request_guard else None, response_guard=response_guard,
-                hold=path.parent / 'HOLD' if request_guard else None)
+                hold=hold_path(path) if request_guard else None)
             factory = client_factory or (lambda role: checked_client(role, session, no_models=not live,
                 **guard_options))
             def world_factory(conn, config, rng):
@@ -585,7 +593,7 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             save_checkpoint(team, directory, record, 'ready')
             if not live:
                 return record
-            return execute(team, manifest, entry, directory, record, path.parent / 'HOLD')
+            return execute(team, manifest, entry, directory, record, hold_path(path))
         except BaseException as exc:
             record.update(status='failed', error_type=type(exc).__name__, error=str(exc))
             write_json(directory / 'attempt.json', record)
@@ -596,6 +604,11 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
 
 
 def execute(team, manifest, entry, directory, record, hold):
+    with team._lifecycle:
+        return _execute(team, manifest, entry, directory, record, hold)
+
+
+def _execute(team, manifest, entry, directory, record, hold):
     from .team_usage import aggregate
     from .team_results import summarize_run
     start = time.monotonic()
@@ -629,6 +642,15 @@ def execute(team, manifest, entry, directory, record, hold):
             save_checkpoint(team, directory, record, 'final')
         except (ValueError, RuntimeError) as exc:
             record['checkpoint_error'] = str(exc)
+            try:
+                from .team_checkpoint import validate_snapshot, validate_recovery_source
+                snapshot, state = validate_snapshot(record['checkpoint'])
+                validate_recovery_source(snapshot, state, current_root=team.root)
+                record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
+                    checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
+                    day=state['day'], stage=state['stage'], current_operation_coverage=True)
+            except (OSError, ValueError, RuntimeError, KeyError) as validation:
+                record['recovery_validation'] = dict(eligible=False, error=str(validation))
     record['checkpoint_reused_at_stop'] = reuse
     logs = {entry['category']: [], 'simulator': []}
     for previous in attempts(entry):

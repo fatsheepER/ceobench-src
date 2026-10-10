@@ -270,8 +270,14 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .simulation import Simulator
     from .shocks import ShockManager
     from .tools import AgentTools
-    _pin_snapshot(snapshot)
+    from .team_recovery import approval, source_revision_allowed
+    revision = approval()
+    migrating = revision and any(str(Path(snapshot).resolve()) == saved['checkpoint']
+        for saved in revision['attempts'].values())
+    if not migrating:
+        _pin_snapshot(snapshot)
     snapshot, state = validate_snapshot(snapshot)
+    migrated = source_revision_allowed(snapshot, state) if tree_hash(Path(__file__).parent) != state['source_sha256'] else False
     validate_recovery_source(snapshot, state)
     root = Path(root).resolve()
     source = Path(state['source_root'])
@@ -282,7 +288,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
     if artifact_hashes(public) != state['public_artifacts']:
         raise ValueError('Public build differs from frozen team configuration')
-    if tree_hash(Path(__file__).parent) != state['source_sha256']:
+    if tree_hash(Path(__file__).parent) != state['source_sha256'] and not migrated:
         raise ValueError('Source differs from frozen team configuration')
     configuration = state['configuration']
     for key in list(options):
@@ -296,7 +302,8 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     copy_workspace(snapshot / 'private', root / 'private')
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
-        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json')))
+        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
+        source_revision_sha256=os.environ.get('CEOBENCH_RECOVERY_APPROVAL_SHA256') if migrated else None))
     conn = load_session_db(snapshot / 'world.nmdb')
     try:
         config = BenchmarkConfig(**state['benchmark_config'])

@@ -19,8 +19,13 @@ class WorkerLifecycle:
         self._model = threading.local()
         self._wake = threading.Event()
         self._thread = None
+        self._depth = 0
 
     def __enter__(self):
+        if self._depth:
+            self._depth += 1
+            return self
+        self._depth = 1
         self._old_handler = signal.signal(signal.SIGUSR1, self._signal) if threading.current_thread() is threading.main_thread() else None
         if self.parent_pid is not None:
             try:
@@ -37,6 +42,7 @@ class WorkerLifecycle:
                     os.close(self._parent)
                 raise
         ready = os.environ.get('CEOBENCH_LIFECYCLE_READY')
+        self._ready = Path(ready) if ready else None
         if ready:
             from .run_state import write_json
             write_json(Path(ready), dict(pid=os.getpid()))
@@ -87,6 +93,9 @@ class WorkerLifecycle:
             self._wake.wait(min(remaining, .25))
 
     def __exit__(self, *exc):
+        self._depth -= 1
+        if self._depth:
+            return
         self._model.active = False
         if self._thread:
             os.write(self._pipe[1], b'x')
@@ -95,4 +104,8 @@ class WorkerLifecycle:
                 os.close(fd)
             del self._parent
         if self._old_handler is not None:
-            signal.signal(signal.SIGUSR1, self._old_handler)
+            # A supervisor may already have queued a signal after reading ready.
+            handler = signal.SIG_IGN if self._ready and self._old_handler == signal.SIG_DFL else self._old_handler
+            signal.signal(signal.SIGUSR1, handler)
+        if self._ready:
+            self._ready.unlink(missing_ok=True)

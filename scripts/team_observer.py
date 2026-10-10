@@ -37,7 +37,8 @@ def identity(path, expected):
         raise ValueError('Manifest anchor mismatch')
     manifest = batch.validate_manifest(path)
     if manifest.get('controller_sha256'):
-        root = Path(manifest['source_root'])
+        from saas_bench.team_recovery import execution_root
+        root = execution_root(path, manifest)
         if (Path(__file__).resolve() != root / 'scripts/team_observer.py' or
                 Path(round5.__file__).resolve() != root / 'scripts/round5.py'):
             raise ValueError('Observer is outside the frozen source root')
@@ -134,7 +135,8 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     deadline = time.monotonic() + max_seconds
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    hold = Path(hold_path or Path(manifest_path).parent / 'HOLD')
+    from saas_bench.team_recovery import hold_path as effective_hold
+    hold = Path(hold_path) if hold_path else effective_hold(manifest_path)
     checks, sql, routes, transient = [], [], [], []
     quota, manifest, quota_error = None, None, None
     if state.get('monitor_identity', expected) != expected:

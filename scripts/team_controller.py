@@ -15,6 +15,7 @@ import time
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
+from saas_bench.team_recovery import execution_root, hold_path, recovery_source
 from team_observer import identity, poll
 
 
@@ -22,7 +23,7 @@ class RequestGate:
     def __init__(self, policy, *, run_id=None, parent_pid=None):
         self.directory = Path(policy).resolve().parent
         self.expected = batch.read(policy)['identity']
-        self.hold = Path(self.expected['manifest']).parent / 'HOLD'
+        self.hold = hold_path(self.expected['manifest'])
         self.parent_pid = parent_pid
         self.entry = None
         if run_id:
@@ -44,7 +45,7 @@ class RequestGate:
     def manifest(self):
         try:
             manifest = identity(self.expected['manifest'], self.expected)
-            if manifest.get('controller_sha256') and Path(__file__).resolve() != Path(manifest['source_root']) / 'scripts/team_controller.py':
+            if manifest.get('controller_sha256') and Path(__file__).resolve() != execution_root(self.expected['manifest'], manifest) / 'scripts/team_controller.py':
                 raise ValueError('Controller is outside the frozen source root')
             return manifest
         except (OSError, ValueError, KeyError, TypeError):
@@ -134,7 +135,8 @@ def supervise(policy, *, resume=False):
             continue
         if bool(saved) != resume:
             raise ValueError('Use fresh execution or explicit --resume for existing attempts')
-        if saved and saved['status'] not in ('paused', 'failed'):
+        audited = recovery_source(gate.expected['manifest'], entry, saved, batch.attempts(entry)[-1]) if saved and resume else None
+        if saved and not audited and saved['status'] not in ('paused', 'failed'):
             raise ValueError('Explicit resume requires a paused or failed attempt')
         entries.append(entry)
     statefile = directory / 'observer/state.json'
@@ -189,7 +191,7 @@ def supervise(policy, *, resume=False):
                 ready = host_logs / f'ready-{entry["run_id"]}-{mode}.json'
                 ready.unlink(missing_ok=True)
                 env = dict(os.environ, PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
-                    PYTHONPATH=str(Path(manifest['source_root']) / 'src'),
+                    PYTHONPATH=str(execution_root(gate.expected['manifest'], manifest) / 'src'),
                     CEOBENCH_LIFECYCLE_READY=str(ready))
                 stream = (host_logs / f'{entry["run_id"]}-{mode}.log').open('a')
                 streams.append(stream)
