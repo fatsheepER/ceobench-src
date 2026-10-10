@@ -158,6 +158,7 @@ variants/
 viz/
 
 # Scratch / tmp
+/.audit/
 _tmp_*/
 core.*
 
