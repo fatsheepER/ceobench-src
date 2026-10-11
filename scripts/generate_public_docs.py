@@ -313,7 +313,12 @@ novamind-operation query "SELECT group_id, COUNT(*) as n FROM subscriptions WHER
 - Read-only (SELECT only) — no INSERT/UPDATE/DELETE
 - Schema introspection blocked (no PRAGMA, sqlite_master)
 - Some internal tables and columns are hidden
-- Results capped at 5,000 rows
+- Results capped at 5,000 rows. JSON preserves all public response fields, including
+  `success`, `columns`, `rows`, and `row_count` (the number of returned rows).
+- Capped results include `truncated: true` and `warning`; warnings also print to stderr.
+  Use SQL aggregates for population calculations.
+- An explicit LIMIT scopes the requested query. Absence of a truncation warning
+  does not establish population coverage.
 
 See `docs/tables-reference.md` for available tables and columns.
 

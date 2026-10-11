@@ -373,7 +373,7 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     # Equal text from another command cannot stand in for a redirected query.
     redirected_sql = 'SELECT 456 AS n'
     cli_code = 'from cli_fixture import cmd_query; from argparse import Namespace; cmd_query(Namespace(session=None, sql=' + repr(redirected_sql) + '))'
-    echo_code = 'print(' + repr(json.dumps({'columns': ['n'], 'rows': [{'n': 456}], 'row_count': 1}, indent=2)) + ')'
+    echo_code = 'print(' + repr(json.dumps({'success': True, 'columns': ['n'], 'rows': [{'n': 456}], 'row_count': 1}, indent=2)) + ')'
     output = executor.execute('bash', {'command': 'python -c ' + shlex.quote(cli_code) + ' > /dev/null; python -c ' + shlex.quote(echo_code)})
     send(store, output)
     with pytest.raises(ValueError, match='not been delivered'):
@@ -385,6 +385,45 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     send(store, output)
     with pytest.raises(ValueError, match='not been delivered'):
         call(registry, 'create', **declaration({'sql': hidden_sql}))
+
+
+def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, server, packed_public):
+    import shlex
+    from test_sql_evidence import settled
+    from saas_bench.pf_stale import compare
+    store, registry, executor = captured(workspace, tmp_path)
+    server.sql_evidence = store
+    server.start()
+    shutil.copy(packed_public / 'novamind-client', workspace / 'novamind-operation')
+    executor.extra_env = {'NOVAMIND_API_PORT': str(server.port)}
+    sql = 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<5001) SELECT n FROM x'
+    command = './novamind-operation query ' + shlex.quote(sql)
+    result = executor.execute('bash', {'command': command})
+    settled(server)
+    event = send(store, result)
+    wire = json.loads(store.get_content(event + ':wire')[1])
+    delivered = wire['messages'][0]['content']
+    assert 'Result exceeded 5000 rows and was truncated.' in delivered
+    assert 'output truncated' in delivered
+    with store.connect() as conn:
+        versions = conn.execute("SELECT version_id FROM versions WHERE json_extract(metadata, '$.layer') = 'query_model_projection'").fetchall()
+    assert len(versions) == 1
+    meta, raw = store.get_content(versions[0][0])
+    body = json.loads(raw)
+    assert body['success'] and body['truncated'] and body['row_count'] == 5000
+    assert meta['source_truncated']
+    assert body == json.loads(store.get_content(meta['derived_from'])[1])
+    with pytest.raises(ValueError, match='source_truncated'):
+        compare(registry.resolver, meta['derived_from'], meta['derived_from'], {}, 'query')
+    nested = 'import json, subprocess; r=json.loads(subprocess.check_output(' + repr(shlex.split(command)) + ')); print(len(r["rows"]))'
+    result = executor.execute('bash', {'command': 'python -c ' + shlex.quote(nested)})
+    event = send(store, result)
+    delivered = json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content']
+    assert '5000' in delivered
+    assert 'Result exceeded 5000 rows and was truncated.' in delivered
+    limited = executor.execute('bash', {'command': './novamind-operation query ' + shlex.quote(sql + ' LIMIT 1')})
+    body = json.loads(limited.rsplit('\n[', 1)[0])
+    assert body['row_count'] == 1 and 'truncated' not in body and 'warning' not in body
 
 
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])

@@ -366,12 +366,9 @@ def cmd_query(args):
         "timestamp": time.time(),
     })
     if result.get("success"):
-        rows = result.get("rows", [])
-        columns = result.get("columns", [])
-        if rows:
-            print(json.dumps({"columns": columns, "rows": rows, "row_count": len(rows)}, indent=2, default=str))
-        else:
-            print(json.dumps({"columns": columns, "rows": [], "row_count": 0}))
+        print(json.dumps(result, indent=2, default=str))
+        if result.get("warning"):
+            print(f"\n⚠️  {result['warning']}", file=sys.stderr)
     else:
         print(f"Error: {result.get('error', 'Unknown error')}", file=sys.stderr)
         sys.exit(1)

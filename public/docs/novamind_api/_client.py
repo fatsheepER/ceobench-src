@@ -170,7 +170,11 @@ def query(sql: str) -> Dict[str, Any]:
 
     Returns:
         Dict with 'columns' (list of column names), 'rows' (list of dicts),
-        and 'row_count' (int).
+        'row_count' (returned row count), and 'success'. Results are capped at
+        5,000 rows. If capped, 'truncated' is true and 'warning' describes the
+        returned subset. Warnings also print to stderr. Use SQL aggregates for
+        population calculations. An explicit LIMIT scopes the requested query;
+        absence of a truncation warning does not establish population coverage.
 
     Raises:
         NovaMindAPIError: On failure (blocked query, syntax error, etc.)

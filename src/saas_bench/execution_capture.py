@@ -447,8 +447,7 @@ def query_projection(capture, stdout):
             projected = json.loads(stdout)
         except ValueError:
             continue
-        expected = {k: body.get(k) for k in ('columns', 'rows', 'row_count')}
-        if body.get('success') and projected == expected:
+        if body.get('success') and projected == body:
             matches.append((public, meta))
     if len(matches) != 1:
         return []
