@@ -521,11 +521,13 @@ def test_memory_strip_limit_and_dashboard_slice_keep_exact_origins(captured):
 
 
 @pytest.mark.parametrize('collection_error', ['timeout', 'oserror'])
-def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch, collection_error):
+@pytest.mark.parametrize('undecodable', [False, True])
+def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch, collection_error, undecodable):
     import subprocess
     from saas_bench.process_boundary import Boundary
     from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
     _, store, executor = captured
+    expected_stdout = b'partial-out\xff' if undecodable else b'partial-out'
     real_communicate = subprocess.Popen.communicate
     def timeout(self, *args, **kwargs):
         if kwargs.get('timeout') == 5:
@@ -533,15 +535,17 @@ def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch, co
             real_communicate(self, timeout=5)
             if collection_error == 'oserror':
                 raise OSError(5, 'injected stream collection failure')
-            raise subprocess.TimeoutExpired(self.args, 5, output=b'partial-out', stderr=b'partial-err')
+            raise subprocess.TimeoutExpired(self.args, 5, output=expected_stdout, stderr=b'partial-err')
         return real_communicate(self, *args, **kwargs)
     monkeypatch.setattr(subprocess.Popen, 'communicate', timeout)
     executor.bash_timeout = .1
+    command = (r"printf 'partial-out\377'" if undecodable else 'printf partial-out')
     with pytest.raises(NextDayTimeoutError, match='cleanup'):
-        executor.execute('bash', {'command': 'printf partial-out; printf partial-err >&2; sleep 60'})
+        executor.execute('bash', {'command': command + '; printf partial-err >&2; sleep 60'})
     event = event_ids(store)[0]
     meta, raw = store.get_content(event + ':stdout_bytes')
-    assert raw == b'partial-out' and meta['extent'] == 'partial'
+    assert raw == expected_stdout and meta['extent'] == 'partial'
+    assert store.get_content(event + ':stderr_bytes')[1] == b'partial-err'
     facts = store.read_event(event)['result']
     assert facts['status'] == 'result_unknown'
     assert facts['process_boundary']['streams_collected'] is False
