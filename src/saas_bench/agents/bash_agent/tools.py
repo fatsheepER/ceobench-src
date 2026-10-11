@@ -930,7 +930,9 @@ class BashAgentToolExecutor:
             if port and int(port) > 0 and not self.identity:
                 import json
                 import urllib.request
-                with urllib.request.urlopen(f'http://127.0.0.1:{int(port)}/game-status', timeout=5) as response:
+                request = urllib.request.Request(f'http://127.0.0.1:{int(port)}/game-status',
+                                                 headers={'X-Harness-Status': 'flags'})
+                with urllib.request.urlopen(request, timeout=5) as response:
                     state = json.load(response)
                 if state.get('timed_out') or state.get('operation_failed'):
                     raise NextDayTimeoutError('Server operation outcome unknown',

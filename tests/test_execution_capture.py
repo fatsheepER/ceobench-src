@@ -86,6 +86,311 @@ except subprocess.TimeoutExpired as exc:
     assert executor.execute('bash', {'command': 'echo next-tool'}) == 'next-tool\n'
 
 
+@pytest.mark.parametrize('sql_first', [True, False], ids=['sql_before_python', 'sql_after_bash'])
+def test_public_cli_timeout_settles_inflight_sql_without_faking_receive(captured, monkeypatch, tmp_path, sql_first):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from saas_bench import public_sql
+    api, store, executor = captured
+    source = Path(__file__).parents[1] / 'src/saas_bench'
+    shutil.copy(source / '_public_cli.py', executor.workspace_path / 'cli.py')
+    shutil.copy(source / 'novamind_api/_capture.py', executor.workspace_path / '_client_capture.py')
+    started, release = threading.Event(), threading.Event()
+    marker = executor.workspace_path / 'sql-started'
+    execute_snapshot = public_sql.execute_snapshot
+    def blocking_snapshot(conn, sql, deadline, metadata):
+        def block():
+            if not started.is_set():
+                marker.write_text('executing')
+                started.set()
+                assert release.wait(10), 'SQL gate was not released'
+            return 0
+        conn.set_progress_handler(block, 1)
+        try:
+            return execute_snapshot(conn, sql, deadline, metadata)
+        finally:
+            conn.set_progress_handler(None, 0)
+    monkeypatch.setattr(public_sql, 'execute_snapshot', blocking_snapshot)
+    complete = store.complete
+    def ordered_complete(event, *args, **kwargs):
+        if sql_first and store.read_event(event)['request']['kind'] == 'cli_python':
+            release.set()
+            settled(api)
+        return complete(event, *args, **kwargs)
+    monkeypatch.setattr(store, 'complete', ordered_complete)
+    driver = '''import os, subprocess, time
+from pathlib import Path
+import cli
+communicate = subprocess.Popen.communicate
+def shortened(self, *args, **kwargs):
+    if kwargs.get('timeout') == 300:
+        deadline = time.monotonic() + 5
+        while not Path('sql-started').exists():
+            assert time.monotonic() < deadline, 'SQL did not start'
+            time.sleep(.01)
+        kwargs['timeout'] = .1
+    return communicate(self, *args, **kwargs)
+subprocess.Popen.communicate = shortened
+cli._execute_python('__env__', int(os.environ['NOVAMIND_API_PORT']),
+    "import novamind_api as nm; nm.query('SELECT amount FROM ledger')", 'blocking.py')
+'''
+    (executor.workspace_path / 'driver.py').write_text(driver)
+    executor.bash_timeout = 5
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(executor.execute, 'bash', {'command': 'python driver.py'})
+        try:
+            assert started.wait(5), 'SQLite query did not enter its progress handler'
+            output = running.result(timeout=10)
+            assert 'TimeoutExpired' in output and '[exit code: 1]' in output, output
+            assert 'AssertionError' not in output, output
+            bash, python, sql = records(store)
+            assert python['result']['exit_code'] == -9
+            assert python['result']['error'] == 'timeout'
+            assert bash['result']['process_boundary']['phase'] == 'closed'
+            assert bash['result']['process_boundary']['children'] == []
+            assert sql['client_receipt'] == {'receive_state': 'unknown'}
+            if not sql_first:
+                assert sql['result']['status'] == 'result_unknown'
+                assert sql.get('client_interruption') is None
+                with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome'):
+                    store.assert_healthy()
+            release.set()
+            settled(api)
+            store.assert_healthy()
+            sql_event = sql['request']['event_id']
+            sql = store.read_event(sql_event)
+            assert sql['result']['status'] == 'succeeded'
+            assert sql['delivery']['send_state'] in ('sent', 'failed')
+            assert sql['client_receipt'] == {'receive_state': 'unknown'}
+            interruption = sql['client_interruption']
+            assert interruption['state'] == 'interrupted'
+            assert interruption['receive_state'] == 'unknown'
+            assert interruption['reason'] == 'python_timeout_kill'
+            assert interruption['python_event_id'] == python['request']['event_id']
+            assert interruption['bash_event_id'] == bash['request']['event_id']
+            with closing(store.connect()) as conn:
+                received, = conn.execute('SELECT received FROM client_calls WHERE event_id=?', (sql_event,)).fetchone()
+            assert received is None
+            assert executor.execute('bash', {'command': 'echo next-tool'}) == 'next-tool\n'
+            api.checkpoint_callback = lambda: store.snapshot(tmp_path / 'checkpoint.sqlite')
+            assert api.checkpoint(0)['cutoff'] == len(event_ids(store))
+            restored = SQLEvidenceStore(tmp_path / 'checkpoint.sqlite', store.identity)
+            restored.assert_healthy()
+            assert restored.read_event(sql_event)['client_interruption'] == interruption
+            assert restored.read_event(sql_event)['client_receipt'] == {'receive_state': 'unknown'}
+        finally:
+            release.set()
+            running.result(timeout=10)
+            settled(api)
+
+
+@pytest.mark.parametrize('capture', [False, True])
+@pytest.mark.parametrize('state', ['healthy', 'timed_out', 'failed', 'in_progress'])
+def test_bash_status_probe_reads_live_flags_without_world_metrics(captured, monkeypatch, capture, state):
+    from saas_bench import database
+    api, _, _ = captured
+    if not capture:
+        api.sql_evidence = None
+    api._step_day_timed_out = state == 'timed_out'
+    api._operation_failed = state == 'failed'
+    if state == 'in_progress':
+        api._advance_lock.acquire()
+    try:
+        def unexpected_read(conn):
+            pytest.fail('Status flag probe read world metrics')
+        with monkeypatch.context() as blocked:
+            blocked.setattr(database, 'get_cash', unexpected_read)
+            blocked.setattr(database, 'get_active_subscriber_count', unexpected_read)
+            request = urllib.request.Request(f'http://127.0.0.1:{api.port}/game-status',
+                                             headers={'X-Harness-Status': 'flags'})
+            with urllib.request.urlopen(request, timeout=3) as response:
+                assert json.load(response) == dict(timed_out=state == 'timed_out',
+                    operation_failed=state == 'failed', operation_in_progress=state == 'in_progress')
+    finally:
+        if state == 'in_progress':
+            api._advance_lock.release()
+        api._step_day_timed_out = False
+        api._operation_failed = False
+    with urllib.request.urlopen(f'http://127.0.0.1:{api.port}/game-status', timeout=3) as response:
+        status = json.load(response)
+    assert status['cash'] == 42 and status['subscribers'] == 0
+
+
+@pytest.fixture
+def timeout_sql_client(tmp_path):
+    from saas_bench.public_sql import PUBLIC_POLICY_VERSION
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', identity(capture_scope='execution'))
+    bash = store.begin_event('bash', {'command': 'python script.py'})
+    python = store.begin_event('cli_python', {'source': 'script.py'}, parent=bash)
+    sql = store.begin(b'{"sql":"SELECT 1 AS n"}', PUBLIC_POLICY_VERSION, parent=python)
+    token = 'a' * 32
+    store.bind_client(sql, token)
+    return store, bash, python, sql, token
+
+
+def closed_bash_result():
+    return dict(exit_code=1, process_started=True, boundary_closed=True,
+        process_boundary=dict(phase='closed', coverage='subreaper_wait',
+                              children=[], unknown=None, exit_code=1))
+
+
+@pytest.mark.parametrize('last', ['sql', 'python', 'bash', 'delivery'])
+@pytest.mark.parametrize('sql_status', [200, 400, 500, 504])
+@pytest.mark.parametrize('send_state', ['sent', 'failed'])
+def test_timeout_sql_client_settles_when_last_terminal_fact_arrives(timeout_sql_client, tmp_path, last, sql_status, send_state):
+    store, bash, python, sql, token = timeout_sql_client
+    stages = {
+        'sql': lambda: store.finish(sql, sql_status, [],
+            b'{"success":true,"columns":["n"],"rows":[{"n":1}]}' if sql_status == 200 else
+            b'{"success":false,"error":"query failed"}', {}),
+        'python': lambda: store.complete(python, 'failed', exit_code=-9, error='timeout'),
+        'bash': lambda: store.complete(bash, 'failed', **closed_bash_result()),
+        'delivery': lambda: store.delivered(sql, send_state),
+    }
+    for name, stage in stages.items():
+        if name != last:
+            stage()
+    assert store.read_event(sql)['client_interruption'] is None
+    with pytest.raises(RuntimeError, match='Unconfirmed'):
+        store.assert_healthy()
+    stages[last]()
+    store.assert_healthy()
+    row = store.read_event(sql)
+    assert row['client_interruption']['state'] == 'interrupted'
+    assert row['client_interruption']['receive_state'] == 'unknown'
+    assert row['client_interruption']['reason'] == 'python_timeout_kill'
+    assert row['client_interruption']['python_event_id'] == python
+    assert row['client_interruption']['bash_event_id'] == bash
+    assert row['client_receipt'] == {'receive_state': 'unknown'}
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT received FROM client_calls WHERE token=?', (token,)).fetchone()[0] is None
+    event = store.begin_event('read_file', {'path': 'next.txt'})
+    store.complete(event)
+    store.snapshot(tmp_path / 'checkpoint.sqlite')
+    restored = SQLEvidenceStore(tmp_path / 'checkpoint.sqlite', store.identity)
+    restored.assert_healthy()
+    assert restored.read_event(sql)['client_interruption'] == row['client_interruption']
+
+
+def test_timeout_sql_client_health_settles_preexisting_terminal_records(timeout_sql_client, monkeypatch):
+    store, bash, python, sql, _ = timeout_sql_client
+    with monkeypatch.context() as delayed:
+        delayed.setattr(store, '_settle_interrupted_clients', lambda conn: None)
+        store.complete(sql)
+        store.delivered(sql, 'failed')
+        store.complete(python, 'failed', exit_code=-9, error='timeout')
+        store.complete(bash, 'failed', **closed_bash_result())
+    assert store.read_event(sql)['client_interruption'] is None
+    store.assert_healthy()
+    assert store.read_event(sql)['client_interruption']['reason'] == 'python_timeout_kill'
+    assert store.read_event(sql)['client_receipt'] == {'receive_state': 'unknown'}
+
+
+@pytest.mark.parametrize('unsafe', [
+    'business_write', 'ordinary_lost_receipt', 'kill_without_timeout', 'python_unknown',
+    'wrong_python_kind', 'wrong_bash_kind', 'no_python_parent', 'no_bash_parent',
+    'missing_cleanup', 'live_descendants', 'unknown_cleanup', 'missing_children',
+    'missing_unknown', 'direct_child_only', 'descendants_not_closed', 'descendants_unknown',
+    'boundary_open', 'process_not_started',
+    'outer_unknown', 'missing_exit_code', 'exit_code_mismatch', 'sql_unknown',
+    'sql_missing', 'sql_unfinished', 'sql_capture_missing', 'delivery_unknown', 'delivery_missing',
+])
+def test_timeout_sql_client_rejects_missing_or_unsafe_proof(timeout_sql_client, unsafe):
+    store, bash, python, sql, token = timeout_sql_client
+    python_result = dict(status='failed', exit_code=-9, error='timeout')
+    bash_result = dict(status='failed', **closed_bash_result())
+    sql_result = dict(status='succeeded')
+    delivery = 'failed'
+    if unsafe == 'business_write':
+        with closing(store.connect()) as conn, conn:
+            request = store.read_event(sql)['request']
+            request.update(kind='public_http', request={'method': 'POST', 'path': '/call',
+                           'tool': 'set_daily_spend'})
+            conn.execute('UPDATE requests SET request=? WHERE event_id=?', (json.dumps(request).encode(), sql))
+    elif unsafe in ('wrong_python_kind', 'wrong_bash_kind', 'no_python_parent', 'no_bash_parent'):
+        event = python if unsafe in ('wrong_python_kind', 'no_bash_parent') else sql if unsafe == 'no_python_parent' else bash
+        request = store.read_event(event)['request']
+        if unsafe.startswith('wrong_'):
+            request['kind'] = 'write_file'
+        else:
+            request['parent_event_id'] = None
+        with closing(store.connect()) as conn, conn:
+            conn.execute('UPDATE requests SET request=? WHERE event_id=?', (json.dumps(request).encode(), event))
+    elif unsafe == 'ordinary_lost_receipt':
+        python_result.update(exit_code=1, error=None)
+    elif unsafe == 'kill_without_timeout':
+        python_result['error'] = None
+    elif unsafe == 'python_unknown':
+        python_result.update(status='result_unknown', exit_code=None)
+    elif unsafe == 'missing_cleanup':
+        bash_result.pop('process_boundary')
+    elif unsafe in ('live_descendants', 'unknown_cleanup', 'missing_children', 'missing_unknown',
+                    'direct_child_only', 'descendants_not_closed', 'descendants_unknown'):
+        boundary = bash_result['process_boundary']
+        if unsafe == 'live_descendants':
+            boundary['children'] = [12345]
+        elif unsafe == 'unknown_cleanup':
+            boundary['unknown'] = 'cleanup not confirmed'
+        elif unsafe == 'direct_child_only':
+            boundary['coverage'] = 'direct_child_and_streams_only'
+        elif unsafe in ('descendants_not_closed', 'descendants_unknown'):
+            boundary['descendants_closed'] = False if unsafe == 'descendants_not_closed' else None
+        else:
+            boundary.pop('children' if unsafe == 'missing_children' else 'unknown')
+    elif unsafe == 'boundary_open':
+        bash_result['boundary_closed'] = False
+    elif unsafe == 'process_not_started':
+        bash_result['process_started'] = False
+    elif unsafe == 'outer_unknown':
+        bash_result['status'] = 'result_unknown'
+    elif unsafe == 'missing_exit_code':
+        bash_result['exit_code'] = None
+    elif unsafe == 'exit_code_mismatch':
+        bash_result['process_boundary']['exit_code'] = 2
+    elif unsafe == 'sql_unknown':
+        sql_result['status'] = 'result_unknown'
+    elif unsafe == 'sql_unfinished':
+        sql_result['completed_at'] = None
+    elif unsafe == 'sql_capture_missing':
+        sql_result['capture_status'] = 'missing'
+    elif unsafe == 'delivery_unknown':
+        delivery = 'unknown'
+    store.complete(python, **python_result)
+    store.complete(bash, **bash_result)
+    if unsafe != 'sql_missing':
+        store.complete(sql, **sql_result)
+    if unsafe != 'delivery_missing':
+        store.delivered(sql, delivery)
+    with pytest.raises(RuntimeError, match='Unconfirmed'):
+        store.assert_healthy()
+    assert store.read_event(sql)['client_interruption'] is None
+    assert store.read_event(sql)['client_receipt'] == {'receive_state': 'unknown'}
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT received FROM client_calls WHERE token=?', (token,)).fetchone()[0] is None
+
+
+@pytest.mark.parametrize('tampered', ['parent', 'interruption'])
+def test_timeout_sql_client_rechecks_stored_interruption_proof(timeout_sql_client, tampered):
+    store, bash, python, sql, token = timeout_sql_client
+    store.complete(sql)
+    store.delivered(sql, 'failed')
+    store.complete(python, 'failed', exit_code=-9, error='timeout')
+    store.complete(bash, 'failed', **closed_bash_result())
+    store.assert_healthy()
+    with closing(store.connect()) as conn, conn:
+        if tampered == 'parent':
+            result = store.read_event(bash)['result']
+            result['process_boundary']['children'] = [12345]
+            conn.execute('UPDATE results SET record=? WHERE event_id=?', (json.dumps(result).encode(), bash))
+        else:
+            record = store.read_event(sql)['client_interruption']
+            record['python_event_id'] = bash
+            conn.execute('UPDATE client_interruptions SET record=? WHERE token=?', (json.dumps(record).encode(), token))
+    with pytest.raises(RuntimeError, match='Unconfirmed client receive outcome'):
+        store.assert_healthy()
+    assert store.read_event(sql)['client_receipt'] == {'receive_state': 'unknown'}
+
+
 def test_public_cli_cleanup_failure_keeps_child_outcome_unknown(captured, monkeypatch):
     import subprocess
     from saas_bench import _public_cli

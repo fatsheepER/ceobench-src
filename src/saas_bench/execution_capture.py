@@ -21,6 +21,37 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
                         'get_market_overview', 'get_group_insights'})
 
 
+def sql_client_interruption(conn, event):
+    row = conn.execute('''SELECT q.request, qr.record, d.record,
+            p.request, pr.record, b.request, br.record
+        FROM requests q JOIN results qr ON qr.event_id=q.event_id
+        JOIN deliveries d ON d.event_id=q.event_id
+        JOIN requests p ON p.event_id=json_extract(q.request, '$.parent_event_id')
+        JOIN results pr ON pr.event_id=p.event_id
+        JOIN requests b ON b.event_id=json_extract(p.request, '$.parent_event_id')
+        JOIN results br ON br.event_id=b.event_id WHERE q.event_id=?''', (event,)).fetchone()
+    if row is None:
+        return None
+    query, result, delivery, python, ended, bash, outer = map(json.loads, row)
+    if (query['kind'] != 'sql_query' or python['kind'] != 'cli_python' or bash['kind'] != 'bash'
+            or result['status'] not in ('succeeded', 'failed', 'rejected', 'timed_out')
+            or delivery.get('send_state') not in ('sent', 'failed')
+            or ended['status'] != 'failed' or ended.get('error') != 'timeout' or ended.get('exit_code') != -9
+            or outer['status'] not in ('succeeded', 'failed', 'timed_out')
+            or any(r.get('capture_status') != 'complete' or not r.get('completed_at')
+                   for r in (result, ended, outer))):
+        return None
+    boundary = outer.get('process_boundary') or {}
+    if (outer.get('process_started') is not True or outer.get('boundary_closed') is not True
+            or outer.get('exit_code') is None or boundary.get('exit_code') != outer['exit_code']
+            or boundary.get('phase') != 'closed' or boundary.get('coverage') != 'subreaper_wait'
+            or boundary.get('descendants_closed', True) is not True
+            or boundary.get('children') != [] or boundary.get('unknown', 'missing') is not None):
+        return None
+    return dict(state='interrupted', reason='python_timeout_kill', receive_state='unknown',
+                python_event_id=python['event_id'], bash_event_id=bash['event_id'])
+
+
 def excluded(rel):
     """Only harness-owned paths at the workspace root; nested business names are legal."""
     from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
@@ -280,11 +311,17 @@ def public_handler(method):
         store = handler.evidence
         if handler.path == '/_capture':
             return receive_client(handler)
-        if not store or not store.execution_capture:
+        status_only = (handler.command == 'GET' and handler.path == '/game-status'
+                       and handler.headers.get('X-Harness-Status') == 'flags')
+        if (not store or not store.execution_capture) and not status_only:
             return method(handler)
         if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh', '/run-metrics'):
-            handler._control_capture = True
+            handler._control_capture = bool(store and store.execution_capture)
             try:
+                if status_only:
+                    return handler._send_json(dict(timed_out=api._step_day_timed_out,
+                        operation_failed=api._operation_failed,
+                        operation_in_progress=api._advance_lock.locked()))
                 return method(handler)
             finally:
                 if hasattr(handler, '_control_record'):

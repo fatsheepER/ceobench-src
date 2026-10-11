@@ -109,6 +109,8 @@ class SQLEvidenceStore:
                 CREATE TABLE IF NOT EXISTS client_calls (
                     token TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES requests(event_id),
                     received BLOB);
+                CREATE TABLE IF NOT EXISTS client_interruptions (
+                    token TEXT PRIMARY KEY REFERENCES client_calls(token), record BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS private_state (name TEXT PRIMARY KEY, value BLOB NOT NULL);
                 CREATE INDEX IF NOT EXISTS versions_object_id ON versions(json_extract(metadata, '$.object_id'));
                 CREATE INDEX IF NOT EXISTS versions_event_id ON versions(event_id);
@@ -176,13 +178,13 @@ class SQLEvidenceStore:
                 raise RuntimeError('SQL evidence capture failed; collection stopped')
             if not quiescent:
                 return
-            with closing(self.connect()) as conn:
+            with self._writer() as conn:
                 pending = conn.execute('''SELECT event_id, event_id IN (SELECT event_id FROM results) FROM requests
                     WHERE (? IS NULL OR json_extract(request,'$.role')=?) AND (event_id NOT IN (SELECT event_id FROM results)
                        OR (coalesce(json_extract(request, '$.requires_delivery'), 1) = 1
                            AND event_id NOT IN (SELECT event_id FROM deliveries)))
                     ORDER BY 2 LIMIT 1''', (self.identity.get('role'), self.identity.get('role'))).fetchone()
-                missing = conn.execute("SELECT token FROM client_calls JOIN requests USING(event_id) WHERE received IS NULL AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
+                missing = self._settle_interrupted_clients(conn)
                 unknown = conn.execute("SELECT event_id FROM results JOIN requests USING(event_id) WHERE json_extract(record, '$.status') = 'result_unknown' AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
             # The response bytes reach the client before its handler records the send.
             if pending and pending[1] and time.monotonic() < deadline:
@@ -192,7 +194,7 @@ class SQLEvidenceStore:
         if pending:
             raise RuntimeError('Unconfirmed SQL evidence outcome: ' + pending[0])
         if missing:
-            raise RuntimeError('Unconfirmed client receive outcome: ' + missing[0])
+            raise RuntimeError('Unconfirmed client receive outcome: ' + missing)
         if unknown:
             raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
 
@@ -307,6 +309,25 @@ class SQLEvidenceStore:
         with self._writer() as conn:
             self._visible(conn, event)
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
+            self._settle_interrupted_clients(conn)
+
+    def _settle_interrupted_clients(self, conn):
+        from .execution_capture import sql_client_interruption
+        missing = None
+        rows = conn.execute('''SELECT c.token,c.event_id,i.record FROM client_calls c
+            JOIN requests r USING(event_id) LEFT JOIN client_interruptions i USING(token)
+            WHERE c.received IS NULL AND (? IS NULL OR json_extract(r.request,'$.role')=?)''',
+            (self.identity.get('role'), self.identity.get('role'))).fetchall()
+        for row in rows:
+            proof = sql_client_interruption(conn, row['event_id'])
+            if proof is None:
+                missing = missing or row['token']
+            elif row['record'] is None:
+                conn.execute('INSERT INTO client_interruptions VALUES (?,?)',
+                             (row['token'], encoded(dict(proof, time=now()))))
+            elif any(json.loads(row['record']).get(key) != value for key, value in proof.items()):
+                missing = missing or row['token']
+        return missing
 
     def context(self, event, token=None):
         token = token or uuid.uuid4().hex
@@ -427,12 +448,14 @@ class SQLEvidenceStore:
                               sha, encoded(metadata)))
             record['capture_seconds'] = time.monotonic() - started
             conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
+            self._settle_interrupted_clients(conn)
 
     def delivered(self, event, state):
         with closing(self.connect()) as conn, conn:
             self._visible(conn, event)
             conn.execute('INSERT INTO deliveries VALUES (?,?)',
                          (event, encoded(dict(send_state=state, receive_state='unknown', time=now()))))
+            self._settle_interrupted_clients(conn)
 
     def _visible(self, conn, event):
         row = conn.execute('SELECT branch,seq FROM requests WHERE event_id=?', (event,)).fetchone()
@@ -456,9 +479,12 @@ class SQLEvidenceStore:
             delivery = conn.execute('SELECT record FROM deliveries WHERE event_id=?', (event,)).fetchone()
             definition = conn.execute('SELECT definition FROM queries WHERE id=?', (request['query_id'],)).fetchone()
             client = conn.execute('SELECT received FROM client_calls WHERE event_id=?', (event,)).fetchone()
+            interruption = conn.execute('''SELECT i.record FROM client_interruptions i
+                JOIN client_calls c USING(token) WHERE c.event_id=?''', (event,)).fetchone()
             versions = conn.execute('SELECT version_id,metadata FROM versions WHERE event_id=? ORDER BY rowid', (event,)).fetchall()
             inputs = sorted({meta['derived_from'] for row in versions if (meta := json.loads(row['metadata'])).get('derived_from')})
             return dict(request=request, inputs=inputs, outputs=[row['version_id'] for row in versions],
+                        client_interruption=json.loads(interruption[0]) if interruption else None,
                         client_receipt=json.loads(client[0]) if client and client[0] else {'receive_state': 'unknown'}, result=json.loads(result[0]) if result else
                         dict(status='result_unknown', completed_at=None, capture_status='missing'),
                         query_definition=json.loads(definition[0]) if definition else None,
