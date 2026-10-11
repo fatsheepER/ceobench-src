@@ -114,7 +114,6 @@ class ShellService:
         return dict(stdout=str(result) if code == 0 else '', stderr=str(result) + '\n' if code else '', code=code)
 
     def project(self, text):
-        """Keep raw streams as evidence and label incomplete final PF delivery."""
         from .execution_capture import slice_origins
         origins, offset = [], 0
         partial = False
@@ -148,7 +147,7 @@ class ShellService:
                     meta, _ = self.capture.store.get_content(read['id'])
                     version = self.capture.store.version(self.capture.event, 'pf_shell_view', str(text),
                         layer='pf_read_full', target=meta['target'], key=meta['key'],
-                        mode=meta['mode'], read_range=[0, 0], complete=False, force_full=True,
+                        mode=meta['mode'], read_range=None, complete=False, force_full=True,
                         view='shell_source_ranges_unknown', original_read=result.pf_read['id'])
                     read = {'id': version}
         return CapturedText(text, origins, read)

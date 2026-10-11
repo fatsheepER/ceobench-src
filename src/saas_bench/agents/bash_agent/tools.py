@@ -898,7 +898,7 @@ class BashAgentToolExecutor:
             except UnicodeError:
                 pass  # Raw streams were retained; decoding cannot close an open execution.
             raise ProcessBoundaryError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr)) from exc
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as timeout:
             self._timed_out = True
             cleanup = dict(phase='timeout_cleanup', timeout_seconds=self.bash_timeout,
                            coverage='direct_child_and_streams_only', descendants_closed=None,
@@ -910,7 +910,7 @@ class BashAgentToolExecutor:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
                 cleanup['actions']['killpg'] = 'signal_sent'
-            except (ProcessLookupError, PermissionError) as exc:
+            except OSError as exc:
                 cleanup['actions']['killpg'] = type(exc).__name__ + ': ' + str(exc)
             try:
                 proc.kill()  # Fallback: kill the direct child
@@ -923,13 +923,15 @@ class BashAgentToolExecutor:
                 raise NextDayTimeoutError('Process cleanup failed; outcome unknown') from exc
             try:
                 raw_stdout, raw_stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired as exc:
+            except (subprocess.TimeoutExpired, OSError) as exc:
                 cleanup.update(exit_code=proc.poll(), direct_child_reaped=proc.returncode is not None,
-                               unknown='second stream collection timed out')
+                               unknown='second stream collection failed: ' + str(exc))
                 self._preserve_process(proc, cleanup)
-                self._streams(exc.output or b'', exc.stderr or b'', proc.poll(), partial=True)
+                raw_stdout = getattr(exc, 'output', None) or timeout.output or b''
+                raw_stderr = getattr(exc, 'stderr', None) or timeout.stderr or b''
+                self._streams(raw_stdout, raw_stderr, proc.poll(), partial=True)
                 raise NextDayTimeoutError('Process cleanup did not finish; outcome unknown',
-                    partial_stdout=repr(exc.output), partial_stderr=repr(exc.stderr))
+                    partial_stdout=repr(raw_stdout), partial_stderr=repr(raw_stderr)) from exc
             cleanup.update(exit_code=proc.returncode, direct_child_reaped=proc.returncode is not None,
                            streams_collected=True)
             partial_stdout, partial_stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
