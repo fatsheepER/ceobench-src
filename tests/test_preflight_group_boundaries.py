@@ -364,7 +364,7 @@ print(json.dumps(results))'''
             assert history.startswith('Error: Unknown tool')
         result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
         structured = child.tool_executor.text_registry.last_result
-        assert result == 'Revised r1.2 (active).'
+        assert result.startswith('Revised r1.2 (active).\nRetained references: facts.json@')
         if mode == 'pf':
             assert structured['evidence'][0]['version'] == 'facts.json@v2'
             assert child.evidence_store.get_content(binding['version_id'])[1] == b'{"n":8}'
