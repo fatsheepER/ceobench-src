@@ -291,7 +291,9 @@ def compact_schema(node):
 def tool_definitions(pf=False, team=False):
     group = 'pf' if pf else 'git'
     checks = ('Optional select and predicate on a reference make the weekly check test a condition instead '
-              'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
+              'of reporting any change. Without select or predicate, the check compares whole content; '
+              'select alone compares the selected value for equality. select picks one cell: '
+              '{"row": {"group_id": "EXAMPLE_GROUP"}, "col": "metric"} in a '
               'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
               'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}, '
               'or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
@@ -306,7 +308,8 @@ def tool_definitions(pf=False, team=False):
                   '"49-" (until revised or retired) or "unknown: <reason>". ' + checks +
                   ' Notes over 200 characters are truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
-                  'supplied references replace the whole list. Earlier revisions remain in registrations.json.',
+                  'supplied references replace the whole list, and [] clears it. '
+                  'Earlier revisions remain in registrations.json.',
         'retire': 'Stop using a registered text. Appends a retired revision with a reason and keeps all history.',
         'list': 'Page through your active registered texts in creation order, with their references and notes. '
                 'Does not check them. Pass next_after as after for the next page.',
@@ -315,7 +318,23 @@ def tool_definitions(pf=False, team=False):
     if pf:
         descriptions['create'] += (' An explicit whole-version citation binds that captured version even when its body '
                                    'is absent from this request; reading scope is recorded separately. '
-                                   'Selected fields require coverage in this request or your own current-context file write.')
+                                   'Selected fields require coverage in this request or your own current-context file write. '
+                                   'Copy the actual returned handle and choose the selector, threshold and applies days '
+                                   'from the evidence and intended claim. The following identifiers and values are synthetic.\n'
+                                   'Example request:\n```json\n'
+                                   '{\n'
+                                   '  "text": "The selected metric remains at least 0.5.",\n'
+                                   '  "objects": [{"kind": "customer_group", "id": "EXAMPLE_GROUP"}],\n'
+                                   '  "references": [{\n'
+                                   '    "cite": "query1@v1",\n'
+                                   '    "purpose": "current",\n'
+                                   '    "select": {"row": {"group_id": "EXAMPLE_GROUP"}, "col": "metric"},\n'
+                                   '    "predicate": {"type": "threshold", "op": ">=", "value": 0.5},\n'
+                                   '    "note": "Only this selected condition supports the claim."\n'
+                                   '  }],\n'
+                                   '  "applies": "7-13",\n'
+                                   '  "reason": "Track this condition over the stated days."\n'
+                                   '}\n```\n')
         descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
     if team:
         descriptions['create'] += (' Team receipts include a Shareable reference such as growth:r4.2. '

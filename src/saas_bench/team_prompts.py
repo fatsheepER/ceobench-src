@@ -32,6 +32,9 @@ Save reusable scripts, results and MEMORY.md. Register only judgments you expect
 to rely on later, not every temporary number. Share registered texts as exact
 role-qualified versions such as growth:r16.1. Bare r16 is local; growth:r16 is
 the latest revision. Keep local IDs for text_revise and text_retire.
+When revising, omitted references keep the old list; supplied references replace
+the whole list, and [] clears it. After changing a conclusion, decide which exact
+evidence versions it still needs and supply that complete list if it changes.
 Analyst handoffs include a host header with author, day, world state, request ID,
 workspace and snapshot commit. The host creates that commit after the analyst's
 final answer. Report relative file paths; do not guess the commit.
@@ -49,12 +52,17 @@ each handoff and every workspace at week close. Use git log or git diff to revie
 past changes.
 '''
 
-PF_HISTORY = '''Copy file and output handles exactly as PF returns them, including their role
-and version, when sharing evidence. Use pf show <handle> to read saved content.
-Use pf depend <handle> --detail when its dependencies need verification. It can
-replay permitted SQL and public read-only API calls, but never analyst scripts.
-Freshly delivered evidence does not need unconditional refresh. Use pf log,
-pf diff and pf search to review history; pf help lists the commands.
+PF_HISTORY = '''Choose PF operations for the evidence question:
+- For exact peer evidence, copy the returned role and version into pf show.
+- Before reusing an old conclusion, read its saved version; use pf depend <handle> --detail
+  when its dependencies need a current check. Fresh handoffs need no automatic refresh.
+- To understand changed evidence, use pf log and pf diff, then decide whether
+  the conclusion and its complete reference list need revision.
+- When only a selected value or condition matters, use select and predicate in
+  text_create instead of treating every content change as a broken condition.
+show reads saved content. depend replays permitted SQL and public read-only API
+calls, never analyst scripts.
+pf help gives complete examples, check boundaries and stopping conditions.
 '''
 
 CEO_DECISIONS = '''## Team decisions

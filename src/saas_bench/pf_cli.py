@@ -12,15 +12,85 @@ USAGE = '''usage: pf <command> ...
   pf blame <file>                      the version and day each line was written
   pf depend <object> [--detail] [--history]   what it cites; reruns and checks current references
   pf rdepend <object> [--detail] [--all]      registered texts that cite it
-  pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about S1, t10_2, ...
+  pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about an object
   pf search --text "term"              literal text in public captured history, newest first
   pf more <cursor>                     the next page of an earlier result
-Objects: a handle (MEMORY.md@v8, scripts/a.py.out@v2, query7@v1), a file path or output name
-(the latest version) or a text (r4, r4.2). In a team, copy exact role-qualified references
-such as growth:r4.2 or returned file/output handles. Bare r4 is local; growth:r4 is latest.
-pf show reads saved content. pf depend replays permitted SQL and public read-only APIs;
-it does not execute analyst scripts. Refresh when verification is needed, not after every handoff.
-Shell combinations, pipes and redirection work normally.'''
+Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
+version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.
+Run pf help for task examples and check boundaries. Shell combinations, pipes and redirection work normally.'''
+
+HELP = USAGE + '''
+
+Examples below use synthetic names. Replace them with handles copied from actual
+receipts, including the role and version. Do not guess a peer's version number.
+
+1. Read exact peer evidence
+When a handoff cites a saved file, read that exact version:
+```bash
+pf show growth:notes.md@v1 --full
+```
+This reads saved content, not a current verification. A bare growth:notes.md would
+read the latest version, which may differ from the cited one. Check the returned
+version and reading scope. Stop when the cited content answers the question;
+use depend only if a current dependency check is needed.
+
+2. Review an old conclusion
+When deciding whether to reuse a registered conclusion, read its saved revision,
+then check its current dependencies if needed:
+```bash
+pf show r1.1 --full
+pf depend r1.1 --detail
+```
+For historical inspection without a current check:
+```bash
+pf depend r1.1 --detail --history
+```
+depend replays permitted SQL and public read-only API calls, never analyst scripts.
+A SQL query with fixed dates keeps those dates when replayed. Read the checked day,
+expanded scope and per-reference results. Historical-only references are not checked.
+Zero checked sources and cannot_check provide no passing condition. Stop when the
+needed scope has a result; if a source cannot be checked, repair or replace that
+reference, obtain other evidence or keep the uncertainty explicit.
+
+3. Find versions and revise references
+When evidence changed, inspect its history and compare versions of the same object:
+```bash
+pf log growth:notes.md
+pf diff growth:notes.md@v1 growth:notes.md@v2
+```
+Use handles returned by log; show reads either saved version. A diff reports content
+changes, not whether the conclusion remains valid. If revising your own conclusion,
+text_revise takes the complete intended reference list. For example, after reading
+the actual query handle, this tool request replaces all earlier references:
+```json
+{"record": "r1", "text": "The revised conclusion uses the reviewed query.", "reason": "Use the reviewed evidence set.", "references": [{"cite": "query1@v1", "purpose": "current"}]}
+```
+Omitting references inherits the old list; references: [] clears it. Use a local rN
+for text_revise, then share the exact role-qualified revision from its receipt.
+Stop once the conclusion and its references match the evidence you intend to retain.
+
+4. Register a selected condition
+When a conclusion depends on one value or threshold, read the saved query:
+```bash
+pf show query1@v1 --full
+```
+Use the complete JSON request in the text_create tool description. Replace its
+synthetic handle, group, metric, threshold and days with the observed evidence and
+the intended claim. Selected fields must be covered in your current model input
+or your own current-context file write; a truncated or partial view may omit them.
+purpose defaults to current. historical_only records past evidence without checking
+it against the current world. With no select/predicate, checks compare whole content;
+select alone checks equality of the selected value. A threshold check reports holds,
+fails or cannot_check. Holds applies only to that declared condition and checked
+scope; it does not verify the whole conclusion. Stop after registration accepts the
+intended condition. A missing selected field needs an adequate read, not a guessed value.
+
+Other boundaries: blame locates the version and day each saved file line was written.
+rdepend follows declared references, not every consumer or inferred business impact.
+more takes the actual cursor returned by a paginated result and continues that frozen
+snapshot. It does not refresh the check. Preserve scope headers when reading results;
+pipes and redirection can leave only a partial view.
+'''
 
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS) + r')\b|\s*$)', re.M)
