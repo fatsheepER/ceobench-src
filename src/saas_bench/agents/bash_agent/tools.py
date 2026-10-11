@@ -929,7 +929,10 @@ class BashAgentToolExecutor:
                 self._preserve_process(proc, cleanup)
                 raw_stdout = getattr(exc, 'output', None) or timeout.output or b''
                 raw_stderr = getattr(exc, 'stderr', None) or timeout.stderr or b''
-                self._streams(raw_stdout, raw_stderr, proc.poll(), partial=True)
+                try:
+                    self._streams(raw_stdout, raw_stderr, proc.poll(), partial=True)
+                except UnicodeError:
+                    pass  # Raw bytes are retained; decoding cannot resolve the open boundary.
                 raise NextDayTimeoutError('Process cleanup did not finish; outcome unknown',
                     partial_stdout=repr(raw_stdout), partial_stderr=repr(raw_stderr)) from exc
             cleanup.update(exit_code=proc.returncode, direct_child_reaped=proc.returncode is not None,
