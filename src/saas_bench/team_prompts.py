@@ -91,6 +91,10 @@ The dashboard describes the last advance; settings may have changed since then.
 Group insights retain their survey snapshot_day until a new survey completes.
 Use ./novamind-operation python or python-c with novamind_api for public read-only
 queries and APIs. Read docs/api, docs/tables and docs/cli.md for details.
+SQL results are limited to 5,000 rows. Check truncated and warning before using
+returned rows to describe the full population. Use SQL aggregates for population
+totals. An explicit LIMIT narrows the requested result, even without a truncation
+warning. row_count counts returned rows, not all matching records.
 Write only in your workspace. You may register read-only scripts for the start of
 each week. Only the CEO can change the business, buy research or advance time.
 Return your advice in final text when finished.

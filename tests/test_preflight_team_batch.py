@@ -23,6 +23,19 @@ PRICES = dict(source='offline acceptance fixture', basis='USD per 1000 tokens',
               rates={batch.MODEL: dict(input=0.001, output=0.002, cache_read=0.0001, cache_write=0.001)})
 
 
+@pytest.mark.parametrize('prior', [{}, {'wall_seconds': None}, {'wall_seconds': 0}, {'wall_seconds': 2.5}])
+def test_wall_time_keeps_missing_attempts_separate_from_zero(tmp_path, prior):
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    write_json(first / 'attempt.json', prior)
+    write_json(second / 'attempt.json', {'wall_seconds': 3.5})
+    missing = prior.get('wall_seconds') is None
+    known = 3.5 + (prior.get('wall_seconds') or 0)
+    assert batch.wall_time([first, second]) == dict(
+        wall_seconds=None if missing else known, wall_seconds_known=known,
+        wall_seconds_missing_attempts=['attempt-001'] if missing else [])
+    assert batch.wall_time([first, second], current=(second, 0))['wall_seconds_known'] == known - 3.5
+
+
 def test_live_batch_refuses_read_only_environment_before_registration(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, 'validate_manifest', lambda path: {})
     monkeypatch.setenv('CEOBENCH_READ_ONLY_TASK', '1')

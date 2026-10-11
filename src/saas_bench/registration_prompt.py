@@ -22,15 +22,6 @@ simulated days the text is about: "49", "49-55", "49-" (from day 49 until
 revised or retired) or "unknown: <reason>". Each week starts with a check of
 your active texts, shown after the dashboard.
 
-Example, shortened from an actual week-7 finding:
-
-```
-text_create {{"text": "S1 leads are linear in ad spend: ~165 leads per $1000/day from $2.9K to $8K/day, no saturation yet.",
-             "objects": [{{"kind": "customer_group", "id": "S1"}}],
-             "references": [{{"cite": "{cite}", "note": "daily leads & subs by start_day d29-49"}}],
-             "applies": "49-", "reason": "ad spend test result"}}
-```
-
 The dashboard reflects the last weekly advance; after changing settings within
 a week, query the current settings instead.
 
@@ -109,7 +100,6 @@ WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `novamind register-da
 def edits(pf):
     """(original, replacement) pairs; every original must occur exactly once."""
     history = PF_HISTORY if pf else GIT_HISTORY
-    cite = 'scripts/an_w7d.py.out@v1' if pf else 'notes/observations.md'
     return [
         ('You have 6 tools:', 'You have 10 tools:'),
         (GLOB_ROW, GLOB_ROW + '\n| `text_create`, `text_revise`, `text_retire`, `text_list` | Register, revise, '
@@ -124,7 +114,7 @@ def edits(pf):
                           'every week (use `git log`)')),
         ('MEMORY.md is the ONLY way to carry knowledge forward.',
          'MEMORY.md is the only file loaded into your context automatically.'),
-        ('## Weekly Workflow', REGISTERED_TEXTS.format(cite=cite) + history + '## Weekly Workflow'),
+        ('## Weekly Workflow', REGISTERED_TEXTS + history + '## Weekly Workflow'),
         ('1. **Read the dashboard** (automatically shown at start of week)',
          '1. **Read the dashboard** (automatically shown at start of week, followed by the check of your '
          'registered texts)'),

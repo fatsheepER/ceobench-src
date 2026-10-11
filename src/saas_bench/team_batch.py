@@ -395,6 +395,18 @@ def attempts(entry):
     return sorted(Path(entry['output_dir']).glob('attempt-*'))
 
 
+def wall_time(history, current=None):
+    known, missing = 0.0, []
+    for directory in history:
+        value = current[1] if current and directory == current[0] else read(directory / 'attempt.json').get('wall_seconds')
+        if value is None:
+            missing.append(directory.name)
+        else:
+            known += value
+    return dict(wall_seconds=None if missing else known, wall_seconds_known=known,
+                wall_seconds_missing_attempts=missing)
+
+
 def mark_interrupted(directory, record):
     if record['status'] in ('preparing', 'ready', 'running'):
         record.update(status='failed', reason='host_interrupted', error='Previous host stopped before finalizing the attempt')
@@ -659,12 +671,12 @@ def _execute(team, manifest, entry, directory, record, hold):
             logs['simulator'].append(previous / 'runtime/private/simulator-model-usage.jsonl')
     usage = aggregate(logs, manifest['pricing'], category=entry['category'])
     elapsed = time.monotonic() - start
-    total_elapsed = elapsed + sum(read(p / 'attempt.json').get('wall_seconds', 0)
-                                 for p in attempts(entry) if p != directory)
+    timing = wall_time(attempts(entry), current=(directory, elapsed))
     result = summarize_run(team.server.conn, run_id=entry['run_id'], group=entry['group'],
         seed=entry['seed'], repeat=entry['repeat'], day=outcome.day, reason=reason,
         usage=usage, attempt=record['attempt'], stop_after_day=entry['stop_after_day'],
-        wall_seconds=total_elapsed)
+        wall_seconds=timing['wall_seconds'])
+    result.update(timing)
     write_json(directory / 'result.json', result)
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
         day=outcome.day, reason=reason, runtime_failure=team.failure, result=result,
@@ -696,6 +708,7 @@ def summarize(path, resource_paths=None):
         row = dict(entry, **{k: v for k, v in result.items() if k not in entry})
         row.update(status=result.get('status', 'technical_failure' if last['status'] == 'failed' else last['status']), attempt_status=last['status'],
                    attempt=last['attempt'], reason=last.get('reason'))
+        row.update(wall_time(history))
         rows.append(row)
         for directory in history:
             categorized[manifest['category']].extend(directory.glob('runtime/private/*/model-usage.jsonl'))
