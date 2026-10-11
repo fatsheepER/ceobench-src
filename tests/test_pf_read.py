@@ -97,6 +97,9 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
     assert json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content'] == result
     meta, saved = store.get_content(result.pf_read['id'])
     assert saved.decode() == result and meta['view'] == 'shell_source_ranges_unknown'
+    assert meta['read_range'] is None and reads[0]['range'] is None
+    original_meta, _ = store.get_content(meta['original_read'])
+    assert original_meta['target'] == meta['target']
     assert store.get_content(meta['created_by_event'] + ':stdout')[1].decode() == shell_output
     for item in result.origins:
         meta, raw = store.get_content(item['version_id'])

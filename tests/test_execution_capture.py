@@ -691,3 +691,65 @@ def test_timeout_cleanup_failure_preserves_boundary_receipt(captured, monkeypatc
     finally:
         if executor.preserved_process:
             executor.preserved_process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('direct_kill_fails', [False, True])
+def test_timeout_signal_oserror_runs_fallback_or_preserves_boundary(captured, monkeypatch, direct_kill_fails):
+    import os
+    import signal
+    import subprocess
+    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError, ProcessBoundaryError
+    _, store, executor = captured
+    executor.bash_timeout = .1
+    real_killpg = os.killpg
+    processes = []
+    real_kill = subprocess.Popen.kill
+    real_init = subprocess.Popen.__init__
+
+    def init(proc, *args, **kwargs):
+        real_init(proc, *args, **kwargs)
+        processes.append(proc)
+
+    def fail_signal(pid, sig):
+        raise OSError(5, 'injected group signal failure')
+
+    def kill(proc):
+        if direct_kill_fails:
+            raise OSError(5, 'injected direct kill failure')
+        return real_kill(proc)
+
+    monkeypatch.setattr(subprocess.Popen, '__init__', init)
+    monkeypatch.setattr(os, 'killpg', fail_signal)
+    monkeypatch.setattr(subprocess.Popen, 'kill', kill)
+    try:
+        if direct_kill_fails:
+            with pytest.raises(NextDayTimeoutError, match='cleanup failed'):
+                executor.execute('bash', {'command': 'sleep .3'})
+        else:
+            result = executor.execute('bash', {'command': 'sleep .3'})
+            assert 'Command timed out' in result
+        facts = store.read_event(event_ids(store)[0])['result']
+        cleanup = facts['process_boundary']
+        assert 'injected group signal failure' in cleanup['actions']['killpg']
+        assert cleanup['descendants_closed'] is None
+        assert processes
+        if direct_kill_fails:
+            assert executor.preserved_process is processes[0]
+            assert facts['boundary_closed'] is False
+            assert cleanup['streams_collected'] is False
+            assert facts['status'] == 'result_unknown'
+            with pytest.raises(RuntimeError):
+                store.assert_healthy()
+            with pytest.raises(ProcessBoundaryError, match='remains open'):
+                executor.execute('bash', {'command': 'true'})
+        else:
+            assert cleanup['actions']['kill'] == 'returned'
+            assert cleanup['direct_child_reaped'] and cleanup['streams_collected']
+            store.assert_healthy()
+    finally:
+        for proc in processes:
+            try:
+                real_killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate(timeout=5)
