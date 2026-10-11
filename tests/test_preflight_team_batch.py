@@ -321,7 +321,8 @@ def test_returned_model_mismatch_keeps_known_raw_receipts(tmp_path):
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_path, group, monkeypatch):
+@pytest.mark.parametrize('missing_first_duration', [False, True])
+def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_path, group, missing_first_duration, monkeypatch):
     base, _, engineering, _ = frozen
     copied = copy.deepcopy(engineering)
     for entry in copied['runs']:
@@ -358,6 +359,10 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     first = batch.prepare(path, run_id, live=True, client_factory=client, simulator_factory=batch.simulator)
     assert first['status'] == 'paused' and first['day'] == 0 and Path(first['checkpoint']).is_dir()
     assert 'Unresolved tool operations' in first['checkpoint_error']
+    if missing_first_duration:
+        first.pop('wall_seconds')
+        entry = batch.selected(copied, run_id)
+        write_json(batch.attempts(entry)[0] / 'attempt.json', first)
     (tmp_path / 'HOLD').unlink()
     resumed = batch.prepare(path, run_id, live=True, resume=True, client_factory=client, simulator_factory=batch.simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28
@@ -365,6 +370,13 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     assert resumed['result']['status'] == 'reached_stop_day'
     assert first['manifest_sha256'] == resumed['manifest_sha256'] == file_hash(path)
     assert len(batch.attempts(batch.selected(copied, run_id))) == 2
+    assert (resumed['result']['wall_seconds'] is None) == missing_first_duration
+    known_seconds = resumed['wall_seconds'] + first.get('wall_seconds', 0)
+    assert resumed['result']['wall_seconds_known'] == known_seconds
+    assert resumed['result']['wall_seconds_missing_attempts'] == (['attempt-001'] if missing_first_duration else [])
+    summarized = next(row for row in batch.summarize(path)['runs'] if row['run_id'] == run_id)
+    for key in ('wall_seconds', 'wall_seconds_known', 'wall_seconds_missing_attempts'):
+        assert summarized[key] == resumed['result'][key]
     assert all(r['body']['model'] == batch.MODEL and r['body']['reasoning_effort'] == 'high' for r in wire)
     assert all('D497' in r['body']['messages'][0]['content'] and 'D28' not in r['body']['messages'][0]['content'] for r in wire)
     entry = batch.selected(copied, run_id)

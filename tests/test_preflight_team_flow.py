@@ -546,3 +546,19 @@ def test_http_retry_attempt_limit_and_hold_during_retry(mode, monkeypatch):
         assert outcome.reason == 'paused'
         assert len(team.test_wire) <= 2 and team.server.tools.current_day == 0
         assert counts['ceo'] == before['ceo']
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_role_inputs_include_query_scope_without_business_answers(mode):
+    def respond(team, role, body):
+        return calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('No change proposed.')
+
+    with make_team(mode, respond, 'query-scope-prompt') as team:
+        assert team.run(stop_after_day=7).reason == 'observation_end'
+        assert {row['role'] for row in team.test_wire} == set(ROLES)
+        for row in team.test_wire:
+            prompt = row['body']['messages'][0]['content']
+            assert '5,000' in prompt, row['role']
+            assert 'truncated' in prompt and 'warning' in prompt, row['role']
+            assert 'actual week-7 finding' not in prompt
+            assert '~165 leads' not in prompt and '$2.9K to $8K' not in prompt
