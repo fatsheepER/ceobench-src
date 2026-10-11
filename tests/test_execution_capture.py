@@ -33,6 +33,46 @@ def records(store):
     return [store.read_event(e) for e in event_ids(store)]
 
 
+def test_sql_timeout_after_bash_exit_and_broken_headers_has_one_response(captured, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    from saas_bench import api_server
+    api, store, _ = captured
+    bash = store.begin_event('bash', {'command': 'timeout 280 python script.py'})
+    context = store.context(bash)
+    raw = b'{"sql":"SELECT amount FROM ledger"}'
+    handler = api_server._APIHandler.__new__(api_server._APIHandler)
+    handler.server = SimpleNamespace(_api_server=api, _role='ceo')
+    handler.path, handler.command, handler.request_version = '/query', 'POST', 'HTTP/1.1'
+    handler.headers = {'Content-Length': str(len(raw)), 'X-Capture-Context': context,
+                       'X-Capture-Call': 'a' * 32}
+    handler.rfile = io.BytesIO(raw)
+    handler._headers_buffer = []
+    statuses = []
+    handler.send_response = statuses.append
+    handler.send_header = lambda key, value: handler._headers_buffer.append(f'{key}: {value}\r\n'.encode())
+    def broken_headers(_):
+        raise BrokenPipeError('client killed before SQL timeout response')
+    handler.wfile = SimpleNamespace(write=broken_headers)
+    def timeout(api, sql, metadata):
+        store.complete(bash, 'failed', **closed_bash_result())
+        metadata.update(day=105, error_kind='timeout')
+        raise TimeoutError('Query time limit exceeded')
+    monkeypatch.setattr(api_server, 'execute_query', timeout)
+    handler.do_POST()
+    assert statuses == [504]
+    assert not store.fault_path.exists() and store.fault is None
+    query = next(row for row in records(store) if row['request']['kind'] == 'sql_query')
+    assert query['request']['parent_event_id'] == bash
+    assert query['result']['status'] == 'timed_out'
+    assert query['delivery']['send_state'] == 'failed'
+    assert query['client_receipt'] == {'receive_state': 'unknown'}
+    assert query['client_interruption'] is None
+    assert handler.close_connection
+    with pytest.raises(RuntimeError, match='Unconfirmed client receive outcome'):
+        store.assert_healthy()
+
+
 @pytest.mark.parametrize('inherited_pipe', [False, True])
 def test_public_cli_timeout_has_known_failed_child_and_allows_next_tool(captured, inherited_pipe):
     api, store, executor = captured

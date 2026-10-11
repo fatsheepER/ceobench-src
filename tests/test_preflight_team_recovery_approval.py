@@ -64,6 +64,19 @@ def test_approval_accepts_bound_host_revision_and_preserves_historical_hold(appr
     assert recovery.hold_path(manifest) == manifest.parent / 'HOLD'
 
 
+@pytest.mark.parametrize('filename', ['api_server.py', 'sql_evidence.py'])
+def test_approval_accepts_fingerprint_bound_capture_fix(approved_revision, monkeypatch, filename):
+    path, _, manifest = approved_revision
+    old = batch.read(manifest)
+    changed = Path(old['source_root']) / 'src/saas_bench' / filename
+    changed.write_text(changed.read_text() + '\n')
+    old['source_sha256'] = tree_hash(Path(old['source_root']) / 'src')
+    write_json(manifest, old)
+    _, record = bind_approval(monkeypatch, path.parent, manifest)
+    assert 'src/saas_bench/' + filename in record['changed_files']
+    assert recovery.approval(manifest) == record
+
+
 @pytest.mark.parametrize('damage,expected', [
     ('fingerprint', 'fingerprint'), ('source_files', 'execution source'),
     ('runtime_source_sha256', 'runtime source'), ('controls', 'controls'),

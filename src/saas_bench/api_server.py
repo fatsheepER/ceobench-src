@@ -304,6 +304,9 @@ class _APIHandler(BaseHTTPRequestHandler):
             )
         except Exception:
             pass
+        if self.path == '/query' and getattr(self, '_query_response_started', False):
+            self.close_connection = True
+            return
         try:
             self._send_json(
                 {

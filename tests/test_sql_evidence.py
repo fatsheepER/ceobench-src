@@ -126,6 +126,52 @@ def test_repeat_change_identity_and_restart(captured):
     assert event_ids(reopened)[-1].endswith('/5')
 
 
+@pytest.mark.parametrize('status,body', [
+    (200, b'{"success":true,"columns":["x"],"rows":[{"x":1}]}'),
+    (504, b'{"success":false,"error":"query timeout"}'),
+])
+def test_finish_identical_replay_preserves_committed_evidence(tmp_path, status, body):
+    from concurrent.futures import ThreadPoolExecutor
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', identity())
+    event = store.begin(b'{"sql":"SELECT 1 AS x"}', PUBLIC_POLICY_VERSION)
+    args = event, status, 'HTTP response headers', body, dict(day=105)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: store.finish(*args), range(2)))
+    before = store.read_event(event)
+    with closing(store.connect()) as conn:
+        versions = [tuple(row) for row in conn.execute('SELECT * FROM versions')]
+    reopened = SQLEvidenceStore(store.path, identity())
+    reopened.finish(*args)
+    assert reopened.read_event(event) == before
+    assert reopened.get_content(event + ':public_response')[1] == body
+    with closing(reopened.connect()) as conn:
+        assert [tuple(row) for row in conn.execute('SELECT * FROM versions')] == versions
+        assert conn.execute('SELECT count(*) FROM results').fetchone()[0] == 1
+    assert len(versions) == (2 if status == 200 else 1)
+    assert not reopened.fault_path.exists()
+
+
+@pytest.mark.parametrize('changed', ['status', 'headers', 'body', 'execution'])
+def test_finish_conflicting_replay_rejects_without_overwriting(tmp_path, changed):
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', identity())
+    event = store.begin(b'{"sql":"SELECT 1 AS x"}', PUBLIC_POLICY_VERSION)
+    args = dict(status=200, headers='original headers',
+        body=b'{"success":true,"columns":["x"],"rows":[{"x":1}]}', execution=dict(day=105))
+    store.finish(event, **args)
+    record = store.read_event(event)
+    with closing(store.connect()) as conn:
+        before = {table: [tuple(row) for row in conn.execute('SELECT * FROM ' + table)]
+                  for table in ('versions', 'blobs', 'results')}
+    args[changed] = dict(status=504, headers='different headers',
+        body=b'{"success":true,"columns":["x"],"rows":[{"x":2}]}', execution=dict(day=112))[changed]
+    with pytest.raises(ValueError, match='Conflicting SQL evidence finish: ' + event):
+        store.finish(event, **args)
+    assert store.read_event(event) == record
+    with closing(store.connect()) as conn:
+        assert {table: [tuple(row) for row in conn.execute('SELECT * FROM ' + table)]
+                for table in before} == before
+
+
 def test_comparison_preserves_rows_types_and_order():
     def compare(rows, columns=['x'], **kwargs):
         return whole_rows(json.dumps(dict(success=True, columns=columns, rows=rows, **kwargs)).encode())[1]
@@ -383,7 +429,7 @@ def test_fault_keeps_first_cause_across_stores_and_preservation(tmp_path):
     original = json.loads(store.fault_path.read_text())
     with ThreadPoolExecutor(2) as pool:
         list(pool.map(lambda s: s.fail(RuntimeError('collection stopped')), (store, other)))
-    executor = SimpleNamespace(capture=SimpleNamespace(store=other, facts={}))
+    executor = SimpleNamespace(capture=SimpleNamespace(store=other, facts={}), _bash_facts={})
     BashAgentToolExecutor._preserve_process(executor, SimpleNamespace(pid=123), {'unknown': 'still running'})
     saved = json.loads(store.fault_path.read_text())
     assert all(saved[key] == value for key, value in original.items())

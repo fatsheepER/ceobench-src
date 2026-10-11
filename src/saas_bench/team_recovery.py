@@ -10,6 +10,7 @@ from .run_state import file_hash, tree_hash
 
 ALLOWED = {'src/saas_bench/run_lifecycle.py', 'src/saas_bench/team_batch.py',
     'src/saas_bench/team_checkpoint.py', 'src/saas_bench/team_recovery.py',
+    'src/saas_bench/api_server.py', 'src/saas_bench/sql_evidence.py',
     'scripts/team_controller.py', 'scripts/team_observer.py'}
 
 

@@ -426,6 +426,15 @@ class SQLEvidenceStore:
         with closing(self.connect()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             self._visible(conn, event)
+            existing = conn.execute('SELECT record FROM results WHERE event_id=?', (event,)).fetchone()
+            if existing:
+                saved = json.loads(existing[0])
+                record.update(completed_at=saved.get('completed_at'), capture_seconds=saved.get('capture_seconds'))
+                response = conn.execute('''SELECT b.content FROM versions v JOIN blobs b USING(content_hash)
+                    WHERE v.version_id=?''', (event + ':public_response',)).fetchone()
+                if encoded(record) != existing[0] or response is None or response[0] != body:
+                    raise ValueError('Conflicting SQL evidence finish: ' + event)
+                return
             request = conn.execute('SELECT query_id FROM requests WHERE event_id=?', (event,)).fetchone()
             previous = conn.execute('''SELECT v.version_id FROM versions v JOIN requests r USING(event_id)
                 WHERE r.query_id=? AND v.version_id LIKE '%:public_response'
