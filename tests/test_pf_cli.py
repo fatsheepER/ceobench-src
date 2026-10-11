@@ -287,3 +287,15 @@ def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
     logfile.write_text(''.join(json.dumps(e) + '\n' for e in entries))
     recovered = analyze(pointer)['weeks'][0]['pf_calls']
     assert len(recovered) == 5 and all(c['capture_match'] is None for c in recovered)
+
+
+def test_reverse_detail_hint_matches_declared_reference_traversal(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', {'path': 'source.json', 'content': '{"n": 1}'})
+    call(registry, 'create', **declaration({'path': 'source.json'}))
+    call(registry, 'create', **declaration({'record': 'r1'}))
+    compact = executor.execute('bash', {'command': 'pf rdepend source.json'})
+    detail = executor.execute('bash', {'command': 'pf rdepend source.json --detail'})
+    assert '--detail lists expanded declared-reference paths.' in compact
+    assert 'scripts, files and outputs derived from it' not in compact
+    assert 'text r1.1' in detail and 'text r2.1' in detail and 'via r1.1' in detail

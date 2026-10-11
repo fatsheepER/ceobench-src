@@ -189,3 +189,27 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
     assert 'revised to r1.2' in check
     if mode == 'pf':  # r3's cited query output is unchanged, so it is not listed.
         assert 'r3.1' not in check and 'refresh' not in check, check
+
+
+@pytest.mark.parametrize('fields', [{}, {'select': {'col': 'amount'}}])
+def test_weekly_without_structured_predicates_does_not_claim_they_passed(workspace, tmp_path, server, fields):
+    _, _, executor = chain(workspace, tmp_path, server, **fields)
+    weekly = executor.weekly_check(14)
+    assert 'No structured predicates were checked.' in weekly
+    assert 'no predicate fails' not in weekly
+
+
+@pytest.mark.parametrize('mode', ['git', 'prefix', 'pf'])
+def test_weekly_zero_checked_has_no_freshness_conclusion(workspace, tmp_path, mode):
+    if mode == 'git':
+        registry = TextRegistry(workspace, mode, sim_day=lambda: 7)
+        weekly_check = registry.weekly_check
+    else:
+        _, registry, executor = captured(workspace, tmp_path, mode)
+        weekly_check = executor.weekly_check
+    registry.execute('create', declaration({'path': 'evidence.json'}, applies_at={'start_day': 7, 'end_day': 13})
+                     if mode != 'pf' else declaration(applies_at={'start_day': 7, 'end_day': 13}))
+    weekly = weekly_check(14)
+    assert 'Checked this week: 0 texts; no new freshness conclusion.' in weekly
+    assert 'unchanged' not in weekly and 'no predicate fails' not in weekly
+    assert 'Not checked: 1 text past the applies window.' in weekly

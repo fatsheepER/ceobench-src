@@ -605,3 +605,29 @@ def test_applicability_accepts_open_ended_start_and_explains_shapes(workspace):
         with pytest.raises(ValueError, match='until revised or retired') as error:
             call(registry, 'create', **declaration(applies_at=bad))
         assert '"21-27"' in str(error.value) and '"unknown: <reason>"' in str(error.value)
+
+
+@pytest.mark.parametrize('mode', ['git', 'prefix', 'pf'])
+def test_changed_body_receipt_discloses_retained_references_and_replacement(workspace, tmp_path, mode):
+    if mode == 'git':
+        registry = TextRegistry(workspace, mode, sim_day=lambda: 7)
+        execute = lambda name, args: registry.execute(name.removeprefix('text_'), args)
+    else:
+        store, registry, executor = captured(workspace, tmp_path, mode)
+        execute = executor.execute
+        send(store, executor.execute('read_file', {'path': 'evidence.json'}))
+    created = execute('text_create', declaration({'path': 'evidence.json'}))
+    cited = created.split('Cited: ', 1)[1]
+    refs = json.loads(registry.path.read_text())['records']['r1'][0]['references']
+    changed = execute('text_revise', dict(record='r1', text='New wording', reason='Clarify'))
+    assert 'Retained references: ' + cited in changed
+    assert json.loads(registry.path.read_text())['records']['r1'][-1]['references'] == refs
+    unchanged = execute('text_revise', dict(record='r1', text='New wording', reason='Reaffirm'))
+    assert 'Retained references:' not in unchanged
+    replaced = execute('text_revise', dict(record='r1', reason='Replace all', references=[dict(cite='r1.1')]))
+    assert 'Cited: r1.1' in replaced and 'evidence.json' not in replaced
+    cleared = execute('text_revise', dict(record='r1', reason='Clear all', references=[]))
+    assert 'Retained references:' not in cleared
+    empty = execute('text_revise', dict(record='r1', text='Independent note', reason='Clarify'))
+    assert 'Retained references: none' in empty
+    assert json.loads(registry.path.read_text())['records']['r1'][-1]['references'] == []
