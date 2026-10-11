@@ -520,7 +520,8 @@ def test_memory_strip_limit_and_dashboard_slice_keep_exact_origins(captured):
     store.assert_healthy()
 
 
-def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch):
+@pytest.mark.parametrize('collection_error', ['timeout', 'oserror'])
+def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch, collection_error):
     import subprocess
     from saas_bench.process_boundary import Boundary
     from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
@@ -530,12 +531,14 @@ def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch):
         if kwargs.get('timeout') == 5:
             # Reap this fixture's killed process before injecting a failed second collection.
             real_communicate(self, timeout=5)
+            if collection_error == 'oserror':
+                raise OSError(5, 'injected stream collection failure')
             raise subprocess.TimeoutExpired(self.args, 5, output=b'partial-out', stderr=b'partial-err')
         return real_communicate(self, *args, **kwargs)
     monkeypatch.setattr(subprocess.Popen, 'communicate', timeout)
     executor.bash_timeout = .1
     with pytest.raises(NextDayTimeoutError, match='cleanup'):
-        executor.execute('bash', {'command': 'sleep 60'})
+        executor.execute('bash', {'command': 'printf partial-out; printf partial-err >&2; sleep 60'})
     event = event_ids(store)[0]
     meta, raw = store.get_content(event + ':stdout_bytes')
     assert raw == b'partial-out' and meta['extent'] == 'partial'
