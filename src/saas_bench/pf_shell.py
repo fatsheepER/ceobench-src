@@ -114,16 +114,31 @@ class ShellService:
         return dict(stdout=str(result) if code == 0 else '', stderr=str(result) + '\n' if code else '', code=code)
 
     def project(self, text):
-        """Only direct stdout proves ranges. Pipelines retain their literal Bash return."""
+        """Keep raw streams as evidence and label incomplete final PF delivery."""
         from .execution_capture import slice_origins
         origins, offset = [], 0
+        partial = False
         for result, sink, code in self.outputs:
             start = str(text).find(str(result), offset)
             if code == 0 and sink == self.capture.facts.get('stdout_sink') and start >= 0:
                 origins.extend(slice_origins(result.origins, 0, len(result), start))
-                offset = start + len(result)
             else:
                 self.capture.facts.setdefault('capture_gaps', []).append('pf_pipeline_source_ranges_unknown')
+            if code == 0 and start >= 0:
+                offset = start + len(result)
+            if code == 0 and result.pf_read and (start < 0 or
+                    len(self.outputs) == 1 and str(text) != result):
+                partial = True
+        if partial:
+            self.capture.facts['pf_delivery'] = dict(complete=False, source_range=None,
+                view='shell_source_ranges_unknown',
+                original_reads=[result.pf_read['id'] for result, _, code in self.outputs
+                                if code == 0 and result.pf_read])
+            notice = ('[PF final delivery: partial or transformed shell view; source ranges unknown. '
+                      'Original PF headers describe responses generated before shell processing.]\n')
+            origins = slice_origins(origins, 0, len(text), len(notice))
+            self.capture.origins = slice_origins(self.capture.origins, 0, len(text), len(notice))
+            text = notice + text
         read = None
         if len(self.outputs) == 1 and self.outputs[0][2] == 0:
             result = self.outputs[0][0]
@@ -134,7 +149,7 @@ class ShellService:
                     version = self.capture.store.version(self.capture.event, 'pf_shell_view', str(text),
                         layer='pf_read_full', target=meta['target'], key=meta['key'],
                         mode=meta['mode'], read_range=[0, 0], complete=False, force_full=True,
-                        view='shell_source_ranges_unknown')
+                        view='shell_source_ranges_unknown', original_read=result.pf_read['id'])
                     read = {'id': version}
         return CapturedText(text, origins, read)
 

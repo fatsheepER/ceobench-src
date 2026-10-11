@@ -109,6 +109,44 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
         call(registry, 'create', **declaration({'path': 'facts.txt'}))
 
 
+@pytest.mark.parametrize('command, partial', [
+    ('pf show facts.txt', False),
+    ('pf show facts.txt | cat', False),
+    ('pf show facts.txt; pf show facts.txt', False),
+    ('pf show facts.txt; pf show facts.txt | tail -1', True),
+    ('pf show facts.txt | cat; pf show facts.txt | tail -1', True),
+    ('pf show facts.txt | head -2; pf show facts.txt | tail -1', True),
+    ("pf show facts.txt | grep observation", True),
+    ("printf '%20000s' x; pf show facts.txt; printf '%20000s' y", True),
+])
+def test_pf_final_shell_delivery_scope_on_model_wire(workspace, tmp_path, command, partial):
+    store, _, executor = captured(workspace, tmp_path)
+    (workspace / 'facts.txt').write_text(sample().replace('\r\n', '\n'))
+    executor.execute('bash', {'command': 'true'})
+    result = executor.execute('bash', {'command': command})
+    assert ('PF final delivery' in result) is partial
+    event, reads = deliver(store, [result])
+    wire = json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content']
+    assert wire == result
+    assert result.count('PF final delivery') == int(partial)
+    tool_event = next(item['version_id'].split(':')[0] for item in result.origins
+                      if item['version_id'].endswith(':tool_return'))
+    facts = store.read_event(tool_event)['result']
+    raw = store.get_content(tool_event + ':stdout')[1].decode()
+    assert 'PF final delivery' not in raw
+    if partial:
+        assert facts['pf_delivery']['complete'] is False
+        assert facts['pf_delivery']['source_range'] is None
+        assert all(not item['complete'] for item in reads)
+    if '20000' in command:
+        assert facts['output_truncated'] is True
+        assert 'output truncated' in wire
+        assert len(raw) > 30000
+    assert all(item['actual_tokens'] == Counter().count(
+        store.get_content(item['actual_version'])[1].decode()) for item in reads)
+    store.assert_healthy()
+
+
 def test_official_model_tokenizer_is_pinned_and_validated(tmp_path, monkeypatch):
     from saas_bench.payload_tokens import load_counter, tokenizer_config
     config = tokenizer_config('deepseek', 'deepseek-flash')

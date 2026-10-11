@@ -539,7 +539,11 @@ def test_second_collection_timeout_retains_raw_streams(captured, monkeypatch):
     event = event_ids(store)[0]
     meta, raw = store.get_content(event + ':stdout_bytes')
     assert raw == b'partial-out' and meta['extent'] == 'partial'
-    assert store.read_event(event)['result']['status'] == 'result_unknown'
+    facts = store.read_event(event)['result']
+    assert facts['status'] == 'result_unknown'
+    assert facts['process_boundary']['streams_collected'] is False
+    assert facts['process_boundary']['descendants_closed'] is None
+    assert facts['boundary_closed'] is False
     with pytest.raises(RuntimeError):
         store.assert_healthy()
 
@@ -640,3 +644,50 @@ def test_weekly_script_failure_keeps_child_outcome(captured):
     assert execution['result']['status'] == 'failed'
     assert store.read_event(execution['result']['child_event_id'])['result']['exit_code'] == 3
     store.assert_healthy()
+
+
+@pytest.mark.parametrize('strict, invalid_utf8', [(True, False), (False, True)])
+def test_timeout_cleanup_receipt_survives_unknown_outcome_and_decode_failure(captured, strict, invalid_utf8):
+    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
+    _, store, executor = captured
+    executor.bash_timeout = .2
+    executor.stop_on_timeout = strict
+    command = ("printf '\\377'; sleep 30" if invalid_utf8 else 'echo partial; sleep 30')
+    if strict:
+        with pytest.raises(NextDayTimeoutError, match='outcome unknown'):
+            executor.execute('bash', {'command': command})
+    else:
+        assert executor.execute('bash', {'command': command}).startswith('Error:')
+    event = event_ids(store)[0]
+    facts = store.read_event(event)['result']
+    cleanup = facts['process_boundary']
+    assert cleanup['phase'] == 'timeout_cleanup'
+    assert cleanup['direct_child_reaped'] and cleanup['streams_collected']
+    assert cleanup['descendants_closed'] is None
+    assert store.get_content(event + ':stdout_bytes')[1] == (b'\xff' if invalid_utf8 else b'partial\n')
+    assert facts['status'] == ('result_unknown' if strict else 'failed')
+
+
+def test_timeout_cleanup_failure_preserves_boundary_receipt(captured, monkeypatch):
+    import subprocess
+    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
+    _, store, executor = captured
+    executor.bash_timeout = .1
+    def fail_kill(proc):
+        raise OSError('injected direct kill failure')
+    monkeypatch.setattr(subprocess.Popen, 'kill', fail_kill)
+    try:
+        with pytest.raises(NextDayTimeoutError, match='cleanup failed'):
+            executor.execute('bash', {'command': 'sleep 30'})
+        facts = store.read_event(event_ids(store)[0])['result']
+        cleanup = facts['process_boundary']
+        assert cleanup['phase'] == 'timeout_cleanup'
+        assert cleanup['streams_collected'] is False
+        assert cleanup['descendants_closed'] is None
+        assert 'injected direct kill failure' in cleanup['actions']['kill']
+        assert facts['boundary_closed'] is False
+        with pytest.raises(RuntimeError):
+            store.assert_healthy()
+    finally:
+        if executor.preserved_process:
+            executor.preserved_process.communicate(timeout=5)

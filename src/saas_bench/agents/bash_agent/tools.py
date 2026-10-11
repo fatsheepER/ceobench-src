@@ -900,26 +900,39 @@ class BashAgentToolExecutor:
             raise ProcessBoundaryError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr)) from exc
         except subprocess.TimeoutExpired:
             self._timed_out = True
-            # Kill the entire process group (bash + all children)
+            cleanup = dict(phase='timeout_cleanup', timeout_seconds=self.bash_timeout,
+                           coverage='direct_child_and_streams_only', descendants_closed=None,
+                           direct_child_reaped=False, streams_collected=False, exit_code=None,
+                           last_supervisor_receipt=boundary.record, actions={})
+            if self.capture:
+                self.capture.facts.update(process_boundary=cleanup, timed_out=True)
+            # A process-group signal does not cover detached descendants.
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+                cleanup['actions']['killpg'] = 'signal_sent'
+            except (ProcessLookupError, PermissionError) as exc:
+                cleanup['actions']['killpg'] = type(exc).__name__ + ': ' + str(exc)
             try:
                 proc.kill()  # Fallback: kill the direct child
+                cleanup['actions']['kill'] = 'returned'
             except OSError as exc:
-                self._preserve_process(proc, dict(unknown='process cleanup failed: ' + str(exc)))
+                cleanup.update(exit_code=proc.poll(), direct_child_reaped=proc.returncode is not None,
+                               unknown='process cleanup failed: ' + str(exc))
+                cleanup['actions']['kill'] = type(exc).__name__ + ': ' + str(exc)
+                self._preserve_process(proc, cleanup)
                 raise NextDayTimeoutError('Process cleanup failed; outcome unknown') from exc
             try:
                 raw_stdout, raw_stderr = proc.communicate(timeout=5)
             except subprocess.TimeoutExpired as exc:
-                self._preserve_process(proc, dict(unknown='second stream collection timed out'))
+                cleanup.update(exit_code=proc.poll(), direct_child_reaped=proc.returncode is not None,
+                               unknown='second stream collection timed out')
+                self._preserve_process(proc, cleanup)
                 self._streams(exc.output or b'', exc.stderr or b'', proc.poll(), partial=True)
                 raise NextDayTimeoutError('Process cleanup did not finish; outcome unknown',
                     partial_stdout=repr(exc.output), partial_stderr=repr(exc.stderr))
+            cleanup.update(exit_code=proc.returncode, direct_child_reaped=proc.returncode is not None,
+                           streams_collected=True)
             partial_stdout, partial_stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
-            if self.capture:
-                self.capture.facts['timed_out'] = True
             if self.stop_on_timeout or './novamind-operation next-week' in command:
                 raise NextDayTimeoutError(
                     f"Tool timed out after {self.bash_timeout}s; outcome unknown",
