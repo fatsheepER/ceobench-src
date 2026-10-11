@@ -11,7 +11,7 @@ from types import MappingProxyType
 import uuid
 
 from .agents.bash_agent.agent import BashAgent, FinalText
-from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
+from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions, validate_bash_limits
 from .api_server import NovaMindAPIServer
 from .execution_capture import join_text
 from .model_usage import ModelUsage
@@ -60,7 +60,8 @@ class MultiAgentRuntime:
     def __init__(self, root, tools, *, client_factory, mode='git', conn=None,
                  simulator=None, public_dir=None, run_id=None, world_id=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
-                 model_pricing=None, _restored_state=None, **server_options):
+                 model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
+                 analyst_bash_warn_after=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
@@ -68,6 +69,13 @@ class MultiAgentRuntime:
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
             total_days=total_days, model_pricing=model_pricing)
+        validate_bash_limits(analyst_bash_timeout, analyst_bash_warn_after)
+        if not _restored_state or 'analyst_bash_timeout' in _restored_state['configuration']:
+            self.configuration.update(analyst_bash_timeout=analyst_bash_timeout,
+                                      analyst_bash_warn_after=analyst_bash_warn_after)
+        if _restored_state:
+            from .team_checkpoint import validate_executor_settings
+            validate_executor_settings(_restored_state['configuration'], _restored_state['roles'])
         if mode == 'pf' and token_counter is None:
             from .payload_tokens import load_counter
             token_counter = load_counter('opencode', model)
@@ -125,11 +133,17 @@ class MultiAgentRuntime:
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
                 require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role],
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
-            executor = BashAgentToolExecutor(**executor_options, text_registry=registry)
-            script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)))
+            settings = dict(bash_timeout=analyst_bash_timeout, bash_warn_after=analyst_bash_warn_after) if role != 'ceo' else {}
+            script_settings = {}
+            if _restored_state:
+                settings = _restored_state['roles'][role]['executor']
+                script_settings = _restored_state['roles'][role]['script_executor']
+            executor = BashAgentToolExecutor(**executor_options, text_registry=registry, **settings)
+            script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)), **script_settings)
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
-            agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf', ask_analyst=role == 'ceo', team=True),
+            agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf',
+                ask_analyst=role == 'ceo', team=True, bash_timeout=executor.bash_timeout, bash_warn_after=executor.bash_warn_after),
                 client_factory(role), workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
                 text_registration=True, pf=mode == 'pf', identity=identity,

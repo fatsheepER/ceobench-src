@@ -62,7 +62,7 @@ def clients():
     return create
 
 
-def make_team(root, mode):
+def make_team(root, mode, **options):
     root.mkdir()
     conn = init_database(':memory:')
     config = BenchmarkConfig(seed=123)
@@ -70,7 +70,7 @@ def make_team(root, mode):
     simulator.initialize()
     tools = AgentTools(conn, 0, root / 'host', rng=simulator.rng, config=config, seed=123)
     runtime = MultiAgentRuntime(root / 'run', tools, simulator=simulator, conn=conn,
-        client_factory=clients(), mode=mode, model_pricing=PRICING)
+        client_factory=clients(), mode=mode, model_pricing=PRICING, **options)
     for role in ROLES:
         code = "import novamind_api as nm\nwith open('script-days.txt','a') as stream: stream.write(str(nm.vars.current_day)+'\\n')\n"
         if role == 'ceo':
@@ -335,3 +335,84 @@ def test_relocated_prompt_preserves_memory_source_spans():
     git_reply = 'Workspace: /old/run/roles/growth\nEvidence contains /old/run/notes.txt'
     moved_git = _relocate_prompt(git_reply, 'Workspace: /old/run/roles/', 'Workspace: /new/run/roles/')
     assert moved_git == 'Workspace: /new/run/roles/growth\nEvidence contains /old/run/notes.txt'
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_bash_policy_checkpoint_roundtrip_and_save_drift(tmp_path, mode):
+    runtime = make_team(tmp_path / 'thresholds', mode, analyst_bash_timeout=2, analyst_bash_warn_after=.05)
+    restored = None
+    try:
+        snapshot = runtime.checkpoint()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored-thresholds',
+            client_factory=clients(), simulator_factory=fast_simulator,
+            analyst_bash_timeout=2, analyst_bash_warn_after=.05)
+        for name, role in restored.roles.items():
+            expected = (1200, None) if name == 'ceo' else (2, .05)
+            assert (role.executor.bash_timeout, role.executor.bash_warn_after) == expected
+            automatic = restored.server.role_executors[name]
+            assert (automatic.bash_timeout, automatic.bash_warn_after) == (1200, None)
+            description = next(tool['description'] for tool in role.agent.tool_descriptions if tool['name'] == 'bash')
+            assert ('0.05 seconds' in description) == (name != 'ceo')
+        assert '[Framework timing notice]' in restored.roles['growth'].executor.execute('bash', dict(command='sleep .08; echo 42'))
+        with pytest.raises(ValueError, match='configuration drift'):
+            MultiAgentRuntime.restore(snapshot, tmp_path / 'drift', client_factory=clients(), analyst_bash_warn_after=.1)
+        runtime.roles['growth'].executor.bash_timeout = 3
+        with pytest.raises(ValueError, match='Bash policy drift'):
+            runtime.checkpoint()
+    finally:
+        if restored:
+            dispose(restored)
+        dispose(runtime)
+
+
+def test_legacy_checkpoint_preserves_custom_hard_limit_and_absent_soft(tmp_path, monkeypatch):
+    from saas_bench import team_checkpoint
+    runtime = make_team(tmp_path / 'legacy', 'git')
+    restored = None
+    try:
+        runtime.configuration.pop('analyst_bash_timeout')
+        runtime.configuration.pop('analyst_bash_warn_after')
+        runtime.roles['growth'].executor.bash_timeout = 17
+        runtime.server.role_executors['ops_finance'].bash_timeout = 29
+        snapshot = runtime.checkpoint()
+        validate = team_checkpoint.validate_snapshot
+        def legacy(source):
+            directory, state = validate(source)
+            for saved in state['roles'].values():
+                saved['executor'].pop('bash_warn_after')
+                saved['script_executor'].pop('bash_warn_after')
+            return directory, state
+        monkeypatch.setattr(team_checkpoint, 'validate_snapshot', legacy)
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored-legacy',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert restored.roles['growth'].executor.bash_timeout == 17
+        assert restored.server.role_executors['ops_finance'].bash_timeout == 29
+        assert all(role.executor.bash_warn_after is None for role in restored.roles.values())
+        assert '[Framework timing notice]' not in restored.roles['growth'].executor.execute('bash', dict(command='echo 42'))
+        with pytest.raises(ValueError, match='configuration drift'):
+            MultiAgentRuntime.restore(snapshot, tmp_path / 'new-policy', client_factory=clients(),
+                analyst_bash_timeout=480, analyst_bash_warn_after=120)
+        with pytest.raises(ValueError, match='configuration drift'):
+            MultiAgentRuntime.restore(snapshot, tmp_path / 'new-soft', client_factory=clients(), analyst_bash_warn_after=1)
+    finally:
+        if restored:
+            dispose(restored)
+        dispose(runtime)
+
+
+def test_checkpoint_rejects_saved_executor_policy_disagreement(tmp_path, monkeypatch):
+    from saas_bench import team_checkpoint
+    runtime = make_team(tmp_path / 'mismatch', 'git', analyst_bash_timeout=480, analyst_bash_warn_after=120)
+    try:
+        snapshot = runtime.checkpoint()
+        validate = team_checkpoint.validate_snapshot
+        def changed(source):
+            directory, state = validate(source)
+            state['roles']['growth']['executor']['bash_warn_after'] = 60
+            return directory, state
+        monkeypatch.setattr(team_checkpoint, 'validate_snapshot', changed)
+        with pytest.raises(ValueError, match='Bash policy drift'):
+            MultiAgentRuntime.restore(snapshot, tmp_path / 'rejected', client_factory=clients())
+        assert not (tmp_path / 'rejected').exists()
+    finally:
+        dispose(runtime)

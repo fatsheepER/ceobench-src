@@ -7,6 +7,7 @@ and file manipulation (read, write, edit, search, glob).
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -258,9 +260,19 @@ NOTE_PARAMETER = {
 }
 
 
-def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False, team=False) -> List[Dict[str, Any]]:
+def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False, team=False,
+                                     bash_timeout=1200, bash_warn_after=None) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
+    if bash_warn_after is not None:
+        definitions = [dict(t, description=t['description'] +
+            f' The outer Bash task limit is {bash_timeout:g} seconds. Subtools may time out earlier; '
+            'the public CLI Python subcommand has its own 300-second limit. '
+            f'Completed commands taking at least {bash_warn_after:g} seconds receive one framework timing notice. '
+            'Use existing output first; reduce the workload or correct the script before computing again. '
+            'A notice only guides subsequent work and does not require a rerun. '
+            'After a hard timeout, inspect partial output and the reported termination status.')
+            if t['name'] == 'bash' else t for t in definitions]
     if text_registration or pf_queries:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.
         definitions = [dict(t, parameters=dict(t['parameters'], properties=dict(
@@ -304,19 +316,28 @@ def get_bash_agent_anthropic_tools() -> List[Dict[str, Any]]:
 # Tool execution
 # =========================================================================
 
+def validate_bash_limits(bash_timeout, bash_warn_after):
+    if type(bash_timeout) not in (int, float) or not math.isfinite(bash_timeout) or bash_timeout <= 0:
+        raise ValueError('bash_timeout must be a finite positive number')
+    if bash_warn_after is not None and (type(bash_warn_after) not in (int, float) or
+            not math.isfinite(bash_warn_after) or not 0 < bash_warn_after < bash_timeout):
+        raise ValueError('bash_warn_after must be positive and below bash_timeout')
+
+
 class BashAgentToolExecutor:
     """Executes bash_agent tools within a working directory."""
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
                  text_registry=None, pf_stale_checks=True, pf_refresh=None,
-                 identity=None, readable_workspaces=(), api_socket=None, audit=None):
+                 identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None):
         """Initialize the tool executor.
 
         Args:
             workspace_path: Agent's working directory.
             env: Extra environment variables for bash commands.
-            bash_timeout: Timeout in seconds for bash commands (default 5 min).
+            bash_timeout: Timeout in seconds for bash commands (default 20 min).
+            bash_warn_after: Optional completed-command timing notice threshold.
         """
         self.audit = audit
         self.identity = identity
@@ -328,7 +349,9 @@ class BashAgentToolExecutor:
             raise ValueError('Team execution requires the Linux sandbox')
         self.workspace_path = Path(workspace_path).resolve()
         self.extra_env = env or {}
+        validate_bash_limits(bash_timeout, bash_warn_after)
         self.bash_timeout = bash_timeout
+        self.bash_warn_after = bash_warn_after
         self.require_sandbox = require_sandbox
         self.stop_on_timeout = stop_on_timeout
         self.evidence_store = evidence_store
@@ -409,6 +432,8 @@ class BashAgentToolExecutor:
         facts = {}
         self._exit_code = None
         self._timed_out = False
+        self._bash_facts = {}
+        accounting_started = time.monotonic()
         if self.pf_queries:
             from saas_bench.pf_queries import MODELS
             dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
@@ -471,8 +496,15 @@ class BashAgentToolExecutor:
             status = 'result_unknown'
             raise
         except Exception as exc:
-            result, status = f"Error: {exc}", 'failed'
+            result = f"Error: {exc}"
+            status = 'timed_out' if self.bash_warn_after is not None and self._timed_out else 'failed'
+            if status == 'timed_out':
+                result = (f'Error: Command timed out after {self.bash_timeout:g} seconds. '
+                    'Task terminated; descendant cleanup and output stream closure verified. '
+                    f'Output is partial; processing the captured output failed: {exc}')
         finally:
+            body = result
+            read_key = None
             if capture:
                 after = None
                 if before is not None:
@@ -483,13 +515,27 @@ class BashAgentToolExecutor:
                                {x:v for x,v in after.get(k, {}).items() if x != 'version'})
                 # A failed or timed-out Bash command may still have delivered SQL output or
                 # written files; decorate whatever this execution actually captured.
-                read_key = None
-                body = result
                 if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                     if tool_name in DELTA_READ_TOOLS and not getattr(result, 'pf_read', None):
                         read_key = capture.safe(read_identity, capture.store, capture.event,
                                                 self.workspace_path, tool_name, args, self.guest_root)
+            if (tool_name == 'bash' and result is not None and status in ('succeeded', 'failed')
+                    and self.bash_warn_after is not None and self._bash_facts.get('boundary_closed')
+                    and not self._timed_out
+                    and self.bash_warn_after <= self._bash_facts['elapsed_seconds'] < self.bash_timeout):
+                from saas_bench.execution_capture import join_text
+                result = join_text(result, '\n\n',
+                    f"[Framework timing notice] This command took {self._bash_facts['elapsed_seconds']:.3f} seconds, "
+                    f"reaching the {self.bash_warn_after:g}-second notice threshold. "
+                    f"The hard execution limit is {self.bash_timeout:g} seconds. "
+                    'Use the existing output first; check saved result files or reduce the computation before rerunning. '
+                    'Do not rerun solely to address this notice.')
+                self._bash_facts['warning_emitted'] = True
+            if capture:
+                capture.facts.update(self._bash_facts)
+                capture.facts['host_accounting_seconds'] = max(0, time.monotonic() - accounting_started
+                    - self._bash_facts.get('elapsed_seconds', 0) - self._bash_facts.get('cleanup_seconds', 0))
                 result = capture.finish(result, status, read_key=read_key, body=body,
                                         read_complete=not capture.facts.get('output_truncated') and
                                                       not capture.facts.get('pf_retrieval'))
@@ -502,7 +548,9 @@ class BashAgentToolExecutor:
             self.last_status = status
             if self.audit:
                 self.audit.record('tool_execution', tool=tool_name, status=status,
-                    model_request_event=model_request_event, context_id=model_context_id)
+                    model_request_event=model_request_event, context_id=model_context_id, **self._bash_facts,
+                    **({key: capture.facts[key] for key in ('host_accounting_seconds', 'capture_finish_seconds',
+                        'stream_capture_seconds', 'before_scan_seconds', 'after_scan_seconds') if key in capture.facts} if capture else {}))
         if capture and tool_name.startswith('pf_'):
             result.pf_call = dict(operation=tool_name, arguments=args, event_id=capture.event,
                                  outcome='usage_error' if tool_name == 'pf_usage' else
@@ -767,7 +815,7 @@ class BashAgentToolExecutor:
         if self.pf_queries:
             from saas_bench.pf_shell import ShellService
             service = self._pf_service = ShellService(self)
-        boundary = Boundary(command, self.python, isolated=bool(self.identity))
+        boundary = Boundary(command, self.python, isolated=bool(self.identity), verified=self.bash_warn_after is not None)
         self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
         try:
             result = self._run_bash(command, boundary)
@@ -819,6 +867,9 @@ class BashAgentToolExecutor:
         import signal
         if self.capture:
             self.capture.facts['process_started'] = False
+        self._bash_facts = dict(bash_timeout=self.bash_timeout, bash_warn_after=self.bash_warn_after,
+                               warning_emitted=False, boundary_closed=False)
+        started_at = time.monotonic()
         if bwrap_cmd:
             # CRITICAL: pass env=env so bwrap inherits a clean dict.
             # Without this, bwrap inherits the launcher's full os.environ —
@@ -850,17 +901,53 @@ class BashAgentToolExecutor:
             sink = os.fstat(proc.stdout.fileno())
             self.capture.facts['stdout_sink'] = [sink.st_dev, sink.st_ino]
         try:
-            raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout)
+            raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout, started_at=started_at)
+            self._bash_facts.update(elapsed_seconds=time.monotonic() - started_at,
+                boundary_closed=boundary.record.get('phase') == 'closed', cleanup_seconds=0,
+                timeout_trigger_seconds=None)
+            if boundary.verified:
+                self._bash_facts.update({key: boundary.record[key] for key in
+                    ('elapsed_seconds', 'boundary_closed', 'cleanup_seconds', 'timeout_trigger_seconds')})
+                self._timed_out = boundary.record['timed_out']
+            self._bash_facts.update(process_boundary=boundary.record, timed_out=self._timed_out)
             if self.capture:
                 self.capture.facts['process_boundary'] = boundary.record
-            stdout, stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
+            decode_error = None
+            try:
+                stdout, stderr = self._streams(raw_stdout, raw_stderr, proc.returncode, partial=self._timed_out)
+            except UnicodeError as exc:
+                if not boundary.verified:
+                    raise
+                decode_error = exc
+                stdout, stderr = repr(raw_stdout), repr(raw_stderr)
+
+            if self._timed_out and (self.stop_on_timeout or './novamind-operation next-week' in command):
+                raise NextDayTimeoutError(f'Tool timed out after {self.bash_timeout:g}s; outcome unknown',
+                    partial_stdout=stdout, partial_stderr=stderr)
+            if self.world_status and self.world_status():
+                raise NextDayTimeoutError('Server operation outcome unknown', partial_stdout=stdout, partial_stderr=stderr)
+            port = self.extra_env.get('NOVAMIND_API_PORT')
+            if port and int(port) > 0 and not self.identity:
+                import json
+                import urllib.request
+                with urllib.request.urlopen(f'http://127.0.0.1:{int(port)}/game-status', timeout=5) as response:
+                    state = json.load(response)
+                if state.get('timed_out') or state.get('operation_failed'):
+                    raise NextDayTimeoutError('Server operation outcome unknown',
+                                              partial_stdout=stdout, partial_stderr=stderr)
+
+            if decode_error:
+                raise decode_error
 
             output_parts = []
             if stdout:
                 output_parts.append(stdout)
             if stderr:
                 output_parts.append(f"[stderr]\n{stderr}")
-            if proc.returncode != 0:
+            if self._timed_out:
+                output_parts.append(f'Error: Command timed out after {self.bash_timeout:g} seconds. '
+                    'Task terminated; descendant cleanup and output stream closure verified. Output is partial.')
+            elif proc.returncode != 0:
                 output_parts.append(f"[exit code: {proc.returncode}]")
 
             output = '\n'.join(output_parts) if output_parts else "(no output)"
@@ -877,21 +964,12 @@ class BashAgentToolExecutor:
                         slice_origins(self.capture.origins, len(output) - 15000, len(output), 15000 + len(marker)))
                 output = output[:15000] + "\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n" + output[-15000:]
 
-            if self.world_status and self.world_status():
-                raise NextDayTimeoutError('Server operation outcome unknown', partial_stdout=stdout, partial_stderr=stderr)
-            port = self.extra_env.get('NOVAMIND_API_PORT')
-            if port and int(port) > 0 and not self.identity:
-                import json
-                import urllib.request
-                with urllib.request.urlopen(f'http://127.0.0.1:{int(port)}/game-status', timeout=5) as response:
-                    state = json.load(response)
-                if state.get('timed_out') or state.get('operation_failed'):
-                    raise NextDayTimeoutError('Server operation outcome unknown',
-                                              partial_stdout=stdout, partial_stderr=stderr)
-
             return output
 
         except BoundaryOpen as exc:
+            self._bash_facts.update({key: exc.record[key] for key in
+                ('elapsed_seconds', 'boundary_closed', 'cleanup_seconds', 'timeout_trigger_seconds') if key in exc.record})
+            self._bash_facts.update(process_boundary=exc.record, timed_out=exc.record.get('timed_out', False))
             self._preserve_process(proc, exc.record)
             try:
                 self._streams(exc.stdout, exc.stderr, exc.record['exit_code'], partial=True)
@@ -900,10 +978,14 @@ class BashAgentToolExecutor:
             raise ProcessBoundaryError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr)) from exc
         except subprocess.TimeoutExpired as timeout:
             self._timed_out = True
+            cleanup_started = time.monotonic()
+            self._bash_facts.update(elapsed_seconds=cleanup_started - started_at,
+                timeout_trigger_seconds=cleanup_started - started_at)
             cleanup = dict(phase='timeout_cleanup', timeout_seconds=self.bash_timeout,
                            coverage='direct_child_and_streams_only', descendants_closed=None,
                            direct_child_reaped=False, streams_collected=False, exit_code=None,
                            last_supervisor_receipt=boundary.record, actions={})
+            self._bash_facts.update(process_boundary=cleanup, timed_out=True)
             if self.capture:
                 self.capture.facts.update(process_boundary=cleanup, timed_out=True)
             # A process-group signal does not cover detached descendants.
@@ -937,6 +1019,7 @@ class BashAgentToolExecutor:
                     partial_stdout=repr(raw_stdout), partial_stderr=repr(raw_stderr)) from exc
             cleanup.update(exit_code=proc.returncode, direct_child_reaped=proc.returncode is not None,
                            streams_collected=True)
+            self._bash_facts['cleanup_seconds'] = time.monotonic() - cleanup_started
             partial_stdout, partial_stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
             if self.stop_on_timeout or './novamind-operation next-week' in command:
                 raise NextDayTimeoutError(
@@ -956,6 +1039,7 @@ class BashAgentToolExecutor:
 
     def _preserve_process(self, proc, record):
         self.preserved_process = proc
+        self._bash_facts.update(process_boundary=record, boundary_closed=False, preserved_pid=proc.pid)
         if self.capture:
             self.capture.facts.update(process_boundary=record, boundary_closed=False, preserved_pid=proc.pid)
             self.capture.store.fail('Process boundary unresolved; branch paused',
@@ -963,16 +1047,22 @@ class BashAgentToolExecutor:
 
     def _streams(self, stdout, stderr, exit_code, partial=False):
         self._exit_code = exit_code
-        from saas_bench.execution_capture import decoded
-        if self.capture:
-            self.capture.facts['exit_code'] = exit_code
-            self.capture.blob('stdout_bytes', stdout, 'stdout_bytes', extent='partial' if partial else 'full')
-            self.capture.blob('stderr_bytes', stderr, 'stderr_bytes', extent='partial' if partial else 'full')
-        out, err = decoded(stdout), decoded(stderr)
-        if self.capture:
-            self.capture.blob('stdout', out, 'stdout', derived_from=self.capture.event + ':stdout_bytes', extent='partial' if partial else 'full')
-            self.capture.blob('stderr', err, 'stderr', derived_from=self.capture.event + ':stderr_bytes', extent='partial' if partial else 'full')
-        return out, err
+        self._bash_facts['exit_code'] = exit_code
+        started = time.monotonic()
+        try:
+            from saas_bench.execution_capture import decoded
+            if self.capture:
+                self.capture.facts['exit_code'] = exit_code
+                self.capture.blob('stdout_bytes', stdout, 'stdout_bytes', extent='partial' if partial else 'full')
+                self.capture.blob('stderr_bytes', stderr, 'stderr_bytes', extent='partial' if partial else 'full')
+            out, err = decoded(stdout), decoded(stderr)
+            if self.capture:
+                self.capture.blob('stdout', out, 'stdout', derived_from=self.capture.event + ':stdout_bytes', extent='partial' if partial else 'full')
+                self.capture.blob('stderr', err, 'stderr', derived_from=self.capture.event + ':stderr_bytes', extent='partial' if partial else 'full')
+            return out, err
+        finally:
+            if self.capture:
+                self.capture.facts['stream_capture_seconds'] = time.monotonic() - started
 
     def _stream_origins(self, stdout, stderr):
         from saas_bench.execution_capture import origin

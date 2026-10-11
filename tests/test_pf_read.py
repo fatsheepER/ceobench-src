@@ -460,3 +460,37 @@ def test_agent_snapshot_restore_pruning_and_new_week(workspace, tmp_path):
     assert accounting(store)['materialized_full_tokens'] > 0
     store.assert_healthy()
     client.close()
+
+
+@pytest.mark.parametrize('command', ['cat facts.txt', 'pf show facts.txt'])
+def test_repeated_slow_bash_keeps_each_notice_in_actual_request(workspace, tmp_path, monkeypatch, command):
+    from saas_bench.process_boundary import Boundary
+    store, _, executor = captured(workspace, tmp_path)
+    (workspace / 'facts.txt').write_text(sample())
+    executor.bash_timeout, executor.bash_warn_after = 480, 120
+    elapsed = iter([120, 121])
+    communicate = Boundary.communicate
+    def timed(boundary, *args, **kwargs):
+        result = communicate(boundary, *args, **kwargs)
+        boundary.record['elapsed_seconds'] = next(elapsed)
+        return result
+    monkeypatch.setattr(Boundary, 'communicate', timed)
+    first = executor.execute('bash', dict(command=command))
+    deliver(store, [first])
+    second = executor.execute('bash', dict(command=command))
+    event, ledger = deliver(store, [first, second])
+    wire = json.loads(store.get_content(event + ':wire')[1])
+    assert wire['messages'][1]['content'] == second
+    assert '120.000 seconds' in first and '121.000 seconds' in second
+    assert ledger[-1]['mode'] == 'FULL'
+    if command.startswith('pf '):
+        span, = second.pf_read_spans
+        a, b = span['request_range']
+        assert second[a:b] == store.get_content(span['id'])[1].decode()
+        assert '[Framework timing notice]' not in second[a:b]
+    else:
+        assert ledger[-1]['reason'] == 'requested_full'
+        first_meta = store.get_content(first.origins[0]['version_id'])[0]
+        second_meta = store.get_content(second.origins[0]['version_id'])[0]
+        assert first_meta['body_sha256'] == second_meta['body_sha256']
+    store.assert_healthy()

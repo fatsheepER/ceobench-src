@@ -43,7 +43,9 @@ PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
     total_days=500, effective_end=497, sdk_max_retries=2, logical_request_attempts=4,
     timeout_seconds=dict(connect=60, read=180, write=60, pool=60),
-    simulator_thinking='disabled', simulator_reasoning_effort='none')
+    simulator_thinking='disabled', simulator_reasoning_effort='none',
+    analyst_bash_timeout=480, analyst_bash_warn_after=120,
+    analyst_bash_scope='growth_and_ops_finance_model_bash_initial_and_ceo_followup')
 
 
 def read(path):
@@ -249,10 +251,18 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             client_factory=factory, public_dir=manifest['public_dir'], mode=entry['group'],
             run_id=entry['run_id'], world_id=manifest['d0'][str(entry['seed'])]['world_id'],
             model=MODEL, reasoning_effort='high', total_days=500,
-            model_pricing=manifest['pricing'], token_counter=token_counter)
+            model_pricing=manifest['pricing'], token_counter=token_counter,
+            **analyst_bash_settings(manifest))
     except BaseException:
         conn.close()
         raise
+
+
+def analyst_bash_settings(manifest):
+    parameters = manifest['parameters']
+    if parameters.get('analyst_bash_scope') != PARAMETERS['analyst_bash_scope']:
+        raise ValueError('Frozen analyst Bash scope changed')
+    return {key: parameters[key] for key in ('analyst_bash_timeout', 'analyst_bash_warn_after')}
 
 
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
@@ -591,7 +601,8 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             if source:
                 team = MultiAgentRuntime.restore(source, directory / 'runtime', client_factory=factory,
                     public_dir=manifest['public_dir'], token_counter=counter, simulator_factory=sim_factory,
-                    model=MODEL, reasoning_effort='high', total_days=500, model_pricing=manifest['pricing'])
+                    model=MODEL, reasoning_effort='high', total_days=500, model_pricing=manifest['pricing'],
+                    **analyst_bash_settings(manifest))
             else:
                 team = make_team(manifest, entry, directory, client_factory=factory,
                                  simulator_factory=sim_factory, token_counter=counter)

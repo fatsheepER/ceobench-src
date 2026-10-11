@@ -64,7 +64,7 @@ def completion(message, stream=False):
 
 
 @contextmanager
-def make_team(mode, responder, label):
+def make_team(mode, responder, label, **runtime_options):
     base = Path(os.environ.get('CEOBENCH_TEAM_ARTIFACTS', tempfile.mkdtemp(prefix='team-flow-')))
     base.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix=f'{label}-{mode}-', dir=base))
@@ -105,7 +105,7 @@ def make_team(mode, responder, label):
         return f'=== Week {day // 7 + 1} Dashboard (Day {day}) ===\nPUBLIC price_A={price}'
 
     team = MultiAgentRuntime(root / 'run', tools, conn=conn, simulator=SimpleNamespace(step_week=step),
-                            client_factory=client, mode=mode, dashboard_callback=dashboard)
+                            client_factory=client, mode=mode, dashboard_callback=dashboard, **runtime_options)
     holder['team'] = team
     team.test_event, team.test_wire, team.test_timeline = event, wire, timeline
     team.test_root = root

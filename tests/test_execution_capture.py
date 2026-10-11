@@ -760,3 +760,177 @@ def test_timeout_signal_oserror_runs_fallback_or_preserves_boundary(captured, mo
             except ProcessLookupError:
                 pass
             proc.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('hard, soft', [(0, None), (True, None), (float('inf'), None),
+    (float('nan'), None), (1, 0), (1, True), (1, 1), (1, 2), (1, float('nan')), (1, float('inf'))])
+def test_bash_threshold_validation(tmp_path, hard, soft):
+    with pytest.raises(ValueError, match='bash_'):
+        BashAgentToolExecutor(tmp_path, bash_timeout=hard, bash_warn_after=soft)
+
+
+@pytest.mark.parametrize('elapsed, exit_code, notice', [(119.999, 0, False), (120, 0, True),
+    (120, 7, True), (479.999, 0, True), (480, 0, False)])
+def test_bash_notice_boundaries_preserve_raw_result(captured, monkeypatch, elapsed, exit_code, notice):
+    from saas_bench.process_boundary import Boundary
+    from saas_bench.evidence_handles import body_digest
+    _, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = 480, 120
+    original = Boundary.communicate
+    def communicate(boundary, *args, **kwargs):
+        output = original(boundary, *args, **kwargs)
+        boundary.record.update(elapsed_seconds=elapsed, timed_out=elapsed >= 480,
+            timeout_trigger_seconds=elapsed if elapsed >= 480 else None)
+        return output
+    monkeypatch.setattr(Boundary, 'communicate', communicate)
+    output = executor.execute('bash', dict(command=f'printf "42\\n"; printf "detail\\n" >&2; exit {exit_code}'))
+    event = event_ids(store)[0]
+    facts = store.read_event(event)['result']
+    assert output.count('[Framework timing notice]') == int(notice)
+    assert facts['warning_emitted'] is notice
+    assert facts['status'] == ('timed_out' if elapsed >= 480 else 'failed' if exit_code else 'succeeded')
+    assert facts['exit_code'] == exit_code
+    assert store.get_content(event + ':stdout_bytes')[1] == b'42\n'
+    assert store.get_content(event + ':stderr_bytes')[1] == b'detail\n'
+    metadata, raw = store.get_content(event + ':tool_return')
+    assert raw.decode() == output
+    assert metadata['body_sha256'] == body_digest(output.split('\n\n[Framework timing notice]')[0])
+    for item in output.origins:
+        a, b = item['request_range']
+        c, d = item['source_range']
+        assert output[a:b] == store.get_content(item['version_id'])[1].decode()[c:d]
+        if item['version_id'].endswith((':stdout', ':stderr')):
+            assert '[Framework timing notice]' not in output[a:b]
+
+
+@pytest.mark.parametrize('command', [
+    "python -c 'import os,time;print(os.getpid(),flush=True);time.sleep(30)'",
+    "python -c 'import os,time;print(os.getpid(),flush=True);time.sleep(30)' &",
+    "python -c \"import subprocess;subprocess.Popen(['python','-c','import os,time;print(os.getpid(),flush=True);time.sleep(30)'], start_new_session=True)\"",
+])
+def test_verified_timeout_reaps_foreground_background_and_detached(captured, monkeypatch, command):
+    import os
+    _, store, executor = captured
+    monkeypatch.setattr(executor, '_bwrap', lambda: None)
+    executor.bash_timeout, executor.bash_warn_after = .3, .1
+    output = executor.execute('bash', dict(command=command))
+    pid = int(output.splitlines()[0])
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    facts = records(store)[0]['result']
+    assert facts['status'] == 'timed_out' and not facts['warning_emitted']
+    assert facts['elapsed_seconds'] >= .3 and facts['timeout_trigger_seconds'] >= .3
+    assert 0 <= facts['cleanup_seconds'] < 2
+    boundary = facts['process_boundary']
+    assert boundary['phase'] == 'closed' and boundary['descendants_closed']
+    assert boundary['direct_child_reaped'] and boundary['streams_collected']
+    assert pid in boundary['reaped'] and pid in boundary['signaled']
+    assert 'Task terminated' in output and 'Output is partial' in output
+    assert store.get_content(event_ids(store)[0] + ':stdout_bytes')[0]['extent'] == 'partial'
+    assert executor.execute('bash', dict(command='echo next')) == 'next\n'
+    store.assert_healthy()
+
+
+def test_verified_deadline_includes_popen_and_ignores_capture_scans(captured, monkeypatch):
+    import time
+    import subprocess
+    from saas_bench.execution_capture import ExecutionCapture
+    _, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    original_init = subprocess.Popen.__init__
+    original_scan = ExecutionCapture.snapshot
+    def init(proc, *args, **kwargs):
+        original_init(proc, *args, **kwargs)
+        time.sleep(.3)
+    def snapshot(capture, *args):
+        time.sleep(.2)
+        return original_scan(capture, *args)
+    monkeypatch.setattr(subprocess.Popen, '__init__', init)
+    monkeypatch.setattr(ExecutionCapture, 'snapshot', snapshot)
+    result = executor.execute('bash', dict(command='echo partial; sleep 30'))
+    facts = records(store)[0]['result']
+    assert 'timed out' in result
+    assert .3 <= facts['timeout_trigger_seconds'] < .45
+    assert facts['host_accounting_seconds'] >= .4
+    assert facts['capture_finish_seconds'] >= 0
+
+
+def test_verified_unknown_receipt_preserves_scene_and_pauses(captured, monkeypatch):
+    import os
+    import signal
+    from saas_bench import process_boundary
+    from saas_bench.agents.bash_agent.tools import ProcessBoundaryError
+    _, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    monkeypatch.setattr(process_boundary, 'SUPERVISOR', process_boundary.SUPERVISOR.replace(
+        "report('unknown' if unknown else 'closed')",
+        "unknown = 'injected missing cleanup proof'; report('unknown')"))
+    try:
+        with pytest.raises(ProcessBoundaryError):
+            executor.execute('bash', dict(command='echo partial; sleep 30'))
+        facts = records(store)[0]['result']
+        assert facts['status'] == 'result_unknown' and not facts['warning_emitted']
+        assert not facts['boundary_closed']
+        assert facts['process_boundary']['unknown'] == 'injected missing cleanup proof'
+        assert executor.preserved_process.poll() is None
+        with pytest.raises(KeyError):
+            store.get_content(event_ids(store)[0] + ':tool_return')
+    finally:
+        if executor.preserved_process:
+            os.killpg(executor.preserved_process.pid, signal.SIGKILL)
+            executor.preserved_process.communicate(timeout=5)
+
+
+def test_verified_timeout_invalid_bytes_stays_timed_out(captured):
+    _, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    output = executor.execute('bash', dict(command="printf '\\377'; sleep 30"))
+    event = event_ids(store)[0]
+    assert executor.last_status == 'timed_out'
+    assert 'timed out' in output and 'Output is partial' in output
+    assert '[Framework timing notice]' not in output
+    assert store.get_content(event + ':stdout_bytes')[1] == b'\xff'
+    assert store.read_event(event)['result']['process_boundary']['descendants_closed']
+
+
+@pytest.mark.parametrize('strict, unknown_world', [(True, False), (False, True), (True, True)])
+def test_verified_invalid_bytes_cannot_hide_unknown_operation(captured, strict, unknown_world):
+    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
+    _, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    executor.stop_on_timeout = strict
+    executor.world_status = lambda: unknown_world
+    with pytest.raises(NextDayTimeoutError, match='outcome unknown'):
+        executor.execute('bash', dict(command="printf 'partial-out\\377'; sleep 30"))
+    event = event_ids(store)[0]
+    assert store.get_content(event + ':stdout_bytes')[1] == b'partial-out\xff'
+    assert store.read_event(event)['result']['status'] == 'result_unknown'
+    assert executor.last_status == 'result_unknown'
+    assert not store.read_event(event)['result']['warning_emitted']
+    with pytest.raises(KeyError):
+        store.get_content(event + ':tool_return')
+
+
+def test_verified_timeout_closes_sandbox_descendants(captured):
+    _, store, executor = captured
+    if executor._bwrap() is None:
+        pytest.skip('bubblewrap required')
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    result = executor.execute('bash', dict(command='(sleep 2; echo escaped > marker) & echo parent'))
+    facts = records(store)[0]['result']
+    assert facts['status'] == 'timed_out' and 'Task terminated' in result
+    assert facts['process_boundary']['descendants_closed']
+    assert facts['process_boundary']['streams_collected']
+    assert facts['process_boundary']['stop_requested']
+    assert not (executor.workspace_path / 'marker').exists()
+    assert executor.execute('bash', dict(command='echo next')) == 'next\n'
+
+
+def test_verified_decode_failure_still_checks_http_world_state(captured):
+    from saas_bench.agents.bash_agent.tools import NextDayTimeoutError
+    api, store, executor = captured
+    executor.bash_timeout, executor.bash_warn_after = .2, .1
+    api._operation_failed = True
+    with pytest.raises(NextDayTimeoutError, match='outcome unknown'):
+        executor.execute('bash', dict(command="printf '\\377'; sleep 30"))
+    assert records(store)[0]['result']['status'] == 'result_unknown'

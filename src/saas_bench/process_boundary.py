@@ -10,8 +10,9 @@ import uuid
 
 # This code runs inside the same sandbox as Bash, with no engine imports.
 SUPERVISOR = r'''
-import ctypes, json, os, signal, socket, subprocess, sys
+import ctypes, json, os, signal, socket, subprocess, sys, time
 address, key, command = sys.argv[1], sys.argv[2], sys.argv[3]
+verified = sys.argv[4] == 'verified'
 if address.startswith('/'):
     channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     channel.connect(address)
@@ -24,14 +25,68 @@ if linux:
     if libc.prctl(36, 1, 0, 0, 0):
         raise OSError(ctypes.get_errno(), 'Cannot supervise descendants')
 proc = subprocess.Popen(['bash', '-c', command])
-code = proc.wait()
+code = None
 unknown = None
 children = []
+stopping = False
+reaped = []
+signaled = []
 def report(phase):
     channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
-        phase=phase, coverage='subreaper_wait' if linux else 'process_group')) + '\n').encode())
+        phase=phase, coverage='subreaper_wait' if linux else 'process_group',
+        stop_requested=stopping, signaled=signaled, reaped=reaped)) + '\n').encode())
 try:
-    if linux:
+    if verified:
+        if not linux:
+            raise RuntimeError('Verified descendant cleanup requires Linux')
+        channel.setblocking(False)
+        data = b''
+        reported = False
+        while True:
+            try:
+                chunk = channel.recv(4096)
+                if not chunk:
+                    raise RuntimeError('Host disconnected before boundary closed')
+                data += chunk
+                while b'\n' in data:
+                    line, data = data.split(b'\n', 1)
+                    if line != b'stop':
+                        raise RuntimeError('Invalid boundary control request')
+                    stopping = True
+            except BlockingIOError:
+                pass
+            while True:
+                try:
+                    pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    children = []
+                    break
+                if not pid:
+                    children = ['running']
+                    break
+                reaped.append(pid)
+                if pid == proc.pid:
+                    code = proc.returncode = os.waitstatus_to_exitcode(status)
+            if not children:
+                break
+            if stopping:
+                # Killing a parent adopts its detached descendants on the next pass.
+                with open('/proc/self/task/%d/children' % os.getpid()) as stream:
+                    children = [int(pid) for pid in stream.read().split()]
+                for pid in children:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        if pid not in signaled:
+                            signaled.append(pid)
+                    except ProcessLookupError:
+                        pass
+            if code is not None and not reported:
+                report('draining')
+                reported = True
+            time.sleep(.01)
+    else:
+        code = proc.wait()
+    if linux and not verified:
         # Adopt and reap orphaned descendants, including detached process groups.
         # The host drains both output pipes and enforces the original deadline.
         while True:
@@ -46,7 +101,7 @@ try:
                 children = []
                 continue
             os.waitpid(info.si_pid, 0)
-    else:
+    elif not linux and not verified:
         import time
         while True:
             probe = subprocess.Popen(['ps', '-axo', 'pid=,ppid=,pgid=,stat='], stdout=subprocess.PIPE, text=True)
@@ -80,14 +135,16 @@ class BoundaryOpen(RuntimeError):
 
 
 class Boundary:
-    def __init__(self, command, python=sys.executable, *, isolated=False):
+    def __init__(self, command, python=sys.executable, *, isolated=False, verified=False):
         self.socket_dir = tempfile.TemporaryDirectory(prefix='ceobench-boundary-') if isolated else None
         self.listener = socket.socket(socket.AF_UNIX if isolated else socket.AF_INET)
         self.listener.bind(self.socket_dir.name + '/socket' if isolated else ('127.0.0.1', 0))
         self.listener.listen(1)
         self.key = uuid.uuid4().hex
         self.command = shlex.join([python, '-c', SUPERVISOR,
-                                  '/run/novamind-boundary/socket' if isolated else str(self.listener.getsockname()[1]), self.key, command])
+                                  '/run/novamind-boundary/socket' if isolated else str(self.listener.getsockname()[1]), self.key, command,
+                                  'verified' if verified else 'legacy'])
+        self.verified = verified
         self.channel = None
         self.record = None
 
@@ -98,9 +155,11 @@ class Boundary:
         if self.socket_dir:
             self.socket_dir.cleanup()
 
-    def communicate(self, process, timeout):
+    def communicate(self, process, timeout, *, started_at=None):
         try:
-            return self._communicate(process, timeout)
+            if self.verified:
+                return self._communicate_verified(process, timeout, started_at)
+            return self._communicate(process, timeout, started_at)
         except subprocess.TimeoutExpired:
             raise
         except BoundaryOpen:
@@ -108,8 +167,80 @@ class Boundary:
         except Exception as exc:
             raise BoundaryOpen(process, dict(exit_code=process.poll(), children=[], unknown=str(exc)), b'', b'') from exc
 
-    def _communicate(self, process, timeout):
-        deadline = time.monotonic() + timeout
+    def _communicate_verified(self, process, timeout, started_at):
+        started_at = time.monotonic() if started_at is None else started_at
+        deadline = started_at + timeout
+        cleanup_started = None
+        stdout, stderr, data = b'', b'', b''
+        authenticated = False
+        stop_sent = False
+        self.listener.settimeout(.01)
+        try:
+            while True:
+                now = time.monotonic()
+                if cleanup_started is None and now >= deadline:
+                    cleanup_started = now
+                if cleanup_started is not None and now >= cleanup_started + 5:
+                    raise RuntimeError('Could not verify cleanup within 5 seconds')
+                if self.channel is None:
+                    try:
+                        self.channel, _ = self.listener.accept()
+                        self.channel.setblocking(False)
+                    except TimeoutError:
+                        if process.poll() is not None:
+                            raise RuntimeError('Supervisor exited before authentication')
+                if self.channel is not None:
+                    try:
+                        chunk = self.channel.recv(65536)
+                        data += chunk
+                        while b'\n' in data:
+                            line, data = data.split(b'\n', 1)
+                            if not authenticated:
+                                if line.decode() != self.key:
+                                    raise RuntimeError('Invalid process boundary channel')
+                                authenticated = True
+                            else:
+                                self.record = json.loads(line)
+                                if self.record.get('unknown'):
+                                    raise RuntimeError(self.record['unknown'])
+                        if not chunk and (not self.record or self.record.get('phase') != 'closed'):
+                            raise RuntimeError('Supervisor exited without a closed boundary')
+                    except BlockingIOError:
+                        pass
+                    if cleanup_started is not None and authenticated and not stop_sent:
+                        if not self.record or self.record.get('phase') != 'closed':
+                            self.channel.sendall(b'stop\n')
+                        stop_sent = True
+                remaining = (cleanup_started + 5 if cleanup_started is not None else deadline) - time.monotonic()
+                try:
+                    stdout, stderr = process.communicate(timeout=max(.001, min(.01, remaining)))
+                except subprocess.TimeoutExpired as exc:
+                    stdout, stderr = exc.output or b'', exc.stderr or b''
+                    continue
+                if self.record and self.record.get('phase') == 'closed':
+                    if self.record.get('children') or self.record.get('coverage') != 'subreaper_wait':
+                        raise RuntimeError('Supervisor did not prove descendant closure')
+                    finished = time.monotonic()
+                    if cleanup_started is None and finished >= deadline:
+                        cleanup_started = finished
+                    self.record.update(boundary_closed=True, descendants_closed=True,
+                        direct_child_reaped=True, streams_collected=True,
+                        elapsed_seconds=(cleanup_started or finished) - started_at,
+                        timed_out=cleanup_started is not None,
+                        timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None else None,
+                        cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
+                    return stdout, stderr
+        except Exception as exc:
+            finished = time.monotonic()
+            self.record = dict(self.record or {}, exit_code=process.poll(), unknown=str(exc),
+                boundary_closed=False, timed_out=cleanup_started is not None,
+                elapsed_seconds=(cleanup_started or finished) - started_at,
+                timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None else None,
+                cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
+            raise BoundaryOpen(process, self.record, stdout, stderr) from exc
+
+    def _communicate(self, process, timeout, started_at=None):
+        deadline = (time.monotonic() if started_at is None else started_at) + timeout
         self.listener.settimeout(min(0.05, max(0.001, timeout)))
         while self.channel is None:
             try:

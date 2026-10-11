@@ -160,6 +160,7 @@ class ExecutionCapture:
         return items
 
     def finish(self, text, status='succeeded', read_key=None, read_complete=True, body=None, **facts):
+        started = time.monotonic()
         # body is the return before PF appended handles; equal bodies keep one version number.
         from .evidence_handles import body_digest
         extra = dict(body_sha256=body_digest(body)) if body is not None else {}
@@ -171,14 +172,17 @@ class ExecutionCapture:
             # The exact tool return is the read target; repeated identical calls in one
             # request context can then be delivered as DELTA or UNCHANGED.
             read = self.blob('read_full', text, 'pf_read_full', target=version, key=read_key, mode='content',
-                             read_range=[0, len(text)], complete=read_complete, force_full=False,
+                             read_range=[0, len(text)], complete=read_complete,
+                             force_full=self.facts.get('warning_emitted', False),
                              read_kind='tool_call')
             pf_read = {'id': read} if read else pf_read
         self.facts.update(facts)
+        self.facts['capture_finish_seconds'] = time.monotonic() - started
         if self.event:
             self.safe(self.store.complete, self.event, status, **self.facts)
         origins = [origin(version, text)] if version else []
-        return CapturedText(text, origins + self.origins, pf_read) if text is not None else None
+        return CapturedText(text, origins + self.origins, pf_read,
+                            getattr(text, 'pf_read_spans', [])) if text is not None else None
 
 
 def capture_http(handler, raw):

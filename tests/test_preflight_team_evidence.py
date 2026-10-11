@@ -564,3 +564,61 @@ def test_public_observations_canonical_numbered_nested_handles_and_late_capture(
         assert 'literal ' in wire['messages'][0]['content']
         for runtime in team.roles.values():
             runtime.store.assert_healthy()
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_analyst_slow_batch_receipts_reach_next_request_and_ceo_followup(mode):
+    seen = {role: 0 for role in ROLES}
+    batches = {}
+    receipts = []
+    def responder(team, role, body):
+        seen[role] += 1
+        if role != 'ceo':
+            if seen[role] % 2:
+                batch = calls(('bash', dict(command='sleep .08; printf "42\\n"')),
+                              ('bash', dict(command='sleep .08; printf "problem\\n" >&2; exit 7')))
+                batches[role] = [call['id'] for call in batch['tool_calls']]
+                return batch
+            messages = {message['tool_call_id']: message for message in body['messages'] if message['role'] == 'tool'}
+            for call_id in batches[role]:
+                receipt = messages[call_id]['content']
+                assert receipt.count('[Framework timing notice]') == 1
+                assert '2 seconds' in receipt and '0.05-second' in receipt
+                receipts.append((role, receipt))
+            assert '42\n' in messages[batches[role][0]]['content']
+            assert '[exit code: 7]' in messages[batches[role][1]]['content']
+            return final(role + ' finished')
+        if seen[role] == 1:
+            return calls(('ask_analyst', dict(role='growth', message='Review the result again.')))
+        return calls(('bash', dict(command=ADVANCE)))
+    with make_team(mode, responder, 'bash-threshold-receipts',
+                   analyst_bash_timeout=2, analyst_bash_warn_after=.05) as team:
+        assert team.run(stop_after_day=7).day == 7
+        assert seen == {'ceo': 2, 'growth': 4, 'ops_finance': 2}
+        assert len(receipts) == 6
+        for name, runtime in team.roles.items():
+            expected = (1200, None) if name == 'ceo' else (2, .05)
+            assert (runtime.executor.bash_timeout, runtime.executor.bash_warn_after) == expected
+            automatic = team.server.role_executors[name]
+            assert (automatic.bash_timeout, automatic.bash_warn_after) == (1200, None)
+            description = next(tool['description'] for tool in runtime.agent.tool_descriptions if tool['name'] == 'bash')
+            assert ('300-second' in description) == (name != 'ceo')
+            events = [json.loads(line) for line in runtime.audit.path.read_text().splitlines()]
+            events = [event for event in events if event['kind'] == 'tool_execution' and event['tool'] == 'bash']
+            if name == 'ceo':
+                assert all(not event['warning_emitted'] and event['bash_timeout'] == 1200 for event in events)
+                continue
+            assert len(events) == (4 if name == 'growth' else 2)
+            assert [event['status'] for event in events] == ['succeeded', 'failed'] * (len(events) // 2)
+            assert all(event['warning_emitted'] and event['elapsed_seconds'] >= .05 and
+                       event['process_boundary']['descendants_closed'] and event['boundary_closed'] for event in events)
+            if mode == 'pf':
+                with closing(runtime.store.connect()) as conn:
+                    ids = [row[0] for row in conn.execute("SELECT event_id FROM requests WHERE json_extract(request, '$.kind') = 'bash' AND json_extract(request, '$.role') = ? ORDER BY rowid", (name,))]
+                saved = []
+                for event in ids:
+                    facts = runtime.store.read_event(event)['result']
+                    assert facts['warning_emitted']
+                    assert facts['host_accounting_seconds'] >= 0 and facts['capture_finish_seconds'] >= 0
+                    saved.append(runtime.store.get_content(event + ':tool_return')[1].decode())
+                assert saved == [receipt for role, receipt in receipts if role == name]

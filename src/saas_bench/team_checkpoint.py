@@ -179,6 +179,25 @@ def checkpoint(runtime, destination=None):
             raise
 
 
+def validate_executor_settings(configuration, roles):
+    from .agents.bash_agent.tools import validate_bash_limits
+    policy_keys = ('analyst_bash_timeout', 'analyst_bash_warn_after')
+    explicit = any(key in configuration for key in policy_keys)
+    if explicit:
+        if not all(key in configuration for key in policy_keys):
+            raise ValueError('Incomplete analyst Bash policy in checkpoint')
+        validate_bash_limits(*(configuration[key] for key in policy_keys))
+    for role, saved in roles.items():
+        for kind in ('executor', 'script_executor'):
+            settings = saved[kind]
+            actual = (settings['bash_timeout'], settings.get('bash_warn_after'))
+            validate_bash_limits(*actual)
+            expected = ((configuration['analyst_bash_timeout'], configuration['analyst_bash_warn_after'])
+                if explicit and role != 'ceo' and kind == 'executor' else (1200, None))
+            if (explicit and actual != expected) or (not explicit and actual[1] is not None):
+                raise ValueError('Checkpoint Bash policy drift for ' + role + ' ' + kind)
+
+
 def _freeze(runtime, directory):
     from .db_protection import save_session_db
     from .execution_capture import text_sources
@@ -199,10 +218,13 @@ def _freeze(runtime, directory):
         context_id=role.usage.context_id, last_request_event=role.usage.last_request_event,
         expected_model=getattr(role.usage, 'expected_model', None),
         total_turns=role.agent.total_turns, system_prompt=role.agent.system_prompt,
-        executor=dict(bash_timeout=role.executor.bash_timeout, stop_on_timeout=role.executor.stop_on_timeout),
+        executor=dict(bash_timeout=role.executor.bash_timeout, bash_warn_after=role.executor.bash_warn_after,
+            stop_on_timeout=role.executor.stop_on_timeout),
         script_executor=dict(bash_timeout=server.role_executors[name].bash_timeout,
+            bash_warn_after=server.role_executors[name].bash_warn_after,
             stop_on_timeout=server.role_executors[name].stop_on_timeout))
         for name, role in runtime.roles.items()}
+    validate_executor_settings(runtime.configuration, roles)
     result = server._last_day_result
     if result is not None and not is_dataclass(result):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
@@ -291,9 +313,15 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     if tree_hash(Path(__file__).parent) != state['source_sha256'] and not migrated:
         raise ValueError('Source differs from frozen team configuration')
     configuration = state['configuration']
+    validate_executor_settings(configuration, state['roles'])
     for key in list(options):
         if key in configuration:
             if options.pop(key) != configuration[key]:
+                raise ValueError('Recovery configuration drift for ' + key)
+        elif key in ('analyst_bash_timeout', 'analyst_bash_warn_after'):
+            field = 'bash_timeout' if key == 'analyst_bash_timeout' else 'bash_warn_after'
+            requested = options.pop(key)
+            if any(saved['executor'].get(field) != requested for name, saved in state['roles'].items() if name != 'ceo'):
                 raise ValueError('Recovery configuration drift for ' + key)
     if state['live_customer'] and simulator_factory is None:
         raise ValueError('Live simulator recovery requires its frozen customer client factory')
@@ -389,10 +417,6 @@ def restore_runtime_state(runtime, state):
         role.usage.last_request_event = saved['last_request_event']
         role.usage.expected_model = saved['expected_model']
         role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
-        for executor, settings in ((role.executor, saved['executor']),
-                (server.role_executors[name], saved['script_executor'])):
-            for key, value in settings.items():
-                setattr(executor, key, value)
         if not role.agent.load_conversation_snapshot(role.agent._snapshot_path):
             raise ValueError('Cannot restore ' + name + ' role conversation')
         for message in role.agent.conversation:
