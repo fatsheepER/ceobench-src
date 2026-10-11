@@ -1,4 +1,3 @@
-"""Execute the examples the model receives, using synthetic evidence and mock transport."""
 import json
 import re
 
