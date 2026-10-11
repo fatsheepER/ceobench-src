@@ -65,8 +65,9 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
     paths = {}
     for run in manifest['runs']:
         try:
-            history = sorted(path for path in Path(run['output_dir']).iterdir()
-                             if path.name.startswith('attempt-'))
+            history = sorted((path for path in Path(run['output_dir']).iterdir()
+                              if path.name.startswith('attempt-')),
+                             key=lambda path: int(path.name.removeprefix('attempt-')))
         except FileNotFoundError:
             history = []
         except OSError as exc:

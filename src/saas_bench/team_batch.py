@@ -266,7 +266,7 @@ def analyst_bash_settings(manifest):
 
 
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
-                 order_seed=0, excluded_seeds=(), selection_rule='', max_attempts=3,
+                 order_seed=0, excluded_seeds=(), selection_rule='',
                  root=ROOT, public_dir=None, token_counter=None):
     root, destination = Path(root).resolve(), Path(destination).resolve()
     public = Path(public_dir or root / 'public').resolve()
@@ -279,8 +279,6 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         raise ValueError('Formal batches require three unused seeds and a recorded selection rule')
     if category == 'engineering' and seeds != [42]:
         raise ValueError('D28 engineering verification uses seed 42')
-    if type(max_attempts) is not int or max_attempts < 1:
-        raise ValueError('Freeze a positive finite attempt limit')
     check_prices(prices, price_source)
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
     d0 = {str(seed): verify_d0(path, seed=seed, prices=prices, price_source=price_source,
@@ -305,7 +303,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
         controller_sha256={name: file_hash(root / name) for name in CONTROLLER_SCRIPTS},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
-        price_source=price_source, max_attempts=max_attempts, d0=d0, runs=runs)
+        price_source=price_source, attempt_policy='explicit_resume', d0=d0, runs=runs)
     counter = token_counter or load_counter('opencode', MODEL)
     manifest['tokenizer'] = counter.metadata if counter else None
     prompts = {}
@@ -334,8 +332,12 @@ def validate_manifest(path):
     manifest = read(path)
     if manifest.get('version') != 1 or manifest.get('parameters') != PARAMETERS:
         raise ValueError('Frozen model parameters or manifest version mismatch')
-    if type(manifest.get('max_attempts')) is not int or manifest['max_attempts'] < 1:
-        raise ValueError('Frozen finite attempt limit is invalid')
+    # Historical limits stay in the immutable manifest but no longer cap resumes.
+    if 'max_attempts' in manifest:
+        if type(manifest['max_attempts']) is not int or manifest['max_attempts'] < 1:
+            raise ValueError('Historical attempt limit metadata is invalid')
+    elif manifest.get('attempt_policy') != 'explicit_resume':
+        raise ValueError('Frozen attempt policy is invalid')
     root, public = Path(manifest['source_root']), Path(manifest['public_dir'])
     from .team_recovery import approval
     revision = approval(path)
@@ -402,7 +404,7 @@ def run_lock(output):
 
 
 def attempts(entry):
-    return sorted(Path(entry['output_dir']).glob('attempt-*'))
+    return sorted(Path(entry['output_dir']).glob('attempt-*'), key=lambda p: int(p.name.removeprefix('attempt-')))
 
 
 def wall_time(history, current=None):
@@ -461,9 +463,7 @@ def register_attempt(path, manifest, entry, *, resume=False):
             raise ValueError('Resume requires a safe checkpoint once execution has started')
     elif resume:
         raise ValueError('Resume requires an original attempt')
-    number = len(history) + 1
-    if number > manifest['max_attempts']:
-        raise ValueError('Frozen finite attempt limit reached')
+    number = int(history[-1].name.removeprefix('attempt-')) + 1 if history else 1
     directory = Path(entry['output_dir']) / f'attempt-{number:03}'
     temporary = Path(tempfile.mkdtemp(prefix='.registration-', dir=directory.parent))
     shutil.copyfile(path, temporary / 'manifest.json')
@@ -755,7 +755,6 @@ def main(argv=None):
     frozen.add_argument('--excluded-debug-seed', action='append', type=int, default=[])
     frozen.add_argument('--seed-selection-rule', default='')
     frozen.add_argument('--order-seed', type=int, default=0)
-    frozen.add_argument('--max-attempts', type=int, default=3)
     for name in ('validate', 'start', 'run', 'resume', 'summarize'):
         sub = commands.add_parser(name)
         sub.add_argument('--manifest', type=Path, required=True)
@@ -775,7 +774,7 @@ def main(argv=None):
             sources[int(seed)] = Path(value)
         result = freeze_batch(args.output, sources, load_pricing(args.pricing), price_source=args.price_source,
             category=args.category, order_seed=args.order_seed, excluded_seeds=args.excluded_debug_seed,
-            selection_rule=args.seed_selection_rule, max_attempts=args.max_attempts)
+            selection_rule=args.seed_selection_rule)
     elif args.command == 'validate':
         result = validate_manifest(args.manifest)['runs']
     elif args.command == 'summarize':

@@ -127,17 +127,13 @@ def approved_attempt(managed_team, tmp_path, monkeypatch):
         manifest_path=manifest_path, snapshot=snapshot, state=state, approval_path=path, revision=revision)
 
 
-def test_audited_registration_preserves_interruption_and_frozen_attempt_limit(approved_attempt):
+def test_audited_registration_preserves_interruption_without_cumulative_limit(approved_attempt):
     directory, manifest, entry = approved_attempt.directory, approved_attempt.manifest, approved_attempt.entry
     manifest_path, snapshot = approved_attempt.manifest_path, approved_attempt.snapshot
     before = (directory / 'attempt.json').read_bytes()
     capped = copy.deepcopy(manifest)
     capped['max_attempts'] = 1
-    with pytest.raises(ValueError, match='finite attempt limit'):
-        batch.register_attempt(manifest_path, capped, entry, resume=True)
-    assert batch.attempts(entry) == [directory]
-    assert (directory / 'attempt.json').read_bytes() == before
-    next_directory, later, source = batch.register_attempt(manifest_path, manifest, entry, resume=True)
+    next_directory, later, source = batch.register_attempt(manifest_path, capped, entry, resume=True)
     assert later['attempt'] == 2 and source == snapshot
     assert later['source_checkpoint'] == str(snapshot)
     assert file_hash(next_directory / 'manifest.json') == file_hash(manifest_path)
