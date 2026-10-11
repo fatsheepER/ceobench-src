@@ -84,13 +84,20 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
         executor.execute('bash', {'command': 'true'})
     full = executor.execute('bash', {'command': command})
     result = executor.execute('bash', {'command': f'{command} | {view[0]} -{view[1]}'})
-    assert result == apply_view(str(full), view)
+    notice, shell_output = result.split('\n', 1)
+    assert 'PF final delivery' in notice and 'partial' in notice and 'source ranges unknown' in notice
+    assert 'before shell processing' in notice
+    assert shell_output == apply_view(str(full), view)
     if command == 'pf show facts.txt' and view[0] == 'tail':
-        assert result == 'B\nC\n'
+        assert shell_output == 'B\nC\n'
     event, reads = deliver(store, [result])
     assert len(reads) == 1 and reads[0]['complete'] is False
     assert reads[0]['mode'] == ('DIFF' if 'diff' in command else 'FULL')
     assert reads[0]['actual_tokens'] == Counter().count(result)
+    assert json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content'] == result
+    meta, saved = store.get_content(result.pf_read['id'])
+    assert saved.decode() == result and meta['view'] == 'shell_source_ranges_unknown'
+    assert store.get_content(meta['created_by_event'] + ':stdout')[1].decode() == shell_output
     for item in result.origins:
         meta, raw = store.get_content(item['version_id'])
         a, b = item['source_range']

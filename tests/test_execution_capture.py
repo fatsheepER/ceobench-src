@@ -284,6 +284,15 @@ def test_finished_bash_timeout_is_distinct_from_unknown_outcome(captured):
     assert row['result']['status'] == 'timed_out'
     assert row['result']['timed_out'] is True
     assert row['result']['exit_code'] is not None
+    cleanup = row['result']['process_boundary']
+    assert cleanup['phase'] == 'timeout_cleanup'
+    assert cleanup['direct_child_reaped'] is True
+    assert cleanup['streams_collected'] is True
+    assert cleanup['exit_code'] == row['result']['exit_code']
+    assert cleanup['coverage'] == 'direct_child_and_streams_only'
+    assert cleanup['descendants_closed'] is None
+    assert 'last_supervisor_receipt' in cleanup
+    assert 'children' not in cleanup
     store.assert_healthy()
 
 
