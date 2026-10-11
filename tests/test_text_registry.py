@@ -180,10 +180,13 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     assert store.get_content(binding['latest_version_id'])[1] == b'{"n":8}'
     newest = executor.execute('read_file', {'path': 'evidence.json'})
     send(store, newest)
-    call(registry, 'revise', record='r1', reason='Text only', text='Clarified')
+    revised = executor.execute('text_revise', dict(record='r1', reason='Text only', text='Clarified'))
+    assert 'Retained references: evidence.json@v1' in revised
     assert store.load_state('declaration:r1.2')['references'] == [binding]
     call(registry, 'revise', record='r1', reason='New evidence', references=declaration({'path': 'evidence.json'})['references'])
     assert store.load_state('declaration:r1.3')['references'][0]['version_id'] != binding['version_id']
+    delivered = send(store, revised)
+    assert json.loads(store.get_content(delivered + ':wire')[1])['messages'][0]['content'] == revised
     with pytest.raises(ValueError, match='or a file path'):
         call(registry, 'create', **declaration({'version': 'v999'}))
 

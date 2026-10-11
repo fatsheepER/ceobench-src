@@ -193,9 +193,11 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
 
 @pytest.mark.parametrize('fields', [{}, {'select': {'col': 'amount'}}])
 def test_weekly_without_structured_predicates_does_not_claim_they_passed(workspace, tmp_path, server, fields):
-    _, _, executor = chain(workspace, tmp_path, server, **fields)
+    store, _, executor = chain(workspace, tmp_path, server, **fields)
     weekly = executor.weekly_check(14)
     assert 'No structured predicates were checked.' in weekly
+    delivered = send(store, weekly)
+    assert json.loads(store.get_content(delivered + ':wire')[1])['messages'][0]['content'] == weekly
     assert 'no predicate fails' not in weekly
 
 
@@ -209,6 +211,8 @@ def test_weekly_zero_checked_has_no_freshness_conclusion(workspace, tmp_path, mo
         weekly_check = executor.weekly_check
     registry.execute('create', declaration({'path': 'evidence.json'}, applies_at={'start_day': 7, 'end_day': 13})
                      if mode != 'pf' else declaration(applies_at={'start_day': 7, 'end_day': 13}))
+    if mode == 'pf':
+        registry.execute('create', declaration({'record': 'r1'}, applies_at={'start_day': 21}))
     weekly = weekly_check(14)
     assert 'Checked this week: 0 texts; no new freshness conclusion.' in weekly
     assert 'unchanged' not in weekly and 'no predicate fails' not in weekly

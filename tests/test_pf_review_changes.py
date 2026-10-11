@@ -67,6 +67,7 @@ def test_mixed_upstream_changes_choose_old_data_change_and_keep_dated_reminder(w
     assert pending['reason']['check']['change_kind'] == 'content_changed'
     second = query.weekly_check(14)
     assert len(calls) == 1
+    assert 'Checked this week: 0 texts; no new freshness conclusion.' in second
     assert 'r1.1 (last verified day 7)' in second and '9→16' in second
     listed = json.loads(executor.execute('text_list', {'review': 'pending'}))
     assert listed['checks']['r1.1']['last_day'] == 7

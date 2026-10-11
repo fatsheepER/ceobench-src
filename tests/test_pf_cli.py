@@ -108,7 +108,8 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
     text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
                                            reason='r', references=[dict(cite='evidence.json', note='why')]))
     assert text == "Registered r1.1 (active).\nCited: evidence.json@week-2 (this week's closing commit)"
-    assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == 'Revised r1.2 (active).'
+    assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == (
+        "Revised r1.2 (active).\nRetained references: evidence.json@week-2 (this week's closing commit)")
     stored = json.loads(registry.path.read_text())['records']['r1'][-1]
     assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
     assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
@@ -299,3 +300,22 @@ def test_reverse_detail_hint_matches_declared_reference_traversal(workspace, tmp
     assert '--detail lists expanded declared-reference paths.' in compact
     assert 'scripts, files and outputs derived from it' not in compact
     assert 'text r1.1' in detail and 'text r2.1' in detail and 'via r1.1' in detail
+
+
+def test_reverse_detail_does_not_follow_automatic_query_output_edges(workspace, tmp_path):
+    from test_pf_stale import record_sql, cite
+    store, registry, executor = captured(workspace, tmp_path)
+    event = store.begin_event('bash', {'command': 'python report.py'})
+    source = record_sql(store, 'SELECT n FROM sample',
+                        dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1), parent=event)
+    output = store.version(event, 'output', 'Stored report', layer='tool_return')
+    store.complete(event)
+    cite(store, registry, executor, output)
+    handle = registry.resolver.handle(source)
+    for flags in ('', ' --detail', ' --detail --all'):
+        result = executor.execute('bash', {'command': f'pf rdepend {handle}{flags}'})
+        assert 'No active registered text cites it.' in result
+        assert 'text r1.1' not in result
+    cite(store, registry, executor, source)
+    result = executor.execute('bash', {'command': f'pf rdepend {handle} --detail'})
+    assert 'text r2.1' in result and 'text r1.1' not in result

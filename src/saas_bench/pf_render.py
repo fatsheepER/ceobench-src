@@ -381,7 +381,7 @@ def render_dependents(page):
         lines.append(f'{i}. ' + item_line(source) + ' — ' + ' — '.join(extras))
     tail = [_more(page, 'referrers')]
     if not detail:
-        tail.append(f"pf rdepend {root['version']} --detail adds scripts, files and outputs derived from it.")
+        tail.append(f"pf rdepend {root['version']} --detail lists expanded declared-reference paths.")
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -390,7 +390,7 @@ def plural(n, noun):
 
 
 def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0,
-                  *, active=None, eligible=None):
+                  *, active=None, eligible=None, predicates_checked=False):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Show changes to existing data even behind a cited output. Pure additions share a line.
@@ -400,12 +400,17 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if active is not None:
         lines.append(f'Registered texts: {active} active; {eligible} within their applies window.')
     checked = 'Checked this week: ' + plural(len(entries), 'text')
-    if not flagged and pending:
+    if not entries:
+        lines.append(checked + '; no new freshness conclusion.')
+    elif not flagged and pending:
         lines.append(f'{checked}; {condition_only} for continuing conditions or read retries. No new direct issues in these checks.')
     elif not flagged:
-        lines.append(checked + '; cited files and texts are unchanged' + (' and no predicate fails.' if pf else '.'))
+        lines.append(checked + '; cited files and texts are unchanged' +
+                     (' and no predicate fails.' if pf and predicates_checked else '.'))
     else:
         lines.append(f'{checked}; {len(flagged)} with changed evidence:')
+    if pf and entries and not predicates_checked:
+        lines.append('No structured predicates were checked.')
     seen, displayed, shared = set(), 0, 0
     for entry in flagged:
         rows = [row if isinstance(row, str) else dependency_line(row, relation=False) for row in entry['changed']]

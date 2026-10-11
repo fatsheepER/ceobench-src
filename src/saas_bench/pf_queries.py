@@ -455,10 +455,18 @@ class PFQueries:
             self._check([row for rows in traced.values() for row in rows], day=day)
             rendering = time.monotonic()
             entries, underlying = [], []
+            predicates_checked = False
             for version, rows in traced.items():
-                tops = ([self._describe_edge(r) for r in rows
-                         if (self._conditional(r) or r.get('retry_refresh')) and not r['historical_only']]
-                        if version in continuing else [self._top(r, rows) for r in rows if _weekly(r)])
+                tops = []
+                for row in rows:
+                    if (row['edge'].get('reference', {}).get('predicate')
+                            and row['check']['predicate_result'] in ('holds', 'fails', 'cannot_check')):
+                        predicates_checked = True
+                    if version in continuing:
+                        if (self._conditional(row) or row.get('retry_refresh')) and not row['historical_only']:
+                            tops.append(self._describe_edge(row))
+                    elif _weekly(row):
+                        tops.append(self._top(row, rows))
                 # Old data changing deserves an example even behind an immutable
                 # output. Only verified row additions are folded into a count.
                 direct = [t for t in tops if t['check'].get('below_failed')
@@ -481,7 +489,7 @@ class PFQueries:
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
             text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
                                           condition_only=len(continuing), pending=len(self.review_pending),
-                                          active=len(active), eligible=len(eligible))
+                                          active=len(active), eligible=len(eligible), predicates_checked=predicates_checked)
             if self.review_pending:
                 example = self.resolver.handle(next(iter(self.review_pending))).split('.')[0]
                 text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "active text")}; '

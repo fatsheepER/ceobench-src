@@ -154,6 +154,8 @@ class TextRegistry:
         self.last_result = result = dict(id=record_id, version=record['version'], status=record['status'])
         if warnings:
             result['warnings'] = list(dict.fromkeys(warnings))
+        retained = (operation == 'revise' and record['text'] != previous['text']
+                    and 'references' not in values)
         shown = operation == 'create' or 'references' in values
         if self.mode == 'pf':
             result['evidence'] = [self._display_binding(b) for b in bindings]
@@ -165,7 +167,9 @@ class TextRegistry:
         lines = [f"{verb} {record['version']} ({record['status']})."]
         if self.identity:
             lines.append(f"Shareable reference: {self.role}:{record['version']}")
-        if shown and cited:
+        if retained:
+            lines.append('Retained references: ' + (' · '.join(cited) or 'none'))
+        elif shown and cited:
             lines.append('Cited: ' + ' · '.join(cited))
         if self.mode == 'pf' and operation != 'retire' and (writes := self._week_writes(record)):
             lines.append('Business writes this week touching ' + ', '.join(writes[0]) + ': ' + ' · '.join(writes[1]))
