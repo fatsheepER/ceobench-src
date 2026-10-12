@@ -140,6 +140,7 @@ class MultiAgentRuntime:
                 script_settings = _restored_state['roles'][role]['script_executor']
             executor = BashAgentToolExecutor(**executor_options, text_registry=registry, **settings)
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)), **script_settings)
+            executor.lifecycle = script_executors[role].lifecycle = self._lifecycle
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf',

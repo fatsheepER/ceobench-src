@@ -28,28 +28,40 @@ def sql_client_interruption(conn, event):
         JOIN deliveries d ON d.event_id=q.event_id
         JOIN requests p ON p.event_id=json_extract(q.request, '$.parent_event_id')
         JOIN results pr ON pr.event_id=p.event_id
-        JOIN requests b ON b.event_id=json_extract(p.request, '$.parent_event_id')
-        JOIN results br ON br.event_id=b.event_id WHERE q.event_id=?''', (event,)).fetchone()
+        LEFT JOIN requests b ON b.event_id=json_extract(p.request, '$.parent_event_id')
+        LEFT JOIN results br ON br.event_id=b.event_id WHERE q.event_id=?''', (event,)).fetchone()
     if row is None:
         return None
-    query, result, delivery, python, ended, bash, outer = map(json.loads, row)
-    if (query['kind'] != 'sql_query' or python['kind'] != 'cli_python' or bash['kind'] != 'bash'
+    query, result, delivery, parent, ended, bash, outer = [json.loads(value) if value else None for value in row]
+    if parent['kind'] == 'bash':
+        bash, outer = parent, ended
+        if not (outer['status'] == 'timed_out' or outer.get('exit_code') in (124, 137)):
+            return None
+        proof = dict(reason='bash_client_timeout')
+    elif (parent['kind'] == 'cli_python' and bash and ended['status'] == 'failed'
+          and ended.get('error') == 'timeout' and ended.get('exit_code') == -9
+          and ended.get('capture_status') == 'complete' and ended.get('completed_at')):
+        proof = dict(reason='python_timeout_kill', python_event_id=parent['event_id'])
+    else:
+        return None
+    if (query['kind'] != 'sql_query' or bash['kind'] != 'bash' or not outer
             or result['status'] not in ('succeeded', 'failed', 'rejected', 'timed_out')
             or delivery.get('send_state') not in ('sent', 'failed')
-            or ended['status'] != 'failed' or ended.get('error') != 'timeout' or ended.get('exit_code') != -9
             or outer['status'] not in ('succeeded', 'failed', 'timed_out')
             or any(r.get('capture_status') != 'complete' or not r.get('completed_at')
-                   for r in (result, ended, outer))):
+                   for r in (result, outer))):
         return None
     boundary = outer.get('process_boundary') or {}
+    boundary_exit = boundary.get('exit_code')
+    if boundary_exit != outer.get('exit_code') and boundary_exit is not None and boundary_exit < 0:
+        boundary_exit = 128 - boundary_exit
     if (outer.get('process_started') is not True or outer.get('boundary_closed') is not True
-            or outer.get('exit_code') is None or boundary.get('exit_code') != outer['exit_code']
+            or outer.get('exit_code') is None or boundary_exit != outer['exit_code']
             or boundary.get('phase') != 'closed' or boundary.get('coverage') != 'subreaper_wait'
             or boundary.get('descendants_closed', True) is not True
             or boundary.get('children') != [] or boundary.get('unknown', 'missing') is not None):
         return None
-    return dict(state='interrupted', reason='python_timeout_kill', receive_state='unknown',
-                python_event_id=python['event_id'], bash_event_id=bash['event_id'])
+    return dict(state='interrupted', receive_state='unknown', bash_event_id=bash['event_id'], **proof)
 
 
 def excluded(rel):
@@ -135,8 +147,7 @@ class ExecutionCapture:
 
     def snapshot(self, workspace, phase):
         started = time.monotonic()
-        with self.store.batch():
-            items = self._snapshot(workspace, phase)
+        items = self._snapshot(workspace, phase)
         self.facts[phase + '_scan_seconds'] = time.monotonic() - started
         return items
 
@@ -167,7 +178,7 @@ class ExecutionCapture:
                             raise RuntimeError('File changed type during capture: ' + rel)
                         raw = stream.read()
                         after = os.fstat(stream.fileno())
-                    if (info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                    if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                         raise RuntimeError('File changed during boundary capture: ' + rel)
                     sha = digest(raw)
                     version, latest_sha = self.store.latest_version(rel, 'file_bytes') if self.event else (None, None)
@@ -216,10 +227,10 @@ class ExecutionCapture:
                             getattr(text, 'pf_read_spans', [])) if text is not None else None
 
 
-def capture_http(handler, raw):
+def capture_http(handler, raw, *, active_parent=True):
     store = handler.evidence
     token = handler.headers.get('X-Capture-Context')
-    parent = store.parent(token) if token else None
+    parent = store.parent(token, active=active_parent) if token else None
     try:
         request = json.loads(raw) if raw else {}
     except (ValueError, UnicodeError):
@@ -296,8 +307,13 @@ def public_handler(method):
     from functools import wraps
     @wraps(method)
     def audited(handler):
+        from .api_server import RequestRejected, RequestDeadlineExceeded
         try:
-            return observed(handler)
+            handler._start_public_request()
+            try:
+                return observed(handler)
+            except (RequestRejected, RequestDeadlineExceeded) as exc:
+                return handler._reject_request(exc)
         finally:
             api = handler.server._api_server
             if audit := api.role_audits.get(handler.role):
@@ -305,6 +321,7 @@ def public_handler(method):
                     tool=getattr(handler, '_audit_tool', None), http_status=getattr(handler, '_audit_status', None))
 
     def observed(handler):
+        from .api_server import RequestRejected, RequestDeadlineExceeded
         api = handler.server._api_server
         if not handler.admit():
             return
@@ -343,21 +360,13 @@ def public_handler(method):
         if store.fault or store.fault_path.exists():
             handler._send_json({'success': False, 'error': 'Execution capture failed; branch stopped'}, 503)
             return
-        with api._sql_lock:
-            while api._sql_paused:
-                try:
-                    if store.parent(handler.headers.get('X-Capture-Context')):
-                        break
-                except ValueError:
-                    pass
-                api._sql_lock.wait()
-            api._sql_active += 1
+        handler._admit_sql()
         handler._sql_event, handler._sql_response = None, None
         handler._sql_execution, handler._sql_capture_failed = {}, False
         handler._generic_capture = handler.path != '/query'
         token = None
         try:
-            raw = handler.rfile.read(int(handler.headers.get('Content-Length', 0)))
+            raw = handler._read_request_bytes()
             handler.rfile = io.BytesIO(raw)
             try:
                 if handler.path == '/query':
@@ -374,6 +383,8 @@ def public_handler(method):
                 handler._sql_capture_failed = True
                 store.fail(exc)
             return method(handler)
+        except (RequestRejected, RequestDeadlineExceeded) as exc:
+            return handler._reject_request(exc)
         finally:
             if token is not None:
                 CURRENT_EVENT.reset(token)
@@ -384,15 +395,16 @@ def public_handler(method):
 
 
 def receive_client(handler):
+    from .api_server import RequestRejected, RequestDeadlineExceeded
     store = handler.evidence
     if not store or not store.execution_capture or handler.command != 'POST':
         handler._send_json({'error': 'Unknown endpoint'}, 404)
         return
     try:
-        length = int(handler.headers.get('Content-Length', 0))
-        if not 0 < length <= 64 * 1024 * 1024:
-            raise ValueError('Invalid capture payload length')
-        body = json.loads(handler.rfile.read(length))
+        raw = handler._read_request_bytes()
+        if not raw:
+            raise RequestRejected('Invalid capture payload length')
+        body = json.loads(raw)
         if set(body) != {'context', 'call', 'record'}:
             raise ValueError('Invalid capture record')
         parent = store.parent(body['context'])
@@ -440,6 +452,8 @@ def receive_client(handler):
                 raise ValueError('Client call does not belong to this execution')
         store.received(body['call'], body['record'])
         handler._send_json({'accepted': True})
+    except (RequestRejected, RequestDeadlineExceeded):
+        raise
     except Exception as exc:
         if not handler.server._api_server.team_mode or not isinstance(exc, (ValueError, KeyError, TypeError)):
             store.fail(exc)
@@ -584,10 +598,12 @@ def restore_sources(value, records):
 
 
 def model_request(store, raw, sources, call_id, attempt_id, context_id, message_ids=()):
+    store.assert_healthy(settle=3)
     event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id, message_ids=list(message_ids)))
     # One transaction for the wire, occurrences and every read of this request.
     with store.batch():
         _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id)
+    store.assert_healthy(quiescent=False)
     return event
 
 

@@ -73,6 +73,8 @@ def whole_rows(body, losses=()):
 
 
 class SQLEvidenceStore:
+    WRITE_TIMEOUT_SECONDS = 30
+
     def __init__(self, path, identity):
         self.path = Path(path).resolve()
         self.identity = identity
@@ -134,7 +136,7 @@ class SQLEvidenceStore:
                 conn.execute('INSERT INTO branches VALUES (?,?,?)', (branch, parent, cutoff))
 
     def connect(self):
-        conn = sqlite3.connect(self.path, timeout=3)
+        conn = sqlite3.connect(self.path, timeout=self.WRITE_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA journal_mode=WAL')

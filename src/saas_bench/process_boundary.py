@@ -179,10 +179,10 @@ class Boundary:
         if self.socket_dir:
             self.socket_dir.cleanup()
 
-    def communicate(self, process, timeout, *, started_at=None):
+    def communicate(self, process, timeout, *, started_at=None, check=None):
         try:
             if self.verified:
-                return self._communicate_verified(process, timeout, started_at)
+                return self._communicate_verified(process, timeout, started_at, check)
             return self._communicate(process, timeout, started_at)
         except subprocess.TimeoutExpired:
             raise
@@ -191,17 +191,25 @@ class Boundary:
         except Exception as exc:
             raise BoundaryOpen(process, dict(exit_code=process.poll(), children=[], unknown=str(exc)), b'', b'') from exc
 
-    def _communicate_verified(self, process, timeout, started_at):
+    def _communicate_verified(self, process, timeout, started_at, check=None):
         started_at = time.monotonic() if started_at is None else started_at
         deadline = started_at + timeout
         cleanup_started = None
         stdout, stderr, data = b'', b'', b''
         authenticated = False
         stop_sent = False
+        cancellation = None
         self.listener.settimeout(.01)
         try:
             while True:
                 now = time.monotonic()
+                if check and cancellation is None:
+                    from .run_lifecycle import RunCancelled
+                    try:
+                        check()
+                    except RunCancelled as exc:
+                        cancellation = str(exc)
+                        cleanup_started = now
                 if cleanup_started is None and now >= deadline:
                     cleanup_started = now
                 if cleanup_started is not None and now >= cleanup_started + 5:
@@ -250,16 +258,18 @@ class Boundary:
                     self.record.update(boundary_closed=True, descendants_closed=True,
                         direct_child_reaped=True, streams_collected=True,
                         elapsed_seconds=(cleanup_started or finished) - started_at,
-                        timed_out=cleanup_started is not None,
-                        timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None else None,
+                        timed_out=cleanup_started is not None and cancellation is None,
+                        cancelled=cancellation,
+                        timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None and cancellation is None else None,
                         cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
                     return stdout, stderr
         except Exception as exc:
             finished = time.monotonic()
             self.record = dict(self.record or {}, exit_code=process.poll(), unknown=str(exc),
-                boundary_closed=False, timed_out=cleanup_started is not None,
+                boundary_closed=False, timed_out=cleanup_started is not None and cancellation is None,
+                cancelled=cancellation,
                 elapsed_seconds=(cleanup_started or finished) - started_at,
-                timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None else None,
+                timeout_trigger_seconds=cleanup_started - started_at if cleanup_started is not None and cancellation is None else None,
                 cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
             raise BoundaryOpen(process, self.record, stdout, stderr) from exc
 

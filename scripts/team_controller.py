@@ -21,6 +21,63 @@ from saas_bench.systemd_guard import memory_bytes, scope_command, unit_status
 from team_observer import identity, poll
 
 
+COOPERATIVE_STOP_SECONDS = 660
+FORCE_STOP_SECONDS = COOPERATIVE_STOP_SECONDS + 30
+
+
+def scope_state(saved, *, exit_code=None):
+    unit = saved['unit']
+    record = unit_status(unit, invocation_id=saved.get('invocation_id'), exit_code=exit_code)
+    response = subprocess.run(['systemctl', '--user', 'show', unit,
+        '--property=LoadState,ActiveState,InvocationID,ControlGroup'],
+        capture_output=True, text=True, timeout=10)
+    if response.returncode:
+        raise RuntimeError('Cannot observe worker scope: ' + response.stderr.strip())
+    properties = dict(line.split('=', 1) for line in response.stdout.splitlines() if '=' in line)
+    invocation, group = properties.get('InvocationID'), properties.get('ControlGroup')
+    if ((invocation and saved.get('invocation_id') and invocation != saved['invocation_id']) or
+            (group and saved.get('control_group') and group != saved['control_group'])):
+        raise RuntimeError('Worker scope identity changed; cleanup refused')
+    if invocation and record.get('invocation_id') not in (None, invocation):
+        raise RuntimeError('Worker scope observations disagree on invocation; cleanup refused')
+    record['invocation_id'] = invocation or saved.get('invocation_id') or record.get('invocation_id')
+    record['control_group'] = group or saved.get('control_group')
+    active = properties.get('ActiveState') in ('active', 'activating', 'deactivating')
+    if active and (not invocation or not group):
+        raise RuntimeError('Active worker scope has no invocation/cgroup binding')
+    if record['control_group']:
+        root = Path('/sys/fs/cgroup')
+        path = root / record['control_group'].lstrip('/')
+        if not path.is_relative_to(root) or '..' in path.parts:
+            raise RuntimeError('Invalid worker cgroup path')
+        try:
+            events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
+            record['scope_empty'] = events['populated'] == '0'
+        except FileNotFoundError:
+            if active:
+                raise RuntimeError('Active worker cgroup is unavailable') from None
+            record['scope_empty'] = True
+    else:
+        record['scope_empty'] = not active and bool(record['invocation_id'])
+    return record
+
+
+def signal_scope(saved, signum):
+    current = scope_state(saved)
+    if current['scope_empty']:
+        return current
+    if not saved.get('invocation_id') or not saved.get('control_group'):
+        raise RuntimeError('Cannot signal an unbound worker scope')
+    response = subprocess.run(['systemctl', '--user', 'kill', '--kill-whom=all',
+        '--signal=' + signal.Signals(signum).name, saved['unit']],
+        capture_output=True, text=True, timeout=10)
+    if response.returncode:
+        current = scope_state(saved)
+        if not current['scope_empty']:
+            raise RuntimeError('Worker scope signal failed: ' + response.stderr.strip())
+    return current
+
+
 class RequestGate:
     def __init__(self, policy, *, run_id=None, parent_pid=None):
         self.directory = Path(policy).resolve().parent
@@ -158,28 +215,51 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
 
     def observe_unit(entry, child):
         saved = units[entry['run_id']]
-        record = unit_status(saved['unit'], invocation_id=saved.get('invocation_id'), exit_code=child.returncode)
+        if saved.get('cleanup_error'):
+            return saved
+        try:
+            record = scope_state(saved, exit_code=child.returncode)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record = dict(saved, scope_empty=False, cleanup_error=str(exc))
+            gate.hold.touch()
+            event('scope_cleanup_refused', run_id=entry['run_id'], unit=record)
         units[entry['run_id']] = record
         write_json(directory / 'controller-units.json', units)
         return record
+
+    def workers_running():
+        return any(child.poll() is None or (not observe_unit(entry, child)['scope_empty'] and
+                   not units[entry['run_id']].get('cleanup_error')) for entry, child, _ in children)
 
     def stop_children(*, global_stop=False):
         if global_stop:
             gate.hold.touch()
         for entry, child, ready in children:
-            if child.poll() is not None or not (global_stop or run_stopped(entry)):
+            unit = observe_unit(entry, child)
+            if unit.get('cleanup_error'):
+                if child.poll() is None:
+                    child.kill()
+                continue
+            residual = child.poll() is not None and not unit['scope_empty']
+            if unit['scope_empty'] or not (residual or global_stop or run_stopped(entry)):
                 continue
             elapsed = time.monotonic() - stopped_at.setdefault(child.pid, time.monotonic())
             try:
-                if ready.exists() and child.pid not in signaled:
+                if child.poll() is None and ready.exists() and child.pid not in signaled:
                     os.kill(child.pid, signal.SIGUSR1)
                     signaled.add(child.pid)
-                if elapsed > 330:
-                    os.killpg(child.pid, signal.SIGKILL)
-                elif elapsed > 300:
-                    os.killpg(child.pid, signal.SIGTERM)
+                if elapsed > FORCE_STOP_SECONDS or residual and elapsed > 30:
+                    signal_scope(unit, signal.SIGKILL)
+                elif elapsed > COOPERATIVE_STOP_SECONDS or residual:
+                    signal_scope(unit, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                unit.update(cleanup_error=str(exc), scope_empty=False)
+                gate.hold.touch()
+                event('scope_cleanup_refused', run_id=entry['run_id'], unit=unit)
+                if child.poll() is None:
+                    child.kill()
 
     with (directory / 'controller.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -219,9 +299,16 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                 child = subprocess.Popen(command, cwd=manifest['source_root'], env=env,
                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
                 children.append((entry, child, ready))
+                deadline = time.monotonic() + 5
+                while not observe_unit(entry, child).get('invocation_id') and child.poll() is None:
+                    if units[entry['run_id']].get('cleanup_error'):
+                        raise RuntimeError(units[entry['run_id']]['cleanup_error'])
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Worker scope invocation did not become observable')
+                    time.sleep(.01)
                 event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode, unit=unit,
                     memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max)
-            while any(child.poll() is None for _, child, _ in children):
+            while workers_running():
                 if time.monotonic() - last_poll >= 300:
                     poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
                     last_poll = time.monotonic()
@@ -232,11 +319,6 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                         unit = observe_unit(entry, child)
                         event('worker_exited', run_id=entry['run_id'], exit_code=child.returncode,
                             status=record.get('status'), day=record.get('day'), unit=unit)
-                        if child.returncode != 0 or record.get('status') != 'finished':
-                            try:
-                                os.killpg(child.pid, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
                 stop_children(global_stop=stopped())
                 time.sleep(1)
             for entry, child, _ in children:
@@ -248,7 +330,8 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             if stopped():
                 gate.hold.touch()
             health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-            units.update(health.get('units', {}))
+            for run_id, observed in health.get('units', {}).items():
+                units[run_id] = dict(units.get(run_id, {}), **observed)
             return [dict(latest(entry) or {}, status='failed', reason='oom-kill')
                     if units[entry['run_id']]['result'] == 'oom-kill' else latest(entry)
                     for entry, _, _ in children]
@@ -256,7 +339,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             gate.hold.touch()
             raise
         finally:
-            while any(child.poll() is None for _, child, _ in children):
+            while workers_running():
                 stop_children(global_stop=True)
                 time.sleep(1)
             for _, child, _ in children:
@@ -266,10 +349,12 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
             write_json(directory / 'controller-exit.json', dict(hold=gate.hold.exists(),
-                failed=gate.hold.exists() or any(record.get('result') != 'success' for record in units.values()) or
+                failed=gate.hold.exists() or any(record.get('result') != 'success' or record.get('cleanup_error')
+                    for record in units.values()) or
                     any(child.returncode != 0 or
                     (latest(entry) or {}).get('status') != 'finished' for entry, child, _ in children),
-                children_reaped=all(child.returncode is not None for _, child, _ in children),
+                children_reaped=all(child.returncode is not None and units[entry['run_id']].get('scope_empty')
+                    for entry, child, _ in children),
                 units=units, batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']]))
 
 

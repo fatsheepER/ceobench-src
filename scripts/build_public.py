@@ -50,6 +50,8 @@ _ENGINE_MODULES = [
     "execution_capture",
     "evidence_handles",
     "pf_refresh",
+    "pf_deadline",
+    "run_lifecycle",
     "process_boundary",
     "config",
     "customer_llm",

@@ -3,8 +3,10 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
 import threading
 import time
+import weakref
 
 
 class RunCancelled(BaseException):
@@ -20,6 +22,8 @@ class WorkerLifecycle:
         self._wake = threading.Event()
         self._thread = None
         self._depth = 0
+        self._sockets = weakref.WeakSet()
+        self._socket_lock = threading.RLock()
 
     def __enter__(self):
         if self._depth:
@@ -56,14 +60,70 @@ class WorkerLifecycle:
             os.kill(os.getpid(), signal.SIGUSR1)
 
     def _signal(self, signum, frame):
-        self.reason = self.reason or 'supervisor_cancelled'
-        self._wake.set()
+        self.cancel('supervisor_cancelled')
         if getattr(self._model, 'active', False):
             raise RunCancelled(self.reason)
 
     def cancel(self, reason='requested_pause'):
         self.reason = self.reason or reason
         self._wake.set()
+        with self._socket_lock:
+            for channel in list(self._sockets):
+                try:
+                    channel.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def watch_client(self, client):
+        http_client = getattr(client, '_client', None)
+        if http_client is None or not hasattr(http_client, 'event_hooks'):
+            return
+        if getattr(http_client, '_ceobench_lifecycle', None) is self:
+            return
+        http_client._ceobench_lifecycle = self
+
+        def request_hook(request):
+            trace = request.extensions.get('trace')
+            channel = tls_socket = None
+            handshakes = getattr(self._model, 'handshakes', None)
+            if handshakes is None:
+                handshakes = self._model.handshakes = set()
+
+            def traced(event, info):
+                nonlocal channel, tls_socket
+                if event in ('connection.start_tls.complete', 'connection.start_tls.failed',
+                             'proxy.start_tls.complete', 'proxy.start_tls.failed'):
+                    with self._socket_lock:
+                        if tls_socket is not None:
+                            tls_socket.close()
+                            handshakes.discard(tls_socket)
+                            self._sockets.discard(tls_socket)
+                            tls_socket = None
+                if trace:
+                    trace(event, info)
+                if event in ('connection.connect_tcp.complete', 'connection.start_tls.complete',
+                             'proxy.start_tls.complete'):
+                    channel = info['return_value'].get_extra_info('socket')
+                    if channel is not None:
+                        with self._socket_lock:
+                            self._sockets.add(channel)
+                            if self.reason:
+                                try:
+                                    channel.shutdown(socket.SHUT_RDWR)
+                                except OSError:
+                                    pass
+                elif event in ('connection.start_tls.started', 'proxy.start_tls.started') and channel is not None:
+                    with self._socket_lock:
+                        # TLS takes the TCP fd before its blocking handshake completes.
+                        tls_socket = socket.fromfd(channel.fileno(), channel.family, channel.type, channel.proto)
+                        handshakes.add(tls_socket)
+                        self._sockets.add(tls_socket)
+                self.check()
+
+            request.extensions['trace'] = traced
+            self.check()
+
+        http_client.event_hooks['request'].append(request_hook)
 
     def check(self, *, retry=False):
         if self.parent_pid is not None and hasattr(self, '_parent'):
@@ -82,6 +142,12 @@ class WorkerLifecycle:
             yield
         finally:
             self._model.active = False
+            with self._socket_lock:
+                for channel in getattr(self._model, 'handshakes', ()):
+                    channel.close()
+                    self._sockets.discard(channel)
+                self._model.handshakes = set()
+            self.check()
 
     def sleep(self, seconds):
         deadline = time.monotonic() + seconds

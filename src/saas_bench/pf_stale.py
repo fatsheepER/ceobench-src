@@ -11,6 +11,8 @@ import time
 
 from .execution_capture import CURRENT_EVENT
 from .pf_refresh import replayable
+from .pf_deadline import check as check_budget
+from .public_sql import FORMATTING_NULL_LOSS, FORMATTING_NULL_WARNING
 from .registration_evidence import selected_ranges, select_row
 from .sql_evidence import encoded, whole_rows
 
@@ -81,6 +83,8 @@ def compare(resolver, before, after, reference, kind, events=None):
         if kind == 'query':
             comparison = event['result'].get('comparison', {})
             if comparison.get('status') != 'available':
+                if comparison.get('reason') == FORMATTING_NULL_LOSS:
+                    raise ValueError(FORMATTING_NULL_WARNING)
                 raise ValueError(comparison.get('reason', 'comparison_unavailable'))
     change_kind = 'content_changed'
     if kind in ('query', 'csv'):
@@ -142,11 +146,13 @@ class StaleCheck:
         retry = self.store.load_state('pf_refresh_failures') or {}
         diagnostics, compared, events = {}, {}, dict(self.q.events)
         for row in rows:
+            check_budget()
             target = row['edge']['target']
             if target and not row['historical_only'] and 'cached_check' not in row:
                 representatives.setdefault(self.q._key(target), target)
         remote = {}
         for key, version in representatives.items():
+            check_budget()
             meta = self.q.nodes[version]['meta']
             event = self.store.read_event(meta['created_by_event'], evidence=True)
             if meta['layer'] == 'file_bytes':
@@ -180,6 +186,7 @@ class StaleCheck:
                     raise ValueError('refresh_unavailable')
                 refreshed = self.q.refresh(list(remote), CURRENT_EVENT.get())
                 for version, key in remote.items():
+                    check_budget()
                     current[key] = refreshed[version]
                     meta, _ = self.resolver.content(current[key])
                     receipt = self.store.read_event(meta['created_by_event'], evidence=True)
@@ -197,12 +204,14 @@ class StaleCheck:
                             last_day=checked_day, retry_day=(checked_day or 0) + 7 * min(8, 2 ** min(attempts - 1, 3)),
                             permanent=result.get('permanent_error', False), result=current[key])
             except Exception:
+                check_budget()
                 self.store.assert_healthy(quiescent=False)
                 for key in remote.values():
                     failures[key] = 'refresh_unavailable' if self.q.refresh is None else 'refresh_failed'
         self.store.save_state('pf_refresh_failures', retry)
         comparing = time.monotonic()
         for row in rows:
+            check_budget()
             edge, target = row['edge'], row['edge']['target']
             ref = edge.get('reference', {})
             check = dict(current_version=None, version_changed=None, predicate_result='not_checked',
@@ -294,12 +303,14 @@ class StaleCheck:
         outgoing = defaultdict(list)
         seen = set()
         for row in rows:
+            check_budget()
             key = encoded(row['edge'])
             if not row['historical_only'] and key not in seen:
                 outgoing[node(row['edge']['source'])].append(row)
                 seen.add(key)
 
         def causes(row, path):
+            check_budget()
             target, check = row['edge']['target'], row['check']
             if check['reason'] in ('historical_only', 'write_receipt'):
                 return []
@@ -313,5 +324,6 @@ class StaleCheck:
 
         paths = [causes(row, [row['edge']['source']]) for row in rows]
         for row, found in zip(rows, paths):
+            check_budget()
             row['check']['affected_paths'] = list(dict.fromkeys(tuple(p) for p in found))
             row['check']['affected'] = bool(found)

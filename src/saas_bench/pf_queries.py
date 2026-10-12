@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError, model_validator
 
 from .execution_capture import CapturedText, CURRENT_EVENT, OBJECT_FIELDS, origin
+from .pf_deadline import budget_scope, check
 from . import evidence_handles, pf_render
 from .registration_evidence import covered
 from .registration_schema import Input, Text
@@ -250,35 +251,41 @@ class PFQueries:
 
     def execute(self, operation, args):
         """Agent-facing result: compact text, one line per item."""
-        if operation == 'pf_more':
-            saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
-            if not saved:
-                raise ValueError('Unknown cursor; run the pf command again')
-            operation = saved['operation']
-        page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
-        if isinstance(page, str):
-            return page  # pf_read content and diff keep their header line and exact body
-        if operation == 'pf_search':
-            if 'text' in self.values:
-                return self._render_text_search(page)
-            if 'sections' in page:
-                return pf_render.render_search(page)
-            wanted = self.values['object']
-            return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
-        if operation == 'pf_log':
-            return pf_render.render_log(page)
-        if operation == 'pf_read':
-            return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
-        if operation == 'pf_dependents':
-            return pf_render.render_dependents(page)
-        return pf_render.render_dependencies(page)
+        with budget_scope():
+            if operation == 'pf_more':
+                saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
+                if not saved:
+                    raise ValueError('Unknown cursor; run the pf command again')
+                operation = saved['operation']
+            page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
+            if isinstance(page, str):
+                return page  # pf_read content and diff keep their header line and exact body
+            if operation == 'pf_search':
+                if 'text' in self.values:
+                    return self._render_text_search(page)
+                if 'sections' in page:
+                    return pf_render.render_search(page)
+                wanted = self.values['object']
+                return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
+            if operation == 'pf_log':
+                return pf_render.render_log(page)
+            if operation == 'pf_read':
+                return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
+            if operation == 'pf_dependents':
+                return pf_render.render_dependents(page)
+            return pf_render.render_dependencies(page)
 
     def answer(self, operation, args):
         """Structured page for one query; pf_read content and diff return their delivered text."""
-        with self.resolver.cached():
-            return self._answer(operation, args)
+        try:
+            with budget_scope(), self.resolver.cached():
+                return self._answer(operation, args)
+        except TimeoutError:
+            self.__dict__.pop('_indexed', None)
+            raise
 
     def _answer(self, operation, args):
+        check()
         try:
             values = MODELS[operation].model_validate(args).model_dump(exclude_none=True)
         except ValidationError as exc:
@@ -353,11 +360,16 @@ class PFQueries:
                 token = CURRENT_EVENT.set(event)
                 try:
                     self._check(rows)
+                    check()
                     self._review_after_manual(target, rows)
                     self.check_state = 'pf_check:' + event
                     self.store.save_state(self.check_state, rows)
                     if own_event:
                         self.store.complete(event)
+                except TimeoutError as exc:
+                    if own_event:
+                        self.store.complete(event, 'timed_out', error=str(exc))
+                    raise
                 finally:
                     CURRENT_EVENT.reset(token)
         unexpanded = list(dict.fromkeys(self.resolver.handle(r['edge']['target']) for r in rows
@@ -400,8 +412,12 @@ class PFQueries:
         self.store.save_state('pf_review', state)
 
     def weekly_check(self, day):
-        with self.resolver.cached():
-            return self._weekly_check(day)
+        try:
+            with budget_scope(), self.resolver.cached():
+                return self._weekly_check(day)
+        except TimeoutError:
+            self.__dict__.pop('_indexed', None)
+            raise
 
     def _weekly_check(self, day):
         """Week-start digest of new issues, pending review and continuing conditions."""
@@ -423,6 +439,7 @@ class PFQueries:
         traced, ended, continuing = {}, [], set()
         eligible = set()
         for version in active:
+            check()
             record = self.records[version]
             if applies_ended(record, day):
                 ended.append(record['version'])
@@ -453,10 +470,12 @@ class PFQueries:
         token = CURRENT_EVENT.set(event)
         try:
             self._check([row for rows in traced.values() for row in rows], day=day)
+            check()
             rendering = time.monotonic()
             entries, underlying = [], []
             predicates_checked = False
             for version, rows in traced.items():
+                check()
                 tops = []
                 for row in rows:
                     if (row['edge'].get('reference', {}).get('predicate')
@@ -506,6 +525,10 @@ class PFQueries:
                                 skipped_pending_texts=skipped_pending,
                                 content_reads=self.resolver.read_stats,
                                 checked_texts=len(traced), pending_texts=len(self.review_pending))
+        except TimeoutError as exc:
+            self.store.complete(event, 'timed_out', error=str(exc), check_complete=False,
+                                pending_texts=len(self.review_pending))
+            raise
         finally:
             CURRENT_EVENT.reset(token)
         return CapturedText(text, [origin(version, text)])
@@ -606,6 +629,7 @@ class PFQueries:
         return request.get('path') == '/vars'
 
     def _index(self, cutoff):
+        check()
         started = time.monotonic()
         reset = not hasattr(self, '_indexed') or (cutoff is not None and cutoff < self._indexed)
         if reset:
@@ -630,6 +654,7 @@ class PFQueries:
                     LEFT JOIN results s USING(event_id) LEFT JOIN queries q ON r.query_id=q.id
                     WHERE r.rowid>? OR r.event_id IN ({placeholders}) ORDER BY r.rowid''',
                     [self._event_cutoff, *pending]):
+                check()
                 self._event_cutoff = max(self._event_cutoff, row['event_row'])
                 if not self.store.identity.get('role'):
                     try:
@@ -656,6 +681,7 @@ class PFQueries:
         self._check_day = max(day, self.registry.sim_day() or 0)
         new_nodes = {}
         for row in versions:
+            check()
             if row['event_id'] not in self.events:
                 continue
             meta = json.loads(row['metadata'])
@@ -968,6 +994,7 @@ class PFQueries:
         follow = self.follow_execution
         queue, scheduled, rows = deque([(root, [root], False)]), {(self._node(root), False)}, []
         while queue:
+            check()
             node, path, historical = queue.popleft()
             for edge in self._edges(node, reverse):
                 if edge['origin'] != 'agent_declaration' and not follow:
@@ -1089,6 +1116,7 @@ class PFQueries:
         groups = [g for g in self._groups(target) if g['k'] <= group['k']]
         origins, lines = [], []
         for g in groups:
+            check()
             text = self._text(next(m for m in g['members'] if m in self.nodes))
             if text is None:
                 raise ValueError('blame needs a text version')
@@ -1121,6 +1149,7 @@ class PFQueries:
         handles = evidence_handles.index(self.store)
         with closing(self.store.connect()) as conn:
             for version, row in reversed(self.nodes.items()):
+                check()
                 if self._rerun(version):
                     continue
                 key = (handles.key(version), row['content_hash'])

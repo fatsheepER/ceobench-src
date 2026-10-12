@@ -5,7 +5,10 @@ import sqlite3
 import time
 
 from .execution_capture import READ_TOOLS, finish_http
-from .public_sql import (PUBLIC_POLICY_VERSION, QueryDenied, SnapshotUnavailable,
+from .pf_deadline import Budget, current_budget
+from .public_sql import (CELL_LIMIT_BYTES, FORMATTING_NULL_WARNING, FORMATTING_NULL_LOSS,
+                         PUBLIC_POLICY_VERSION, RESPONSE_LIMIT_BYTES,
+                         QueryDenied, QueryResultTooLarge, SnapshotUnavailable,
                          check_deadline, execute_snapshot, install_authorizer, query_snapshot,
                          record_query_failure)
 
@@ -19,6 +22,17 @@ def replayable(event):
 
 
 def refresh(server, versions, parent, *, store=None):
+    budget = current_budget() or Budget(time.monotonic() + server.QUERY_TIMEOUT_SECONDS)
+    deadline = min(budget.deadline, time.monotonic() + server.QUERY_TIMEOUT_SECONDS)
+
+    def check():
+        budget.check()
+        check_deadline(deadline)
+
+    def interrupted():
+        return int(budget.expired() or time.monotonic() >= deadline)
+
+    check()
     store = store or server.sql_evidence
     if not store or server.oracle_mode:
         raise ValueError('Public evidence capture is required')
@@ -26,6 +40,7 @@ def refresh(server, versions, parent, *, store=None):
         raise ValueError('Refresh requires a forward query or weekly check event')
     sources = {}
     for version in dict.fromkeys(versions):
+        check()
         meta, _ = store.public_content(version)
         event = store.read_event(meta['created_by_event'], evidence=True)
         definition = event['query_definition']
@@ -49,7 +64,6 @@ def refresh(server, versions, parent, *, store=None):
             finish_http(store, event, status, '', raw, execution)
         result[version] = event + ':public_response'
 
-    deadline = time.monotonic() + server.QUERY_TIMEOUT_SECONDS
     # ponytail: hold the world lock for this synchronous check; use frozen SDK readers
     # if measured business-action contention warrants releasing it earlier.
     locked = False
@@ -57,37 +71,48 @@ def refresh(server, versions, parent, *, store=None):
     has_sql = any(e['query_definition'] for e in sources.values())
     stage = 'lock'
     try:
-        locked = server._lock.acquire(timeout=max(0, deadline - time.monotonic()))
-        if not locked:
-            raise TimeoutError('Refresh lock wait exceeded time limit')
+        while not locked:
+            check()
+            locked = server._lock.acquire(timeout=min(.05, max(0, deadline - time.monotonic())))
         stage = 'setup'
-        check_deadline(deadline)
+        check()
         if server._operation_failed or server._step_day_timed_out or server.conn.in_transaction:
             raise SnapshotUnavailable('World state unavailable for refresh')
         context = (query_snapshot(server, deadline, snapshot) if has_sql
                    else nullcontext((None, {'day': server.tools.current_day})))
         with context as (conn, snapshot):
             for version, source in sources.items():
+                check()
                 started = time.monotonic()
-                deadline = started + server.QUERY_TIMEOUT_SECONDS
                 definition = source['query_definition']
                 request = source['request'].get('request')
+                snapshot.pop('_format_returned_null', None)
+                snapshot.pop('_format_timed_out', None)
                 execution = dict(snapshot, snapshot_status='success', refresh_of=version, attempted=True)
                 status = 200
                 try:
-                    check_deadline(deadline)
+                    check()
                     if definition:
                         # Reset the denial record for every statement in this shared snapshot.
                         denied = install_authorizer(conn)
-                        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                        conn.set_progress_handler(interrupted, 1000)
                         try:
                             body = execute_snapshot(conn, definition[5], deadline, execution)
                         except sqlite3.Error as exc:
+                            if snapshot.pop('_format_timed_out', False):
+                                raise TimeoutError('Query time limit exceeded') from exc
                             if denied:
                                 raise QueryDenied('Query is not allowed by the read-only SQL policy') from exc
-                            if (getattr(exc, 'sqlite_errorcode', None) or 0) & 0xff == sqlite3.SQLITE_INTERRUPT:
+                            code = (getattr(exc, 'sqlite_errorcode', None) or 0) & 0xff
+                            if code == sqlite3.SQLITE_INTERRUPT:
                                 raise TimeoutError('Query time limit exceeded') from exc
+                            if code == sqlite3.SQLITE_TOOBIG:
+                                raise QueryResultTooLarge(
+                                    f'SQL value or row exceeded {CELL_LIMIT_BYTES} bytes. Narrow the query.') from exc
                             raise
+                        if snapshot.pop('_format_returned_null', False):
+                            execution['losses'].append(FORMATTING_NULL_LOSS)
+                            body['warning'] = (body.get('warning', '') + ' ' + FORMATTING_NULL_WARNING).strip()
                         from .api_server import _get_enum_hint_for_query
                         hint = _get_enum_hint_for_query(definition[5], body['rows'])
                         if hint:
@@ -96,29 +121,37 @@ def refresh(server, versions, parent, *, store=None):
                         body = {'current_day': server.tools.current_day}
                     else:
                         parsed = request['parsed']
-                        server.conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                        server.conn.set_progress_handler(interrupted, 1000)
                         try:
                             body = server.execute_tool(parsed['tool'], parsed.get('args', {})).to_json()
                         finally:
                             server.conn.set_progress_handler(None, 0)
-                    check_deadline(deadline)
-                    chunks = []
+                    check()
+                    chunks, size = [], 0
                     for chunk in json.JSONEncoder(default=str).iterencode(body):
-                        check_deadline(deadline)
+                        check()
+                        chunk = chunk.encode()
+                        size += len(chunk)
+                        if size > RESPONSE_LIMIT_BYTES:
+                            raise QueryResultTooLarge(
+                                f'PF refresh response exceeded {RESPONSE_LIMIT_BYTES} bytes. Narrow the source.')
                         chunks.append(chunk)
-                    raw = ''.join(chunks).encode()
-                    check_deadline(deadline)
+                    raw = b''.join(chunks)
+                    check()
                 except Exception as exc:
-                    status = 403 if isinstance(exc, QueryDenied) else 504 if isinstance(exc, TimeoutError) else 500
+                    status = (403 if isinstance(exc, QueryDenied) else 413 if isinstance(exc, QueryResultTooLarge)
+                              else 504 if isinstance(exc, TimeoutError) else 500)
                     # Detailed private diagnostics never become a public error string.
                     execution['refresh_error'] = type(exc).__name__
                     execution['refresh_error_detail'] = str(exc)
                     if definition:
                         record_query_failure(execution, exc, 'execute', log=True)
                     raw = json.dumps(dict(success=False, error='refresh_denied' if status == 403 else
+                                          'refresh_result_too_large' if status == 413 else
                                           'refresh_timed_out' if status == 504 else 'refresh_failed')).encode()
                 execution['refresh_seconds'] = time.monotonic() - started
                 save(version, status, raw, execution)
+                check()
         return result
     except (TimeoutError, SnapshotUnavailable) as exc:
         if has_sql and 'error_kind' not in snapshot:
@@ -126,7 +159,8 @@ def refresh(server, versions, parent, *, store=None):
         for version in sources:
             if version not in result:
                 save(version, 504 if isinstance(exc, TimeoutError) else 503,
-                     b'{"success":false,"error":"snapshot_unavailable"}',
+                     b'{"success":false,"error":"refresh_timed_out"}' if isinstance(exc, TimeoutError)
+                     else b'{"success":false,"error":"snapshot_unavailable"}',
                      dict(snapshot, refresh_of=version, refresh_error=type(exc).__name__, attempted=False))
         return result
     except Exception as exc:

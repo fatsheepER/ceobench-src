@@ -175,6 +175,10 @@ def query(sql: str) -> Dict[str, Any]:
         returned subset. Warnings also print to stderr. Use SQL aggregates for
         population calculations. An explicit LIMIT scopes the requested query;
         absence of a truncation warning does not establish population coverage.
+        SQL values are limited to 1 MiB, accumulated rows to 8 MiB,
+        and the JSON response to 16 MiB. Oversized results fail with HTTP 413.
+        SQLite formatting can return NULL at its value limit; the response
+        warns when NULL also permits an invalid-format interpretation.
 
     Raises:
         NovaMindAPIError: On failure (blocked query, syntax error, etc.)

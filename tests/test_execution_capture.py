@@ -47,6 +47,7 @@ def test_sql_timeout_after_bash_exit_and_broken_headers_has_one_response(capture
     handler.headers = {'Content-Length': str(len(raw)), 'X-Capture-Context': context,
                        'X-Capture-Call': 'a' * 32}
     handler.rfile = io.BytesIO(raw)
+    handler.connection = SimpleNamespace(settimeout=lambda _: None)
     handler._headers_buffer = []
     statuses = []
     handler.send_response = statuses.append

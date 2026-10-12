@@ -13,6 +13,7 @@ import sqlite3
 import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,7 +33,16 @@ from .database import TABLE_DOCS
 from .environment import build_weekly_dashboard
 
 
-from .public_sql import PUBLIC_COLUMNS, QueryDenied, SnapshotUnavailable, execute_query
+from .public_sql import (PUBLIC_COLUMNS, RESPONSE_LIMIT_BYTES, QueryDenied,
+                         QueryResultTooLarge, SnapshotUnavailable, execute_query)
+
+
+class RequestRejected(ValueError):
+    pass
+
+
+class RequestDeadlineExceeded(TimeoutError):
+    pass
 
 _TABLE_COLUMNS = {table: list(columns) for table, columns in PUBLIC_COLUMNS.items()}
 
@@ -184,6 +194,111 @@ class _APIHandler(BaseHTTPRequestHandler):
     def evidence(self):
         return self.server._api_server.evidence_for(self.role)
 
+    def handle_one_request(self):
+        for name in ('_request_deadline', '_request_body', '_request_body_complete'):
+            self.__dict__.pop(name, None)
+        self._start_public_request()
+        timer = threading.Timer(max(0, self._request_deadline - time.monotonic()),
+                                self._expire_request_input)
+        timer.daemon = True
+        self._request_input_timer = timer
+        timer.start()
+        try:
+            return super().handle_one_request()
+        finally:
+            timer.cancel()
+
+    def _expire_request_input(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
+    def _start_public_request(self):
+        if not hasattr(self, '_request_deadline'):
+            self._request_deadline = time.monotonic() + self.server._api_server.QUERY_TIMEOUT_SECONDS
+            self._request_body = bytearray()
+
+    def _read_request_bytes(self):
+        if getattr(self, '_request_body_complete', False):
+            return self._request_body
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError) as exc:
+            raise RequestRejected('Invalid Content-Length') from exc
+        limit = 64 * 1024 * 1024 if self.path == '/_capture' else 2 * 1024 * 1024
+        if not 0 <= length <= limit or self.headers.get('Transfer-Encoding'):
+            raise RequestRejected(f'Request body must have Content-Length between 0 and {limit} bytes')
+        while len(self._request_body) < length:
+            remaining = self._request_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RequestDeadlineExceeded('Request input exceeded its time limit')
+            self.connection.settimeout(remaining)
+            try:
+                part = self.rfile.read1(min(65536, length - len(self._request_body)))
+            except TimeoutError as exc:
+                raise RequestDeadlineExceeded('Request input exceeded its time limit') from exc
+            if not part:
+                if time.monotonic() >= self._request_deadline:
+                    raise RequestDeadlineExceeded('Request input exceeded its time limit')
+                raise RequestRejected('Incomplete request body')
+            self._request_body.extend(part)
+        if time.monotonic() >= self._request_deadline:
+            raise RequestDeadlineExceeded('Request input exceeded its time limit')
+        self._request_body = bytes(self._request_body)
+        self._request_body_complete = True
+        if timer := getattr(self, '_request_input_timer', None):
+            timer.cancel()
+        return self._request_body
+
+    def _admit_sql(self):
+        api = self.server._api_server
+        with api._sql_lock:
+            while api._sql_paused:
+                store = self.evidence
+                if store:
+                    try:
+                        if store.parent(self.headers.get('X-Capture-Context')):
+                            break
+                    except ValueError:
+                        pass
+                remaining = self._request_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestDeadlineExceeded('Request admission exceeded its time limit')
+                api._sql_lock.wait(timeout=remaining)
+            api._sql_active += 1
+
+    def _reject_request(self, exc):
+        self.close_connection = True
+        self._sql_execution = dict(permanent_error=isinstance(exc, RequestRejected),
+                                   failure_stage='request', error_kind='timeout' if
+                                   isinstance(exc, RequestDeadlineExceeded) else 'query')
+        self._sql_event, self._sql_capture_failed = None, False
+        self._generic_capture = self.path != '/query'
+        store = self.evidence
+        if store and self.path != '/_capture':
+            try:
+                parent = store.parent(self.headers.get('X-Capture-Context'), active=False)
+                if self.path == '/query':
+                    from .public_sql import PUBLIC_POLICY_VERSION
+                    self._sql_event = store.begin(bytes(self._request_body), PUBLIC_POLICY_VERSION, parent=parent)
+                else:
+                    from .execution_capture import capture_http
+                    self._sql_event = capture_http(self, bytes(self._request_body), active_parent=False)
+                if client := self.headers.get('X-Capture-Call'):
+                    store.bind_client(self._sql_event, client)
+            except (ValueError, KeyError):
+                pass
+            except Exception as error:
+                self._sql_capture_failed = True
+                store.fail(error)
+        self.connection.settimeout(self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS)
+        try:
+            self._send_json({'success': False, 'error': str(exc)},
+                            504 if isinstance(exc, RequestDeadlineExceeded) else 400)
+        except OSError:
+            pass
+
     def admit(self):
         api = self.server._api_server
         controls = ('/checkpoint', '/pf-refresh', '/run-metrics')
@@ -226,14 +341,21 @@ class _APIHandler(BaseHTTPRequestHandler):
                                      'usage': api.simulator.customer_simulator.usage_recorder.summary})
                     return
                 if self.path == '/pf-refresh':
-                    if (set(body) != {'versions', 'parent'} or not isinstance(body['parent'], str) or
+                    if (set(body) not in ({'versions', 'parent'}, {'versions', 'parent', 'remaining_seconds'})
+                            or not isinstance(body.get('parent'), str) or
                             not isinstance(body['versions'], list) or
-                            not all(isinstance(v, str) for v in body['versions'])):
+                            not all(isinstance(v, str) for v in body['versions']) or
+                            ('remaining_seconds' in body and
+                             (type(body['remaining_seconds']) not in (int, float) or
+                              not math.isfinite(body['remaining_seconds']) or body['remaining_seconds'] <= 0))):
                         self._send_json({'error': 'versions and parent are required'}, 400)
                         return
                     from .pf_refresh import refresh
+                    from .pf_deadline import budget_scope
                     try:
-                        result = refresh(self.server._api_server, body['versions'], body['parent'])
+                        with budget_scope(timeout=min(body.get('remaining_seconds', self.server._api_server.QUERY_TIMEOUT_SECONDS),
+                                                      self.server._api_server.QUERY_TIMEOUT_SECONDS)):
+                            result = refresh(self.server._api_server, body['versions'], body['parent'])
                     except (ValueError, KeyError, TimeoutError, SnapshotUnavailable) as exc:
                         self._send_json({'error': type(exc).__name__}, 400)
                         return
@@ -245,6 +367,8 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server._api_server.checkpoint(body['expected_day']))
             else:
                 self._send_json({"error": f"Unknown endpoint: {self.path}"}, 404)
+        except (RequestRejected, RequestDeadlineExceeded):
+            raise
         except Exception as exc:
             self._send_internal_error(exc, op=f"POST {self.path}")
 
@@ -322,13 +446,14 @@ class _APIHandler(BaseHTTPRequestHandler):
             pass
 
     def _read_body(self) -> Dict:
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
+        body = self._read_request_bytes()
         if getattr(self, '_control_capture', False):
             self._control_request = body.hex()
         return json.loads(body) if body else {}
 
     def _send_json(self, data: Dict, status: int = 200):
+        if self.path == '/query':
+            return self._send_query_json(data, status)
         if getattr(self, '_generic_capture', False):
             from .execution_capture import text_sources
             self._sql_execution['public_fields'] = text_sources(data)
@@ -406,6 +531,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             else:
                 # Fallback for non-ToolResult returns
                 self._send_json({"success": True, "data": {"output": str(result)}, "message": str(result)})
+        except (RequestRejected, RequestDeadlineExceeded):
+            raise
         except PermissionError as e:
             self._send_json({"success": False, "error": str(e)}, 403)
         except Exception as e:
@@ -504,6 +631,8 @@ class _APIHandler(BaseHTTPRequestHandler):
 
             result = server.advance_week(predictions=parsed, rationale=rationale, role=self.role)
             self._send_json(result)
+        except (RequestRejected, RequestDeadlineExceeded):
+            raise
         except PermissionError as e:
             self._send_json({'success': False, 'error': str(e)}, 403)
         except Exception as e:
@@ -514,10 +643,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         if self.evidence and self.evidence.execution_capture:
             self._query_response_started = False
             return self._handle_query_request()
-        with api._sql_lock:
-            while api._sql_paused:
-                api._sql_lock.wait()
-            api._sql_active += 1
+        self._admit_sql()
         try:
             self._query_response_started = False
             self._sql_event = None
@@ -525,6 +651,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._sql_capture_failed = False
             self._sql_execution = {}
             self._handle_query_request()
+        except (RequestRejected, RequestDeadlineExceeded) as exc:
+            self._reject_request(exc)
         finally:
             self._sql_event = None
             with api._sql_lock:
@@ -534,7 +662,7 @@ class _APIHandler(BaseHTTPRequestHandler):
     def _handle_query_request(self):
         sql = ''
         try:
-            raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            raw = self._read_request_bytes()
             from .public_sql import PUBLIC_POLICY_VERSION
             if not (self.evidence and self.evidence.execution_capture):
                 self._sql_event = self._capture_sql('begin', raw, PUBLIC_POLICY_VERSION)
@@ -543,6 +671,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._send_json({'success': False, 'error': 'sql must be a non-empty string'}, 400)
                 return
             sql = body['sql']
+            self._sql_execution['_request_deadline'] = self._request_deadline
             response = execute_query(self.server._api_server, sql, metadata=self._sql_execution)
             enum_hint = _get_enum_hint_for_query(sql, response['rows'])
             if enum_hint:
@@ -550,6 +679,11 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._send_query_json(response)
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({'success': False, 'error': 'Invalid JSON body'}, 400)
+        except (RequestRejected, RequestDeadlineExceeded):
+            raise
+        except QueryResultTooLarge as exc:
+            self._sql_execution['permanent_error'] = True
+            self._send_json({'success': False, 'error': str(exc)}, 413)
         except QueryDenied as exc:
             self._sql_execution.setdefault('permanent_error', True)
             self._send_json({'success': False, 'error': str(exc)}, 403)
@@ -568,27 +702,33 @@ class _APIHandler(BaseHTTPRequestHandler):
             if not self._query_response_started:
                 self._send_internal_error(exc, op='query')
 
-    def _send_query_json(self, data):
+    def _send_query_json(self, data, status=200):
         """Bound serialization and socket writes separately from SQL execution."""
         import time
         from .public_sql import check_deadline
         started = time.monotonic()
         chunks = []
-        deadline = started + self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS
+        size = 0
+        response_budget = self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS
+        deadline = started + (max(.05, response_budget) if status >= 400 else response_budget)
         for chunk in json.JSONEncoder(default=str).iterencode(data):
             check_deadline(deadline)
-            chunks.append(chunk.encode())
+            payload = chunk.encode()
+            size += len(payload)
+            if size > RESPONSE_LIMIT_BYTES:
+                raise QueryResultTooLarge(f'SQL response exceeded {RESPONSE_LIMIT_BYTES} bytes. Narrow the query.')
+            chunks.append(payload)
         response = b''.join(chunks)
         check_deadline(deadline)
         capture_started = time.monotonic()
-        self._capture_response(200, response)
+        self._capture_response(status, response)
         # Capture has its own accounting, never spend SQL/response execution budgets on it.
         deadline += time.monotonic() - capture_started
         serialized = time.monotonic()
         self.connection.settimeout(max(0.001, deadline - serialized))
         try:
             self._query_response_started = True
-            self.send_response(200)
+            self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(response)))
             self.end_headers()

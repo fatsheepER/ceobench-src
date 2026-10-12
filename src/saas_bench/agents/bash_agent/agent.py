@@ -511,6 +511,7 @@ class BashAgent(BaseAgent):
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
+            lifecycle.watch_client(self.client)
             lifecycle.check(retry=getattr(self, '_llm_attempt', 0) > 0)
             original = invoke
             def invoke():

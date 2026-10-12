@@ -416,6 +416,13 @@ class BashAgentToolExecutor:
                 except PermissionError as exc:
                     self.last_status = 'cancelled'
                     return f'Error: {exc}'
+            lifecycle = getattr(self, 'lifecycle', None)
+            if lifecycle:
+                lifecycle.check()
+            service = getattr(self, '_pf_service', None)
+            if service:
+                service.close()
+                self._pf_service = None
             if self.preserved_process:
                 raise ProcessBoundaryError('Previous process boundary remains open')
             return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id)
@@ -507,6 +514,10 @@ class BashAgentToolExecutor:
                 result = (f'Error: Command timed out after {self.bash_timeout:g} seconds. '
                     'Task terminated; descendant cleanup and output stream closure verified. '
                     f'Output is partial; processing the captured output failed: {exc}')
+        except BaseException:
+            result = None
+            status = 'result_unknown'
+            raise
         finally:
             body = result
             read_key = None
@@ -820,7 +831,8 @@ class BashAgentToolExecutor:
         if self.pf_queries:
             from saas_bench.pf_shell import ShellService
             service = self._pf_service = ShellService(self)
-        boundary = Boundary(command, self.python, isolated=bool(self.identity), verified=self.bash_warn_after is not None,
+        boundary = Boundary(command, self.python, isolated=bool(self.identity),
+                            verified=self.bash_warn_after is not None or bool(getattr(self, 'lifecycle', None)),
                             memory_limit_bytes=self.bash_memory_limit_bytes)
         self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
         try:
@@ -833,8 +845,11 @@ class BashAgentToolExecutor:
             boundary.close()
             self._boundary_socket_dir = None
             if service:
-                service.close()
-                self.capture.facts['pf_calls'] = service.calls
+                try:
+                    service.close()
+                finally:
+                    if self.capture:
+                        self.capture.facts['pf_calls'] = service.calls
                 self._pf_service = None
 
     def _run_bash(self, command, boundary):
@@ -878,6 +893,10 @@ class BashAgentToolExecutor:
         self._bash_facts = dict(bash_timeout=self.bash_timeout, bash_warn_after=self.bash_warn_after,
                                warning_emitted=False, boundary_closed=False)
         started_at = time.monotonic()
+        lifecycle = getattr(self, 'lifecycle', None)
+        if getattr(self, '_pf_service', None):
+            self._pf_service.set_deadline(started_at + self.bash_timeout,
+                                          check=lifecycle.check if lifecycle else None)
         if bwrap_cmd:
             # CRITICAL: pass env=env so bwrap inherits a clean dict.
             # Without this, bwrap inherits the launcher's full os.environ —
@@ -909,7 +928,8 @@ class BashAgentToolExecutor:
             sink = os.fstat(proc.stdout.fileno())
             self.capture.facts['stdout_sink'] = [sink.st_dev, sink.st_ino]
         try:
-            raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout, started_at=started_at)
+            raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout, started_at=started_at,
+                                                        check=lifecycle.check if lifecycle else None)
             self._bash_facts.update(elapsed_seconds=time.monotonic() - started_at,
                 boundary_closed=boundary.record.get('phase') == 'closed', cleanup_seconds=0,
                 timeout_trigger_seconds=None)
@@ -917,17 +937,22 @@ class BashAgentToolExecutor:
                 self._bash_facts.update({key: boundary.record[key] for key in
                     ('elapsed_seconds', 'boundary_closed', 'cleanup_seconds', 'timeout_trigger_seconds')})
                 self._timed_out = boundary.record['timed_out']
+                self._bash_facts['cancelled'] = boundary.record.get('cancelled')
             self._bash_facts.update(process_boundary=boundary.record, timed_out=self._timed_out)
             if self.capture:
                 self.capture.facts['process_boundary'] = boundary.record
             decode_error = None
             try:
-                stdout, stderr = self._streams(raw_stdout, raw_stderr, proc.returncode, partial=self._timed_out)
+                stdout, stderr = self._streams(raw_stdout, raw_stderr, proc.returncode,
+                                              partial=self._timed_out or bool(boundary.record.get('cancelled')))
             except UnicodeError as exc:
                 if not boundary.verified:
                     raise
                 decode_error = exc
                 stdout, stderr = repr(raw_stdout), repr(raw_stderr)
+
+            if lifecycle:
+                lifecycle.check()
 
             if self._timed_out and (self.stop_on_timeout or './novamind-operation next-week' in command):
                 raise NextDayTimeoutError(f'Tool timed out after {self.bash_timeout:g}s; outcome unknown',

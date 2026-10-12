@@ -433,9 +433,11 @@ class BashAgentRunner:
 
     def _pf_refresh(self, versions, parent):
         from saas_bench.api_server import NovaMindAPIServer
-        # Each source has its own timeout; this transport must let all sources finish.
-        timeout = (len(versions) + 1) * NovaMindAPIServer.QUERY_TIMEOUT_SECONDS + 30
-        return self._http_post('/pf-refresh', dict(versions=versions, parent=parent), timeout=timeout)['versions']
+        from saas_bench.pf_deadline import budget_scope
+        with budget_scope(timeout=NovaMindAPIServer.QUERY_TIMEOUT_SECONDS) as budget:
+            remaining = budget.remaining()
+            return self._http_post('/pf-refresh', dict(versions=versions, parent=parent,
+                remaining_seconds=remaining), timeout=remaining)['versions']
 
     def _get_cash(self) -> float:
         """Use the same status receipt as the run loop."""

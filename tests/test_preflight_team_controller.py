@@ -23,11 +23,18 @@ from test_preflight_team_observer import observer
 
 
 @pytest.fixture
-def controller(observer):
+def controller(observer, monkeypatch):
     path = Path(__file__).resolve().parents[1] / 'scripts/team_controller.py'
     spec = importlib.util.spec_from_file_location('team_controller', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Supervisor tests below replace systemd-run with local Popen workers.
+    def scope(saved, *, exit_code=None):
+        record = module.unit_status(saved['unit'], invocation_id=saved.get('invocation_id'), exit_code=exit_code)
+        record.update(invocation_id=record.get('invocation_id') or saved['unit'],
+                      control_group='/test/' + saved['unit'], scope_empty=exit_code is not None)
+        return record
+    monkeypatch.setattr(module, 'scope_state', scope)
     policy = observer.output.parent / 'policy.json'
     write_json(policy, dict(identity=observer.expected))
     return SimpleNamespace(module=module, policy=policy, gate=module.RequestGate(policy))
@@ -301,7 +308,7 @@ def test_controller_preserves_live_peer_when_other_worker_exits(observer, contro
         None if missing_record else 'failed', 'finished']
     assert not observer.hold.exists()
     assert len(processes) == 2 and all(child.poll() is not None for _, child in processes)
-    assert all(pid == processes[0][1].pid and sig == signal.SIGTERM for pid, sig in signals)
+    assert signals == []
     assert len(checks) == (3 if initial_pending else 2)
     assert batch.read(controller.policy.parent / 'controller-exit.json')['children_reaped'] is True
     with pytest.raises(ValueError, match='explicit --resume'):

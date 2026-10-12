@@ -361,6 +361,9 @@ def test_final_wire_validation_and_private_snapshot_sources(workspace, tmp_path)
     bad_sources = text_sources(bad)
     with pytest.raises(ValueError, match='cannot be reconstructed'):
         model_request(store, encoded(bad), bad_sources, 'call', 'bad', 'week')
+    with closing(store.connect()) as conn:
+        failed = conn.execute("SELECT event_id FROM requests WHERE json_extract(request, '$.kind')='model_request' ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    store.complete(failed, 'failed', error='wire validation rejected before transport')
     # Serialized mutation is rejected before it can be sent to a provider.
     restored['messages'][1]['content'] += 'corrupt'
     with pytest.raises(ValueError, match='serialization changed'):

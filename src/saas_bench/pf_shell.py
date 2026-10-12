@@ -3,13 +3,16 @@ import json
 import os
 import re
 from pathlib import Path, PurePosixPath
+import socket
 import socketserver
 import tempfile
 import threading
+import time
 
 from . import pf_cli
 from .evidence_handles import RAW_VERSION
 from .execution_capture import CapturedText, CURRENT_EVENT, ExecutionCapture
+from .pf_deadline import Budget, budget_scope
 
 
 CLIENT = '''import json, os, socket, sys
@@ -35,6 +38,10 @@ class ShellService:
         self.executor = executor
         self.capture = executor.capture
         self.calls, self.outputs = [], []
+        self.cancelled = threading.Event()
+        self.deadline = time.monotonic() + executor.bash_timeout
+        self.check_cancelled = None
+        self.connection = None
         self.directory = tempfile.TemporaryDirectory(prefix='ceobench-pf-')
         self.root = Path(self.directory.name)
         self.guest = '/opt/pf' if executor._bwrap() else str(self.root)
@@ -45,24 +52,44 @@ class ShellService:
 
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
-                self.connection.settimeout(30)
+                service.connection = self.connection
                 try:
-                    data = self.rfile.readline(65537)
-                    if len(data) > 65536:
-                        raise ValueError('PF request too large')
-                    response = service.call(json.loads(data))
+                    budget = Budget(service.deadline, cancelled=service.cancelled,
+                                    check=service.check_cancelled)
+                    with budget_scope(budget=budget) as budget:
+                        data = bytearray()
+                        while not data.endswith(b'\n') and len(data) <= 65536:
+                            self.connection.settimeout(min(30, budget.remaining()))
+                            chunk = self.connection.recv(4096)
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                        if len(data) > 65536:
+                            raise ValueError('PF request too large')
+                        response = service.call(json.loads(bytes(data)), budget)
                 except Exception as exc:
-                    response = dict(stdout='', stderr='pf: ' + str(exc) + '\n', code=2)
+                    response = dict(stdout='', stderr='pf: ' + str(exc) + '\n',
+                                    code=124 if isinstance(exc, TimeoutError) else 2)
                 try:
                     self.wfile.write(json.dumps(response).encode())
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:
                     pass  # The child result remains captured even if its pipe consumer exits.
+                finally:
+                    service.connection = None
 
         self.server = socketserver.UnixStreamServer(str(self.root / 'socket'), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        self.server.timeout = .02
+        self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
-    def call(self, request):
+    def _serve(self):
+        while not self.cancelled.is_set():
+            self.server.handle_request()
+
+    def set_deadline(self, deadline, check=None):
+        self.deadline, self.check_cancelled = deadline, check
+
+    def call(self, request, budget=None):
         argv, cwd = request.get('argv'), request.get('cwd')
         if not isinstance(argv, list) or any(not isinstance(v, str) for v in argv):
             raise ValueError('PF argv must be strings')
@@ -88,8 +115,12 @@ class ShellService:
             error = str(exc)
         capture = ExecutionCapture(self.executor.evidence_store)
         parent_args = self.capture.store.read_event(self.capture.event)['request']['request']
+        audit = dict(operation=operation, arguments=args, event_id=None, outcome='running',
+                     argv=argv, cwd=str(relative), exit_code=None, note=parent_args.get('note'))
+        self.calls.append(audit)
         capture.begin(operation, args, parent=self.capture.event, argv=argv, cwd=str(relative),
                       command=parent_args.get('command'), note=parent_args.get('note'))
+        audit['event_id'] = capture.event
         token = CURRENT_EVENT.set(capture.event)
         code, outcome = 0, 'succeeded'
         try:
@@ -100,16 +131,21 @@ class ShellService:
             else:
                 try:
                     result = self.executor.pf_queries.execute(operation, args)
+                    if budget:
+                        budget.check()
+                except TimeoutError as exc:
+                    result, code, outcome = 'Error: ' + str(exc), 124, 'timed_out'
                 except (ValueError, KeyError, PermissionError) as exc:
                     result, code, outcome = 'Error: ' + str(exc), 1, 'execution_error'
+                except Exception as exc:
+                    result, code, outcome = 'Error: ' + str(exc), 1, 'execution_error'
             capture.origins.extend(getattr(result, 'origins', []))
-            result = capture.finish(result, 'succeeded' if code == 0 else 'failed',
+            result = capture.finish(result, 'timed_out' if outcome == 'timed_out' else
+                                    'succeeded' if code == 0 else 'failed',
                                     exit_code=code, stdout_sink=request.get('stdout_sink'))
         finally:
             CURRENT_EVENT.reset(token)
-        audit = dict(operation=operation, arguments=args, event_id=capture.event, outcome=outcome,
-                     argv=argv, cwd=str(relative), exit_code=code, note=parent_args.get('note'))
-        self.calls.append(audit)
+        audit.update(outcome=outcome, exit_code=code)
         self.outputs.append((result, request.get('stdout_sink'), code))
         return dict(stdout=str(result) if code == 0 else '', stderr=str(result) + '\n' if code else '', code=code)
 
@@ -153,7 +189,20 @@ class ShellService:
         return CapturedText(text, origins, read)
 
     def close(self):
-        self.server.shutdown()
-        self.thread.join()
+        self.cancelled.set()
+        if connection := self.connection:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.thread.join(timeout=.5)
+        closed = not self.thread.is_alive()
+        self.capture.facts['pf_calls'] = self.calls
+        self.capture.facts['pf_cleanup'] = dict(closed=closed,
+            unfinished_event_ids=[call['event_id'] for call in self.calls
+                                  if call['outcome'] == 'running' and call['event_id']])
+        if not closed:
+            from .agents.bash_agent.tools import ProcessBoundaryError
+            raise ProcessBoundaryError('PF host request remains active after cancellation; execution stopped')
         self.server.server_close()
         self.directory.cleanup()

@@ -390,7 +390,7 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
     ('SELECT * FROM group_insight_snapshots', 403),
     ('WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x', 504),
 ])
-def test_mixed_refresh_keeps_sdk_independent_after_sql_failure(workspace, tmp_path, server, sql, status):
+def test_mixed_refresh_keeps_reads_independent_within_total_budget(workspace, tmp_path, server, sql, status):
     from saas_bench.tools import AgentTools
     store, _, _ = captured(workspace, tmp_path)
     server.sql_evidence = store
@@ -411,9 +411,15 @@ def test_mixed_refresh_keeps_sdk_independent_after_sql_failure(workspace, tmp_pa
         meta, raw = store.get_content(refreshed[version])
         records.append(store.read_event(meta['created_by_event'])['result'])
         bodies.append(json.loads(raw))
-    assert [record['http_status'] for record in records] == [status, 200, 200]
-    assert bodies[1:] == [fast_body, sdk_body]
+    if status == 504:
+        assert [record['http_status'] for record in records] == [504, 504, 504]
+        assert [record['attempted'] for record in records] == [True, False, False]
+        assert bodies[1:] == [dict(success=False, error='refresh_timed_out')] * 2
+    else:
+        assert [record['http_status'] for record in records] == [403, 200, 200]
+        assert bodies[1:] == [fast_body, sdk_body]
     assert len({record['snapshot_ref'] for record in records}) == 1
     assert {record['day'] for record in records} == {0}
     assert all(record['snapshot_bytes'] == 0 and not record['snapshot_reused'] for record in records[:2])
     assert server.conn.serialize() == before
+    assert server.execute_tool('list_research_projects', {}).to_json() == sdk_body
