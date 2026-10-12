@@ -164,6 +164,8 @@ class MultiAgentRuntime:
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
         self.server.script_check = self._check
+        for runtime in self.roles.values():
+            runtime.usage.request_check = self._check_model_send
         self._guard_business_operations()
         for runtime in self.roles.values():
             if runtime.executor.pf_queries:
@@ -265,11 +267,22 @@ class MultiAgentRuntime:
             return None
         return tree_hash(workspace)
 
+    @staticmethod
+    def _operation_finalization(executor):
+        return (dict(execution_status=getattr(executor, 'last_status', None),
+            process_boundary=getattr(executor, '_bash_facts', {}).get('process_boundary'),
+            preserved_process=bool(executor.preserved_process),
+            pf_service_open=bool(getattr(executor, '_pf_service', None))) if executor else None)
+
     def _finish_operation(self, path, executor=None):
         state = json.loads(path.read_text())
+        finalization = self._operation_finalization(executor)
         if state['status'] in ('completed', 'interrupted'):
+            if 'finalization' in state and state['finalization'] != finalization:
+                raise RuntimeError('Conflicting operation finalization')
             return
         if state.get('wrapper_version') == 1 and executor:
+            state['finalization'] = finalization
             from .team_checkpoint import business_operations, recovery_operation_safe
             subprocess = state['kind'] in ('ceo_tool:bash', 'ceo_scripts')
             status = getattr(executor, 'last_status', None)
@@ -297,6 +310,11 @@ class MultiAgentRuntime:
                     operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)
                 state['status'] = 'interrupted' if status == 'result_unknown' else 'completed'
                 state['execution_status'] = status
+                if requests['queued'] or any(request.get('read_only') is not True for request in requests['active']):
+                    state['status'] = 'running'
+                    state['recovery']['classification'] = 'pending_business_write'
+                    write_json(path, state)
+                    raise RunCancelled('business_operation_pending')
                 if (state['kind'] == 'ceo_scripts' and client_closed and not requests['active'] and
                         not requests['queued'] and not self.server._operation_failed and
                         not self.server._step_day_timed_out and
@@ -365,6 +383,12 @@ class MultiAgentRuntime:
         if self._lifecycle.hold and self._lifecycle.hold.exists():
             self._lifecycle.cancel('hold')
         self._lifecycle.check()
+
+    def _check_model_send(self):
+        requests = self.server.public_request_state()
+        if requests['queued'] or any(request.get('read_only') is not True for request in requests['active']):
+            raise RunCancelled('business_operation_pending')
+        self._check()
 
     def _rotate_sessions(self):
         for runtime in self.roles.values():
@@ -538,8 +562,6 @@ class MultiAgentRuntime:
                     finally:
                         self._finish_operation(operation, runtime.executor)
                 if self.server.tools.current_day != day:
-                    while runtime.agent._pending_tool_calls:
-                        runtime.agent.record_tool_result('Cancelled because this tool batch crossed a week boundary.')
                     return
                 action = runtime.agent.next_tool_action()
             self._check()
@@ -586,13 +608,7 @@ class MultiAgentRuntime:
                     elif self._stage != 'ceo':
                         raise RuntimeError('Team interrupted outside a recoverable boundary')
                     self._run_ceo(self._week['observation'])
-                    closed_day = self.server.tools.current_day
-                    for runtime in self.roles.values():
-                        from .registration_evidence import week_commit_subject
-                        self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
-                    self._stage = 'boundary'
-                    self._week = {}
-                    self._set_phase('boundary')
+                    self._close_week()
                     self._boundary('week_boundary')
         except RunCancelled as exc:
             self.failure = str(exc)
@@ -609,6 +625,40 @@ class MultiAgentRuntime:
         finally:
             self._pool = None
 
+    def _close_week(self):
+        while self.roles['ceo'].agent._pending_tool_calls:
+            self.roles['ceo'].agent.record_tool_result('Cancelled because this tool batch crossed a week boundary.')
+        closed_day = self.server.tools.current_day
+        for runtime in self.roles.values():
+            from .registration_evidence import week_commit_subject
+            self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
+        self._stage = 'boundary'
+        self._week = {}
+        self._set_phase('boundary')
+
     def close(self):
         self.server.stop()
+        requests = self.server.public_request_state()
+        if not requests['active'] and not requests['queued']:
+            for runtime in self.roles.values():
+                runtime.executor.api_socket = None
+            for executor in self.server.role_executors.values():
+                executor.api_socket = None
+            for path in (self.root / 'private/operations').glob('*.json'):
+                state = json.loads(path.read_text())
+                if (state.get('status') != 'running' or
+                        state.get('recovery', {}).get('classification') != 'pending_business_write'):
+                    continue
+                executor = (self.server.role_executors['ceo'] if state['kind'] == 'ceo_scripts' else
+                            self.roles['ceo'].executor)
+                if state.get('finalization') != self._operation_finalization(executor):
+                    continue
+                try:
+                    self._finish_operation(path, executor)
+                except RuntimeError as exc:
+                    if str(exc) != 'Business operation outcome unknown; continuation refused':
+                        raise
+                else:
+                    if self._stage == 'ceo' and state['day'] < self.server.tools.current_day:
+                        self._close_week()
         self._sockets.cleanup()

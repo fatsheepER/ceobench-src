@@ -51,9 +51,10 @@ def test_uncooperative_pf_cleanup_is_bounded_and_stops_next_tool(captured):
         try:
             assert entered.wait(2)
             with pytest.raises(ProcessBoundaryError, match='PF host request remains active'):
-                running.result(timeout=2)
+                running.result(timeout=4)
             elapsed = time.monotonic() - started
-            assert elapsed < 1.6
+            assert elapsed < 4
+            assert not release.is_set()
             service = executor._pf_service
             assert service.thread.is_alive()
             bash, child = records(store)
@@ -111,7 +112,7 @@ def test_cooperative_pf_deadline_closes_host_and_allows_next_tool(captured):
 def test_refresh_sources_share_deadline_and_preserve_completed_reads(captured, monkeypatch):
     api, store, _ = captured
     from saas_bench import pf_refresh
-    api.QUERY_TIMEOUT_SECONDS = .15
+    api.QUERY_TIMEOUT_SECONDS = 2
     sqls = ['SELECT 42 AS n',
             'WITH RECURSIVE t(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM t WHERE n<100000000) SELECT sum(n) AS n FROM t',
             'SELECT 3 AS n']

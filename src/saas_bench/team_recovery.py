@@ -20,6 +20,30 @@ ALLOWED = {'src/saas_bench/run_lifecycle.py', 'src/saas_bench/team_batch.py',
     'scripts/team_batch.py', 'scripts/team_controller.py', 'scripts/team_observer.py',
     'scripts/team_recovery.py', 'scripts/team_driver.py'}
 
+REPAIR_BODIES = {
+    'src/saas_bench/api_server.py': {'_APIHandler.handle_one_request', '_APIHandler.parse_request',
+        '_APIHandler._expire_request_input', '_APIHandler._start_public_request', '_APIHandler._read_request_bytes',
+        '_APIHandler._capture_sql', '_APIHandler._capture_response', '_APIHandler._capture_delivery',
+        '_TrackedHTTPServer.get_request', '_TrackedHTTPServer.shutdown_request', 'registered_script_classification',
+        'NovaMindAPIServer.start', 'NovaMindAPIServer.stop', 'NovaMindAPIServer.public_request_state',
+        'NovaMindAPIServer.checkpoint'},
+    'src/saas_bench/agents/bash_agent/tools.py': {'agent_runtime', 'validate_bash_limits',
+        'BashAgentToolExecutor.verify_sandbox', 'BashAgentToolExecutor._preserve_process'},
+    'src/saas_bench/multi_agent.py': {'MultiAgentRuntime.checkpoint', 'MultiAgentRuntime.restore',
+        'MultiAgentRuntime._begin_operation', 'MultiAgentRuntime._workspace_fingerprint',
+        'MultiAgentRuntime._finish_operation', 'MultiAgentRuntime._guard_business_operations',
+        'MultiAgentRuntime.request_pause', 'MultiAgentRuntime._check', 'MultiAgentRuntime.close'},
+    'src/saas_bench/team_batch.py': {'close_team', 'wall_time', 'mark_interrupted', 'register_attempt',
+        'prune_checkpoints', 'save_checkpoint'},
+    'src/saas_bench/execution_capture.py': {'sql_client_interruption', 'capture_http', 'finish_http',
+        'public_handler', 'receive_client', 'restore_sources', 'model_request', '_record_model_request'},
+    'scripts/team_controller.py': {'scope_state', 'signal_scope', 'run_disposition',
+        'RequestGate.stop', 'RequestGate.check_stop', 'RequestGate.__call__', 'RequestGate.response'},
+    'scripts/team_observer.py': {'_capture_logs', 'poll'},
+    'scripts/team_driver.py': set(),
+    'scripts/team_batch.py': set(),
+}
+
 
 def source_files(root):
     root = Path(root)
@@ -113,6 +137,34 @@ def declared_fix(record, old, actual):
                      isinstance(node.func, ast.Attribute) and node.func.attr in ('act', 'record_tool_result'))]
         if model_inputs(old['source_root']) != model_inputs(new_root):
             raise ValueError('harness_fix cannot change role model inputs')
+    for name in changed & REPAIR_BODIES.keys():
+        def design(root):
+            class RepairBodies(ast.NodeTransformer):
+                def __init__(self):
+                    self.classes = []
+
+                def visit_ClassDef(self, node):
+                    self.classes.append(node.name)
+                    self.generic_visit(node)
+                    self.classes.pop()
+                    return node
+
+                def visit_FunctionDef(self, node):
+                    symbol = '.'.join([*self.classes, node.name])
+                    if symbol in REPAIR_BODIES[name]:
+                        node.body = [ast.Pass()]
+                    elif name == 'src/saas_bench/multi_agent.py' and symbol in (
+                            'MultiAgentRuntime._run_ceo', 'MultiAgentRuntime._script_output'):
+                        node = WithoutOperationJournal().visit(node)
+                    elif name == 'src/saas_bench/api_server.py' and symbol == '_APIHandler._send_json':
+                        for handler in ast.walk(node):
+                            if isinstance(handler, ast.ExceptHandler) and isinstance(handler.type, ast.Name) and handler.type.id == 'OSError':
+                                handler.body = [ast.Pass()]
+                    return node
+
+            return ast.dump(RepairBodies().visit(ast.parse((Path(root) / name).read_text())), include_attributes=False)
+        if design(old['source_root']) != design(new_root):
+            raise ValueError('harness_fix cannot change model inputs, tool execution or frozen scheduling design')
     verify_fix_commit(new_root, record.get('fix_commit'), changed, actual)
     return changed
 
@@ -216,6 +268,15 @@ def validate_residual_declarations(record):
                     not all(isinstance(unit.get(key), str) and unit[key] for key in ('unit', 'invocation_id', 'control_group')) or
                     item.get('worker_unit') != unit['unit'] or item.get('worker_invocation_id') != unit['invocation_id']):
                 raise ValueError('Residual resource evidence must bind the original attempt and worker invocation')
+            if classification in ('read_only_interrupted', 'pending_read_only'):
+                from .team_checkpoint import recovery_operation_safe
+                root = Path(item['root'])
+                operation = root / 'private/operations' / item['operation']
+                if (not root.is_absolute() or root.resolve() != root or Path(item['operation']).name != item['operation'] or
+                        operation.is_symlink() or file_hash(operation) != item['sha256']):
+                    raise ValueError('Approved residual operation changed')
+                if not recovery_operation_safe(root, json.loads(operation.read_text())):
+                    raise ValueError('Read-only residual approval requires positive operation-bound proof')
 
 
 def approval(manifest_path=None):

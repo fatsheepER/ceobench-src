@@ -133,6 +133,8 @@ tests/*
 !tests/test_sql_evidence.py
 !tests/test_team_sql_monitor.py
 !tests/test_execution_capture.py
+!tests/test_pending_business_requests.py
+!tests/test_client_admission_race.py
 !tests/test_manual_continuation.py
 !tests/test_text_registry.py
 !tests/test_pf_queries.py

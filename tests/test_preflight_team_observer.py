@@ -323,8 +323,10 @@ def test_compressed_physical_receipt_retains_served_model_and_usage_checks(obser
 
 
 @pytest.mark.parametrize('error', [httpx.ConnectError, httpx.ReadTimeout])
-def test_quota_failure_waits_for_consecutive_polls_and_survives_restart(observer, error):
+def test_quota_outage_retries_with_backoff_survives_restart_then_holds(observer, monkeypatch, error):
     calls = []
+    clock = [1000.0]
+    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
 
     def unavailable():
         calls.append(True)
@@ -339,12 +341,24 @@ def test_quota_failure_waits_for_consecutive_polls_and_survives_restart(observer
     restarted = json.loads((observer.output / 'state.json').read_text())
     second = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                   restarted, quota_fn=unavailable)
-    assert second['status'] == 'hold' and observer.hold.exists()
-    assert second['checks'] == ['quota_unavailable:' + error.__name__]
-    assert restarted['quota_failures'] == 2 and len(calls) == 2
+    assert second['status'] == 'pending' and not observer.hold.exists()
+    assert restarted['quota_failures'] == 1 and len(calls) == 1
+    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
+    third = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                 restarted, quota_fn=unavailable)
+    assert third['status'] == 'pending' and len(calls) == 2
+    assert third['quota_retry_after'] == 2 * observer.module.QUOTA_RETRY_INITIAL_SECONDS
+    clock[0] = 1000 + observer.module.QUOTA_OUTAGE_SECONDS
+    expired = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                   restarted, quota_fn=unavailable)
+    assert expired['status'] == 'hold' and observer.hold.exists()
+    assert expired['checks'] == ['quota_outage_timeout:' + error.__name__]
+    assert len(calls) == 2
 
 
-def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer):
+def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
     def unavailable():
         raise httpx.ConnectError('temporary quota failure')
 
@@ -353,11 +367,13 @@ def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer
                                     observer.state, quota_fn=unavailable)
 
     assert failed_poll()['status'] == 'pending'
+    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
     healthy = observer.poll()
     assert healthy['status'] == 'healthy' and healthy['quota_error'] is None
     assert observer.state['quota_failures'] == 0
     assert failed_poll()['status'] == 'pending'
     assert not observer.hold.exists()
+    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
     quota = observer.quota()
     quota['rolling']['percent'] = 100
     calls = []
@@ -371,6 +387,66 @@ def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer
     assert health['status'] == 'hold' and observer.hold.exists()
     assert health['checks'] == ['quota_exhausted'] and len(calls) == 1
     assert observer.state['quota_failures'] == 0
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_quota_confirmed_http_failure_holds_without_retries(observer, status):
+    def denied():
+        httpx.Response(status, request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
+    result = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+        observer.state, quota_fn=denied)
+    assert result['status'] == 'hold'
+    assert result['checks'] == ['quota_unavailable:HTTPStatusError']
+
+
+@pytest.mark.parametrize('status', [408, 429, 500, 502, 503, 504])
+def test_quota_http_read_unavailability_retries_but_confirmed_exhaustion_stops(observer, status):
+    def unavailable():
+        httpx.Response(status, request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
+    health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+        observer.state, quota_fn=unavailable)
+    assert health['status'] == 'pending' and not observer.hold.exists()
+    observer.state['quota_retry_at'] = 0
+    exhausted = observer.quota()
+    exhausted['rolling']['percent'] = 100
+    def confirmed():
+        httpx.Response(429, json={'usage': exhausted},
+            request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
+    health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+        observer.state, quota_fn=confirmed)
+    assert health['status'] == 'hold' and observer.hold.exists()
+
+
+def test_quota_backoff_caps_at_five_minutes_then_alerts_once(observer, monkeypatch):
+    clock, calls = [1000.0], []
+    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
+    def unavailable():
+        calls.append(clock[0])
+        raise httpx.ConnectError('offline')
+    delays = []
+    while clock[0] < 1000 + observer.module.QUOTA_OUTAGE_SECONDS:
+        health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+            observer.state, quota_fn=unavailable)
+        assert health['status'] == 'pending' and not observer.hold.exists()
+        delays.append(health['quota_retry_after'])
+        clock[0] = observer.state['quota_retry_at']
+    assert delays == [5, 10, 20, 40, 80, 160, 300, 285]
+    for _ in range(2):
+        health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+            observer.state, quota_fn=unavailable)
+        assert health['status'] == 'hold'
+    assert len(calls) == 8
+    assert [row['new_checks'] for row in events(observer)] == [['quota_outage_timeout:ConnectError']]
+
+
+@pytest.mark.parametrize('usage', [{'rolling': {}}, {'rolling': {}, 'weekly': {}, 'monthly': {'percent': 'broken'}}])
+def test_quota_rate_limit_with_malformed_usage_is_permanent(observer, usage):
+    def malformed():
+        httpx.Response(429, json={'usage': usage},
+            request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
+    health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+        observer.state, quota_fn=malformed)
+    assert health['status'] == 'hold' and observer.hold.exists()
 
 
 def test_invalid_quota_response_still_holds_immediately(observer):

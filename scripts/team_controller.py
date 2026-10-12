@@ -330,6 +330,33 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max,
             scope=units[entry['run_id']], **fields)
 
+    def finalize_oom(entry, unit):
+        record = latest(entry)
+        if (unit.get('scope_empty') and record and record.get('status') in ('preparing', 'ready', 'running') and
+                unit.get('result') == 'oom-kill'):
+            record = dict(record, status='failed', reason='oom-kill',
+                controller_finalization=dict(previous_status=record['status'], unit=unit))
+            write_json(batch.attempts(entry)[-1] / 'attempt.json', record)
+            event('attempt_finalized_after_oom', run_id=entry['run_id'], unit=unit)
+        return record
+
+    def coverage_for(entry, health):
+        roots = batch.attempts(entry)
+        return {name: value for name, value in health['coverage'].items()
+            if any(Path(name).is_relative_to(root) for root in roots) or
+            Path(name).parent == host_logs and Path(name).name.startswith(entry['run_id'] + '-')}
+
+    def finalize_capture_fault(entry, record, coverage):
+        roots = batch.attempts(entry)
+        capture_faults = {name: value for name, value in coverage.items() if value.get('terminal_fault') and
+            roots and state['cursors'][name]['closed_tail'].get('attempt_dir') == str(roots[-1])}
+        if record and capture_faults and not record.get('controller_capture_faults'):
+            record = dict(record, status='failed', reason=record.get('reason') if record['status'] == 'failed'
+                else 'run_evidence_fault', controller_capture_faults=capture_faults)
+            write_json(roots[-1] / 'attempt.json', record)
+            event('attempt_finalized_after_capture_fault', run_id=entry['run_id'], coverage=capture_faults)
+        return record
+
     def join_next(entry, child):
         if child.pid in settled:
             return
@@ -337,12 +364,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         if not unit.get('scope_empty'):
             return
         child.wait()
-        record = latest(entry)
-        if record and record.get('status') in ('preparing', 'ready', 'running') and unit.get('result') == 'oom-kill':
-            record = dict(record, status='failed', reason='oom-kill',
-                controller_finalization=dict(previous_status=record['status'], unit=unit))
-            write_json(batch.attempts(entry)[-1] / 'attempt.json', record)
-            event('attempt_finalized_after_oom', run_id=entry['run_id'], unit=unit)
+        record = finalize_oom(entry, unit)
         disposition = run_disposition(entry, record, unit)
         if disposition == 'hold':
             gate.hold.touch()
@@ -352,12 +374,11 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             return
         health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
         roots = batch.attempts(entry)
-        coverage = {name: value for name, value in health['coverage'].items()
-            if any(Path(name).is_relative_to(root) for root in roots) or
-            Path(name).parent == host_logs and Path(name).name.startswith(entry['run_id'] + '-')}
-        if (health['status'] != 'healthy' or
+        coverage = coverage_for(entry, health)
+        if (health['status'] == 'hold' or health['quota_error'] or
                 any(value.get('backlog_bytes') or value.get('reason') for value in coverage.values())):
             return
+        record = finalize_capture_fault(entry, record, coverage)
         settled.add(child.pid)
         terminal[entry['run_id']] = dict(disposition=disposition, status=record['status'],
             reason=record.get('runtime_failure') or record.get('reason'), unit=unit, coverage=coverage,
@@ -425,7 +446,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             last_poll = time.monotonic()
             while health['status'] == 'pending' and not stopped():
                 time.sleep(1)
-                if time.monotonic() - last_poll >= 300:
+                if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
                     health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
                     last_poll = time.monotonic()
             if health['status'] == 'hold' or stopped():
@@ -443,8 +464,8 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                         predecessor = queue[ordinal - 1]
                 launch(entry, predecessor=predecessor)
             while workers_running() or independent and any(child.pid not in settled for _, child, _ in children):
-                if time.monotonic() - last_poll >= 300:
-                    poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+                if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
+                    health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
                     last_poll = time.monotonic()
                 for entry, child, _ in list(children):
                     if child.poll() is not None and child.pid not in exited:
@@ -462,8 +483,8 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                 time.sleep(1)
             for entry, child, _ in children:
                 child.wait()
-                record = latest(entry) or {}
                 unit = observe_unit(entry, child)
+                record = finalize_oom(entry, unit) or {}
                 event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
                     status=record.get('status'), day=record.get('day'), unit=unit)
             if stopped():
@@ -471,6 +492,15 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
             for run_id, observed in health.get('units', {}).items():
                 units[run_id] = dict(units.get(run_id, {}), **observed)
+            finalized_capture = False
+            for entry, _, _ in children:
+                saved = latest(entry)
+                record = finalize_capture_fault(entry, saved, coverage_for(entry, health))
+                finalized_capture |= record is not saved
+                if not independent and record and record.get('controller_capture_faults') and run_disposition(entry, record, units[entry['run_id']]) == 'hold':
+                    gate.hold.touch()
+            if finalized_capture:
+                poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
             return [dict(latest(entry) or {}, status='failed', reason='oom-kill')
                     if units[entry['run_id']]['result'] == 'oom-kill' else latest(entry)
                     for entry, _, _ in children]

@@ -115,6 +115,8 @@ class SQLEvidenceStore:
                 CREATE TABLE IF NOT EXISTS client_calls (
                     token TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES requests(event_id),
                     received BLOB);
+                CREATE TABLE IF NOT EXISTS client_receipts (
+                    token TEXT PRIMARY KEY, parent TEXT REFERENCES requests(event_id), payload BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS client_interruptions (
                     token TEXT PRIMARY KEY REFERENCES client_calls(token), record BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS private_state (name TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -191,6 +193,10 @@ class SQLEvidenceStore:
                            AND event_id NOT IN (SELECT event_id FROM deliveries)))
                     ORDER BY 2 LIMIT 1''', (self.identity.get('role'), self.identity.get('role'))).fetchone()
                 missing = self._settle_interrupted_clients(conn)
+                unbound = conn.execute('''SELECT c.token FROM client_receipts c
+                    JOIN requests p ON p.event_id=c.parent LEFT JOIN client_calls b USING(token)
+                    WHERE b.token IS NULL AND (? IS NULL OR json_extract(p.request,'$.role')=?) LIMIT 1''',
+                    (self.identity.get('role'), self.identity.get('role'))).fetchone()
                 unknown = conn.execute("SELECT event_id FROM results JOIN requests USING(event_id) WHERE json_extract(record, '$.status') = 'result_unknown' AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
             if self.fault or self.fault_path.exists():
                 raise RuntimeError('SQL evidence capture failed; collection stopped')
@@ -198,12 +204,14 @@ class SQLEvidenceStore:
                 raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
             if missing:
                 raise RuntimeError('Unconfirmed client receive outcome: ' + missing)
-            if pending and time.monotonic() < deadline:
+            if (pending or unbound) and time.monotonic() < deadline:
                 time.sleep(.01)
                 continue
             break
         if pending:
             raise EvidencePending('Unconfirmed SQL evidence outcome: ' + pending[0])
+        if unbound:
+            raise EvidencePending('Unbound client receipt: ' + unbound[0])
 
     def actor_fields(self):
         fields = {k: self.identity[k] for k in ('run_id', 'world_id', 'role', 'agent_id', 'session_id') if k in self.identity}
@@ -367,23 +375,67 @@ class SQLEvidenceStore:
     def bind_client(self, event, token):
         if not re.fullmatch('[a-f0-9]{32}', token or ''):
             raise ValueError('Invalid client call key')
-        with closing(self.connect()) as conn, conn:
-            self._visible(conn, event)
-            conn.execute('INSERT INTO client_calls VALUES (?,?,NULL)', (token, event))
-
-    def received(self, token, payload):
         with self.batch(), self._writer() as conn:
-            row = conn.execute('SELECT event_id,received FROM client_calls WHERE token=?', (token,)).fetchone()
-            if row is None or row['received'] is not None:
-                raise ValueError('Unknown or already recorded client call')
-            event = row['event_id']
             self._visible(conn, event)
-            # All fields are client observations, never server-authored facts.
-            for slot, value in payload.items():
-                self.version(event, 'client_' + slot, bytes.fromhex(value) if slot == 'body' else encoded(value),
-                             layer='program_' + slot, origin='standard_client_observation')
-            conn.execute('UPDATE client_calls SET received=? WHERE token=? AND received IS NULL',
-                         (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
+            existing = conn.execute('SELECT event_id,received FROM client_calls WHERE token=?', (token,)).fetchone()
+            if existing:
+                if existing['event_id'] != event:
+                    raise ValueError('Conflicting client call binding')
+                return
+            receipt = conn.execute('SELECT parent,payload FROM client_receipts WHERE token=?', (token,)).fetchone()
+            parent = json.loads(conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()[0]).get('parent_event_id')
+            if receipt and receipt['parent'] != parent:
+                raise ValueError('Client call does not belong to this execution')
+            conn.execute('INSERT INTO client_calls VALUES (?,?,NULL)', (token, event))
+            if receipt:
+                self._record_client_receipt(conn, event, token, json.loads(receipt['payload']))
+
+    def received(self, token, payload, *, parent=None, allow_unbound=False):
+        if not re.fullmatch('[a-f0-9]{32}', token or ''):
+            raise ValueError('Invalid client call key')
+        if 'body' in payload:
+            bytes.fromhex(payload['body'])
+        body = encoded(payload)
+        with self.batch(), self._writer() as conn:
+            existing = conn.execute('SELECT parent,payload FROM client_receipts WHERE token=?', (token,)).fetchone()
+            row = conn.execute('''SELECT c.event_id,c.received,r.request FROM client_calls c
+                JOIN requests r USING(event_id) WHERE token=?''', (token,)).fetchone()
+            if row:
+                self._visible(conn, row['event_id'])
+                expected_parent = json.loads(row['request']).get('parent_event_id')
+                if parent is not None and parent != expected_parent:
+                    raise ValueError('Client call does not belong to this execution')
+                parent = expected_parent
+            elif (not allow_unbound and not existing) or parent is None:
+                raise ValueError('Unknown client call')
+            else:
+                self._visible(conn, parent)
+            if existing and (existing['parent'] != parent or existing['payload'] != body):
+                raise ValueError('Conflicting client receipt already recorded')
+            if row and row['received'] is not None:
+                if not existing:
+                    prefix = row['event_id'] + ':client_'
+                    saved = {}
+                    for version in conn.execute('''SELECT v.version_id,b.content FROM versions v
+                            JOIN blobs b USING(content_hash) WHERE v.event_id=?''', (row['event_id'],)):
+                        if version['version_id'].startswith(prefix):
+                            slot = version['version_id'][len(prefix):]
+                            saved[slot] = version['content'].hex() if slot == 'body' else json.loads(version['content'])
+                    if encoded(saved) != body:
+                        raise ValueError('Conflicting client receipt already recorded')
+                    conn.execute('INSERT INTO client_receipts VALUES (?,?,?)', (token, parent, body))
+                return
+            if not existing:
+                conn.execute('INSERT INTO client_receipts VALUES (?,?,?)', (token, parent, body))
+            if row:
+                self._record_client_receipt(conn, row['event_id'], token, payload)
+
+    def _record_client_receipt(self, conn, event, token, payload):
+        for slot, value in payload.items():
+            self.version(event, 'client_' + slot, bytes.fromhex(value) if slot == 'body' else encoded(value),
+                         layer='program_' + slot, origin='standard_client_observation')
+        conn.execute('UPDATE client_calls SET received=? WHERE token=? AND received IS NULL',
+                     (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
 
     def _state_name(self, name):
         return self.identity['role'] + ':' + name if self.identity.get('role') and name != 'admission_paused' else name

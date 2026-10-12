@@ -199,7 +199,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         api = self.server._api_server
         with api._request_lock:
             api._active_requests[id(self.connection)] = dict(read_only=False, method=None, path=None)
-        for name in ('_request_deadline', '_request_body', '_request_body_complete'):
+        for name in ('_request_deadline', '_request_body', '_request_body_complete', '_capture_parent'):
             self.__dict__.pop(name, None)
         self._start_public_request()
         timer = threading.Timer(max(0, self._request_deadline - time.monotonic()),
@@ -220,9 +220,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self.command == 'GET' and self.path in ('/health', '/game-status', '/daily-scripts', '/vars'))
             with api._request_lock:
                 api._active_requests[id(self.connection)] = dict(
-                    read_only=read_only, method=self.command, path=self.path)
-                if not read_only and self.path != '/call':
-                    api._request_mutations += 1
+                    read_only=read_only, method=self.command, path=self.path,
+                    capture_context=self.headers.get('X-Capture-Context'),
+                    capture_call=self.headers.get('X-Capture-Call'))
         return parsed
 
     def _expire_request_input(self):
@@ -285,7 +285,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 api._sql_lock.wait(timeout=remaining)
             api._sql_active += 1
 
-    def _reject_request(self, exc):
+    def _reject_request(self, exc, status=None):
         self.close_connection = True
         self._sql_execution = dict(permanent_error=isinstance(exc, RequestRejected),
                                    failure_stage='request', error_kind='timeout' if
@@ -312,6 +312,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         self.connection.settimeout(self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS)
         try:
             self._send_json({'success': False, 'error': str(exc)},
+                            status if status is not None else
                             504 if isinstance(exc, RequestDeadlineExceeded) else 400)
         except OSError:
             pass
@@ -487,8 +488,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response)
         except OSError:
+            self.close_connection = True
             self._capture_delivery('failed')
-            raise
         else:
             self._capture_delivery('sent')
 
@@ -541,8 +542,6 @@ class _APIHandler(BaseHTTPRequestHandler):
             with server._request_lock:
                 read_only = CALL_POLICY.get(tool_name) == 'read'
                 server._active_requests[id(self.connection)]['read_only'] = read_only
-                if not read_only:
-                    server._request_mutations += 1
             if server.read_only_task and tool_name not in READ_ONLY_TASK_TOOLS:
                 self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
                 return
@@ -1138,6 +1137,9 @@ class NovaMindAPIServer:
             dispatch_fn = _TOOL_DISPATCH.get(tool_name)
             if dispatch_fn is None:
                 return ToolResult(False, f"Unknown tool: {tool_name}")
+            if CALL_POLICY[tool_name] != 'read':
+                with self._request_lock:
+                    self._request_mutations += 1
             result = dispatch_fn(self.tools, args)
             if CALL_POLICY[tool_name] != 'read' and result.success:
                 self.world_state_id = uuid.uuid4().hex
@@ -1207,6 +1209,8 @@ class NovaMindAPIServer:
         require_advance(role)
         with self._lock:
             self.authorize_team(role, 'advance')
+            with self._request_lock:
+                self._request_mutations += 1
         if not self._advance_lock.acquire(blocking=False):
             raise RuntimeError('Week advancement already in progress')
         try:
@@ -1517,6 +1521,8 @@ class NovaMindAPIServer:
             if not isinstance(scripts, dict) or any(not isinstance(n, str) or not n or not isinstance(c, str)
                                                     for n, c in scripts.items()):
                 raise ValueError('Invalid registered script snapshots')
+            with self._request_lock:
+                self._request_mutations += 1
             if self.team_mode and role != "ceo" and self.conn is not None:
                 with self.conn:
                     self.conn.execute('DELETE FROM _team_scripts WHERE role=?', (role,))

@@ -150,18 +150,12 @@ def _approved_residuals(snapshot):
             receipt = json.loads(operation.read_text())
             classification = residual['classification']
             if classification in ('read_only_interrupted', 'pending_read_only'):
-                if not _wrapper(receipt):
-                    raise ValueError('Read-only residual approval cannot cover a business operation')
-                proof = receipt.get('recovery', {})
-                contradictory = (proof.get('operation_failed') is True or proof.get('step_day_timed_out') is True or
-                    any(before in receipt and after in proof and receipt[before] != proof[after]
-                        for before, after in (('business_operations_before', 'business_operations_after'),
-                            ('mutation_epoch_before', 'mutation_epoch_after'),
-                            ('workspace_sha256_before', 'workspace_sha256_after'))))
-                if contradictory:
-                    raise ValueError('Read-only residual approval contradicts recorded mutations or server failure')
+                if not recovery_operation_safe(root, receipt):
+                    raise ValueError('Read-only residual approval requires positive operation-bound proof')
             elif classification != 'unknown_business_write' or saved.get('allow_unknown_business_write') is not True:
                 raise ValueError('Unknown business write requires explicit recovery approval')
+            else:
+                raise ValueError('Unknown business write cannot restore an earlier checkpoint')
             for value, checksum in residual['evidence'].items():
                 evidence = Path(value)
                 if not evidence.is_absolute() or evidence.resolve() != evidence or file_hash(evidence) != checksum:
@@ -185,6 +179,28 @@ def validate_recovery_source(snapshot, state, *, current_root=None):
     for root in roots:
         if not root.is_dir():
             raise RuntimeError('Recovery source is unavailable; operation coverage cannot be verified')
+        roles = root / 'roles'
+        frozen_roles = snapshot / 'roles'
+        if frozen_roles.exists():
+            if not roles.is_dir() or roles.is_symlink():
+                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
+            links = {str(path.relative_to(roles)): os.readlink(path)
+                for path in roles.rglob('*') if path.is_symlink()}
+            frozen_links = {str(path.relative_to(frozen_roles)): os.readlink(path)
+                for path in frozen_roles.rglob('*') if path.is_symlink()}
+            try:
+                unsafe_links = any(Path(target).is_absolute() or not (roles / name).resolve().is_relative_to(roles)
+                    for name, target in links.items())
+            except (OSError, RuntimeError):
+                unsafe_links = True
+            if links != frozen_links or unsafe_links:
+                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
+            modes = [{str(path.relative_to(workspace)): path.lstat().st_mode
+                for path in (workspace, *workspace.rglob('*'))
+                if '__pycache__' not in path.parts and path.suffix != '.pyc'}
+                for workspace in (roles, frozen_roles)]
+            if modes[0] != modes[1] or tree_hash(roles) != tree_hash(frozen_roles):
+                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
         current = {}
         for path in (root / 'private' / 'operations').glob('*.json'):
             receipt = json.loads(path.read_text())

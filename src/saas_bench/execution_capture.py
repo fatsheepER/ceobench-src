@@ -230,7 +230,8 @@ class ExecutionCapture:
 def capture_http(handler, raw, *, active_parent=True):
     store = handler.evidence
     token = handler.headers.get('X-Capture-Context')
-    parent = store.parent(token, active=active_parent) if token else None
+    parent = (handler._capture_parent if hasattr(handler, '_capture_parent') else
+              store.parent(token, active=active_parent) if token else None)
     try:
         request = json.loads(raw) if raw else {}
     except (ValueError, UnicodeError):
@@ -353,10 +354,9 @@ def public_handler(method):
                         store.fail(exc)
         if api.team_mode:
             try:
-                store.parent(handler.headers.get('X-Capture-Context'))
+                handler._capture_parent = store.parent(handler.headers.get('X-Capture-Context'))
             except (ValueError, KeyError):
-                handler._send_json({'success': False, 'error': 'Capture context belongs to a different execution'}, 403)
-                return
+                return handler._reject_request(RequestRejected('Capture context belongs to a different execution'), 403)
         if store.fault or store.fault_path.exists():
             handler._send_json({'success': False, 'error': 'Execution capture failed; branch stopped'}, 503)
             return
@@ -372,7 +372,8 @@ def public_handler(method):
                 if handler.path == '/query':
                     from .public_sql import PUBLIC_POLICY_VERSION
                     handler._sql_event = store.begin(raw, PUBLIC_POLICY_VERSION,
-                        parent=store.parent(handler.headers.get('X-Capture-Context')))
+                        parent=handler._capture_parent if api.team_mode else
+                            store.parent(handler.headers.get('X-Capture-Context')))
                 else:
                     handler._sql_event = capture_http(handler, raw)
                 client = handler.headers.get('X-Capture-Call')
@@ -407,8 +408,10 @@ def receive_client(handler):
         body = json.loads(raw)
         if set(body) != {'context', 'call', 'record'}:
             raise ValueError('Invalid capture record')
-        parent = store.parent(body['context'])
-        if parent is None or not isinstance(body['record'], dict):
+        if not isinstance(body['record'], dict):
+            raise ValueError('Capture requires an active execution')
+        parent = store.parent(body['context'], active=body['record'].get('kind') == 'python_start')
+        if parent is None:
             raise ValueError('Capture requires an active execution')
         record = body['record']
         if record.get('kind') == 'python_start':
@@ -446,11 +449,11 @@ def receive_client(handler):
             return
         if not set(body['record']) <= {'body', 'parsed', 'returned', 'error', 'state', 'projection', 'transformations'}:
             raise ValueError('Unsupported capture fields')
-        with closing(store.connect()) as conn:
-            row = conn.execute('SELECT r.request FROM client_calls c JOIN requests r USING(event_id) WHERE c.token=?', (body['call'],)).fetchone()
-            if not row or json.loads(row[0]).get('parent_event_id') != parent:
-                raise ValueError('Client call does not belong to this execution')
-        store.received(body['call'], body['record'])
+        api = handler.server._api_server
+        with api._request_lock:
+            pending = any(request.get('capture_context') == body['context'] and
+                request.get('capture_call') == body['call'] for request in api._active_requests.values())
+        store.received(body['call'], body['record'], parent=parent, allow_unbound=pending)
         handler._send_json({'accepted': True})
     except (RequestRejected, RequestDeadlineExceeded):
         raise

@@ -4,7 +4,9 @@ import binascii
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import time
 
 import brotli
@@ -15,6 +17,77 @@ from saas_bench import team_batch as batch
 from saas_bench.model_usage import usage_values
 from saas_bench.run_state import file_hash, write_json
 from saas_bench.team_usage import _body
+
+
+QUOTA_RETRY_INITIAL_SECONDS = 5
+QUOTA_RETRY_MAX_SECONDS = 300
+QUOTA_OUTAGE_SECONDS = 900
+
+
+def quota_transient(exc):
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            pass
+        else:
+            if isinstance(payload, dict) and 'usage' in payload:
+                usage = payload['usage']
+                try:
+                    return (isinstance(usage, dict) and set(usage) == {'rolling', 'weekly', 'monthly'} and
+                        all(row.get('status') == 'ok' and row.get('percent', 100) < 100 for row in usage.values()))
+                except (TypeError, AttributeError):
+                    return False
+    return (isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)) or
+            isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 429, 500, 502, 503, 504))
+
+
+def tail_hash(path, offset):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        stream.seek(offset)
+        while chunk := stream.read(1024**2):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preserve_closed_tail(path, target, output, manifest, expected):
+    unitfile = output.parent / 'controller-units.json'
+    if not unitfile.exists():
+        return None
+    units = batch.read(unitfile)
+    run = next((run for run in manifest['runs']
+        if path.is_relative_to(Path(run['output_dir'])) or
+        path.parent == Path(expected['host_logs']) and path.name.startswith(run['run_id'] + '-')), None)
+    run_id = run['run_id'] if run else None
+    unit = units.get(run_id, {})
+    if (not unit.get('scope_empty') or not unit.get('invocation_id') or
+            unit.get('exit_code') is None or unit.get('cleanup_error')):
+        return None
+    # A reaped client and empty invocation-bound scope prove these bytes cannot finish.
+    directory = output / 'closed-log-tails'
+    directory.mkdir(exist_ok=True)
+    name = hashlib.sha256(json.dumps([str(path), target['identity'], target['target_size']]).encode()).hexdigest()
+    tail = directory / (name + '.bin')
+    with path.open('rb') as source, tail.with_suffix('.tmp').open('wb') as saved:
+        source.seek(target['offset'])
+        shutil.copyfileobj(source, saved, length=1024**2)
+        saved.flush()
+        os.fsync(saved.fileno())
+    tail.with_suffix('.tmp').replace(tail)
+    after = path.stat()
+    digest = file_hash(tail)
+    if ([after.st_dev, after.st_ino] != target['identity'] or after.st_size != target['target_size'] or
+            digest != tail_hash(path, target['offset'])):
+        raise ValueError('Closed log changed while preserving its tail')
+    history = batch.attempts(run)
+    attempt = next((root for root in history if path.is_relative_to(root)), history[-1] if history else None)
+    proof = dict(path=str(path), identity=target['identity'], start=target['offset'],
+        end=target['target_size'], tail_path=str(tail), tail_sha256=digest, run_id=run_id,
+        original_sha256=file_hash(path), attempt_dir=str(attempt) if attempt else None,
+        unit=unit, fault_kind='permanent_capture_fault', reason='closed_partial_line')
+    write_json(tail.with_suffix('.json'), proof)
+    return proof
 
 
 def physical_body(value):
@@ -127,6 +200,17 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
                 target['reason'] = 'log_identity_changed'
             elif target['offset'] > stat.st_size:
                 target['reason'] = 'log_truncated'
+            elif prior.get('closed_tail'):
+                proof = prior['closed_tail']
+                if (stat.st_size != proof['end'] or tail_hash(key, proof['start']) != proof['tail_sha256'] or
+                        file_hash(key) != proof['original_sha256'] or
+                        file_hash(proof['tail_path']) != proof['tail_sha256']):
+                    target['reason'] = 'closed_log_changed'
+                else:
+                    target['terminal_fault'] = proof['reason']
+                    faults[proof['tail_path']] = proof['run_id']
+                    if proof.get('attempt_dir'):
+                        (Path(proof['attempt_dir']) / 'STOP').touch()
         except OSError as exc:
             target['reason'] = 'log_io:' + type(exc).__name__
         if target['reason']:
@@ -151,22 +235,37 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         manifest = identity(manifest_path, expected)
     except Exception as exc:
         checks.append('freeze:' + str(exc))
-    try:
-        quota = quota_fn()
-        if set(quota) != {'rolling', 'weekly', 'monthly'}:
-            checks.append('quota_windows_changed')
-        if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
-            checks.append('quota_exhausted')
-    except httpx.HTTPError as exc:
-        quota_error = 'quota_unavailable:' + type(exc).__name__
-        state['quota_failures'] = state.get('quota_failures', 0) + 1
-        if state['quota_failures'] >= 2:
-            checks.append(quota_error)
-    except Exception as exc:
-        quota_error = 'quota_unavailable:' + type(exc).__name__
-        checks.append(quota_error)
+    now = time.time()
+    outage = state.get('quota_outage_started')
+    if outage is not None and now - outage >= QUOTA_OUTAGE_SECONDS:
+        quota_error = state['quota_error']
+        checks.append('quota_outage_timeout:' + quota_error.split(':', 1)[1])
+    elif now < state.get('quota_retry_at', 0):
+        quota_error = state['quota_error']
     else:
-        state['quota_failures'] = 0
+        try:
+            quota = quota_fn()
+            if set(quota) != {'rolling', 'weekly', 'monthly'}:
+                checks.append('quota_windows_changed')
+            if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
+                checks.append('quota_exhausted')
+        except Exception as exc:
+            quota_error = 'quota_unavailable:' + type(exc).__name__
+            if quota_transient(exc):
+                finished = time.time()
+                failures = state.get('quota_failures', 0) + 1
+                start = outage if outage is not None else now
+                delay = min(QUOTA_RETRY_MAX_SECONDS, QUOTA_RETRY_INITIAL_SECONDS * 2**min(failures - 1, 16),
+                            max(0, QUOTA_OUTAGE_SECONDS - (finished - start)))
+                state.update(quota_failures=failures, quota_outage_started=start,
+                    quota_retry_at=finished + delay, quota_error=quota_error)
+                if finished - start >= QUOTA_OUTAGE_SECONDS:
+                    checks.append('quota_outage_timeout:' + type(exc).__name__)
+            else:
+                checks.append(quota_error)
+        else:
+            state.update(quota_failures=0, quota_outage_started=None, quota_retry_at=0,
+                quota_error=None, quota_last_success=now)
     physical_requests = state.setdefault('physical_request_meta', {})
     cursors = state.setdefault('cursors', {})
     seen = state.setdefault('receipt_hashes', {})
@@ -271,8 +370,23 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                                     identity=target['identity'])
                 write_json(output / 'state.json', state)
                 if next_offset == offset:
-                    target['reason'] = 'partial_line'
-                    pending = True
+                    try:
+                        proof = preserve_closed_tail(path, target, output, manifest, expected)
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        target['reason'] = 'closed_tail_fault:' + type(exc).__name__
+                        checks.append(target['reason'] + ':' + key)
+                        break
+                    if proof:
+                        target.update(offset=target['target_size'], backlog_bytes=0,
+                            terminal_fault=proof['reason'])
+                        cursors[key].update(offset=target['offset'], closed_tail=proof)
+                        faults[proof['tail_path']] = proof['run_id']
+                        if proof.get('attempt_dir'):
+                            (Path(proof['attempt_dir']) / 'STOP').touch()
+                        write_json(output / 'state.json', state)
+                    else:
+                        target['reason'] = 'partial_line'
+                        pending = True
                     break
         if time.monotonic() >= deadline:
             pending = True
@@ -312,6 +426,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']] if manifest else [],
         batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
+        quota_retry_after=max(0, state.get('quota_retry_at', 0) - time.time()) if quota_error else 0,
         run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],
         progress=progress, units=units, coverage=coverage, state=state)
     write_json(output / 'health.json', health)
@@ -336,7 +451,7 @@ def main(argv=None):
         if args.once or args.drain:
             print(json.dumps({key: health[key] for key in ('time', 'status', 'checks', 'quota', 'coverage')}, indent=2))
             return
-        time.sleep(300)
+        time.sleep(min(300, max(1, health['quota_retry_after'])) if health['quota_error'] else 300)
 
 
 if __name__ == '__main__':

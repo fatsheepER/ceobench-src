@@ -1,6 +1,7 @@
 import subprocess
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -237,4 +238,54 @@ def test_approval_cli_preserves_manifest_and_records_explicit_declaration(tmp_pa
         assert record['affected_files'] == [] and record['evidence'] == {str(evidence): file_hash(evidence)}
         assert receipt['sha256'] == file_hash(receipt['path'])
         assert not (tmp_path / 'HOLD').exists()
+
+
+@pytest.mark.parametrize('filename,before,after', [
+    ('src/saas_bench/api_server.py', 'return self._last_dashboard',
+        "return 'Changed model instructions\\n' + self._last_dashboard"),
+    ('src/saas_bench/api_server.py', 'response = json.dumps(data, default=str).encode()',
+        "response = json.dumps({'changed': data}, default=str).encode()"),
+    ('src/saas_bench/agents/bash_agent/tools.py', "stream.write(args['content'].encode())",
+        "stream.write((args['content'] + 'changed').encode())"),
+    ('scripts/team_controller.py', "for group in ('git', 'pf')} if independent else {}",
+        "for group in ('pf', 'git')} if independent else {}"),
+    ('src/saas_bench/team_batch.py', "return policy['mode']", "return 'paired'"),
+    ('src/saas_bench/execution_capture.py', "return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS",
+        "return True or rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS"),
+])
+def test_real_approval_cli_rejects_mixed_module_design_changes(tmp_path, filename, before, after):
+    old, root = tmp_path / 'original', tmp_path / 'revision'
+    for directory in ('src', 'scripts'):
+        shutil.copytree(batch.ROOT / directory, old / directory,
+            ignore=shutil.ignore_patterns('__pycache__', '.env', '.env.*'))
+    shutil.copytree(old, root)
+    target = root / filename
+    text = target.read_text()
+    assert before in text
+    target.write_text(text.replace(before, after, 1))
+    subprocess.run(['git', 'init', '--quiet'], cwd=root, check=True)
+    subprocess.run(['git', 'add', 'src', 'scripts'], cwd=root, check=True)
+    tree = subprocess.check_output(['git', 'write-tree'], cwd=root, text=True).strip()
+    commit = subprocess.check_output(['git', '-c', 'user.name=Offline', '-c', 'user.email=offline@example.invalid',
+        'commit-tree', tree, '-m', 'fix: offline design boundary proof'], cwd=root, text=True).strip()
+    subprocess.run(['git', 'update-ref', '--no-deref', 'HEAD', commit], cwd=root, check=True)
+    assert subprocess.check_output(['git', 'for-each-ref', 'refs/heads'], cwd=root) == b''
+    recovery.verify_fix_commit(root, commit, {filename}, recovery.source_files(root))
+    manifest = tmp_path / 'manifest.json'
+    write_json(manifest, dict(source_root=str(old), source_sha256=tree_hash(old / 'src')))
+    evidence = tmp_path / 'evidence.json'
+    write_json(evidence, dict(offline=True))
+    declaration = tmp_path / 'declaration.json'
+    write_json(declaration, dict(fix_classification='harness_fix', fix_commit=commit,
+        affected_files=[filename], reason='Verify a mixed module design boundary', evidence=[str(evidence)]))
+    original = manifest.read_bytes()
+    output = tmp_path / 'approval'
+    result = subprocess.run([os.sys.executable, str(root / 'scripts/team_recovery.py'),
+        '--manifest', str(manifest), '--output', str(output), '--declaration', str(declaration),
+        '--source-root', str(root), '--approve'], cwd=root,
+        env=dict(os.environ, PYTHONPATH=str(root / 'src'), PYTHONDONTWRITEBYTECODE='1',
+            PYTHON_DOTENV_DISABLED='1'), capture_output=True, text=True, timeout=45)
+    assert result.returncode != 0, result.stdout
+    assert 'design' in result.stderr, result.stderr
+    assert manifest.read_bytes() == original and not output.exists()
 

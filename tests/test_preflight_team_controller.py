@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_lifecycle import WorkerLifecycle
 from saas_bench.run_state import write_json
+from saas_bench.model_usage import ModelUsage
 from test_preflight_team_flow import completion, final
 from test_preflight_team_observer import observer
 
@@ -84,6 +87,8 @@ def test_real_act_waits_then_resumes_same_request_without_hold(observer, control
                 if pending == 'coverage':
                     with path.open('a') as stream:
                         stream.write('}\n')
+                if pending == 'quota':
+                    observer.state['quota_retry_at'] = 0
                 assert observer.poll()['status'] == 'healthy'
             finally:
                 release.set()
@@ -93,6 +98,74 @@ def test_real_act_waits_then_resumes_same_request_without_hold(observer, control
         assert agent.total_turns == 1
     finally:
         client.close()
+
+
+def test_two_quota_network_errors_then_recovery_releases_same_model_call(observer, controller, monkeypatch):
+    clock, calls, waits, requests = [1000.0], [], [], []
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        address = probe.getsockname()
+    monkeypatch.setattr(observer.module.round5, 'ENDPOINT', f'http://127.0.0.1:{address[1]}/')
+    monkeypatch.setenv('OPENCODE_API_KEY', 'offline-test')
+    def forbid_credentials(*args):
+        raise AssertionError('Offline quota test must not read credentials')
+    monkeypatch.setattr(observer.module.round5, 'load_env_file', forbid_credentials)
+    class QuotaServer(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'usage': observer.quota()}).encode())
+        def log_message(self, *args):
+            pass
+    servers = []
+    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
+    def unavailable():
+        calls.append(clock[0])
+        return observer.module.round5.quota_health()
+    def quota_poll():
+        return observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+            observer.state, quota_fn=unavailable)
+    assert quota_poll()['status'] == 'pending'
+    def wait(seconds):
+        assert seconds == .25 and not requests and not observer.hold.exists()
+        waits.append(clock[0])
+        clock[0] = observer.state['quota_retry_at']
+        if len(waits) == 1:
+            assert quota_poll()['status'] == 'pending'
+            assert observer.state['quota_failures'] == 2
+        else:
+            server = ThreadingHTTPServer(address, QuotaServer)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            servers.append((server, thread))
+            thread.start()
+            assert quota_poll()['status'] == 'healthy'
+    monkeypatch.setattr(controller.module.time, 'sleep', wait)
+    def respond(request):
+        requests.append(request)
+        return completion(final('same pending call recovered'), stream=True)
+    usage = ModelUsage(observer.output.parent / 'model-entry.jsonl', 'growth')
+    try:
+        with batch.checked_client('growth', 'offline', transport=httpx.MockTransport(respond),
+                request_guard=controller.gate, response_guard=controller.gate.response, hold=observer.hold) as client:
+            agent = BashAgent(get_bash_agent_tool_descriptions(), client, model=batch.MODEL,
+                system_prompt='Give advice.', workspace_path=observer.output.parent,
+                identity=SimpleNamespace(role='growth'), reasoning_effort='high', allow_final_text=True,
+                usage_recorder=usage)
+            assert agent.act('dashboard', 0, False, {'day': 0}) == FinalText('same pending call recovered')
+            assert agent._llm_attempt == 1 and len(requests) == 1
+            assert agent.act('next dashboard', 7, False, {'day': 7}) == FinalText('same pending call recovered')
+    finally:
+        for server, thread in servers:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+    assert calls == [1000, 1005, 1015] and waits == [1000, 1005]
+    assert len(requests) == 2 and usage.summary['calls'] == 2
+    assert observer.state['quota_failures'] == 0 and not observer.hold.exists()
+    rows = [json.loads(line) for line in usage.path.read_text().splitlines()]
+    assert sum(row['event'] == 'http_request' for row in rows) == 2
+    assert sum(row['event'] == 'http_response' for row in rows) == 2
 
 
 @pytest.mark.parametrize('retry', [False, True])
@@ -196,15 +269,18 @@ def test_run_evidence_stop_cancels_only_own_model_request(observer, controller):
     assert not observer.hold.exists()
 
 
-@pytest.mark.parametrize('stop', ['HOLD', 'STOP', 'QUOTA_EXHAUSTED', 'second_quota', 'identity'])
-def test_global_conditions_cancel_before_model_request(observer, controller, stop):
+@pytest.mark.parametrize('stop', ['HOLD', 'STOP', 'QUOTA_EXHAUSTED', 'quota_timeout', 'identity'])
+def test_global_conditions_cancel_before_model_request(observer, controller, monkeypatch, stop):
     observer.poll()
-    if stop == 'second_quota':
+    if stop == 'quota_timeout':
+        clock = [1000.0]
+        monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
         def unavailable():
             raise httpx.ConnectError('unavailable')
         for _ in range(2):
             observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                  observer.state, quota_fn=unavailable)
+            clock[0] += observer.module.QUOTA_OUTAGE_SECONDS
     elif stop == 'identity':
         health = batch.read(observer.output / 'health.json')
         health['batch_id'] = 'another-batch'
@@ -313,6 +389,7 @@ def test_controller_preserves_live_peer_when_other_worker_exits(observer, contro
     monkeypatch.setattr(controller.module.os, 'killpg', signal_group)
     monkeypatch.setattr(controller.module.time, 'sleep', tick)
     monkeypatch.setattr(controller.module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(controller.module.time, 'time', lambda: clock[0] + 1000)
     monkeypatch.setattr(controller.module, 'poll', poll)
     results = controller.module.supervise(controller.policy)
     assert [record['status'] if record else None for record in results] == [

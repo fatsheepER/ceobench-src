@@ -221,15 +221,42 @@ def prompt_templates(runtime):
             for role, rr in runtime.roles.items()}
 
 
-def close_team(runtime):
+def close_team(runtime, record=None):
     clients = [rr.agent.client for rr in runtime.roles.values()]
     customer = getattr(runtime.server.simulator, 'customer_simulator', None)
     if customer and customer.client:
         clients.append(customer.client)
-    runtime.close()
-    for client in clients:
-        client.close()
-    runtime.server.conn.close()
+    with ExitStack() as cleanup:
+        cleanup.callback(runtime.server.conn.close)
+        for client in clients:
+            cleanup.callback(client.close)
+        runtime.close()
+        path = runtime.root.parent / 'attempt.json'
+        if path.exists():
+            record = record if record is not None else read(path)
+            if record.get('status') == 'paused' and record.get('checkpoint'):
+                from .team_checkpoint import validate_recovery_source, validate_snapshot
+                snapshot, state = validate_snapshot(record['checkpoint'])
+                try:
+                    validate_recovery_source(snapshot, state, current_root=runtime.root)
+                except RuntimeError as exc:
+                    record['recovery_validation'] = dict(eligible=False, error=str(exc))
+                    if runtime.failure == 'business_operation_pending':
+                        try:
+                            snapshot = save_checkpoint(runtime, path.parent, record, 'settled')
+                        except (ValueError, RuntimeError) as unsettled:
+                            record['recovery_validation'] = dict(eligible=False, error=str(unsettled))
+                        else:
+                            snapshot, state = validate_snapshot(snapshot)
+                            validate_recovery_source(snapshot, state, current_root=runtime.root)
+                            record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
+                                checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
+                                day=state['day'], stage=state['stage'], current_operation_coverage=True)
+                else:
+                    record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
+                        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
+                        day=state['day'], stage=state['stage'], current_operation_coverage=True)
+                write_json(path, record)
 
 
 def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=None, token_counter=None):
@@ -642,7 +669,7 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             raise
         finally:
             if team:
-                close_team(team)
+                close_team(team, record)
 
 
 def execute(team, manifest, entry, directory, record, hold):
@@ -665,7 +692,7 @@ def _execute(team, manifest, entry, directory, record, hold):
     team.checkpoint_callback = checkpoint
     outcome = team.run(stop_after_day=entry['stop_after_day'], hold=hold)
     reason = outcome.reason
-    if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled', 'sql_evidence_pending', 'registered_script_transient_infrastructure'):
+    if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled', 'sql_evidence_pending', 'business_operation_pending', 'registered_script_transient_infrastructure'):
         reason = 'failed'
     reuse = (last_boundary is not None and reason == 'observation_end' and
         outcome.day == entry['stop_after_day'] == team.server.tools.current_day and

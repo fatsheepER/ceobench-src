@@ -203,6 +203,7 @@ class ModelUsage:
         self.expected_model = expected_model
         self.message_ids = []
         self.world_state = lambda: None
+        self.request_check = lambda: None
         self.call_world_state = None
         self.evidence_store = evidence_store
         self.token_counter = token_counter
@@ -243,6 +244,7 @@ class ModelUsage:
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
             recorder, call_id = _CALL.get() or (self, None)
+            recorder.request_check()
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
             with recorder.lock:
@@ -336,6 +338,7 @@ class ModelUsage:
             return self._call(api, request, invoke, **context)
 
     def _call(self, api, request, invoke, **context):
+        self.request_check()
         self.last_request_event = None
         self.call_world_state = self.world_state()
         replacements = []
