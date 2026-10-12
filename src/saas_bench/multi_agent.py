@@ -248,10 +248,19 @@ class MultiAgentRuntime:
             from .team_checkpoint import business_operations
             with self.server._request_lock:
                 state.update(wrapper_version=1, business_operations_before=business_operations(self.root),
-                    workspace_sha256_before=tree_hash(self.roles['ceo'].workspace),
+                    workspace_sha256_before=self._workspace_fingerprint(),
                     mutation_epoch_before=self.server._request_mutations)
         write_json(path, state)
         return path
+
+    def _workspace_fingerprint(self):
+        if any(executor.preserved_process for executor in
+                (self.roles['ceo'].executor, self.server.role_executors['ceo'])):
+            return None
+        workspace = self.roles['ceo'].workspace
+        if workspace.is_symlink() or any(path.is_symlink() for path in workspace.rglob('*')):
+            return None
+        return tree_hash(workspace)
 
     def _finish_operation(self, path, executor=None):
         state = json.loads(path.read_text())
@@ -261,15 +270,20 @@ class MultiAgentRuntime:
             from .team_checkpoint import business_operations, recovery_operation_safe
             subprocess = state['kind'] in ('ceo_tool:bash', 'ceo_scripts')
             status = getattr(executor, 'last_status', None)
+            boundary = getattr(executor, '_bash_facts', {}).get('process_boundary') or {}
+            client_closed = (not executor.preserved_process and not getattr(executor, '_pf_service', None) and
+                (not subprocess or (boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait' and
+                    boundary.get('descendants_closed') is True and boundary.get('children') == [] and
+                    boundary.get('unknown', 'missing') is None and boundary.get('exit_code') is not None)))
             with self.server._request_lock:
                 requests = self.server.public_request_state()
                 state['recovery'] = dict(
                     classification='pending_read_only' if requests['active'] else
                         'read_only_interrupted' if status == 'result_unknown' else 'read_only',
-                    client_closed=not executor.preserved_process and not getattr(executor, '_pf_service', None),
-                    subprocess=subprocess, process_boundary=getattr(executor, '_bash_facts', {}).get('process_boundary'),
+                    client_closed=client_closed,
+                    subprocess=subprocess, process_boundary=boundary,
                     business_operations_after=business_operations(self.root),
-                    workspace_sha256_after=tree_hash(self.roles['ceo'].workspace),
+                    workspace_sha256_after=self._workspace_fingerprint() if client_closed else None,
                     mutation_epoch_after=requests['mutation_epoch'],
                     pending_requests=requests['active'], queued_requests=requests['queued'],
                     operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)

@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
+import shlex
 
 import httpx
 import pytest
@@ -36,7 +37,7 @@ def managed_git(frozen, tmp_path, request):
 
 @pytest.mark.parametrize('managed_git,interruption', [(group, case) for group in ('git', 'pf')
     for case in ('completed', 'cancelled', 'pending_query', 'pending_write', 'registered_write', 'local_write')]
-    + [('pf', 'pending_capture')], indirect=['managed_git'])
+    + [('pf', 'pending_capture'), ('git', 'symlink'), ('pf', 'symlink')], indirect=['managed_git'])
 def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monkeypatch, interruption):
     from saas_bench import api_server
     team, directory, record, manifest, entry = managed_git
@@ -61,7 +62,19 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return receive(handler)
         monkeypatch.setattr(execution_capture, 'receive_client', delayed_capture)
     command = 'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'
-    blocked = interruption in ('pending_write', 'registered_write', 'local_write')
+    blocked = interruption in ('pending_write', 'registered_write', 'local_write', 'symlink')
+    hashed_symlinks = []
+    if interruption == 'symlink':
+        from saas_bench import run_state
+        target = tmp_path / 'host-canary.txt'
+        target.write_text('Nonsensitive host fixture.\n')
+        original_hash = run_state.file_hash
+        def observed_hash(path):
+            if Path(path).is_symlink():
+                hashed_symlinks.append(str(path))
+            return original_hash(path)
+        monkeypatch.setattr(run_state, 'file_hash', observed_hash)
+        command = 'ln -s ' + shlex.quote(str(target)) + ' evidence-link'
     if interruption == 'registered_write':
         command = './novamind-operation register-daily-script registered.py'
     if interruption == 'local_write':
@@ -83,6 +96,8 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         wire.append(body)
         if len(wire) == 1:
             message = calls(('bash', dict(command=command)))
+        elif interruption == 'symlink' and len(wire) == 2:
+            message = calls(('read_file', dict(path='MEMORY.md')))
         else:
             hold.touch()
             message = calls(('bash', dict(command=ADVANCE)))
@@ -122,7 +137,14 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             assert result['status'] == ('failed' if interruption == 'pending_write' and entry['group'] == 'pf' else 'paused')
             assert result['checkpoint'] == str(source)
             assert result['recovery_validation']['eligible'] is not blocked
-            assert role.executor._bash_facts['boundary_closed'] is True
+            if interruption == 'symlink':
+                assert hashed_symlinks == []
+                bash = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
+                    if batch.read(path)['kind'] == 'ceo_tool:bash')
+                assert bash['recovery']['client_closed'] is True
+                assert bash['recovery']['process_boundary']['descendants_closed'] is True
+            else:
+                assert role.executor._bash_facts['boundary_closed'] is True
             if interruption in ('pending_query', 'pending_write', 'pending_capture'):
                 assert entered.is_set() and not release.is_set()
             if interruption in ('pending_query', 'pending_capture'):
@@ -138,6 +160,8 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
                 before = operation.read_bytes()
                 team._finish_operation(operation, role.executor)
                 assert operation.read_bytes() == before
+            if interruption == 'symlink':
+                assert hashed_symlinks == []
             if blocked:
                 with pytest.raises(RuntimeError, match='changed|unknown'):
                     validate_recovery_source(source, state, current_root=team.root)
