@@ -7,6 +7,8 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -719,6 +721,78 @@ def test_paused_and_failed_outcomes_still_freeze_final_state(managed_team, tmp_p
     assert result['checkpoint_reused_at_stop'] is False
     state = batch.read(Path(result['checkpoint']) / 'team.json')
     assert state['phase'] == 'paused' and state['failure'] == failure
+
+
+@pytest.mark.parametrize('operation', ['covered', 'new_completed', 'unknown'])
+def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_path, monkeypatch, operation):
+    from saas_bench import api_server
+    from test_sql_evidence import settled
+    from test_execution_capture import records
+    path = changed_manifest(frozen, tmp_path, lambda manifest: None)
+    manifest = batch.validate_manifest(path)
+    entry = next(row for row in manifest['runs'] if row['group'] == 'pf')
+    entered, release = threading.Event(), threading.Event()
+    execute = api_server.execute_query
+    sent = []
+
+    def delayed_query(*args, **kwargs):
+        entered.set()
+        assert release.wait(15), 'query release missing'
+        return execute(*args, **kwargs)
+
+    def client_factory(role):
+        def transport(request):
+            sent.append(role)
+            body = json.loads(request.content)
+            return completion(final('Use existing public data.'), body.get('stream', False))
+        return batch.checked_client(role, 'offline', transport=httpx.MockTransport(transport))
+
+    monkeypatch.setattr(api_server, 'execute_query', delayed_query)
+    with batch.run_lock(Path(entry['output_dir'])):
+        directory, record, _ = batch.register_attempt(path, manifest, entry)
+        team = batch.make_team(manifest, entry, directory, client_factory=client_factory)
+        try:
+            record['status'] = 'ready'
+            batch.save_checkpoint(team, directory, record, 'ready')
+            previous = record['checkpoint']
+            if operation != 'covered':
+                write_json(team.root / 'private/operations/post-snapshot.json',
+                    dict(status='completed' if operation == 'new_completed' else 'started'))
+            team._set_phase('analysis')
+            growth = team.roles['growth']
+            growth.executor.bash_timeout, growth.executor.bash_warn_after = .5, .1
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                running = pool.submit(growth.executor.execute, 'bash', dict(
+                    command='python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'))
+                assert entered.wait(5)
+                output = running.result(timeout=5)
+                assert 'timed out after 0.5 seconds' in output
+            result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
+            assert result['status'] == 'paused'
+            assert result['reason'] == 'paused' and result['runtime_failure'] == 'sql_evidence_pending'
+            assert batch.read(directory / 'attempt.json')['status'] == 'paused'
+            assert result['checkpoint'] == previous
+            assert 'outside a recoverable handoff' in result['checkpoint_error']
+            assert result['recovery_validation']['eligible'] is (operation == 'covered')
+            assert growth.store.fault is None and not growth.store.fault_path.exists()
+            assert 'growth' not in sent and 'ceo' not in sent
+            rows = records(growth.store)
+            assert any(row['request']['kind'] == 'sql_query' for row in rows)
+            assert not any(row['request']['kind'] == 'model_request' for row in rows)
+            release.set()
+            settled(team.server)
+            growth.store.assert_healthy()
+            if operation != 'covered':
+                with pytest.raises(RuntimeError, match='Business operation'):
+                    batch.register_attempt(path, manifest, entry, resume=True)
+        finally:
+            release.set()
+            batch.close_team(team)
+    if operation == 'covered':
+        resumed = batch.prepare(path, entry['run_id'], resume=True, client_factory=client_factory)
+        assert resumed['status'] == 'ready' and resumed['attempt'] == 2
+        assert resumed['source_checkpoint'] == previous
+        validate_snapshot(resumed['checkpoint'])
 
 
 @pytest.mark.parametrize('key, value', [('analyst_bash_timeout', 600), ('analyst_bash_warn_after', 60),
