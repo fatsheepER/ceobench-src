@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import socket
+import select
 import sys
 import threading
 import time
@@ -195,6 +196,9 @@ class _APIHandler(BaseHTTPRequestHandler):
         return self.server._api_server.evidence_for(self.role)
 
     def handle_one_request(self):
+        api = self.server._api_server
+        with api._request_lock:
+            api._active_requests[id(self.connection)] = dict(read_only=False, method=None, path=None)
         for name in ('_request_deadline', '_request_body', '_request_body_complete'):
             self.__dict__.pop(name, None)
         self._start_public_request()
@@ -207,6 +211,19 @@ class _APIHandler(BaseHTTPRequestHandler):
             return super().handle_one_request()
         finally:
             timer.cancel()
+
+    def parse_request(self):
+        parsed = super().parse_request()
+        if parsed:
+            api = self.server._api_server
+            read_only = (self.command == 'POST' and self.path in ('/query', '/_capture') or
+                self.command == 'GET' and self.path in ('/health', '/game-status', '/daily-scripts', '/vars'))
+            with api._request_lock:
+                api._active_requests[id(self.connection)] = dict(
+                    read_only=read_only, method=self.command, path=self.path)
+                if not read_only and self.path != '/call':
+                    api._request_mutations += 1
+        return parsed
 
     def _expire_request_input(self):
         try:
@@ -521,6 +538,11 @@ class _APIHandler(BaseHTTPRequestHandler):
             args = body.get('args', {})
 
             server: NovaMindAPIServer = self.server._api_server
+            with server._request_lock:
+                read_only = CALL_POLICY.get(tool_name) == 'read'
+                server._active_requests[id(self.connection)]['read_only'] = read_only
+                if not read_only:
+                    server._request_mutations += 1
             if server.read_only_task and tool_name not in READ_ONLY_TASK_TOOLS:
                 self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
                 return
@@ -902,7 +924,26 @@ _TOOL_DISPATCH = {
 assert set(CALL_POLICY) == set(_TOOL_DISPATCH), 'Every public tool needs an explicit role policy'
 
 
-class _UnixHTTPServer(ThreadingHTTPServer):
+class _TrackedHTTPServer(ThreadingHTTPServer):
+    def get_request(self):
+        api = self._api_server
+        # Account for accepted sockets before a handler thread can be delayed.
+        with api._request_lock:
+            request, address = super().get_request()
+            api._active_requests[id(request)] = dict(read_only=False, method=None, path=None)
+        return request, address
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            api = self._api_server
+            with api._request_lock:
+                api._active_requests.pop(id(request), None)
+                api._request_lock.notify_all()
+
+
+class _UnixHTTPServer(_TrackedHTTPServer):
     address_family = socket.AF_UNIX
 
     def server_bind(self):
@@ -972,6 +1013,9 @@ class NovaMindAPIServer:
         self.port: int = 0
         self._lock = threading.RLock()
         self._sql_lock = threading.Condition()
+        self._request_lock = threading.Condition()
+        self._active_requests = {}
+        self._request_mutations = 0
         self._sql_active = 0
         self._sql_paused = False
         self._advance_lock = threading.Lock()
@@ -1006,7 +1050,7 @@ class NovaMindAPIServer:
 
     def start(self):
         """Start the HTTP server in a background thread."""
-        self._httpd = ThreadingHTTPServer(('127.0.0.1', 0), _APIHandler)
+        self._httpd = _TrackedHTTPServer(('127.0.0.1', 0), _APIHandler)
         self._httpd._api_server = self
         self._httpd._role = None if self.team_mode else "ceo"
         self.port = self._httpd.server_address[1]
@@ -1031,6 +1075,13 @@ class NovaMindAPIServer:
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
+
+    def public_request_state(self):
+        with self._request_lock:
+            listeners = [server.socket for server in [self._httpd, *self._role_httpds] if server]
+            return dict(active=list(self._active_requests.values()),
+                queued=bool(listeners and select.select(listeners, [], [], 0)[0]),
+                mutation_epoch=self._request_mutations)
 
     def evidence_for(self, role):
         return self.role_stores.get(role) if self.team_mode else self.sql_evidence

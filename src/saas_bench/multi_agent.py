@@ -16,7 +16,7 @@ from .api_server import NovaMindAPIServer
 from .execution_capture import join_text
 from .model_usage import ModelUsage
 from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit
-from .run_state import write_json
+from .run_state import tree_hash, write_json
 from .run_lifecycle import RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
 from .text_registry import TextRegistry
@@ -243,14 +243,47 @@ class MultiAgentRuntime:
 
     def _begin_operation(self, kind):
         path = self.root / 'private' / 'operations' / (uuid.uuid4().hex + '.json')
-        write_json(path, dict(kind=kind, day=self.server.tools.current_day, status='running'))
+        state = dict(kind=kind, day=self.server.tools.current_day, status='running')
+        if kind == 'ceo_scripts' or kind.startswith('ceo_tool:'):
+            from .team_checkpoint import business_operations
+            with self.server._request_lock:
+                state.update(wrapper_version=1, business_operations_before=business_operations(self.root),
+                    workspace_sha256_before=tree_hash(self.roles['ceo'].workspace),
+                    mutation_epoch_before=self.server._request_mutations)
+        write_json(path, state)
         return path
 
     def _finish_operation(self, path, executor=None):
+        state = json.loads(path.read_text())
+        if state['status'] in ('completed', 'interrupted'):
+            return
+        if state.get('wrapper_version') == 1 and executor:
+            from .team_checkpoint import business_operations, recovery_operation_safe
+            subprocess = state['kind'] in ('ceo_tool:bash', 'ceo_scripts')
+            status = getattr(executor, 'last_status', None)
+            with self.server._request_lock:
+                requests = self.server.public_request_state()
+                state['recovery'] = dict(
+                    classification='pending_read_only' if requests['active'] else
+                        'read_only_interrupted' if status == 'result_unknown' else 'read_only',
+                    client_closed=not executor.preserved_process and not getattr(executor, '_pf_service', None),
+                    subprocess=subprocess, process_boundary=getattr(executor, '_bash_facts', {}).get('process_boundary'),
+                    business_operations_after=business_operations(self.root),
+                    workspace_sha256_after=tree_hash(self.roles['ceo'].workspace),
+                    mutation_epoch_after=requests['mutation_epoch'],
+                    pending_requests=requests['active'], queued_requests=requests['queued'],
+                    operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)
+                state['status'] = 'interrupted' if status == 'result_unknown' else 'completed'
+                state['execution_status'] = status
+                if recovery_operation_safe(self.root, state):
+                    write_json(path, state)
+                    return
+                state['recovery']['classification'] = 'unproven'
         if (self.server._operation_failed or self.server._step_day_timed_out or
                 executor and (executor.preserved_process or getattr(executor, 'last_status', None) == 'result_unknown')):
+            state['status'] = 'running'
+            write_json(path, state)
             raise RuntimeError('Business operation outcome unknown; continuation refused')
-        state = json.loads(path.read_text())
         write_json(path, dict(state, status='completed'))
 
     def _guard_business_operations(self):
@@ -338,9 +371,11 @@ class MultiAgentRuntime:
         operation = None
         if role == 'ceo' and self.server.get_daily_scripts(role):
             operation = self._begin_operation('ceo_scripts')
-        outputs = self.server._run_daily_scripts_internal(role)
-        if operation is not None:
-            self._finish_operation(operation, self.server.role_executors[role])
+        try:
+            outputs = self.server._run_daily_scripts_internal(role)
+        finally:
+            if operation is not None:
+                self._finish_operation(operation, self.server.role_executors[role])
         if any(r['status'] != 'succeeded' for r in self.server.role_script_results[role]):
             raise RunCancelled('registered_script_failed')
         text = ''
@@ -459,11 +494,13 @@ class MultiAgentRuntime:
                         self._boundary('ask_completed')
                 else:
                     operation = self._begin_operation('ceo_tool:' + action.tool)
-                    result = runtime.executor.execute(action.tool, action.arguments,
-                        model_request_event=runtime.usage.last_request_event,
-                        model_context_id=runtime.usage.context_id)
-                    runtime.agent.record_tool_result(result)
-                    self._finish_operation(operation, runtime.executor)
+                    try:
+                        result = runtime.executor.execute(action.tool, action.arguments,
+                            model_request_event=runtime.usage.last_request_event,
+                            model_context_id=runtime.usage.context_id)
+                        runtime.agent.record_tool_result(result)
+                    finally:
+                        self._finish_operation(operation, runtime.executor)
                 if self.server.tools.current_day != day:
                     while runtime.agent._pending_tool_calls:
                         runtime.agent.record_tool_result('Cancelled because this tool batch crossed a week boundary.')

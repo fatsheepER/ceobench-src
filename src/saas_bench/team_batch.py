@@ -267,11 +267,13 @@ def analyst_bash_settings(manifest):
 
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
                  order_seed=0, excluded_seeds=(), selection_rule='',
-                 root=ROOT, public_dir=None, token_counter=None):
+                 root=ROOT, public_dir=None, token_counter=None, scheduling='paired'):
     root, destination = Path(root).resolve(), Path(destination).resolve()
     public = Path(public_dir or root / 'public').resolve()
     if category not in ('formal', 'engineering'):
         raise ValueError('Category must be formal or engineering')
+    if scheduling not in ('paired', 'group_independent'):
+        raise ValueError('Unknown frozen scheduling policy')
     seeds = list(d0_sources)
     if any(type(seed) is not int or seed < 0 for seed in seeds) or len(seeds) != len(set(seeds)):
         raise ValueError('Seeds must be unique nonnegative integers')
@@ -296,14 +298,18 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
             runs.append(dict(run_id=run_id, pair_id=f's{seed}-r{repeat}', seed=seed, repeat=repeat,
                 group=group, category=category, d0=d0[str(seed)]['path'],
                 output_dir=str(destination / 'runs' / run_id), stop_after_day=112 if category == 'formal' else 28))
+    controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
     manifest = dict(version=1, category=category, batch_id=uuid.uuid4().hex, seeds=seeds,
         excluded_debug_seeds=list(excluded_seeds), seed_selection_rule=selection_rule,
         order=dict(method='python.Random.shuffle pairs then groups', seed=order_seed),
         source_root=str(root), source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
-        controller_sha256={name: file_hash(root / name) for name in CONTROLLER_SCRIPTS},
+        controller_sha256={name: file_hash(root / name) for name in controllers},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
         price_source=price_source, attempt_policy='explicit_resume', d0=d0, runs=runs)
+    if scheduling == 'group_independent':
+        manifest['scheduling'] = dict(mode=scheduling, queues={group:
+            [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
     counter = token_counter or load_counter('opencode', MODEL)
     manifest['tokenizer'] = counter.metadata if counter else None
     prompts = {}
@@ -347,7 +353,8 @@ def validate_manifest(path):
         raise ValueError('Frozen source or public build changed')
     if file_hash(root / 'scripts' / 'team_batch.py') != manifest['host_script_sha256']:
         raise ValueError('Frozen batch entry changed')
-    if manifest.get('controller_sha256') != {name: file_hash(root / name) for name in CONTROLLER_SCRIPTS}:
+    controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling_policy(manifest) == 'group_independent' else CONTROLLER_SCRIPTS
+    if manifest.get('controller_sha256') != {name: file_hash(root / name) for name in controllers}:
         raise ValueError('Frozen controller or observer changed')
     check_prices(manifest['pricing'], manifest['price_source'])
     category, seeds = manifest['category'], manifest['seeds']
@@ -380,9 +387,21 @@ def validate_manifest(path):
         outputs.add(output)
     if actual != expected or len(manifest['runs']) != len(expected):
         raise ValueError('Frozen run list is incomplete')
+    scheduling_policy(manifest)
     if set(manifest['prompts']) != {'git', 'pf'} or any(set(p) != set(ROLES) for p in manifest['prompts'].values()):
         raise ValueError('Frozen role prompts are incomplete')
     return manifest
+
+
+def scheduling_policy(manifest):
+    policy = manifest.get('scheduling')
+    if policy is None:
+        return 'paired'
+    expected = dict(mode='group_independent', queues={group:
+        [entry['run_id'] for entry in manifest['runs'] if entry['group'] == group] for group in ('git', 'pf')})
+    if policy != expected:
+        raise ValueError('Frozen scheduling queues differ from the assigned run order')
+    return policy['mode']
 
 
 def selected(manifest, run_id):
@@ -755,6 +774,7 @@ def main(argv=None):
     frozen.add_argument('--excluded-debug-seed', action='append', type=int, default=[])
     frozen.add_argument('--seed-selection-rule', default='')
     frozen.add_argument('--order-seed', type=int, default=0)
+    frozen.add_argument('--scheduling', choices=('paired', 'group_independent'), default='paired')
     for name in ('validate', 'start', 'run', 'resume', 'summarize'):
         sub = commands.add_parser(name)
         sub.add_argument('--manifest', type=Path, required=True)
@@ -774,7 +794,7 @@ def main(argv=None):
             sources[int(seed)] = Path(value)
         result = freeze_batch(args.output, sources, load_pricing(args.pricing), price_source=args.price_source,
             category=args.category, order_seed=args.order_seed, excluded_seeds=args.excluded_debug_seed,
-            selection_rule=args.seed_selection_rule)
+            selection_rule=args.seed_selection_rule, scheduling=args.scheduling)
     elif args.command == 'validate':
         result = validate_manifest(args.manifest)['runs']
     elif args.command == 'summarize':

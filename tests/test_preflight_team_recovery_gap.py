@@ -45,8 +45,11 @@ def test_nonempty_ceo_script_pass_keeps_receipt_and_blocks_old_restore(tmp_path,
         assert 'same.py' in source._script_output('ceo')
         operations = [json.loads(path.read_text()) for path in
             (source.root / 'private/operations').glob('*.json')]
-        assert [op for op in operations if op['kind'] == 'ceo_scripts'] == [
+        wrappers = [op for op in operations if op['kind'] == 'ceo_scripts']
+        assert [{key: op[key] for key in ('kind', 'day', 'status')} for op in wrappers] == [
             dict(kind='ceo_scripts', day=0, status='completed')]
+        assert wrappers[0]['wrapper_version'] == 1
+        assert wrappers[0]['recovery']['classification'] == 'unproven'
         with pytest.raises(RuntimeError, match='after checkpoint'):
             MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
                 client_factory=clients(), simulator_factory=fast_simulator)

@@ -85,26 +85,118 @@ def _pin_snapshot(snapshot):
         write_json(path, pins)
 
 
+def business_operations(root):
+    return {path.name: file_hash(path) for path in (Path(root) / 'private' / 'operations').glob('*.json')
+        if not _wrapper(json.loads(path.read_text()))}
+
+
+def _wrapper(receipt):
+    kind = receipt.get('kind', '')
+    return kind == 'ceo_scripts' or kind.startswith('ceo_tool:')
+
+
+def recovery_operation_safe(root, receipt):
+    proof = receipt.get('recovery', {})
+    if (not _wrapper(receipt) or receipt.get('wrapper_version') != 1 or
+            receipt.get('status') not in ('completed', 'interrupted') or
+            proof.get('classification') not in ('read_only', 'read_only_interrupted', 'pending_read_only') or
+            proof.get('client_closed') is not True or proof.get('operation_failed') is not False or
+            proof.get('step_day_timed_out') is not False or proof.get('queued_requests') is not False or
+            not isinstance(proof.get('business_operations_after'), dict) or
+            receipt.get('business_operations_before') != proof['business_operations_after'] or
+            not isinstance(receipt.get('mutation_epoch_before'), int) or
+            receipt['mutation_epoch_before'] != proof.get('mutation_epoch_after') or
+            not isinstance(receipt.get('workspace_sha256_before'), str) or
+            receipt['workspace_sha256_before'] != proof.get('workspace_sha256_after') or
+            any(request.get('read_only') is not True for request in proof.get('pending_requests', []))):
+        return False
+    if proof.get('subprocess') is False:
+        return receipt['kind'].startswith('ceo_tool:') and receipt['kind'] != 'ceo_tool:bash'
+    boundary = proof.get('process_boundary') or {}
+    return (boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait' and
+        boundary.get('descendants_closed') is True and boundary.get('children') == [] and
+        boundary.get('unknown', 'missing') is None and boundary.get('exit_code') is not None)
+
+
 def _known_operation(root):
     for path in (Path(root) / 'private' / 'operations').glob('*.json'):
-        if json.loads(path.read_text()).get('status') != 'completed':
+        receipt = json.loads(path.read_text())
+        if receipt.get('status') != 'completed' and not recovery_operation_safe(root, receipt):
             raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
+
+
+def _approved_residuals(snapshot):
+    from .team_recovery import approval
+    revision = approval()
+    if not revision:
+        return {}
+    matches = [saved for saved in revision['attempts'].values()
+        if saved.get('checkpoint') == str(Path(snapshot).resolve()) and
+        saved.get('checkpoint_sha256') == file_hash(Path(snapshot) / 'checkpoint.json')]
+    approved = {}
+    for saved in matches:
+        for residual in saved.get('residual_operations', []):
+            root = Path(residual['root'])
+            filename = residual['operation']
+            if (not root.is_absolute() or root.resolve() != root or Path(filename).name != filename or
+                    not filename.endswith('.json') or not residual.get('reason', '').strip() or
+                    not residual.get('evidence')):
+                raise ValueError('Recovery residual requires an exact root, receipt, reason and evidence')
+            operation = root / 'private' / 'operations' / filename
+            if operation.is_symlink():
+                raise ValueError('Recovery residual operation cannot be a symlink')
+            if file_hash(operation) != residual['sha256']:
+                raise ValueError('Approved residual operation changed')
+            receipt = json.loads(operation.read_text())
+            classification = residual['classification']
+            if classification in ('read_only_interrupted', 'pending_read_only'):
+                if not _wrapper(receipt):
+                    raise ValueError('Read-only residual approval cannot cover a business operation')
+                proof = receipt.get('recovery', {})
+                contradictory = (proof.get('operation_failed') is True or proof.get('step_day_timed_out') is True or
+                    any(before in receipt and after in proof and receipt[before] != proof[after]
+                        for before, after in (('business_operations_before', 'business_operations_after'),
+                            ('mutation_epoch_before', 'mutation_epoch_after'),
+                            ('workspace_sha256_before', 'workspace_sha256_after'))))
+                if contradictory:
+                    raise ValueError('Read-only residual approval contradicts recorded mutations or server failure')
+            elif classification != 'unknown_business_write' or saved.get('allow_unknown_business_write') is not True:
+                raise ValueError('Unknown business write requires explicit recovery approval')
+            for value, checksum in residual['evidence'].items():
+                evidence = Path(value)
+                if not evidence.is_absolute() or evidence.resolve() != evidence or file_hash(evidence) != checksum:
+                    raise ValueError('Approved residual recovery evidence changed')
+            key = str(root), filename
+            if key in approved and approved[key] != residual:
+                raise ValueError('Conflicting residual operation approvals')
+            approved[key] = residual
+    return approved
 
 
 def validate_recovery_source(snapshot, state, *, current_root=None):
     """Reject rollback across operations that the stored world does not contain."""
     snapshot = Path(snapshot)
-    frozen = {p.name: file_hash(p) for p in (snapshot / 'private' / 'operations').glob('*.json')}
+    approved = _approved_residuals(snapshot)
+    frozen = {p.name: file_hash(p) for p in (snapshot / 'private' / 'operations').glob('*.json')
+        if not recovery_operation_safe(snapshot, json.loads(p.read_text()))}
     roots = {Path(state['source_root'])}
     if current_root is not None:
         roots.add(Path(current_root))
     for root in roots:
         if not root.is_dir():
             raise RuntimeError('Recovery source is unavailable; operation coverage cannot be verified')
-        _known_operation(root)
-        current = {p.name: file_hash(p) for p in (root / 'private' / 'operations').glob('*.json')}
+        current = {}
+        for path in (root / 'private' / 'operations').glob('*.json'):
+            receipt = json.loads(path.read_text())
+            if recovery_operation_safe(root, receipt) or (str(root.resolve()), path.name) in approved:
+                continue
+            if receipt.get('status') != 'completed':
+                raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
+            current[path.name] = file_hash(path)
+        frozen_root = {name: checksum for name, checksum in frozen.items()
+            if (str(root.resolve()), name) not in approved}
         # A completed receipt identifies a known outcome, not a snapshotted outcome.
-        if current != frozen:
+        if current != frozen_root:
             raise RuntimeError('Business operations changed after checkpoint; recovery refused')
 
 
@@ -150,9 +242,19 @@ def checkpoint(runtime, destination=None):
             server._sql_paused = True
             if not server._sql_lock.wait_for(lambda: server._sql_active == 0, timeout=180):
                 raise RuntimeError('World query is still in flight')
+        with server._request_lock:
+            def quiescent():
+                requests = server.public_request_state()
+                return not requests['active'] and not requests['queued']
+            if not server._request_lock.wait_for(quiescent, timeout=3):
+                raise RuntimeError('Public HTTP operation is still in flight')
         if not server._lock.acquire(blocking=False):
             raise RuntimeError('World API operation is still in flight')
         stack.callback(server._lock.release)
+        stack.enter_context(server._request_lock)
+        requests = server.public_request_state()
+        if requests['active'] or requests['queued']:
+            raise RuntimeError('Public HTTP operation is still in flight')
         _known_operation(runtime.root)
         if server._operation_failed or server._step_day_timed_out:
             raise RuntimeError('World operation outcome unknown; checkpoint refused')
@@ -279,7 +381,6 @@ def validate_snapshot(snapshot):
         if tree_hash(snapshot / name) != receipt[name + '_sha256']:
             raise ValueError('Team checkpoint checksum mismatch for ' + name)
     state = json.loads((snapshot / 'team.json').read_text())
-    _known_operation(state['source_root'])
     _known_operation(snapshot)
     return snapshot, state
 

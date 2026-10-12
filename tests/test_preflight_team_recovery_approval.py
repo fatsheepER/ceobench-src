@@ -30,6 +30,9 @@ def bind_approval(monkeypatch, directory, manifest_path, attempts=None):
         evidence={str(evidence): file_hash(evidence)}, control_freeze_file=str(controls),
         control_freeze_sha256=file_hash(controls), hold=str(directory / 'HOLD'),
         attempts=attempts or {})
+    record.update(fix_classification='harness_fix', fix_commit='offline-fixture',
+        affected_files=record['changed_files'], reason='Offline lifecycle repair proof')
+    monkeypatch.setattr(recovery, 'verify_fix_commit', lambda *args: None)
     path = directory / 'approval.json'
     write_json(path, record)
     monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL', str(path))
@@ -42,8 +45,10 @@ def approved_revision(tmp_path, monkeypatch):
     source = tmp_path / 'legacy'
     shutil.copytree(batch.ROOT / 'src', source / 'src', ignore=shutil.ignore_patterns('__pycache__'))
     (source / 'scripts').mkdir()
-    for name in ('team_batch.py', 'team_controller.py', 'team_observer.py', 'round5.py'):
-        shutil.copyfile(batch.ROOT / 'scripts' / name, source / 'scripts' / name)
+    shutil.copytree(batch.ROOT / 'scripts', source / 'scripts', dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns('__pycache__', '.env', '.env.*'))
+    shutil.copytree(batch.ROOT / 'public', source / 'public', ignore=shutil.ignore_patterns('__pycache__'))
+    shutil.copytree(batch.ROOT / 'public_sources', source / 'public_sources')
     host = source / 'src/saas_bench/run_lifecycle.py'
     host.write_text(host.read_text() + '\n')
     manifest_path = tmp_path / 'formal/manifest.json'
@@ -111,13 +116,14 @@ def test_approval_refuses_drift_before_execution(approved_revision, monkeypatch,
 def test_approval_refuses_business_changes_even_when_fingerprints_are_rebound(approved_revision, monkeypatch):
     path, record, manifest_path = approved_revision
     old = batch.read(manifest_path)
-    business = Path(old['source_root']) / 'src/saas_bench/multi_agent.py'
+    business = Path(old['source_root']) / 'src/saas_bench/simulation.py'
     business.write_text(business.read_text() + '\n')
     old['source_sha256'] = tree_hash(Path(old['source_root']) / 'src')
     write_json(manifest_path, old)
     record['manifest_sha256'] = file_hash(manifest_path)
     record['legacy_runtime_source_sha256'] = tree_hash(business.parent)
-    record['changed_files'].append('src/saas_bench/multi_agent.py')
+    record['changed_files'].append('src/saas_bench/simulation.py')
+    record['affected_files'] = record['changed_files']
     write_json(path, record)
     monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(path))
     with pytest.raises(ValueError, match='business code'):

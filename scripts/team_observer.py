@@ -46,17 +46,21 @@ def identity(path, expected):
         if manifest[key] != expected[key]:
             raise ValueError('Wrong frozen ' + key)
     selection = expected.get('runs')
+    independent = batch.scheduling_policy(manifest) == 'group_independent'
     if selection is None:
         if manifest['category'] != 'engineering' or len(manifest['runs']) != 2:
             raise ValueError('Formal monitoring requires an explicit frozen pair')
         return manifest
-    if (not isinstance(selection, list) or len(selection) != 2 or
+    if (not isinstance(selection, list) or not selection or (not independent and len(selection) != 2) or
             any(not isinstance(run, dict) or set(run) != {'run_id', 'output_dir'} for run in selection)):
         raise ValueError('Monitoring requires two anchored run IDs and output paths')
     runs = [batch.selected(manifest, run['run_id']) for run in selection]
     if any(run['output_dir'] != anchor['output_dir'] for run, anchor in zip(runs, selection)):
         raise ValueError('Wrong monitored run output path')
-    if len({run['pair_id'] for run in runs}) != 1 or {run['group'] for run in runs} != {'git', 'pf'}:
+    if independent:
+        if selection != [{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']]:
+            raise ValueError('Group scheduling must monitor the complete frozen run order')
+    elif len({run['pair_id'] for run in runs}) != 1 or {run['group'] for run in runs} != {'git', 'pf'}:
         raise ValueError('Monitoring requires the git and PF runs from one frozen pair')
     return dict(manifest, runs=runs)
 
