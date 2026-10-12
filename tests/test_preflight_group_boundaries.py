@@ -28,8 +28,22 @@ def original_prompt(days):
                       'lead generation from all ad spend',
                       '- `ads_strength` (0–1, default 0) controls in-app ads only; it does not change how many '
                       'leads ad spend generates')
+    template = ORIGINAL['system_template'].replace('''# Daily script management
+novamind register-daily-script setup.py  # Register a script to run automatically at start of each week
+novamind list-daily-scripts              # List all registered weekly scripts
+novamind remove-daily-script setup.py    # Remove a registered weekly script
+```''', '''# Weekly script management (legacy command names)
+./novamind-operation register-daily-script setup.py  # Register a script to run automatically at start of each week
+./novamind-operation list-daily-scripts              # List all registered weekly scripts
+./novamind-operation remove-daily-script setup.py    # Remove a registered weekly script
+```
+
+Registration snapshots the source file under its filename. Re-register after edits.
+Scripts run in insertion order at the start of each week and must explicitly
+`import novamind_api as nm`. Print results for your weekly input.''')
     years = days / 365
-    return (ORIGINAL['system_template'].replace('{simulator_instructions}', sim)
+    return (template.replace('{simulator_instructions}', sim)
+            .replace('`novamind register-daily-script`', '`./novamind-operation register-daily-script`')
             .replace('{total_days}', str(days))
             # User-approved common repair: resolve the original week placeholder.
             .replace('{total_weeks}', str((days + 6) // 7))
@@ -116,7 +130,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             base = original_prompt(42)
         else:
             # Registration groups: sections integrated in place, weekly wording, one history line.
-            history = '[pf: MEMORY.md@v1, written day 0 | 1 version: pf log MEMORY.md]\n' if mode == 'pf' else ''
+            history = '[pf: MEMORY.md@v1, written day unknown | 1 version: pf log MEMORY.md]\n' if mode == 'pf' else ''
             header = MEMORY_HEADER + history + '\n'
             base = integrate(original_prompt(42), pf=mode == 'pf')
         expected = (base + header + memory[:40000] +
@@ -133,7 +147,11 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
             for item in definitions[:6]:
                 assert ('note' in item['parameters']['properties']) == (item['name'] in NOTE_TOOLS)
                 item['parameters']['properties'].pop('note', None)
-        assert definitions[:6] == ORIGINAL['tools']
+        expected_tools = [dict(item) for item in ORIGINAL['tools']]
+        if mode == 'pf':
+            expected_tools[0]['description'] += (' Run PF directly as `pf`, for example `pf depend r1`; '
+                                                 'never `novamind-operation pf`.')
+        assert definitions[:6] == expected_tools
         assert [t['name'] for t in definitions[6:]] == ([] if mode == 'off' else
             ['text_create', 'text_revise', 'text_retire', 'text_list'])
         assert 'DO_NOT_AUTOLOAD_REGISTRATIONS' not in json.dumps(requests[0])
