@@ -290,6 +290,18 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     if newchecks or newfaults or completed:
         event(new_checks=newchecks, new_faults=newfaults, completed=completed)
     state.update(active_checks=checks, known_faults=sorted(known | set(faults)), progress=progress)
+    units = {}
+    unitfile = output.parent / 'controller-units.json'
+    if unitfile.exists():
+        from saas_bench.systemd_guard import unit_status
+        for run_id, saved in json.loads(unitfile.read_text()).items():
+            units[run_id] = unit_status(saved['unit'], invocation_id=saved.get('invocation_id'),
+                exit_code=saved.get('exit_code'))
+            if units[run_id]['result'] == 'oom-kill':
+                progress[run_id] = dict(progress.get(run_id, {}), status='failed', reason='oom-kill')
+                if run_id not in state.get('known_oom_runs', []):
+                    event(new_checks=['unit_oom:' + run_id])
+        state['known_oom_runs'] = [run_id for run_id, record in units.items() if record['result'] == 'oom-kill']
     write_json(output / 'state.json', state)
     health = dict(time=datetime.now(timezone.utc).isoformat(), manifest=expected['manifest'],
         manifest_sha256=expected['manifest_sha256'],
@@ -297,7 +309,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
         run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],
-        progress=progress, coverage=coverage, state=state)
+        progress=progress, units=units, coverage=coverage, state=state)
     write_json(output / 'health.json', health)
     with (output / 'health.jsonl').open('a') as stream:
         stream.write(json.dumps({key: value for key, value in health.items() if key != 'state'}) + '\n')

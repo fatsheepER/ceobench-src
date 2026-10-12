@@ -1,5 +1,6 @@
 """A per-command supervisor; unfinished descendants retain their sandbox."""
 import json
+import os
 import shlex
 import socket
 import subprocess
@@ -8,11 +9,26 @@ import time
 import tempfile
 import uuid
 
+DEFAULT_MEMORY_LIMIT_BYTES = 1024**3
+
+
+def command_memory_limit(value=None):
+    if value is None:
+        value = os.environ.get('CEOBENCH_BASH_MEMORY_MAX_BYTES', str(DEFAULT_MEMORY_LIMIT_BYTES))
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValueError('Bash memory limit must be a positive integer in bytes') from None
+    if type(value) is not int or value < 32 * 1024**2:
+        raise ValueError('Bash memory limit must be an integer of at least 32 MiB')
+    return value
+
 # This code runs inside the same sandbox as Bash, with no engine imports.
 SUPERVISOR = r'''
-import ctypes, json, os, signal, socket, subprocess, sys, time
+import ctypes, json, os, resource, signal, socket, subprocess, sys, time
 address, key, command = sys.argv[1], sys.argv[2], sys.argv[3]
 verified = sys.argv[4] == 'verified'
+memory_limit = int(sys.argv[5])
 if address.startswith('/'):
     channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     channel.connect(address)
@@ -24,6 +40,12 @@ if linux:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0):
         raise OSError(ctypes.get_errno(), 'Cannot supervise descendants')
+# Set limits here, never in preexec_fn in the threaded host worker.
+hard_limit = resource.getrlimit(resource.RLIMIT_AS)[1]
+if hard_limit != resource.RLIM_INFINITY:
+    memory_limit = min(memory_limit, hard_limit)
+resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 proc = subprocess.Popen(['bash', '-c', command])
 code = None
 unknown = None
@@ -34,7 +56,8 @@ signaled = []
 def report(phase):
     channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
         phase=phase, coverage='subreaper_wait' if linux else 'process_group',
-        stop_requested=stopping, signaled=signaled, reaped=reaped)) + '\n').encode())
+        stop_requested=stopping, signaled=signaled, reaped=reaped,
+        memory_limit_bytes=memory_limit, memory_limit_kind='per_process_address_space')) + '\n').encode())
 try:
     if verified:
         if not linux:
@@ -135,7 +158,8 @@ class BoundaryOpen(RuntimeError):
 
 
 class Boundary:
-    def __init__(self, command, python=sys.executable, *, isolated=False, verified=False):
+    def __init__(self, command, python=sys.executable, *, isolated=False, verified=False, memory_limit_bytes=None):
+        memory_limit_bytes = command_memory_limit(memory_limit_bytes)
         self.socket_dir = tempfile.TemporaryDirectory(prefix='ceobench-boundary-') if isolated else None
         self.listener = socket.socket(socket.AF_UNIX if isolated else socket.AF_INET)
         self.listener.bind(self.socket_dir.name + '/socket' if isolated else ('127.0.0.1', 0))
@@ -143,7 +167,7 @@ class Boundary:
         self.key = uuid.uuid4().hex
         self.command = shlex.join([python, '-c', SUPERVISOR,
                                   '/run/novamind-boundary/socket' if isolated else str(self.listener.getsockname()[1]), self.key, command,
-                                  'verified' if verified else 'legacy'])
+                                  'verified' if verified else 'legacy', str(memory_limit_bytes)])
         self.verified = verified
         self.channel = None
         self.record = None

@@ -330,7 +330,8 @@ class BashAgentToolExecutor:
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
                  text_registry=None, pf_stale_checks=True, pf_refresh=None,
-                 identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None):
+                 identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None,
+                 bash_memory_limit_bytes=None):
         """Initialize the tool executor.
 
         Args:
@@ -338,6 +339,8 @@ class BashAgentToolExecutor:
             env: Extra environment variables for bash commands.
             bash_timeout: Timeout in seconds for bash commands (default 20 min).
             bash_warn_after: Optional completed-command timing notice threshold.
+            bash_memory_limit_bytes: Per-process address-space limit, default 1 GiB or
+                CEOBENCH_BASH_MEMORY_MAX_BYTES. Descendants inherit the hard limit.
         """
         self.audit = audit
         self.identity = identity
@@ -352,6 +355,8 @@ class BashAgentToolExecutor:
         validate_bash_limits(bash_timeout, bash_warn_after)
         self.bash_timeout = bash_timeout
         self.bash_warn_after = bash_warn_after
+        from saas_bench.process_boundary import command_memory_limit
+        self.bash_memory_limit_bytes = command_memory_limit(bash_memory_limit_bytes)
         self.require_sandbox = require_sandbox
         self.stop_on_timeout = stop_on_timeout
         self.evidence_store = evidence_store
@@ -815,7 +820,8 @@ class BashAgentToolExecutor:
         if self.pf_queries:
             from saas_bench.pf_shell import ShellService
             service = self._pf_service = ShellService(self)
-        boundary = Boundary(command, self.python, isolated=bool(self.identity), verified=self.bash_warn_after is not None)
+        boundary = Boundary(command, self.python, isolated=bool(self.identity), verified=self.bash_warn_after is not None,
+                            memory_limit_bytes=self.bash_memory_limit_bytes)
         self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
         try:
             result = self._run_bash(command, boundary)
@@ -849,6 +855,8 @@ class BashAgentToolExecutor:
             'TMPDIR': self.guest_root,
             'LANG': os.environ.get('LANG', 'en_US.UTF-8'),
             'TERM': os.environ.get('TERM', 'xterm'),
+            'OPENBLAS_NUM_THREADS': '1',
+            'OMP_NUM_THREADS': '1',
         }
         env.update(self.extra_env)
         if getattr(self, '_pf_service', None):
@@ -951,6 +959,11 @@ class BashAgentToolExecutor:
                     'Task terminated; descendant cleanup and output stream closure verified. Output is partial.')
             elif proc.returncode != 0:
                 output_parts.append(f"[exit code: {proc.returncode}]")
+                if any(marker in stderr for marker in ('MemoryError', 'Cannot allocate memory',
+                                                       'cannot allocate memory', 'std::bad_alloc')):
+                    output_parts.append('Error: Command reported an allocation failure under the per-process '
+                        f'address-space memory limit of {boundary.record["memory_limit_bytes"]} bytes. '
+                        'Reduce the allocation before retrying. This command has exited; the worker can continue.')
 
             output = '\n'.join(output_parts) if output_parts else "(no output)"
 

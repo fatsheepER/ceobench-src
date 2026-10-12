@@ -11,11 +11,13 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
 from saas_bench.team_recovery import execution_root, hold_path, recovery_source
+from saas_bench.systemd_guard import memory_bytes, scope_command, unit_status
 from team_observer import identity, poll
 
 
@@ -119,7 +121,9 @@ def worker(policy, run_id, *, resume, parent_pid):
     return 0 if record['status'] == 'finished' else 2
 
 
-def supervise(policy, *, resume=False):
+def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0):
+    scope_command([], 'ceobench-validation.scope', memory_high=memory_high,
+                  memory_max=memory_max, memory_swap_max=memory_swap_max)
     policy = Path(policy).resolve()
     gate = RequestGate(policy)
     manifest = gate.manifest()
@@ -142,6 +146,7 @@ def supervise(policy, *, resume=False):
     statefile = directory / 'observer/state.json'
     state = batch.read(statefile) if statefile.exists() else {}
     children, streams = [], []
+    units = {}
     stopped_at, signaled, exited = {}, set(), set()
 
     def event(kind, **fields):
@@ -150,6 +155,13 @@ def supervise(policy, *, resume=False):
 
     def stopped():
         return any(path.exists() for path in (gate.hold, directory / 'STOP', directory / 'QUOTA_EXHAUSTED'))
+
+    def observe_unit(entry, child):
+        saved = units[entry['run_id']]
+        record = unit_status(saved['unit'], invocation_id=saved.get('invocation_id'), exit_code=child.returncode)
+        units[entry['run_id']] = record
+        write_json(directory / 'controller-units.json', units)
+        return record
 
     def stop_children(*, global_stop=False):
         if global_stop:
@@ -199,10 +211,16 @@ def supervise(policy, *, resume=False):
                     '--live', '--worker', entry['run_id'], '--parent-pid', str(os.getpid())]
                 if resume:
                     command.append('--resume')
+                unit = 'ceobench-worker-' + uuid.uuid4().hex + '.scope'
+                command = scope_command(command, unit, memory_high=memory_high,
+                    memory_max=memory_max, memory_swap_max=memory_swap_max)
+                units[entry['run_id']] = dict(unit=unit)
+                write_json(directory / 'controller-units.json', units)
                 child = subprocess.Popen(command, cwd=manifest['source_root'], env=env,
                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
                 children.append((entry, child, ready))
-                event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode)
+                event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode, unit=unit,
+                    memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max)
             while any(child.poll() is None for _, child, _ in children):
                 if time.monotonic() - last_poll >= 300:
                     poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
@@ -211,8 +229,9 @@ def supervise(policy, *, resume=False):
                     if child.poll() is not None and child.pid not in exited:
                         exited.add(child.pid)
                         record = latest(entry) or {}
+                        unit = observe_unit(entry, child)
                         event('worker_exited', run_id=entry['run_id'], exit_code=child.returncode,
-                            status=record.get('status'), day=record.get('day'))
+                            status=record.get('status'), day=record.get('day'), unit=unit)
                         if child.returncode != 0 or record.get('status') != 'finished':
                             try:
                                 os.killpg(child.pid, signal.SIGTERM)
@@ -223,12 +242,16 @@ def supervise(policy, *, resume=False):
             for entry, child, _ in children:
                 child.wait()
                 record = latest(entry) or {}
+                unit = observe_unit(entry, child)
                 event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
-                    status=record.get('status'), day=record.get('day'))
+                    status=record.get('status'), day=record.get('day'), unit=unit)
             if stopped():
                 gate.hold.touch()
-            poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-            return [latest(entry) for entry, _, _ in children]
+            health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+            units.update(health.get('units', {}))
+            return [dict(latest(entry) or {}, status='failed', reason='oom-kill')
+                    if units[entry['run_id']]['result'] == 'oom-kill' else latest(entry)
+                    for entry, _, _ in children]
         except BaseException:
             gate.hold.touch()
             raise
@@ -243,8 +266,11 @@ def supervise(policy, *, resume=False):
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
             write_json(directory / 'controller-exit.json', dict(hold=gate.hold.exists(),
+                failed=gate.hold.exists() or any(record.get('result') != 'success' for record in units.values()) or
+                    any(child.returncode != 0 or
+                    (latest(entry) or {}).get('status') != 'finished' for entry, child, _ in children),
                 children_reaped=all(child.returncode is not None for _, child, _ in children),
-                batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']]))
+                units=units, batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']]))
 
 
 def main(argv=None):
@@ -255,15 +281,27 @@ def main(argv=None):
     parser.add_argument('--resume', action='store_true', help='Explicitly resume paused or failed runs; skip finished runs.')
     parser.add_argument('--worker', help=argparse.SUPPRESS)
     parser.add_argument('--parent-pid', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--memory-high', type=memory_bytes, default=2 * 1024**3,
+        help='Per-worker cgroup MemoryHigh in bytes or K/M/G/T (default 2G).')
+    parser.add_argument('--memory-max', type=memory_bytes, default=3 * 1024**3,
+        help='Per-worker cgroup MemoryMax (default 3G). Each group gets a separate scope.')
+    parser.add_argument('--memory-swap-max', type=memory_bytes, default=0,
+        help='Per-worker cgroup MemorySwapMax (default 0).')
+    parser.add_argument('--bash-memory-max', type=memory_bytes,
+        help='Per-process Bash address-space limit; default 1G or CEOBENCH_BASH_MEMORY_MAX_BYTES.')
     args = parser.parse_args(argv)
     if not args.live:
         parser.error('Execution requires explicit --live')
+    if args.bash_memory_max is not None:
+        from saas_bench.process_boundary import command_memory_limit
+        os.environ['CEOBENCH_BASH_MEMORY_MAX_BYTES'] = str(command_memory_limit(args.bash_memory_max))
     if args.worker:
         if args.parent_pid is None:
             parser.error('Workers require their controller parent PID')
         return worker(args.policy, args.worker, resume=args.resume, parent_pid=args.parent_pid)
-    supervise(args.policy, resume=args.resume)
-    return 0
+    supervise(args.policy, resume=args.resume, memory_high=args.memory_high,
+        memory_max=args.memory_max, memory_swap_max=args.memory_swap_max)
+    return 2 if batch.read(args.policy.resolve().parent / 'controller-exit.json')['failed'] else 0
 
 
 if __name__ == '__main__':

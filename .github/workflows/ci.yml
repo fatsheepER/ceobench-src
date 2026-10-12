@@ -11,6 +11,8 @@ permissions:
 
 env:
   PYTHONHASHSEED: "0"
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
 
 jobs:
   tests:
@@ -35,7 +37,7 @@ jobs:
         run: uv sync --dev
 
       - name: Run tests
-        run: uv run python -m pytest tests -q
+        run: prlimit --as=2147483648 --cpu=900 -- uv run python -m pytest tests -q
 
   public-bundle:
     name: Public Bundle
@@ -59,10 +61,10 @@ jobs:
         run: uv sync --dev
 
       - name: Rebuild public NovaMind bundle
-        run: uv run python scripts/build_public.py
+        run: prlimit --as=2147483648 --cpu=900 -- uv run python scripts/build_public.py
 
       - name: Verify rebuilt NovaMind CLI starts
-        run: python public/novamind-operation --help
+        run: prlimit --as=2147483648 --cpu=30 -- python public/novamind-operation --help
 
       - name: Verify public docs are up to date
         run: git diff --exit-code -- public/docs public/README.md public/requirements.txt
