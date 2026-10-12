@@ -379,7 +379,7 @@ def test_weekly_registration_roots_and_review_hints_keep_role_identity():
         third = ceo.executor.weekly_check(21)
         assert 'Registered texts: 2 active; 2 within their applies window.' in third, third
         assert 'ceo:r2.1 (day 0)' in third and 'text growth:r1.1' in third
-        assert '1 of 1 underlying sources changed' in third
+        assert '1 underlying source changed:' in third
         pending = ceo.store.load_state('pf_review')['pending']
         assert len(pending) == 2 and {v.split('/')[1] for v in pending} == {'ceo'}
         listed = json.loads(ceo.executor.execute('text_list', {'review': 'pending'}))

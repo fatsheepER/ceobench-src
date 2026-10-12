@@ -363,6 +363,14 @@ write_json(record,dict(status='finished',day=28))
         signals.append((pid, sig))
         kill(pid, sig)
 
+    def signal_local_scope(saved, signum):
+        units = batch.read(controller.policy.parent / 'controller-units.json')
+        role = next(role for role, unit in units.items() if unit['unit'] == saved['unit'])
+        child = next(child for name, child in processes if name == role)
+        if child.poll() is None:
+            kill(child.pid, signum)
+        return controller.module.scope_state(saved, exit_code=child.poll())
+
     clock = [0]
 
     def tick(_):
@@ -372,6 +380,7 @@ write_json(record,dict(status='finished',day=28))
 
     monkeypatch.setattr(controller.module.subprocess, 'Popen', launch)
     monkeypatch.setattr(controller.module.os, 'kill', signal_worker)
+    monkeypatch.setattr(controller.module, 'signal_scope', signal_local_scope)
     monkeypatch.setattr(controller.module.time, 'sleep', tick)
     monkeypatch.setattr(controller.module.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(controller.module, 'poll',

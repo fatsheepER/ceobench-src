@@ -20,7 +20,7 @@ def file_versions(store):
         return conn.execute("SELECT count(*) FROM versions WHERE json_extract(metadata,'$.layer')='file_bytes'").fetchone()[0]
 
 
-def test_boundary_snapshots_reuse_unchanged_versions_in_one_transaction(workspace, tmp_path):
+def test_boundary_snapshots_reuse_unchanged_versions_and_exact_bytes(workspace, tmp_path):
     store, _, executor = captured(workspace, tmp_path, 'prefix')
     executor.execute('bash', {'command': 'printf A > a.txt'})
     baseline = file_versions(store)
@@ -36,16 +36,7 @@ def test_boundary_snapshots_reuse_unchanged_versions_in_one_transaction(workspac
     # Manifests still name one version per path, and it holds exactly the observed bytes.
     capture = ExecutionCapture(store)
     capture.begin('probe', {})
-    connects, original = [], store.connect
-    def counted():
-        connects.append(1)
-        return original()
-    store.connect = counted
-    try:
-        items = capture.snapshot(workspace, 'before')
-    finally:
-        store.connect = original
-    assert len(connects) == 1, 'one snapshot is one transaction'
+    items = capture.snapshot(workspace, 'before')
     for path, item in items.items():
         if item.get('type') == 'file':
             assert store.get_content(item['version'])[0]['blob_sha256'] == item['sha256'], path

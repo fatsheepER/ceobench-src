@@ -326,7 +326,7 @@ def test_pending_review_keeps_conditions_live_and_manual_scope_matters(workspace
     assert {v: list(e) for v, e in cold.outgoing.items() if e} == warm
 
 
-def test_each_refresh_source_gets_its_own_timeout(workspace, tmp_path, server, monkeypatch):
+def test_refresh_sources_share_deadline_and_next_call_can_continue(workspace, tmp_path, server, monkeypatch):
     from saas_bench.pf_refresh import refresh
     from saas_bench.public_sql import execute_query
     from test_pf_stale import record_sql
@@ -339,8 +339,11 @@ def test_each_refresh_source_gets_its_own_timeout(workspace, tmp_path, server, m
     monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', .025)
     result = refresh(server, [slow, fast], parent)
     receipts = [store.read_event(store.get_content(result[v])[0]['created_by_event'])['result'] for v in (slow, fast)]
-    assert [r['http_status'] for r in receipts] == [504, 200]
-    assert all(r['attempted'] for r in receipts)
+    assert [r['http_status'] for r in receipts] == [504, 504]
+    assert [r['attempted'] for r in receipts] == [True, False]
+    resumed = refresh(server, [fast], parent)
+    receipt = store.read_event(store.get_content(resumed[fast])[0]['created_by_event'])['result']
+    assert receipt['http_status'] == 200 and receipt['attempted'] is True
     store.complete(parent)
 
 
