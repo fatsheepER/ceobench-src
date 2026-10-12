@@ -21,7 +21,17 @@ class _UnixConnection(http.client.HTTPConnection):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
             self.sock.settimeout(self.timeout)
-        self.sock.connect(os.environ['NOVAMIND_API_SOCKET'])
+        address = os.environ['NOVAMIND_API_SOCKET']
+        descriptor = None
+        if len(os.fsencode(address)) >= 108:
+            parent, name = os.path.split(address)
+            descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            address = f'/proc/self/fd/{descriptor}/{name}'
+        try:
+            self.sock.connect(address)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 class _UnixHandler(urllib.request.HTTPHandler):

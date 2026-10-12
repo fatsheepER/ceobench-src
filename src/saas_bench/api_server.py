@@ -943,11 +943,31 @@ class _TrackedHTTPServer(ThreadingHTTPServer):
                 api._request_lock.notify_all()
 
 
+def registered_script_classification(facts, error=None):
+    import errno
+    boundary = facts.get('process_boundary') or {}
+    resource_errno = {errno.ENOSPC, errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.EDQUOT}
+    if (facts.get('error_errno') in resource_errno or boundary.get('spawn_errno') in resource_errno or
+            facts.get('timed_out') or facts.get('cancelled') or
+            facts.get('exit_code') == -9 or boundary.get('exit_code') == -9):
+        return 'transient_infrastructure'
+    if facts.get('process_started') is False or facts.get('target_started') is not True and not error:
+        return 'transient_infrastructure'
+    if facts.get('boundary_closed') is not True or error:
+        return 'unknown'
+    if facts.get('target_started') is not True:
+        return 'transient_infrastructure'
+    if facts.get('exit_code') == 0:
+        return 'succeeded'
+    return 'script_error' if facts.get('exit_code') is not None else 'unknown'
+
+
 class _UnixHTTPServer(_TrackedHTTPServer):
     address_family = socket.AF_UNIX
 
     def server_bind(self):
-        self.socket.bind(self.server_address)
+        from .runtime_temp import bind_unix
+        bind_unix(self.socket, self.server_address)
         self.server_name, self.server_port = 'localhost', 0
 
 
@@ -1398,31 +1418,38 @@ class NovaMindAPIServer:
             self.role_script_results[role] = records
             if not self.team_mode:
                 self.last_script_results = records
+        executor.extra_env['PYTHONDONTWRITEBYTECODE'] = '1'
         for name, code in self.get_daily_scripts(role).items():
-            if self.team_mode and self.team_phase is not None and self.script_check:
-                self.script_check()
+            import uuid
             from .execution_capture import ExecutionCapture, CURRENT_EVENT
+            from .run_state import write_json
             capture = ExecutionCapture(executor.evidence_store) if executor.evidence_store else None
             token = None
-            if capture:
-                versions = capture.store.load_state('script_versions') or {}
-                parent_token = CURRENT_EVENT.set(None) if self.team_mode else None
-                try:
-                    capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name),
-                                                                  'day': self.tools.current_day})
-                finally:
-                    if parent_token is not None:
-                        CURRENT_EVENT.reset(parent_token)
-                capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
-                token = CURRENT_EVENT.set(capture.event)
+            output, error = '', None
+            executor.last_status = 'not_started'
+            executor._bash_facts = dict(process_started=False, target_started=False, boundary_closed=True)
+            executor._raw_streams = (b'', b'')
+            executor._bash_error = None
+            executor.registered_execution = True
+            audit = self.role_audits.get(role)
+            evidence_root = audit.path.parent if audit else workspace / 'sessions' / 'registered-script-evidence'
+            evidence = evidence_root / 'scripts' / uuid.uuid4().hex
             try:
+                if self.team_mode and self.team_phase is not None and self.script_check:
+                    self.script_check()
+                if capture:
+                    versions = capture.store.load_state('script_versions') or {}
+                    parent_token = CURRENT_EVENT.set(None) if self.team_mode else None
+                    try:
+                        capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name),
+                                                                      'day': self.tools.current_day})
+                    finally:
+                        if parent_token is not None:
+                            CURRENT_EVENT.reset(parent_token)
+                    capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
+                    token = CURRENT_EVENT.set(capture.event)
                 command = shlex.quote(executor.python) + ' -c ' + shlex.quote(code)
                 output = executor.execute('bash', {'command': command})
-            except BaseException as exc:
-                if capture and capture.event:
-                    capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)
-                raise
-            else:
                 if capture and capture.event:
                     child = output.origins[0]['version_id'].rsplit(':', 1)[0] if getattr(output, 'origins', []) else None
                     child_record = capture.safe(capture.store.read_event, child) if child else None
@@ -1439,15 +1466,46 @@ class NovaMindAPIServer:
                         if read:
                             output = CapturedText(output, output.origins, {'id': read})
                     capture.safe(capture.store.complete, capture.event, status, child_event_id=child)
+            except BaseException as exc:
+                error = exc
+                from .run_lifecycle import RunCancelled
+                if isinstance(exc, RunCancelled) and executor._bash_facts.get('boundary_closed') is True:
+                    executor.last_status = 'cancelled'
+                    executor._bash_facts['cancelled'] = str(exc)
+                if capture and capture.event:
+                    status = 'cancelled' if executor.last_status == 'cancelled' else 'result_unknown'
+                    capture.safe(capture.store.complete, capture.event, status, error=type(exc).__name__)
+                raise
             finally:
                 if token is not None:
                     CURRENT_EVENT.reset(token)
-            if audit := self.role_audits.get(role):
-                audit.record('registered_script_execution', name=name, status=executor.last_status,
-                    sha256=hashlib.sha256(code.encode()).hexdigest())
+                executor.registered_execution = False
+                facts = dict(executor._bash_facts)
+                failure = error or executor._bash_error
+                if failure:
+                    facts.update(error_type=type(failure).__name__, error_errno=getattr(failure, 'errno', None))
+                raw_stdout, raw_stderr = executor._raw_streams
+                classification = registered_script_classification(facts, failure)
+                if executor.evidence_store and executor.evidence_store.fault:
+                    classification = 'unknown'
+                    facts['capture_fault'] = executor.evidence_store.fault
+                record = dict(name=name, role=role, day=getattr(self.tools, 'current_day', None),
+                    sha256=hashlib.sha256(code.encode()).hexdigest(), output=str(output),
+                    status=executor.last_status, classification=classification, facts=facts,
+                    error=str(failure) if failure else None, evidence=str(evidence))
+                evidence.mkdir(parents=True)
+                (evidence / 'stdout.bin').write_bytes(raw_stdout)
+                (evidence / 'stderr.bin').write_bytes(raw_stderr)
+                (evidence / 'code.py').write_text(code)
+                write_json(evidence / 'execution.json', record)
+                records.append(record)
+                if audit:
+                    audit.record('registered_script_execution', **record)
             results[name] = output
-            records.append(dict(name=name, role=role,
-                sha256=hashlib.sha256(code.encode()).hexdigest(), output=output, status=executor.last_status))
+            if self.team_mode and classification in ('transient_infrastructure', 'unknown'):
+                break
+        if executor.evidence_store:
+            executor.evidence_store.assert_healthy(quiescent=False)
         return results
 
     def set_daily_scripts(self, scripts: Dict[str, str], registration=None, *, role="ceo"):

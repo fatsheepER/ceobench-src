@@ -97,6 +97,41 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
                                               '" | 2 versions: pf log MEMORY.md]')
 
 
+@pytest.mark.parametrize('sandboxed', [False, True])
+def test_pf_shell_uses_and_cleans_long_owned_tmpdir(workspace, tmp_path, monkeypatch, sandboxed):
+    from test_execution_capture import records
+    store, _, executor = captured(workspace, tmp_path)
+    if sandboxed:
+        assert executor._bwrap(), 'The sandboxed PF wrapper requires bubblewrap'
+    else:
+        monkeypatch.setattr(executor, '_bwrap', lambda: None)
+    root = tmp_path / ('run-' + 'x' * 120) / 'tmp'
+    root.mkdir(parents=True)
+    executor.temp_root = root
+    executor.execute('write_file', {'path': 'owned.txt', 'content': 'owned temporary storage\n'})
+    execute = executor.pf_queries.execute
+    sockets = []
+
+    def observed(operation, arguments):
+        socket = executor._pf_service.root / 'socket'
+        assert socket.parent.parent == root
+        assert socket.is_socket()
+        sockets.append(socket)
+        return execute(operation, arguments)
+
+    monkeypatch.setattr(executor.pf_queries, 'execute', observed)
+    result = executor.execute('bash', {'command': 'pf log owned.txt'})
+    assert result.splitlines()[:2] == [
+        'file owned.txt: 1 version, newest first', 'owned.txt@v1 · day unknown · 1 line']
+    assert len(sockets) == 1
+    assert executor.last_status == 'succeeded'
+    bash = next(row['result'] for row in records(store) if row['request']['kind'] == 'bash')
+    assert bash['process_boundary']['target_started'] is True
+    assert bash['pf_cleanup'] == dict(closed=True, unfinished_event_ids=[])
+    assert list(root.iterdir()) == []
+    store.assert_healthy()
+
+
 def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(workspace):
     from saas_bench.agents.bash_agent.agent import BashAgent
     agent = BashAgent.__new__(BashAgent)

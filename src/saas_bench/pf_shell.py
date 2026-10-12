@@ -17,7 +17,16 @@ from .pf_deadline import Budget, budget_scope
 
 CLIENT = '''import json, os, socket, sys
 channel = socket.socket(socket.AF_UNIX)
-channel.connect(os.environ['PF_SOCKET'])
+address = os.environ['PF_SOCKET']
+parent_fd = None
+if len(os.fsencode(address)) >= 108:
+    parent, name = os.path.split(address)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    address = '/proc/self/fd/%d/%s' % (parent_fd, name)
+try:
+    channel.connect(address)
+finally:
+    if parent_fd is not None: os.close(parent_fd)
 sink = os.fstat(1)
 channel.sendall((json.dumps(dict(argv=sys.argv[1:], cwd=os.getcwd(),
                                stdout_sink=[sink.st_dev, sink.st_ino])) + '\\n').encode())
@@ -42,12 +51,16 @@ class ShellService:
         self.deadline = time.monotonic() + executor.bash_timeout
         self.check_cancelled = None
         self.connection = None
-        self.directory = tempfile.TemporaryDirectory(prefix='ceobench-pf-')
+        self.directory = tempfile.TemporaryDirectory(prefix='ceobench-pf-', dir=getattr(executor, 'temp_root', None))
         self.root = Path(self.directory.name)
         self.guest = '/opt/pf' if executor._bwrap() else str(self.root)
         client = self.root / 'pf'
-        client.write_text('#!' + executor.python + '\n' + CLIENT)
-        client.chmod(0o555)
+        try:
+            client.write_text('#!' + executor.python + '\n' + CLIENT)
+            client.chmod(0o555)
+        except BaseException:
+            self.directory.cleanup()
+            raise
         service = self
 
         class Handler(socketserver.StreamRequestHandler):
@@ -77,10 +90,23 @@ class ShellService:
                 finally:
                     service.connection = None
 
-        self.server = socketserver.UnixStreamServer(str(self.root / 'socket'), Handler)
+        class Server(socketserver.UnixStreamServer):
+            def server_bind(server):
+                from .runtime_temp import bind_unix
+                bind_unix(server.socket, server.server_address)
+        try:
+            self.server = Server(str(self.root / 'socket'), Handler)
+        except BaseException:
+            self.directory.cleanup()
+            raise
         self.server.timeout = .02
         self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self.server.server_close()
+            self.directory.cleanup()
+            raise
 
     def _serve(self):
         while not self.cancelled.is_set():

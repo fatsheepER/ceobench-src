@@ -2,10 +2,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from types import SimpleNamespace
 
@@ -254,6 +256,8 @@ def test_quota_response_sets_hold_and_frozen_request_drift_holds_immediately(obs
 def test_controller_preserves_live_peer_when_other_worker_exits(observer, controller, monkeypatch,
                                                                initial_pending, missing_record):
     processes, signals, checks = [], [], []
+    scopes = {}
+    observe_scope = controller.module.scope_state
     popen, killpg, sleep = subprocess.Popen, controller.module.os.killpg, controller.module.time.sleep
     source = str(Path(__file__).resolve().parents[1])
     observer.expected['source_root'] = observer.manifest['source_root'] = source
@@ -265,6 +269,7 @@ def test_controller_preserves_live_peer_when_other_worker_exits(observer, contro
     def launch(command, **kwargs):
         role = command[command.index('--worker') + 1]
         entry = batch.selected(observer.manifest, role)
+        assert kwargs['env']['TMPDIR'] == str(Path(entry['output_dir']) / 'tmp')
         record = Path(entry['output_dir']) / 'attempt-001/attempt.json'
         child_code = (
             'import json,sys,time; from pathlib import Path; '
@@ -278,7 +283,12 @@ def test_controller_preserves_live_peer_when_other_worker_exits(observer, contro
             '0' if role == 'git' else '.25', status,
             '2' if role == 'git' else '0'], **kwargs)
         processes.append((role, child))
+        unit = next(part.split('=', 1)[1] for part in command if part.startswith('--unit='))
+        scopes[unit] = child
         return child
+
+    def scope(saved, *, exit_code=None):
+        return observe_scope(saved, exit_code=scopes[saved['unit']].poll())
 
     def signal_group(pid, sig):
         signals.append((pid, sig))
@@ -299,6 +309,7 @@ def test_controller_preserves_live_peer_when_other_worker_exits(observer, contro
         sleep(.01)
 
     monkeypatch.setattr(controller.module.subprocess, 'Popen', launch)
+    monkeypatch.setattr(controller.module, 'scope_state', scope)
     monkeypatch.setattr(controller.module.os, 'killpg', signal_group)
     monkeypatch.setattr(controller.module.time, 'sleep', tick)
     monkeypatch.setattr(controller.module.time, 'monotonic', lambda: clock[0])
@@ -320,6 +331,52 @@ def test_controller_requires_explicit_live_flag(controller):
     with pytest.raises(SystemExit) as exc:
         controller.module.main(['--policy', str(controller.policy)])
     assert exc.value.code == 2
+
+
+def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):
+    entry = observer.manifest['runs'][0]
+    temporary = Path(entry['output_dir']) / 'tmp'
+    monkeypatch.setattr(os, 'environ', dict(os.environ, OPENCODE_API_KEY='offline'))
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.tempdir)
+    calls = []
+
+    def prepare(manifest, run_id, **kwargs):
+        calls.append((manifest, run_id, kwargs))
+        assert os.environ['TMPDIR'] == tempfile.gettempdir() == str(temporary)
+        with tempfile.TemporaryFile() as probe:
+            probe.write(b'worker-owned')
+        return dict(status='finished', run_id=run_id)
+
+    def forbidden_env_read(*args):
+        raise AssertionError('Offline worker must not read credentials')
+
+    monkeypatch.setattr(batch, 'prepare', prepare)
+    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', forbidden_env_read)
+    assert controller.module.worker(controller.policy, entry['run_id'], resume=False,
+                                    parent_pid=None) == 0
+    assert temporary.is_dir() and list(temporary.iterdir()) == []
+    assert len(calls) == 1 and calls[0][2]['live'] is True
+
+
+@pytest.mark.parametrize('bytes_available,inodes', [(1, 999999), (999999999, 1)])
+def test_controller_prechecks_storage_before_worker_launch(observer, controller, monkeypatch,
+                                                         bytes_available, inodes):
+    source = str(Path(__file__).resolve().parents[1])
+    observer.expected['source_root'] = observer.manifest['source_root'] = source
+    write_json(controller.policy, dict(identity=observer.expected))
+    monkeypatch.setattr(controller.module, 'identity', observer.module.identity)
+    monkeypatch.setattr(controller.module, 'poll',
+        lambda *args: observer.module.poll(*args, quota_fn=observer.quota))
+    monkeypatch.setattr(os, 'statvfs', lambda path: SimpleNamespace(f_bavail=bytes_available,
+        f_frsize=1, f_favail=inodes, f_files=1000000))
+    launches = []
+    monkeypatch.setattr(controller.module.subprocess, 'Popen',
+        lambda *args, **kwargs: launches.append(args))
+    with pytest.raises(OSError, match='Insufficient temporary storage') as error:
+        controller.module.supervise(controller.policy)
+    assert error.value.errno == 28
+    assert launches == [] and observer.hold.exists()
+    assert all(batch.attempts(entry) == [] for entry in observer.manifest['runs'])
 
 
 def test_pf_evidence_fault_stops_its_worker_while_git_finishes(observer, controller, monkeypatch):

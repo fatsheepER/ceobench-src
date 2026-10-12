@@ -979,3 +979,21 @@ def test_harness_preserves_unfinished_descendants_and_server(offline_runner, mon
         if proc:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('execution_capture', [False, True])
+def test_packed_weekly_script_keeps_full_streams_in_durable_evidence(offline_runner, execution_capture):
+    runner = offline_runner(execution_capture=execution_capture)
+    code = "import sys\nprint('PACKED-' + 'x' * 31000)\nprint('PACKED-ERR', file=sys.stderr)\nsys.exit(3)\n"
+    (runner.agent_workspace / 'weekly.py').write_text(code)
+    result = runner.tool_executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py'))
+    assert 'registered' in result.lower(), result
+    receipt = advance(runner)
+    assert receipt['success'] is True
+    assert 'PACKED-' in receipt['dashboard']
+    evidence = list(runner.workspace_dir.rglob('registered-script-evidence/scripts/*/execution.json'))
+    assert len(evidence) == 1
+    record = json.loads(evidence[0].read_text())
+    assert record['classification'] == 'script_error'
+    assert (evidence[0].parent / 'stdout.bin').read_bytes() == ('PACKED-' + 'x' * 31000 + '\n').encode()
+    assert (evidence[0].parent / 'stderr.bin').read_bytes() == b'PACKED-ERR\n'

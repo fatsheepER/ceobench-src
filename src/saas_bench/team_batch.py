@@ -665,7 +665,7 @@ def _execute(team, manifest, entry, directory, record, hold):
     team.checkpoint_callback = checkpoint
     outcome = team.run(stop_after_day=entry['stop_after_day'], hold=hold)
     reason = outcome.reason
-    if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled', 'sql_evidence_pending'):
+    if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled', 'sql_evidence_pending', 'registered_script_transient_infrastructure'):
         reason = 'failed'
     reuse = (last_boundary is not None and reason == 'observation_end' and
         outcome.day == entry['stop_after_day'] == team.server.tools.current_day and

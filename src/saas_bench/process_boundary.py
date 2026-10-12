@@ -36,17 +36,8 @@ else:
     channel = socket.create_connection(('127.0.0.1', int(address)))
 channel.sendall((key + '\n').encode())
 linux = sys.platform == 'linux'
-if linux:
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0):
-        raise OSError(ctypes.get_errno(), 'Cannot supervise descendants')
-# Set limits here, never in preexec_fn in the threaded host worker.
-hard_limit = resource.getrlimit(resource.RLIMIT_AS)[1]
-if hard_limit != resource.RLIM_INFINITY:
-    memory_limit = min(memory_limit, hard_limit)
-resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-proc = subprocess.Popen(['bash', '-c', command])
+proc = None
+spawn_errno = None
 code = None
 unknown = None
 children = []
@@ -55,10 +46,22 @@ reaped = []
 signaled = []
 def report(phase):
     channel.sendall((json.dumps(dict(exit_code=code, children=children, unknown=unknown,
-        phase=phase, coverage='subreaper_wait' if linux else 'process_group',
+        phase=phase, coverage='no_target_start' if proc is None else 'subreaper_wait' if linux else 'process_group',
         stop_requested=stopping, signaled=signaled, reaped=reaped,
-        memory_limit_bytes=memory_limit, memory_limit_kind='per_process_address_space')) + '\n').encode())
+        memory_limit_bytes=memory_limit, memory_limit_kind='per_process_address_space',
+        target_started=proc is not None, spawn_errno=spawn_errno)) + '\n').encode())
 try:
+    if linux:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):
+            raise OSError(ctypes.get_errno(), 'Cannot supervise descendants')
+    # Set limits here, never in preexec_fn in the threaded host worker.
+    hard_limit = resource.getrlimit(resource.RLIMIT_AS)[1]
+    if hard_limit != resource.RLIM_INFINITY:
+        memory_limit = min(memory_limit, hard_limit)
+    resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    proc = subprocess.Popen(['bash', '-c', command])
     if verified:
         if not linux:
             raise RuntimeError('Verified descendant cleanup requires Linux')
@@ -137,7 +140,12 @@ try:
             report('draining')
             time.sleep(.01)
 except Exception as exc:
-    unknown = type(exc).__name__ + ': ' + str(exc)
+    if proc is None:
+        spawn_errno = getattr(exc, 'errno', None)
+        code = 125
+        sys.stderr.write(type(exc).__name__ + ': ' + str(exc) + '\n')
+    else:
+        unknown = type(exc).__name__ + ': ' + str(exc)
 report('unknown' if unknown else 'closed')
 channel.close()
 if children or unknown:
@@ -158,12 +166,23 @@ class BoundaryOpen(RuntimeError):
 
 
 class Boundary:
-    def __init__(self, command, python=sys.executable, *, isolated=False, verified=False, memory_limit_bytes=None):
+    def __init__(self, command, python=sys.executable, *, isolated=False, verified=False, memory_limit_bytes=None, temp_root=None):
         memory_limit_bytes = command_memory_limit(memory_limit_bytes)
-        self.socket_dir = tempfile.TemporaryDirectory(prefix='ceobench-boundary-') if isolated else None
-        self.listener = socket.socket(socket.AF_UNIX if isolated else socket.AF_INET)
-        self.listener.bind(self.socket_dir.name + '/socket' if isolated else ('127.0.0.1', 0))
-        self.listener.listen(1)
+        self.socket_dir = None
+        self.listener = None
+        self.channel = None
+        try:
+            self.socket_dir = tempfile.TemporaryDirectory(prefix='ceobench-boundary-', dir=temp_root) if isolated else None
+            self.listener = socket.socket(socket.AF_UNIX if isolated else socket.AF_INET)
+            if isolated:
+                from .runtime_temp import bind_unix
+                bind_unix(self.listener, self.socket_dir.name + '/socket')
+            else:
+                self.listener.bind(('127.0.0.1', 0))
+            self.listener.listen(1)
+        except BaseException:
+            self.close()
+            raise
         self.key = uuid.uuid4().hex
         self.command = shlex.join([python, '-c', SUPERVISOR,
                                   '/run/novamind-boundary/socket' if isolated else str(self.listener.getsockname()[1]), self.key, command,
@@ -175,7 +194,8 @@ class Boundary:
     def close(self):
         if self.channel:
             self.channel.close()
-        self.listener.close()
+        if self.listener:
+            self.listener.close()
         if self.socket_dir:
             self.socket_dir.cleanup()
 
@@ -220,7 +240,13 @@ class Boundary:
                         self.channel.setblocking(False)
                     except TimeoutError:
                         if process.poll() is not None:
-                            raise RuntimeError('Supervisor exited before authentication')
+                            stdout, stderr = process.communicate(timeout=5)
+                            self.record = dict(phase='closed', coverage='preauthentication_no_target',
+                                target_started=False, exit_code=process.returncode, children=[], unknown=None,
+                                direct_child_reaped=True, streams_collected=True, descendants_closed=None,
+                                boundary_closed=True, elapsed_seconds=time.monotonic() - started_at,
+                                timed_out=False, cancelled=cancellation, cleanup_seconds=0, timeout_trigger_seconds=None)
+                            return stdout, stderr
                 if self.channel is not None:
                     try:
                         chunk = self.channel.recv(65536)
@@ -250,12 +276,14 @@ class Boundary:
                     stdout, stderr = exc.output or b'', exc.stderr or b''
                     continue
                 if self.record and self.record.get('phase') == 'closed':
-                    if self.record.get('children') or self.record.get('coverage') != 'subreaper_wait':
+                    no_target = (self.record.get('coverage') == 'no_target_start' and
+                                 self.record.get('target_started') is False)
+                    if self.record.get('children') or self.record.get('coverage') != 'subreaper_wait' and not no_target:
                         raise RuntimeError('Supervisor did not prove descendant closure')
                     finished = time.monotonic()
                     if cleanup_started is None and finished >= deadline:
                         cleanup_started = finished
-                    self.record.update(boundary_closed=True, descendants_closed=True,
+                    self.record.update(boundary_closed=True, descendants_closed=None if no_target else True,
                         direct_child_reaped=True, streams_collected=True,
                         elapsed_seconds=(cleanup_started or finished) - started_at,
                         timed_out=cleanup_started is not None and cancellation is None,
@@ -264,6 +292,8 @@ class Boundary:
                         cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
                     return stdout, stderr
         except Exception as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                stdout, stderr = exc.output or stdout, exc.stderr or stderr
             finished = time.monotonic()
             self.record = dict(self.record or {}, exit_code=process.poll(), unknown=str(exc),
                 boundary_closed=False, timed_out=cleanup_started is not None and cancellation is None,

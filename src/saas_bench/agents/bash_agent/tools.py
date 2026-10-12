@@ -450,7 +450,9 @@ class BashAgentToolExecutor:
         facts = {}
         self._exit_code = None
         self._timed_out = False
-        self._bash_facts = {}
+        self._bash_facts = dict(process_started=False, target_started=False, boundary_closed=True)
+        self._raw_streams = (b'', b'')
+        self._bash_error = None
         accounting_started = time.monotonic()
         if self.pf_queries:
             from saas_bench.pf_queries import MODELS
@@ -514,15 +516,20 @@ class BashAgentToolExecutor:
             status = 'result_unknown'
             raise
         except Exception as exc:
+            self._bash_error = exc
+            self._bash_facts['error_type'] = type(exc).__name__
+            self._bash_facts['error_errno'] = getattr(exc, 'errno', None)
             result = f"Error: {exc}"
             status = 'timed_out' if self.bash_warn_after is not None and self._timed_out else 'failed'
             if status == 'timed_out':
                 result = (f'Error: Command timed out after {self.bash_timeout:g} seconds. '
                     'Task terminated; descendant cleanup and output stream closure verified. '
                     f'Output is partial; processing the captured output failed: {exc}')
-        except BaseException:
+        except BaseException as exc:
+            self._bash_error = exc
             result = None
-            status = 'result_unknown'
+            status = ('cancelled' if getattr(self, 'registered_execution', False) and
+                      self._bash_facts.get('boundary_closed') is True else 'result_unknown')
             raise
         finally:
             body = result
@@ -833,22 +840,24 @@ class BashAgentToolExecutor:
             return "Error: No command provided"
 
         from saas_bench.process_boundary import Boundary
-        service = None
-        if self.pf_queries:
-            from saas_bench.pf_shell import ShellService
-            service = self._pf_service = ShellService(self)
-        boundary = Boundary(command, self.python, isolated=bool(self.identity),
-                            verified=self.bash_warn_after is not None or bool(getattr(self, 'lifecycle', None)),
-                            memory_limit_bytes=self.bash_memory_limit_bytes)
-        self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
+        service = boundary = None
         try:
+            if self.pf_queries:
+                from saas_bench.pf_shell import ShellService
+                service = self._pf_service = ShellService(self)
+            boundary = Boundary(command, self.python, isolated=bool(self.identity),
+                                verified=self.bash_warn_after is not None or bool(getattr(self, 'lifecycle', None)),
+                                memory_limit_bytes=self.bash_memory_limit_bytes,
+                                temp_root=getattr(self, 'temp_root', None))
+            self._boundary_socket_dir = boundary.socket_dir.name if boundary.socket_dir else None
             result = self._run_bash(command, boundary)
             if service:
                 self.capture.facts['pf_calls'] = service.calls
                 return service.project(result)
             return result
         finally:
-            boundary.close()
+            if boundary:
+                boundary.close()
             self._boundary_socket_dir = None
             if service:
                 try:
@@ -896,8 +905,8 @@ class BashAgentToolExecutor:
         import signal
         if self.capture:
             self.capture.facts['process_started'] = False
-        self._bash_facts = dict(bash_timeout=self.bash_timeout, bash_warn_after=self.bash_warn_after,
-                               warning_emitted=False, boundary_closed=False)
+        self._bash_facts.update(bash_timeout=self.bash_timeout, bash_warn_after=self.bash_warn_after,
+                                warning_emitted=False)
         started_at = time.monotonic()
         lifecycle = getattr(self, 'lifecycle', None)
         if getattr(self, '_pf_service', None):
@@ -929,6 +938,7 @@ class BashAgentToolExecutor:
                 env=env,
                 start_new_session=True,
             )
+        self._bash_facts.update(process_started=True, pid=proc.pid, boundary_closed=False)
         if self.capture:
             self.capture.facts.update(process_started=True, pid=proc.pid)
             sink = os.fstat(proc.stdout.fileno())
@@ -944,7 +954,8 @@ class BashAgentToolExecutor:
                     ('elapsed_seconds', 'boundary_closed', 'cleanup_seconds', 'timeout_trigger_seconds')})
                 self._timed_out = boundary.record['timed_out']
                 self._bash_facts['cancelled'] = boundary.record.get('cancelled')
-            self._bash_facts.update(process_boundary=boundary.record, timed_out=self._timed_out)
+            self._bash_facts.update(process_boundary=boundary.record, timed_out=self._timed_out,
+                target_started=boundary.record.get('target_started', False))
             if self.capture:
                 self.capture.facts['process_boundary'] = boundary.record
             decode_error = None
@@ -990,7 +1001,7 @@ class BashAgentToolExecutor:
                     'Task terminated; descendant cleanup and output stream closure verified. Output is partial.')
             elif proc.returncode != 0:
                 output_parts.append(f"[exit code: {proc.returncode}]")
-                if any(marker in stderr for marker in ('MemoryError', 'Cannot allocate memory',
+                if not getattr(self, 'registered_execution', False) and any(marker in stderr for marker in ('MemoryError', 'Cannot allocate memory',
                                                        'cannot allocate memory', 'std::bad_alloc')):
                     output_parts.append('Error: Command reported an allocation failure under the per-process '
                         f'address-space memory limit of {boundary.record["memory_limit_bytes"]} bytes. '
@@ -1001,7 +1012,7 @@ class BashAgentToolExecutor:
             # Truncate very long output (same limit as Claude Code: 30K chars)
             if self.capture:
                 self.capture.origins = self._stream_origins(stdout, stderr)
-            if len(output) > 30000:
+            if len(output) > 30000 and not getattr(self, 'registered_execution', False):
                 if self.capture:
                     self.capture.facts['output_truncated'] = True
                     from saas_bench.execution_capture import slice_origins
@@ -1092,6 +1103,7 @@ class BashAgentToolExecutor:
                                     preserve_scene=True, supervisor_pid=proc.pid, process_boundary=record)
 
     def _streams(self, stdout, stderr, exit_code, partial=False):
+        self._raw_streams = (stdout, stderr)
         self._exit_code = exit_code
         self._bash_facts['exit_code'] = exit_code
         started = time.monotonic()

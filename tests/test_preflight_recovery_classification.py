@@ -132,11 +132,39 @@ def test_input_source_mutation_cannot_be_declared_harness_fix(approved_revision,
         recovery.approval(manifest)
 
 
-def test_actual_runtime_journal_fix_keeps_frozen_model_inputs(approved_revision, monkeypatch):
+def test_historical_runtime_downgrade_cannot_be_declared_harness_fix(approved_revision, monkeypatch):
     path, _, manifest = approved_revision
     old = batch.read(manifest)
     target = Path(old['source_root']) / 'src/saas_bench/multi_agent.py'
     target.write_bytes(subprocess.check_output(['git', 'show', '95bcf95:src/saas_bench/multi_agent.py'], cwd=batch.ROOT))
+    old['source_sha256'] = tree_hash(Path(old['source_root']) / 'src')
+    write_json(manifest, old)
+    bind_approval(monkeypatch, path.parent, manifest)
+    with pytest.raises(ValueError, match='frozen settings|scheduling design'):
+        recovery.approval(manifest)
+
+
+def test_runtime_journal_fix_keeps_frozen_model_inputs(approved_revision, monkeypatch):
+    path, _, manifest = approved_revision
+    old = batch.read(manifest)
+    target = Path(old['source_root']) / 'src/saas_bench/multi_agent.py'
+    current = target.read_text()
+    journaled = """                    operation = self._begin_operation('ceo_tool:' + action.tool)
+                    try:
+                        result = runtime.executor.execute(action.tool, action.arguments,
+                            model_request_event=runtime.usage.last_request_event,
+                            model_context_id=runtime.usage.context_id)
+                        runtime.agent.record_tool_result(result)
+                    finally:
+                        self._finish_operation(operation, runtime.executor)
+"""
+    legacy = """                    result = runtime.executor.execute(action.tool, action.arguments,
+                        model_request_event=runtime.usage.last_request_event,
+                        model_context_id=runtime.usage.context_id)
+                    runtime.agent.record_tool_result(result)
+"""
+    assert current.count(journaled) == 1
+    target.write_text(current.replace(journaled, legacy))
     old['source_sha256'] = tree_hash(Path(old['source_root']) / 'src')
     write_json(manifest, old)
     bind_approval(monkeypatch, path.parent, manifest)

@@ -83,7 +83,8 @@ def shell(team, role, code, cli=False):
 def raw(team, role, path, body=None, method=None, headers=None):
     conn = http.client.HTTPConnection('localhost')
     conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.sock.connect(str(team.server.role_sockets[role]))
+    from saas_bench.runtime_temp import connect_unix
+    connect_unix(conn.sock, team.server.role_sockets[role])
     conn.request(method or ('POST' if body is not None else 'GET'), path,
         body=json.dumps(body) if body is not None else None,
         headers={'Content-Type': 'application/json', **(headers or {})})

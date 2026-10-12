@@ -53,6 +53,7 @@ _ENGINE_MODULES = [
     "pf_deadline",
     "run_lifecycle",
     "process_boundary",
+    "runtime_temp",
     "config",
     "customer_llm",
     "database",

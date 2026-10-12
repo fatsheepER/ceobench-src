@@ -105,7 +105,9 @@ class MultiAgentRuntime:
             run_id, world_id = saved_run, saved_world
         else:
             run_id, world_id = run_id or uuid.uuid4().hex, world_id or uuid.uuid4().hex
-        self._sockets = tempfile.TemporaryDirectory(prefix='ceobench-team-')
+        from .runtime_temp import prepare_tmpdir
+        self._temp_root = prepare_tmpdir(self.root / 'tmp')
+        self._sockets = tempfile.TemporaryDirectory(prefix='ceobench-team-', dir=self._temp_root)
         public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
         self._public_dir = public
         workspaces = {role: self.root / 'roles' / role for role in ROLES}
@@ -141,6 +143,7 @@ class MultiAgentRuntime:
             executor = BashAgentToolExecutor(**executor_options, text_registry=registry, **settings)
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)), **script_settings)
             executor.lifecycle = script_executors[role].lifecycle = self._lifecycle
+            executor.temp_root = script_executors[role].temp_root = self._temp_root
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf',
@@ -271,8 +274,13 @@ class MultiAgentRuntime:
             subprocess = state['kind'] in ('ceo_tool:bash', 'ceo_scripts')
             status = getattr(executor, 'last_status', None)
             boundary = getattr(executor, '_bash_facts', {}).get('process_boundary') or {}
+            not_started = getattr(executor, '_bash_facts', {}).get('process_started') is False
+            startup_closed = (state['kind'] == 'ceo_scripts' and boundary.get('phase') == 'closed' and
+                boundary.get('coverage') in ('preauthentication_no_target', 'no_target_start') and
+                boundary.get('target_started') is False and boundary.get('direct_child_reaped') is True and
+                boundary.get('streams_collected') is True and boundary.get('unknown') is None)
             client_closed = (not executor.preserved_process and not getattr(executor, '_pf_service', None) and
-                (not subprocess or (boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait' and
+                (not subprocess or not_started or startup_closed or (boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait' and
                     boundary.get('descendants_closed') is True and boundary.get('children') == [] and
                     boundary.get('unknown', 'missing') is None and boundary.get('exit_code') is not None)))
             with self.server._request_lock:
@@ -289,6 +297,17 @@ class MultiAgentRuntime:
                     operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)
                 state['status'] = 'interrupted' if status == 'result_unknown' else 'completed'
                 state['execution_status'] = status
+                if (state['kind'] == 'ceo_scripts' and client_closed and not requests['active'] and
+                        not requests['queued'] and not self.server._operation_failed and
+                        not self.server._step_day_timed_out and
+                        state['business_operations_before'] == state['recovery']['business_operations_after'] and
+                        state['mutation_epoch_before'] == requests['mutation_epoch'] and
+                        isinstance(state['workspace_sha256_before'], str) and
+                        state['workspace_sha256_before'] == state['recovery']['workspace_sha256_after']):
+                    state['recovery']['classification'] = 'read_only'
+                    write_json(self.root / 'private' / 'ceo' / 'script-closures' / path.name, state)
+                    path.unlink()
+                    return
                 if recovery_operation_safe(self.root, state):
                     write_json(path, state)
                     return
@@ -390,8 +409,11 @@ class MultiAgentRuntime:
         finally:
             if operation is not None:
                 self._finish_operation(operation, self.server.role_executors[role])
-        if any(r['status'] != 'succeeded' for r in self.server.role_script_results[role]):
-            raise RunCancelled('registered_script_failed')
+        classifications = {record['classification'] for record in self.server.role_script_results[role]}
+        if 'unknown' in classifications:
+            raise RunCancelled('registered_script_outcome_unknown')
+        if 'transient_infrastructure' in classifications:
+            raise RunCancelled('registered_script_transient_infrastructure')
         text = ''
         for name, output in outputs.items():
             text = join_text(text, '\n' if text else '', join_text(name, '\n', output))
@@ -574,6 +596,9 @@ class MultiAgentRuntime:
                     self._boundary('week_boundary')
         except RunCancelled as exc:
             self.failure = str(exc)
+            if self.failure == 'registered_script_transient_infrastructure':
+                self._stage = 'boundary'
+                self._week = {}
             self._set_phase('stopped' if str(exc) == 'natural_end' else 'paused')
             return RunOutcome(self.server.tools.current_day, 'natural_end' if str(exc) == 'natural_end' else 'paused')
         except Exception as exc:

@@ -197,7 +197,11 @@ def run_disposition(entry, record, unit):
 def worker(policy, run_id, *, resume, parent_pid):
     gate = RequestGate(policy, run_id=run_id, parent_pid=parent_pid)
     manifest = gate.manifest()
-    batch.selected(manifest, run_id)
+    entry = batch.selected(manifest, run_id)
+    from saas_bench.runtime_temp import prepare_tmpdir
+    import tempfile
+    os.environ['TMPDIR'] = str(prepare_tmpdir(Path(entry['output_dir']) / 'tmp'))
+    tempfile.tempdir = os.environ['TMPDIR']
     from saas_bench.agents.bash_agent.run_test import load_env_file
     key = os.environ.get('OPENCODE_API_KEY') or load_env_file(Path(manifest['source_root']) / '.env').get('OPENCODE_API_KEY')
     if not key:
@@ -283,7 +287,9 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         mode = 'resume' if resume and saved else 'run'
         ready = host_logs / f'ready-{entry["run_id"]}-{mode}.json'
         ready.unlink(missing_ok=True)
-        env = dict(os.environ, PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
+        from saas_bench.runtime_temp import prepare_tmpdir
+        temporary = prepare_tmpdir(Path(entry['output_dir']) / 'tmp')
+        env = dict(os.environ, TMPDIR=str(temporary), PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
             PYTHONPATH=str(execution_root(gate.expected['manifest'], manifest) / 'src'),
             CEOBENCH_LIFECYCLE_READY=str(ready))
         stream = (host_logs / f'{entry["run_id"]}-{mode}.log').open('a')

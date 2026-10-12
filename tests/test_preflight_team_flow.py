@@ -123,7 +123,8 @@ def make_team(mode, responder, label, **runtime_options):
 def raw(team, role, path, body=None, method=None):
     connection = http.client.HTTPConnection('localhost')
     connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.sock.connect(str(team.server.role_sockets[role]))
+    from saas_bench.runtime_temp import connect_unix
+    connect_unix(connection.sock, team.server.role_sockets[role])
     connection.request(method or ('POST' if body is not None else 'GET'), path,
                        json.dumps(body) if body is not None else None,
                        {'content-type': 'application/json'})
