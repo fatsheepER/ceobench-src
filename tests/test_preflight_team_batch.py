@@ -706,7 +706,8 @@ def test_checkpoint_publication_failure_preserves_previous_snapshots_and_origina
     assert len(list(first.parent.glob('*/checkpoint.json'))) == 3
 
 
-@pytest.mark.parametrize('reason,failure', [('paused', 'requested_pause'), ('failed', 'offline business failure')])
+@pytest.mark.parametrize('reason,failure', [('paused', 'requested_pause'), ('paused', 'sql_evidence_pending'),
+                                           ('failed', 'offline business failure')])
 def test_paused_and_failed_outcomes_still_freeze_final_state(managed_team, tmp_path, monkeypatch, reason, failure):
     team, directory, record, manifest, entry = managed_team
     previous = record['checkpoint']

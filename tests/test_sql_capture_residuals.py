@@ -10,6 +10,7 @@ import urllib.request
 import pytest
 
 from saas_bench.execution_capture import ExecutionCapture, model_request
+from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.sql_evidence import SQLEvidenceStore
 from test_execution_capture import captured, records
 from test_public_sql import server
@@ -44,6 +45,80 @@ def test_shared_fault_during_wire_capture_blocks_model_transport(captured, monke
             usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
         assert 'capture failed' in str(raised.value.__cause__)
     assert sent == []
+
+
+@pytest.mark.parametrize('timeout_kind', ['gnu', 'bash'])
+@pytest.mark.parametrize('settlement', ['late', 'pending'])
+def test_model_usage_waits_or_pauses_for_interrupted_sql(captured, monkeypatch, timeout_kind, settlement):
+    import httpx
+    from openai import OpenAI
+    from saas_bench import api_server
+    from saas_bench.model_usage import ModelUsage
+    from test_preflight_usage import reply
+    api, store, executor = captured
+    entered, release = threading.Event(), threading.Event()
+    execute = api_server.execute_query
+
+    def delayed_query(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), 'query release missing'
+        return execute(*args, **kwargs)
+
+    monkeypatch.setattr(api_server, 'execute_query', delayed_query)
+    executor.bash_timeout = 5 if timeout_kind == 'gnu' else .5
+    executor.bash_warn_after = .1
+    client_command = 'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'
+    command = 'timeout --kill-after=.1 .5 ' + client_command if timeout_kind == 'gnu' else client_command
+    sent = []
+
+    def transport(request):
+        assert release.is_set()
+        query = next(row for row in records(store) if row['request']['kind'] == 'sql_query')
+        assert query['result']['status'] == 'succeeded'
+        assert query['delivery']['send_state'] in ('sent', 'failed')
+        assert query['client_interruption']['reason'] == 'bash_client_timeout'
+        sent.append(request.read())
+        return httpx.Response(200, json=reply('chat'))
+
+    usage = ModelUsage(executor.workspace_path.parent / 'model-usage.jsonl', 'agent', evidence_store=store)
+    timer = None
+    with ThreadPoolExecutor(max_workers=1) as pool, usage.attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
+        running = pool.submit(executor.execute, 'bash', {'command': command})
+        try:
+            assert entered.wait(3)
+            output = running.result(timeout=3)
+            assert ('[exit code: 124]' if timeout_kind == 'gnu' else 'timed out after 0.5 seconds') in output
+            assert records(store)[0]['result']['boundary_closed'] is True
+            payload = dict(model='test-model', messages=[dict(role='user', content=output)])
+            if settlement == 'late':
+                timer = threading.Timer(.2, release.set)
+                timer.start()
+            else:
+                started = time.monotonic()
+                with pytest.raises(RunCancelled, match='sql_evidence_pending'):
+                    usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+                assert 3 <= time.monotonic() - started < 5
+                assert sent == []
+                assert not any(row['request']['kind'] == 'model_request' for row in records(store))
+                assert store.fault is None and not store.fault_path.exists()
+                with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome'):
+                    store.snapshot(executor.workspace_path.parent / 'unsafe.sqlite')
+                release.set()
+                settled(api)
+            response = usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+            assert response.choices[0].message.content == 'hello'
+            assert len(sent) == 1
+            assert store.fault is None and not store.fault_path.exists()
+            store.assert_healthy()
+            snapshot = executor.workspace_path.parent / 'settled.sqlite'
+            store.snapshot(snapshot)
+            assert snapshot.exists()
+        finally:
+            release.set()
+            if timer:
+                timer.join(3)
+            running.result(timeout=5)
 
 
 @pytest.mark.parametrize('timeout_kind', ['gnu', 'bash'])
