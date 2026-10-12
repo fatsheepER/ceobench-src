@@ -310,7 +310,8 @@ class MultiAgentRuntime:
                     operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)
                 state['status'] = 'interrupted' if status == 'result_unknown' else 'completed'
                 state['execution_status'] = status
-                if requests['queued'] or any(request.get('read_only') is not True for request in requests['active']):
+                if requests['queued'] or any(request.get('read_only') is not True and
+                        request.get('outcome_known') is not True for request in requests['active']):
                     state['status'] = 'running'
                     state['recovery']['classification'] = 'pending_business_write'
                     write_json(path, state)
@@ -386,7 +387,8 @@ class MultiAgentRuntime:
 
     def _check_model_send(self):
         requests = self.server.public_request_state()
-        if requests['queued'] or any(request.get('read_only') is not True for request in requests['active']):
+        if requests['queued'] or any(request.get('read_only') is not True and
+                request.get('outcome_known') is not True for request in requests['active']):
             raise RunCancelled('business_operation_pending')
         self._check()
 

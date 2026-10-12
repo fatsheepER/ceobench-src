@@ -295,6 +295,78 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
+@pytest.mark.parametrize('denied', [False, True])
+@pytest.mark.parametrize('phase', ['host_result', 'delivery'])
+def test_confirmed_public_response_allows_model_while_handler_closes(mode, denied, phase, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    delivered = api_server._APIHandler._capture_delivery
+
+    def delayed_cleanup(handler, state):
+        if handler.path == '/call' and phase == 'host_result':
+            entered.set()
+            assert release.wait(15)
+        delivered(handler, state)
+        if handler.path == '/call' and phase == 'delivery':
+            entered.set()
+            assert release.wait(15)
+
+    monkeypatch.setattr(api_server._APIHandler, '_capture_delivery', delayed_cleanup)
+    with make_team(mode, lambda team, role, body: final('Confirmed response checked.'), 'confirmed-response') as team:
+        team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
+        team._set_phase('analysis' if denied else 'ceo')
+        executor = team.roles['growth' if denied else 'ceo'].executor
+        operation = None if denied else team._begin_operation('ceo_tool:bash')
+        pending_role = None
+        checkpoint_pool = ThreadPoolExecutor(max_workers=1)
+        checkpoint_started = threading.Event()
+        def checkpoint():
+            checkpoint_started.set()
+            return team.checkpoint()
+        code = "from novamind_api import _client\ntry: _client.call('set_prices', {'A': 29})\nexcept _client.NovaMindAPIError: print('REJECTED')\nelse: print('CONFIRMED')"
+        try:
+            output = executor.execute('bash', dict(command='python -c ' + shlex.quote(code)))
+            assert ('REJECTED' if denied else 'CONFIRMED') in output
+            assert entered.is_set() and not release.is_set()
+            assert executor.last_status == 'succeeded'
+            assert team.server.public_request_state()['active']
+            if operation:
+                team._finish_operation(operation, executor)
+                assert batch.read(operation)['status'] == 'completed'
+            for role in ROLES:
+                runtime = team.roles[role]
+                payload = dict(model=batch.MODEL, messages=[dict(role='user', content='Check the confirmed response.')],
+                    stream=True, stream_options={'include_usage': True})
+                if mode == 'pf' and phase == 'host_result' and runtime.executor is executor:
+                    with pytest.raises(RunCancelled, match='^sql_evidence_pending$'):
+                        runtime.usage.call('chat', payload,
+                            lambda: _stream_chat_completion(runtime.agent.client, payload))
+                    assert runtime.store.fault is None
+                    pending_role = runtime
+                else:
+                    result = runtime.usage.call('chat', payload,
+                        lambda: _stream_chat_completion(runtime.agent.client, payload))
+                    assert result.choices[0].message.content == 'Confirmed response checked.'
+            assert len(team.test_wire) == 3 - int(pending_role is not None)
+            saving = checkpoint_pool.submit(checkpoint)
+            assert checkpoint_started.wait(1)
+            threading.Event().wait(.2)
+            assert not saving.done()
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while team.server.public_request_state()['active'] and time.monotonic() < deadline:
+                threading.Event().wait(.01)
+            checkpoint_pool.shutdown(wait=True)
+        assert saving.result().exists()
+        if pending_role:
+            result = pending_role.usage.call('chat', payload,
+                lambda: _stream_chat_completion(pending_role.agent.client, payload))
+            assert result.choices[0].message.content == 'Confirmed response checked.'
+            assert len(team.test_wire) == 3
+        assert team.server._operation_failed is False
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
 def test_ceo_wrapper_accepts_identical_finalization_and_rejects_conflict(mode):
     with make_team(mode, lambda team, role, body: final('unused'), 'finalization-replay') as team:
         team._set_phase('ceo')

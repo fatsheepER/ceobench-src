@@ -522,6 +522,10 @@ class _APIHandler(BaseHTTPRequestHandler):
             # Includes BaseHTTPRequestHandler's actual Server/Date/status line too.
             headers = (b''.join(self._headers_buffer) + b'\r\n').decode('latin-1')
             self._capture_sql('finish', self._sql_event, status, headers, body, self._sql_execution)
+        if getattr(self, '_audit_status', 500) < 500 and not getattr(self, '_sql_capture_failed', False):
+            api = self.server._api_server
+            with api._request_lock:
+                api._active_requests[id(self.connection)]['outcome_known'] = True
         super().end_headers()
 
     def _capture_delivery(self, state):
@@ -1069,19 +1073,33 @@ class NovaMindAPIServer:
 
     def start(self):
         """Start the HTTP server in a background thread."""
-        self._httpd = _TrackedHTTPServer(('127.0.0.1', 0), _APIHandler)
-        self._httpd._api_server = self
-        self._httpd._role = None if self.team_mode else "ceo"
-        self.port = self._httpd.server_address[1]
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
-        for role, path in self.role_sockets.items():
-            from pathlib import Path
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            httpd = _UnixHTTPServer(str(path), _APIHandler)
-            httpd._api_server, httpd._role = self, role
-            self._role_httpds.append(httpd)
-            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        httpd = _TrackedHTTPServer(('127.0.0.1', 0), _APIHandler)
+        httpd._api_server = self
+        httpd._role = None if self.team_mode else "ceo"
+        self.port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            httpd.server_close()
+            raise
+        self._httpd, self._thread = httpd, thread
+        try:
+            for role, path in self.role_sockets.items():
+                from pathlib import Path
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                httpd = _UnixHTTPServer(str(path), _APIHandler)
+                httpd._api_server, httpd._role = self, role
+                try:
+                    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                except BaseException:
+                    httpd.server_close()
+                    os.unlink(httpd.server_address)
+                    raise
+                self._role_httpds.append(httpd)
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self):
         """Stop the HTTP server."""

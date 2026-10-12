@@ -57,6 +57,89 @@ def log(path, rows):
     return path
 
 
+@pytest.mark.parametrize('tail', [b'{"event":', b'{"event":"response"',
+    b'{"reply":"\xe4\xb8', b'{"event":"request","flag":tru'])
+def test_truncated_final_receipt_preserves_known_usage_and_pending_tail(tmp_path, tail):
+    path = log(tmp_path / 'model-usage.jsonl', receipts('known', 'ceo', body(), cost=.1))
+    prefix = path.read_bytes()
+    path.write_bytes(prefix + tail)
+    result = aggregate([path], PRICES)
+    assert result['team']['known']['input_tokens'] == 10
+    assert result['team']['known']['output_tokens'] == 2
+    assert result['team']['known']['total_tokens'] == 12
+    assert all(value is None for value in result['team']['complete'].values())
+    assert all(value is None for value in result['all_resources']['complete'].values())
+    assert result['missing_receipts'] == [dict(path=str(path.resolve()), line=3,
+        offset=len(prefix), bytes=len(tail), category='formal', reason='unterminated_log_tail')]
+    assert path.read_bytes() == prefix + tail
+    assert not list(tmp_path.glob('*.fault.json'))
+
+
+@pytest.mark.parametrize('broken', [b'{bad}\n', b'{bad}', b'{"event":\n',
+    b'{"reply":"\xff"}\n', b'{"event":\n{"event":"response"}\n'])
+def test_complete_or_midfile_malformed_receipt_still_fails(tmp_path, broken):
+    path = log(tmp_path / 'model-usage.jsonl', receipts('known', 'ceo', body(), cost=.1))
+    path.write_bytes(path.read_bytes() + broken)
+    with pytest.raises((json.JSONDecodeError, UnicodeDecodeError)):
+        aggregate([path], PRICES)
+
+
+def test_completed_pending_log_next_read_restores_complete_totals(tmp_path):
+    rows = receipts('known', 'ceo', body(), cost=.1)
+    next_rows = receipts('next', 'growth', body(20, 4), cost=.2)
+    raw = ''.join(json.dumps(row) + '\n' for row in rows + next_rows).encode()
+    path = tmp_path / 'model-usage.jsonl'
+    path.write_bytes(raw[:-5])
+    assert aggregate([path], PRICES)['missing_receipts']
+    path.write_bytes(raw)
+    result = aggregate([path], PRICES)
+    assert result['team']['complete']['input_tokens'] == 30
+    assert result['team']['complete']['output_tokens'] == 6
+    assert result['team']['complete']['total_tokens'] == 36
+    assert result['missing_receipts'] == []
+
+
+@pytest.mark.parametrize('resource', ['simulator', 'shared_d0', 'abandoned'])
+def test_explicit_resource_tail_keeps_confirmed_primary_totals(tmp_path, resource):
+    formal = log(tmp_path / 'formal.jsonl', receipts('formal', 'ceo', body(), cost=.1))
+    resource_log = log(tmp_path / f'{resource}.jsonl',
+        receipts(resource, 'simulator' if resource != 'abandoned' else 'growth', body(20, 4), cost=.2))
+    paths = dict(formal=[formal], **{resource: [resource_log]})
+    confirmed = aggregate(paths, PRICES)
+    original = resource_log.read_bytes() + b'{"reply":"\xe4\xb8'
+    resource_log.write_bytes(original)
+    result = aggregate(paths, PRICES)
+    assert result['team'] == confirmed['team']
+    assert result['roles'] == confirmed['roles']
+    assert result['resources']['formal'] == confirmed['resources']['formal']
+    assert result['resources'][resource]['known'] == confirmed['resources'][resource]['known']
+    assert result['resources'][resource]['known']['total_tokens'] == 24
+    for summary in (result['resources'][resource], result['all_resources'], result['failed_attempt_usage']):
+        assert all(value is None for value in summary['complete'].values())
+    assert result['all_resources']['known'] == confirmed['all_resources']['known']
+    assert result['missing_receipts'][0]['category'] == resource
+    assert resource_log.read_bytes() == original
+
+
+@pytest.mark.parametrize('resource,primary', [('formal', 'engineering'), ('engineering', 'formal')])
+def test_unrouted_role_tail_only_invalidates_source_category_and_simulator(tmp_path, resource, primary):
+    paths = {category: [log(tmp_path / f'{category}.jsonl',
+        receipts(category, 'simulator' if category == 'simulator' else 'ceo', body(), cost=.1))]
+        for category in ('formal', 'engineering', 'simulator')}
+    confirmed = aggregate(paths, PRICES, category=primary)
+    resource_log = paths[resource][0]
+    original = resource_log.read_bytes() + b'{"event":'
+    resource_log.write_bytes(original)
+    result = aggregate(paths, PRICES, category=primary)
+    assert result['team'] == confirmed['team']
+    assert result['roles'] == confirmed['roles']
+    assert result['resources'][primary] == confirmed['resources'][primary]
+    for affected in (resource, 'simulator'):
+        assert result['resources'][affected]['known'] == confirmed['resources'][affected]['known']
+        assert all(value is None for value in result['resources'][affected]['complete'].values())
+    assert resource_log.read_bytes() == original
+
+
 def test_manually_recomputed_team_and_all_resource_receipts(tmp_path):
     failed, success = body(5, 1, 2, 1, bill=.01), body(bill=.02)
     rows = receipts('retry', 'ceo', success, attempts=[('retry-1', failed, 'provider_error', 503),

@@ -78,6 +78,119 @@ def changed_manifest(frozen, tmp_path, change, *, reanchor=True):
     return path
 
 
+@pytest.mark.parametrize('fault', ['controller_capture_faults', 'runtime_failure', 'reason', 'fault_file',
+    'historical_capture', 'historical_fault_file', 'pending_tail', 'simulator_tail', None])
+def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_complete(frozen, tmp_path, fault):
+    _, original, _, _ = frozen
+    path = changed_manifest(frozen, tmp_path, lambda manifest: None)
+    manifest = batch.read(path)
+    pair = [entry for entry in manifest['runs'] if entry['seed'] == original['seeds'][0] and entry['repeat'] == 1]
+    originals, results = {}, {}
+    for entry in pair:
+        directory = Path(entry['output_dir']) / 'attempt-001'
+        private = directory / 'runtime/private/ceo'
+        private.mkdir(parents=True)
+        tokens = 20 if entry['group'] == 'pf' else 10
+        response = dict(model=batch.MODEL, usage=dict(prompt_tokens=tokens,
+            completion_tokens=tokens // 2, prompt_cache_hit_tokens=0,
+            prompt_tokens_details={'cached_tokens': 0, 'cache_write_tokens': 0}))
+        logfile = private / 'model-usage.jsonl'
+        logfile.write_text('\n'.join(json.dumps(row) for row in [
+            dict(event='request', call_id=entry['run_id'], role='ceo', day=112, api='chat', request={'model': batch.MODEL}),
+            dict(event='response', call_id=entry['run_id'], role='ceo', api='chat', response=response,
+                 error=None, cost_usd=.1)]) + '\n')
+        usage = aggregate([logfile], manifest['pricing'], category='formal')
+        if fault == 'simulator_tail' and entry['group'] == 'pf':
+            simulator_log = private.parent / 'simulator-model-usage.jsonl'
+            simulator_log.write_text('\n'.join(json.dumps(dict(row, role='simulator',
+                call_id=entry['run_id'] + '-simulator')) for row in
+                [json.loads(line) for line in logfile.read_text().splitlines()]) + '\n')
+            usage = aggregate(dict(formal=[logfile], simulator=[simulator_log]), manifest['pricing'])
+            simulator_log.write_bytes(simulator_log.read_bytes() + b'{"reply":"\xe4\xb8')
+            originals[simulator_log] = simulator_log.read_bytes()
+        result = dict(status='reached_d112', day=112, cash_at_advance=123456,
+            mrr=654321, usage=usage, stop_reason='observation_end')
+        failed = entry['group'] == 'pf' and fault != 'simulator_tail'
+        record = dict(attempt=1, status='failed' if failed else 'finished', result=result,
+            reason='model_attempt_limit' if failed else 'observation_end', wall_seconds=3)
+        if failed and fault in ('controller_capture_faults', 'historical_capture'):
+            record['controller_capture_faults'] = {str(logfile): {'terminal_fault': 'closed_partial_line'}}
+        elif failed and fault in ('runtime_failure', 'reason'):
+            record[fault] = 'run_evidence_fault'
+        elif failed and fault in ('fault_file', 'historical_fault_file'):
+            write_json(private.parent / 'evidence.fault.json', {'reason': 'permanent capture failure'})
+        write_json(directory / 'attempt.json', record)
+        write_json(directory / 'result.json', result)
+        for name in ('attempt.json', 'result.json'):
+            originals[directory / name] = (directory / name).read_bytes()
+        originals[logfile] = logfile.read_bytes()
+        results[entry['group']] = result
+        if failed and fault == 'pending_tail':
+            with logfile.open('ab') as stream:
+                stream.write(b'{"event":"response","reply":"\xe4\xb8')
+            originals[logfile] = logfile.read_bytes()
+        if failed and fault in ('historical_capture', 'historical_fault_file'):
+            resumed = directory.parent / 'attempt-002'
+            resumed_private = resumed / 'runtime/private/ceo'
+            resumed_private.mkdir(parents=True)
+            resumed_log = resumed_private / 'model-usage.jsonl'
+            resumed_log.write_text(logfile.read_text().replace(entry['run_id'], entry['run_id'] + '-resumed'))
+            result = dict(result, usage=aggregate([logfile, resumed_log], manifest['pricing'], category='formal'))
+            write_json(resumed / 'attempt.json', dict(attempt=2, status='finished', result=result,
+                reason='observation_end', wall_seconds=3))
+            write_json(resumed / 'result.json', result)
+            for name in ('attempt.json', 'result.json'):
+                originals[resumed / name] = (resumed / name).read_bytes()
+            results['pf'] = result
+    completed = subprocess.run([os.sys.executable, str(batch.ROOT / 'scripts/team_batch.py'),
+        'summarize', '--manifest', str(path)], capture_output=True, text=True, check=True,
+        env=dict(os.environ, PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(batch.ROOT / 'src')))
+    summary = json.loads(completed.stdout)
+    pf = next(row for row in summary['runs'] if row['run_id'] == next(entry['run_id'] for entry in pair if entry['group'] == 'pf'))
+    comparison = next(row for row in summary['pairs']['pairs'] if row['seed'] == pair[0]['seed'] and row['repeat'] == 1)
+    historical = fault in ('historical_capture', 'historical_fault_file')
+    assert pf['status'] == ('reached_d112' if historical or fault == 'simulator_tail' else 'technical_failure')
+    assert pf['attempt_status'] == ('finished' if historical or fault == 'simulator_tail' else 'failed')
+    assert comparison['complete_d112'] == (fault == 'simulator_tail')
+    assert summary['pairs']['complete_d112_pairs'] == int(fault == 'simulator_tail')
+    permanent = fault not in (None, 'pending_tail', 'simulator_tail')
+    assert pf['evidence_fault'] == permanent
+    assert pf['day'] == 112 and pf['cash_at_advance'] == 123456 and pf['mrr'] == 654321
+    if fault == 'pending_tail':
+        assert pf['usage']['team']['known'] == results['pf']['usage']['team']['known']
+        assert all(value is None for value in pf['usage']['team']['complete'].values())
+    elif fault == 'simulator_tail':
+        assert pf['usage']['team'] == results['pf']['usage']['team']
+        assert pf['usage']['roles'] == results['pf']['usage']['roles']
+        assert pf['usage']['resources']['formal'] == results['pf']['usage']['resources']['formal']
+        assert pf['usage']['resources']['simulator']['known'] == results['pf']['usage']['resources']['simulator']['known']
+        assert all(value is None for value in pf['usage']['resources']['simulator']['complete'].values())
+        assert all(value is None for value in pf['usage']['all_resources']['complete'].values())
+        assert pf['usage']['missing_receipts'][0]['category'] == 'simulator'
+    else:
+        assert pf['usage'] == results['pf']['usage']
+    for metric in ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd'):
+        observed = comparison['comparison'][metric]
+        if permanent or fault == 'pending_tail':
+            assert observed['pf_minus_git'] is None and observed['pf_over_git'] is None
+            assert observed['missing_groups'] == ['pf']
+        else:
+            expected = results['pf']['usage']['team']['complete'][metric] - results['git']['usage']['team']['complete'][metric]
+            assert observed['pf_minus_git'] == pytest.approx(expected) and observed['pf_over_git'] == 2
+            assert observed['missing_groups'] == []
+    assert all(path.read_bytes() == data for path, data in originals.items())
+    if fault in ('pending_tail', 'simulator_tail'):
+        assert summary['resources']['team']['known']['input_tokens'] == 30
+        assert summary['resources']['team']['complete']['input_tokens'] == (30 if fault == 'simulator_tail' else None)
+        if fault == 'simulator_tail':
+            assert summary['resources']['roles']['ceo']['complete']['total_tokens'] == 45
+            assert summary['resources']['resources']['simulator']['known']['total_tokens'] == 30
+            assert all(value is None for value in summary['resources']['resources']['simulator']['complete'].values())
+        assert next(gap for gap in summary['resources']['missing_receipts']
+            if gap['reason'] == 'unterminated_log_tail')['bytes'] > 0
+        assert not list(tmp_path.rglob('evidence.fault.json'))
+
+
 def test_model_free_validation_enumerates_exact_formal_pairs_and_engineering(frozen):
     base, manifest, engineering, _ = frozen
     assert len(batch.validate_manifest(base / 'formal/manifest.json')['runs']) == 12
@@ -118,7 +231,8 @@ def test_formal_observer_selects_pair_from_real_frozen_manifest(frozen, tmp_path
     assert health['runs'] == expected['runs'] and health['manifest_sha256'] == file_hash(path)
 
 
-def test_explicit_safe_resume_ignores_historical_run_fault_stop(frozen, tmp_path, monkeypatch):
+@pytest.mark.parametrize('unknown_write', [False, True])
+def test_permanent_capture_fault_requires_approved_resume(frozen, tmp_path, monkeypatch, unknown_write):
     import importlib.util
     _, _, engineering, _ = frozen
     manifest = copy.deepcopy(engineering)
@@ -128,7 +242,7 @@ def test_explicit_safe_resume_ignores_historical_run_fault_stop(frozen, tmp_path
     write_json(path, manifest)
     write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
     run = next(entry for entry in manifest['runs'] if entry['group'] == 'pf')
-    first = batch.prepare(path, run['run_id'])
+    first = batch.prepare(path, run['run_id'], simulator_factory=batch.simulator)
     attempt = batch.attempts(run)[0]
     fault = attempt / 'runtime/private/evidence.fault.json'
     write_json(fault, dict(reason='offline capture fault after the safe checkpoint'))
@@ -150,14 +264,87 @@ def test_explicit_safe_resume_ignores_historical_run_fault_stop(frozen, tmp_path
 
     assert poll()['status'] == 'healthy'
     assert (attempt / 'STOP').exists() and not (path.parent / 'HOLD').exists()
-    resumed = batch.prepare(path, run['run_id'], resume=True)
-    assert resumed['status'] == 'ready' and resumed['attempt'] == 2
+    with pytest.raises(ValueError, match='evidence fault.*approval'):
+        batch.prepare(path, run['run_id'], resume=True)
+    assert batch.attempts(run) == [attempt]
+    raw_log = attempt / 'runtime/private/ceo/model-usage.jsonl'
+    raw_log.write_bytes(b'{"event":"response","reply":"\xe4\xb8')
+    original_log = raw_log.read_bytes()
+    from test_preflight_team_recovery_approval import bind_approval
+    snapshot = Path(first['checkpoint'])
+    checkpoint = batch.read(snapshot / 'team.json')
+    saved = dict(attempt=first['attempt'], attempt_id=first['attempt_id'],
+        attempt_sha256=file_hash(attempt / 'attempt.json'), checkpoint=str(snapshot),
+        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'), day=checkpoint['day'],
+        roles={name: role['identity'] for name, role in checkpoint['roles'].items()})
+    approval, revision = bind_approval(monkeypatch, tmp_path / 'approved-recovery', path, {run['run_id']: saved})
+    revision['evidence'].update({str(fault): file_hash(fault), str(raw_log): file_hash(raw_log)})
+    write_json(approval, revision)
+    monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(approval))
+    wire = []
+    def client(role):
+        def respond(request):
+            wire.append(role)
+            request_body = json.loads(request.content)
+            message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
+            return completion(message, request_body.get('stream', False))
+        return batch.checked_client(role, 'approved-tail', transport=httpx.MockTransport(respond))
+    if unknown_write:
+        write_json(attempt / 'runtime/private/operations/unknown.json', dict(kind='api:set_prices', status='running'))
+        with pytest.raises(RuntimeError, match='outcome unknown'):
+            batch.prepare(path, run['run_id'], resume=True, live=True,
+                client_factory=client, simulator_factory=batch.simulator)
+        assert batch.attempts(run) == [attempt]
+        assert wire == []
+        return
+    resumed = batch.prepare(path, run['run_id'], resume=True, live=True,
+        client_factory=client, simulator_factory=batch.simulator)
+    assert resumed['status'] == 'finished' and resumed['attempt'] == 2 and resumed['day'] == 28
+    assert wire.count('ceo') >= 2 and raw_log.read_bytes() == original_log
+    assert resumed['result']['usage']['team']['known']['input_tokens'] > 0
+    assert all(value is None for value in resumed['result']['usage']['team']['complete'].values())
     assert resumed['source_checkpoint'] == first['checkpoint']
     health = poll()
-    assert health['status'] == 'healthy'
+    assert health['status'] == 'pending'
     assert health['run_faults'] == [dict(run_id=run['run_id'], path=str(fault))]
     assert (attempt / 'STOP').exists()
     assert not (batch.attempts(run)[-1] / 'STOP').exists()
+
+
+@pytest.mark.parametrize('group', ['git', 'pf'])
+def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, tmp_path, group):
+    manifest = batch.canonical(frozen[2])
+    for entry in manifest['runs']:
+        entry['output_dir'] = str(tmp_path / 'runs' / entry['run_id'])
+    path = tmp_path / 'manifest.json'
+    write_json(path, manifest)
+    write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
+    entry = next(entry for entry in manifest['runs'] if entry['group'] == group)
+    first = batch.prepare(path, entry['run_id'], simulator_factory=batch.simulator)
+    directory = batch.attempts(entry)[0]
+    first.update(status='failed', reason='host_interrupted')
+    write_json(directory / 'attempt.json', first)
+    log = directory / 'runtime/private/ceo/model-usage.jsonl'
+    with log.open('ab') as stream:
+        stream.write(b'{"event":"response","reply":"\xe4\xb8')
+    original = log.read_bytes()
+    calls_sent = []
+    def client(role):
+        def respond(request):
+            calls_sent.append(role)
+            request_body = json.loads(request.content)
+            message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
+            return completion(message, request_body.get('stream', False))
+        return batch.checked_client(role, 'pending-tail', transport=httpx.MockTransport(respond))
+    resumed = batch.prepare(path, entry['run_id'], resume=True, live=True,
+        client_factory=client, simulator_factory=batch.simulator)
+    assert resumed['status'] == 'finished' and resumed['attempt'] == 2 and resumed['day'] == 28
+    assert calls_sent.count('ceo') >= 2
+    assert log.read_bytes() == original and not list(directory.rglob('evidence.fault.json'))
+    assert resumed['result']['usage']['team']['known']['input_tokens'] > 0
+    assert all(value is None for value in resumed['result']['usage']['team']['complete'].values())
+    assert any(gap['reason'] == 'unterminated_log_tail' for gap in resumed['result']['usage']['missing_receipts'])
+    assert batch.summarize(path)['pairs']['complete_d112_pairs'] == 0
 
 
 @pytest.mark.parametrize('change', [
@@ -760,13 +947,17 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
                     dict(status='completed' if operation == 'new_completed' else 'started'))
             team._set_phase('analysis')
             growth = team.roles['growth']
-            growth.executor.bash_timeout, growth.executor.bash_warn_after = .5, .1
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                running = pool.submit(growth.executor.execute, 'bash', dict(
-                    command='python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'))
-                assert entered.wait(5)
-                output = running.result(timeout=5)
-                assert 'timed out after 0.5 seconds' in output
+            # Keep both peers pending so a confirmed handoff cannot invalidate the older checkpoint.
+            for role in ('growth', 'ops_finance'):
+                executor = team.roles[role].executor
+                executor.bash_timeout, executor.bash_warn_after = .5, .1
+                entered.clear()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    running = pool.submit(executor.execute, 'bash', dict(
+                        command='python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'))
+                    assert entered.wait(5)
+                    output = running.result(timeout=5)
+                    assert 'timed out after 0.5 seconds' in output
             result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
             assert result['status'] == 'paused'
             assert result['reason'] == 'paused' and result['runtime_failure'] == 'sql_evidence_pending'
@@ -775,7 +966,7 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert 'outside a recoverable handoff' in result['checkpoint_error']
             assert result['recovery_validation']['eligible'] is (operation == 'covered')
             assert growth.store.fault is None and not growth.store.fault_path.exists()
-            assert 'growth' not in sent and 'ceo' not in sent
+            assert sent == []
             with closing(growth.store.connect()) as conn:
                 rows = [growth.store.read_event(row[0]) for row in conn.execute(
                     'SELECT event_id FROM requests WHERE branch=?', (growth.store.identity['branch_id'],))]
@@ -783,7 +974,8 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert not any(row['request']['kind'] == 'model_request' for row in rows)
             release.set()
             settled(team.server)
-            growth.store.assert_healthy()
+            for role in ('growth', 'ops_finance'):
+                team.roles[role].store.assert_healthy()
             if operation != 'covered':
                 with pytest.raises(RuntimeError, match='Business operation'):
                     batch.register_attempt(path, manifest, entry, resume=True)

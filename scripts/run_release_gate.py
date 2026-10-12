@@ -30,6 +30,7 @@ def run(directory, tests):
     try:
         env = dict(os.environ, TMPDIR=temporary, CEOBENCH_TEAM_ARTIFACTS=temporary + '/team',
                    OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1',
+                   MALLOC_ARENA_MAX='2',
                    PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(source / 'src'))
         commands = [[sys.executable, '-c', "from pathlib import Path; from saas_bench.run_state import verify_build; verify_build(Path('public'), root=Path.cwd())"],
                     [sys.executable, '-m', 'pytest', '-ra', '--basetemp=' + temporary + '/pytest',

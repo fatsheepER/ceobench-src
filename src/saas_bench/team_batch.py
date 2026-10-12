@@ -472,6 +472,12 @@ def mark_interrupted(directory, record):
     return record
 
 
+def evidence_fault(directory, record):
+    return bool(record.get('controller_capture_faults') or record.get('reason') == 'run_evidence_fault' or
+        record.get('runtime_failure') == 'run_evidence_fault' or
+        (Path(directory) / 'runtime/private/evidence.fault.json').exists())
+
+
 def register_attempt(path, manifest, entry, *, resume=False):
     from .team_recovery import hold_path, recovery_source
     if hold_path(path).exists():
@@ -483,6 +489,8 @@ def register_attempt(path, manifest, entry, *, resume=False):
         if not resume:
             raise ValueError('Run already registered; use explicit resume for paused or failed attempts')
         audited = recovery_source(path, entry, previous, history[-1])
+        if not audited and evidence_fault(history[-1], previous):
+            raise ValueError('Permanent evidence fault requires explicit recovery approval')
         if not audited:
             previous = mark_interrupted(history[-1], previous)
         if not audited and previous['status'] not in ('paused', 'failed'):
@@ -745,7 +753,7 @@ def _execute(team, manifest, entry, directory, record, hold):
 
 
 def summarize(path, resource_paths=None):
-    from .team_usage import aggregate
+    from .team_usage import aggregate, mark_truncated_totals
     from .team_results import summarize_pairs
     manifest = validate_manifest(path)
     rows, categorized = [], {manifest['category']: [], 'simulator': [], 'shared_d0': []}
@@ -762,8 +770,10 @@ def summarize(path, resource_paths=None):
             except ValueError:
                 pass
         result = last.get('result', {})
+        fault = any(evidence_fault(directory, read(directory / 'attempt.json')) for directory in history)
         row = dict(entry, **{k: v for k, v in result.items() if k not in entry})
-        row.update(status=result.get('status', 'technical_failure' if last['status'] == 'failed' else last['status']), attempt_status=last['status'],
+        row.update(status='technical_failure' if last['status'] == 'failed' else result.get('status', last['status']),
+                   attempt_status=last['status'], evidence_fault=fault,
                    attempt=last['attempt'], reason=last.get('reason'))
         row.update(wall_time(history))
         rows.append(row)
@@ -780,6 +790,14 @@ def summarize(path, resource_paths=None):
             raise ValueError('Unknown resource category')
         categorized.setdefault(category, []).extend(Path(p) for p in paths)
     resources = aggregate(categorized, manifest['pricing'], category=manifest['category'])
+    for row in rows:
+        tails = [gap for gap in resources['missing_receipts'] if gap['reason'] == 'unterminated_log_tail' and
+                 Path(gap['path']).is_relative_to(Path(row['output_dir']))]
+        usage = row.get('usage')
+        if tails and usage:
+            usage['missing_receipts'] = [gap for gap in usage.get('missing_receipts', [])
+                if gap['reason'] != 'unterminated_log_tail'] + tails
+            mark_truncated_totals(usage, tails, category=row['category'])
     return dict(category=manifest['category'], runs=rows,
                 pairs=summarize_pairs(rows), resources=resources)
 

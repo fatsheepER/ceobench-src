@@ -46,14 +46,15 @@ def summarize_pairs(runs):
         comparison = {}
         for metric in PRIMARY_METRICS:
             values = {group: (run.get('usage') or {}).get('team', {}).get('complete', {}).get(metric)
-                for group, run in pair.items()}
+                for group, run in pair.items() if not run.get('evidence_fault')}
             left, right = values.get('git'), values.get('pf')
             missing = [group for group, value in (('git', left), ('pf', right)) if value is None]
             comparison[metric] = dict(pf_minus_git=right - left if not missing else None,
                 pf_over_git=right / left if not missing and left != 0 else None,
                 missing_groups=missing, ratio_reason='missing_metric' if missing else
                     ('zero_git_denominator' if left == 0 else None))
-        complete = bool(git and pf and git['status'] == pf['status'] == 'reached_d112')
+        complete = bool(git and pf and git['status'] == pf['status'] == 'reached_d112' and
+                        not any(run.get('evidence_fault') for run in pair.values()))
         bankruptcy = bool(git and pf and 'natural_bankruptcy' in (git['status'], pf['status']))
         common_day = min(git['day'], pf['day']) // 7 * 7 if bankruptcy and all(
             run.get('day') is not None for run in (git, pf)) else None

@@ -80,6 +80,22 @@ def _summary(records):
                 no_response_requests=len({r['call_id'] for r in records if r['no_response']}))
 
 
+def mark_truncated_totals(usage, gaps, *, category):
+    """Mask only totals a truncated resource log could still change."""
+    affected = {gap['category'] for gap in gaps if gap['reason'] == 'unterminated_log_tail'}
+    if not affected:
+        return
+    if affected & {'formal', 'engineering'}:
+        affected.add('simulator')
+    summaries = [usage.get('all_resources', {}), usage.get('failed_attempt_usage', {})]
+    summaries.extend(summary for resource, summary in usage.get('resources', {}).items() if resource in affected)
+    if category in affected:
+        summaries.extend([usage.get('team', {}), *usage.get('roles', {}).values()])
+    for summary in summaries:
+        if 'complete' in summary:
+            summary['complete'] = dict.fromkeys(summary['complete'])
+
+
 def _attempt_order(attempt):
     request = attempt.get('http_request', {})
     timestamp = request.get('timestamp') or attempt.get('http_response', {}).get('timestamp')
@@ -103,15 +119,33 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
     if category not in CATEGORIES:
         raise ValueError('Unknown primary resource category: ' + category)
     groups = paths if isinstance(paths, Mapping) else {category: paths}
-    calls, attempts, seen, duplicates = {}, {}, {}, 0
+    calls, attempts, seen, duplicates, gaps = {}, {}, {}, 0, []
     for resource, files in groups.items():
         if resource not in CATEGORIES:
             raise ValueError('Unknown resource category: ' + resource)
         files = [files] if isinstance(files, (str, Path)) else files
         for path in files:
-            with Path(path).open() as stream:
+            with Path(path).open('rb') as stream:
                 for line_number, line in enumerate(stream, 1):
-                    row = json.loads(line)
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        if isinstance(exc, UnicodeDecodeError):
+                            truncated = exc.reason == 'unexpected end of data'
+                        else:
+                            suffix = exc.doc[exc.pos:].strip()
+                            truncated = (exc.pos >= len(exc.doc.rstrip()) or
+                                exc.msg.startswith('Unterminated string') or
+                                exc.msg == 'Expecting value' and suffix in ('t', 'tr', 'tru', 'f', 'fa', 'fal', 'fals', 'n', 'nu', 'nul', '-') or
+                                exc.msg == "Expecting ',' delimiter" and suffix in ('e', 'E', 'e+', 'E+', 'e-', 'E-', '.') or
+                                exc.msg.startswith('Invalid \\uXXXX escape') and suffix.startswith('u') and
+                                len(suffix) < 5 and set(suffix[1:]) <= set('0123456789abcdefABCDEF'))
+                        if line.endswith(b'\n') or not truncated:
+                            raise
+                        gaps.append(dict(path=str(Path(path).resolve()), line=line_number,
+                            offset=stream.tell() - len(line), bytes=len(line), category=resource,
+                            reason='unterminated_log_tail'))
+                        break
                     event = row.get('event')
                     if event not in ('request', 'response', 'http_request', 'http_response', 'http_error'):
                         raise ValueError('Unknown model receipt event: ' + str(event))
@@ -140,7 +174,7 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                         attempt[event] = row
                     else:
                         call[event] = row
-    records, gaps = [], []
+    records = []
     for call_id, call in calls.items():
         request, response = call.get('request', {}), call.get('response')
         day = request.get('day')
@@ -200,10 +234,12 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                 response_receipt=dict(path=receipt.get('receipt_path'),
                     line=receipt.get('receipt_line'))))
     team_records = [r for r in records if r['category'] == category and r['role'] in ROLES]
-    return dict(pricing=prices, primary_category=category, team=_summary(team_records),
+    result = dict(pricing=prices, primary_category=category, team=_summary(team_records),
         roles={role: _summary([r for r in team_records if r['role'] == role]) for role in ROLES},
         resources={resource: _summary([r for r in records if r['category'] == resource]) for resource in CATEGORIES},
         all_resources=_summary(records), calls=len({r['call_id'] for r in records}),
         attempts=sum(r['attempt_id'] is not None for r in records), duplicates=duplicates,
         missing_receipts=gaps, failed_attempt_usage=_summary([r for r in records if r['failed_http_attempt']]),
         records=records)
+    mark_truncated_totals(result, gaps, category=category)
+    return result

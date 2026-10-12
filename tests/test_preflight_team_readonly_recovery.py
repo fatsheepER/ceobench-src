@@ -135,7 +135,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
                 assert entered.wait(5)
                 team.request_pause()
             result = running.result(timeout=7)
-            assert result['status'] == ('failed' if interruption == 'pending_write' and entry['group'] == 'pf' else 'paused')
+            assert result['status'] == 'paused'
             assert result['checkpoint'] == str(source)
             assert result['recovery_validation']['eligible'] is not blocked
             if interruption == 'symlink':
@@ -165,7 +165,21 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         finally:
             release.set()
             running.result(timeout=7)
-    team.close()
+    if interruption == 'pending_write':
+        batch.close_team(team, record)
+        assert any(item.get('kind') == 'public_http' and item.get('path') == '/call' and
+            item.get('http_status') == 403 for item in
+            [json.loads(line) for line in role.audit.path.read_text().splitlines()])
+        wrapper = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
+            if batch.read(path)['kind'] == 'ceo_tool:bash')
+        assert wrapper['recovery']['classification'] in ('read_only', 'read_only_interrupted')
+        assert wrapper['recovery']['mutation_epoch_after'] == 0
+        assert record['checkpoint'] == str(source)
+        assert record['recovery_validation']['eligible'] is True
+        assert batch.read(directory / 'attempt.json') == record
+        blocked = False
+    else:
+        team.close()
     def resume_client(name):
         def resume_response(request):
             body = json.loads(request.content)
@@ -288,17 +302,21 @@ def test_resume_refuses_old_bash_write_even_with_closed_worker_or_readonly_label
     monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(approved.approval_path))
     original = {path: path.read_bytes() for path in
         (approved.directory / 'attempt.json', operation, changed, approved.snapshot / 'checkpoint.json')}
-    with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
-        batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
-            simulator_factory=fast_simulator)
-    assert batch.attempts(approved.entry) == [approved.directory]
-    destination = tmp_path / 'restore-refused'
-    with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
-        batch.MultiAgentRuntime.restore(approved.snapshot, destination,
-            client_factory=lambda role: batch.checked_client(role, 'offline-recovery', no_models=True),
-            public_dir=approved.manifest['public_dir'], simulator_factory=fast_simulator)
-    assert not destination.exists()
-    assert {path: path.read_bytes() for path in original} == original
+    try:
+        with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
+            batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
+                simulator_factory=fast_simulator)
+        assert batch.attempts(approved.entry) == [approved.directory]
+        destination = tmp_path / 'restore-refused'
+        with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
+            batch.MultiAgentRuntime.restore(approved.snapshot, destination,
+                client_factory=lambda role: batch.checked_client(role, 'offline-recovery', no_models=True),
+                public_dir=approved.manifest['public_dir'], simulator_factory=fast_simulator)
+        assert not destination.exists()
+        assert {path: path.read_bytes() for path in original} == original
+    finally:
+        monkeypatch.delenv('CEOBENCH_RECOVERY_APPROVAL', raising=False)
+        monkeypatch.delenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', raising=False)
 
 
 @pytest.mark.parametrize('managed_git', ['git', 'pf'], indirect=True)

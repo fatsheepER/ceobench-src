@@ -47,6 +47,68 @@ def wait_until(predicate, seconds=5):
     assert predicate()
 
 
+@pytest.mark.parametrize('failed_listener', [1, 3])
+def test_listener_start_failure_closes_real_runtime_and_next_start(tmp_path, monkeypatch, failed_listener):
+    from numpy.random import default_rng
+    from saas_bench.api_server import NovaMindAPIServer
+    from saas_bench.config import BenchmarkConfig
+    from saas_bench.database import init_database
+    from saas_bench.simulation import Simulator
+    from saas_bench.tools import AgentTools
+    from test_preflight_team_flow import final, make_team
+    conn = init_database(':memory:')
+    config = BenchmarkConfig(seed=123)
+    simulator = Simulator(conn, config, default_rng(123))
+    simulator.initialize()
+    tools = AgentTools(conn, 0, tmp_path / 'host', config=config, rng=simulator.rng)
+    starts, apis, clients, listeners = [], [], [], []
+    thread_start, api_start = threading.Thread.start, NovaMindAPIServer.start
+
+    def injected_start(thread):
+        if getattr(thread._target, '__name__', None) == 'serve_forever':
+            starts.append(thread)
+            if len(starts) == failed_listener:
+                raise RuntimeError('Injected listener startup failure')
+            listeners.append(thread)
+        return thread_start(thread)
+
+    def remember(api):
+        apis.append(api)
+        return api_start(api)
+
+    def client(role):
+        result = OpenAI(api_key='OFFLINE', http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={}))))
+        clients.append(result)
+        return result
+
+    try:
+        started = time.monotonic()
+        with monkeypatch.context() as failure:
+            failure.setattr(threading.Thread, 'start', injected_start)
+            failure.setattr(NovaMindAPIServer, 'start', remember)
+            with pytest.raises(RuntimeError, match='Injected listener startup failure'):
+                MultiAgentRuntime(tmp_path / 'failed', tools, conn=conn, simulator=simulator,
+                    mode='git', client_factory=client)
+        assert time.monotonic() - started < 5
+        assert len(apis) == 1
+        assert apis[0]._httpd is None and apis[0]._role_httpds == []
+        assert apis[0].public_request_state()['active'] == []
+        assert all(not Path(path).exists() for path in apis[0].role_sockets.values())
+        for thread in listeners:
+            thread.join(1)
+            assert not thread.is_alive()
+    finally:
+        for item in clients:
+            item.close()
+        conn.close()
+    with make_team('git', lambda team, role, body: final('unused'), 'startup-retry') as team:
+        output = team.roles['ceo'].executor.execute('bash',
+            dict(command="python -c 'import novamind_api as nm; print(nm.vars.current_day)'"))
+        assert output.strip() == '0'
+        assert team.server.public_request_state()['mutation_epoch'] == 0
+
+
 @pytest.mark.parametrize('bash_timeout', [480, 1200])
 def test_analyst_failure_cancels_partner_bash_before_publication(tmp_path, monkeypatch, bash_timeout):
     marker = tmp_path / 'running'

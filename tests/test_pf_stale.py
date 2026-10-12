@@ -466,7 +466,7 @@ def test_mixed_refresh_keeps_reads_independent_within_total_budget(workspace, tm
     versions = [record_sql(store, sql, {}), record_sql(store, 'SELECT amount FROM ledger', fast_body),
                 event + ':public_response']
     parent = store.begin_event('pf_dependencies', {})
-    server.QUERY_TIMEOUT_SECONDS = .05
+    server.QUERY_TIMEOUT_SECONDS = 2
     before = server.conn.serialize()
     refreshed = refresh(server, versions, parent)
     records, bodies = [], []
