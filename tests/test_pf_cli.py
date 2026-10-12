@@ -52,6 +52,8 @@ def test_pf_command_parsing_views_and_refusals():
 
 def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
+    dashboard = store.begin_event('dashboard_generation', {'day': 0})
+    store.complete(dashboard)
     first = executor.execute('write_file', {'path': 'MEMORY.md', 'content': 'a\nb\n', 'note': 'first notes'})
     assert first.endswith('\n[pf: wrote MEMORY.md@v1 | note saved]'), first
     # The note is not part of the call: repeating the command keeps its handle.
@@ -138,6 +140,8 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
 def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
     runner = offline_runner(text_registration='pf')
     runner.agent.current_day = 0
+    stamp = runner.evidence_store.begin_event('dashboard_generation', {'day': 0})
+    runner.evidence_store.complete(stamp)
     output = runner._execute_tool('bash', {'command': './novamind-operation python-c "import novamind_api as nm; '
                                            "nm.analytics.set_targeted_dev_spend(targeted_spend={'S1': 500})\""})
     assert '[pf: cmd' in output, output
@@ -171,7 +175,7 @@ def test_next_weeks_memory_names_its_history(offline_runner, monkeypatch, mode):
     system = requests[-1]['messages'][0]['content']
     assert 'loaded into your context at the start of every week.\n' in system
     if mode == 'pf':
-        assert '[pf: MEMORY.md@v1, written day 0, note: "cap table kept here" | 1 version: pf log MEMORY.md]' in system
+        assert '[pf: MEMORY.md@v1, written day unknown, note: "cap table kept here" | 1 version: pf log MEMORY.md]' in system
     else:
         assert re.search(r'\[git: MEMORY\.md last committed in week-1 \([0-9a-f]{7}\) \| git log -p -- MEMORY\.md\]', system)
     assert system.endswith('\n\ncap 272812')

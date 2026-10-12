@@ -1357,7 +1357,8 @@ class NovaMindAPIServer:
                 versions = capture.store.load_state('script_versions') or {}
                 parent_token = CURRENT_EVENT.set(None) if self.team_mode else None
                 try:
-                    capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name)})
+                    capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name),
+                                                                  'day': self.tools.current_day})
                 finally:
                     if parent_token is not None:
                         CURRENT_EVENT.reset(parent_token)

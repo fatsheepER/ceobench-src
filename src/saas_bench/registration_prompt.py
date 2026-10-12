@@ -94,7 +94,7 @@ removed.
 '''
 
 GLOB_ROW = '| `glob_files` | Find files by pattern (like `*.py`, `docs/**/*.json`) |'
-WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `novamind register-daily-script`'
+WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `./novamind-operation register-daily-script`'
 
 
 def edits(pf):
@@ -168,7 +168,7 @@ def pf_memory_line(store, version):
     group = handles.group(version)
     if group is None:
         return None
-    head = f"{handles.name(version)}, written day {group['day']}"
+    head = f"{handles.name(version)}, written day {group['day'] if group['day'] is not None else 'unknown'}"
     if note := handles.note(version):
         head += f', note: "{short(note[1], 200)}"'
     count = len(handles.groups[group['key']])

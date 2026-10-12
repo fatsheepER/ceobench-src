@@ -68,7 +68,7 @@ def test_compact_lines_carry_day_what_and_value_without_clock_time(workspace, tm
     # One line per declared reference; the failed threshold shows the value then and now.
     assert len([l for l in lines if re.match(r'\d+\. ', l)]) == 1
     assert 'cites' in lines[2] and 'text r1.1' in lines[2]
-    assert '1 of 1 underlying sources PREDICATE FAILS on SQL: SELECT amount FROM ledger: >= 40: now 39 (was 42)' in lines[2]
+    assert '1 underlying source PREDICATE FAILS on SQL: SELECT amount FROM ledger: >= 40: now 39 (was 42)' in lines[2]
     detail = executor.execute('pf_dependencies', {'target': {'record': 'r2'}, 'detail': True})
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39', detail) and 'note: Keep at least forty' in detail
     assert 'SQL (1 rows): SELECT amount FROM ledger' in detail

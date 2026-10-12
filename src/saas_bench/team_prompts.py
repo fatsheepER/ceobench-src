@@ -80,6 +80,9 @@ when you expect to rely on them later.
 Use ask_analyst(role, message) for focused questions. Include relevant references,
 candidate actions and settings already changed this week. The analysts cannot
 read each other's workspaces; pass relevant findings when coordinating them.
+Registered scripts and their printed output belong to their registering role.
+Your scripts can change the business; analyst scripts have read-only access.
+ask_analyst follow-ups do not rerun registered scripts.
 
 '''
 
@@ -103,7 +106,17 @@ returned rows to describe the full population. Use SQL aggregates for population
 totals. An explicit LIMIT narrows the requested result, even without a truncation
 warning. row_count counts returned rows, not all matching records.
 Write only in your workspace. You may register read-only scripts for the start of
-each week. Only the CEO can change the business, buy research or advance time.
+each week. Manage your registered snapshots with:
+
+- ./novamind-operation register-daily-script <path>
+- ./novamind-operation list-daily-scripts
+- ./novamind-operation remove-daily-script <filename>
+
+The legacy daily names mean weekly execution. Registration snapshots the source;
+re-register after editing.
+Scripts run in insertion order, must import novamind_api explicitly, and deliver
+printed output only to their owner. ask_analyst follow-ups do not rerun them.
+Only the CEO can change the business, buy research or advance time.
 Return your advice in final text when finished.
 
 Use text_create, text_revise, text_retire and text_list for lasting judgments.

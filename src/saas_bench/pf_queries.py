@@ -233,7 +233,7 @@ class PFQueries:
 
     def _noted(self, version):
         note = evidence_handles.index(self.store).note(version)
-        return f' note (day {note[0]}): "{pf_render.short(note[1], 200)}"' if note else ''
+        return f' note (day {note[0] if note[0] is not None else "unknown"}): "{pf_render.short(note[1], 200)}"' if note else ''
 
     def _shown_notes(self, after, written, body):
         """Notes on workspace files whose whole content this output shows, e.g. after cat."""
@@ -372,6 +372,8 @@ class PFQueries:
                     raise
                 finally:
                     CURRENT_EVENT.reset(token)
+        checked_days = {r['check'].get('checked_day') for r in rows if 'check' in r}
+        checked_day = next(iter(checked_days)) if len(checked_days) == 1 else None
         unexpanded = list(dict.fromkeys(self.resolver.handle(r['edge']['target']) for r in rows
                                        if r['stop'] == 'depth_limit'))
         describe = lambda r, all_rows=rows: self._top(r, all_rows) if _depth(r) == 1 else self._describe_edge(r)
@@ -389,7 +391,7 @@ class PFQueries:
                 rows = endpoints
         return self._page(rows, offset, describe, root=self._describe(target),
                           stale_check='performed' if checking else 'not_performed', unexpanded=unexpanded,
-                          checked_day=self._check_day if checking else None)
+                          checked_day=checked_day if checking else None)
 
     def _review_after_manual(self, target, rows):
         state = self.store.load_state('pf_review')
@@ -483,7 +485,7 @@ class PFQueries:
                         predicates_checked = True
                     if version in continuing:
                         if (self._conditional(row) or row.get('retry_refresh')) and not row['historical_only']:
-                            tops.append(self._describe_edge(row))
+                            tops.append(self._top(row, rows))
                     elif _weekly(row):
                         tops.append(self._top(row, rows))
                 # Old data changing deserves an example even behind an immutable
@@ -493,7 +495,9 @@ class PFQueries:
                           or t['check']['predicate_result'] in ('fails', 'cannot_check')
                           or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds'
                               and t['check'].get('change_kind') != 'append_only')]
-                entries.append(dict(text=self._describe(version), total=len(tops), changed=direct))
+                entries.append(dict(text=self._describe(version), total=len(tops), changed=direct,
+                                    stored_conditions=[self._describe_edge(r) for r in rows if not r['historical_only']
+                                        and r['check'].get('evaluation_scope') == 'stored_artifact' and self._conditional(r)]))
                 if not direct and any(t['check'].get('below_changed') or
                                       t['check'].get('change_kind') == 'append_only' for t in tops):
                     underlying.append(self.resolver.handle(version))
@@ -555,14 +559,40 @@ class PFQueries:
             target = row['edge']['target']
             failure = failures.get(encoded(self._key(target)).decode(), {}) if target else {}
             return bool(failure) and not failure.get('permanent') and not row['historical_only']
-        paths = [r['path'] for r in rows if not r['historical_only'] and (self._conditional(r) or needs_retry(r))]
+        active = [r for r in rows if not r['historical_only']]
+        selected = {encoded(r['edge']) for r in active if self._conditional(r) or needs_retry(r)}
+        descendants = {self._node(r['edge']['target']) for r in active if self._conditional(r)
+                       and r['edge']['target'] and r['check'].get('evaluation_scope') == 'stored_artifact'}
+        fresh = set()
+        while True:
+            check()
+            before = len(descendants)
+            for row in active:
+                check()
+                if self._node(row['edge']['source']) in descendants:
+                    fresh.add(encoded(row['edge']))
+                    if row['edge']['target']:
+                        descendants.add(self._node(row['edge']['target']))
+            if len(descendants) == before:
+                break
+        selected.update(fresh)
+        while True:
+            check()
+            before = len(selected)
+            sources = {self._node(r['edge']['source']) for r in active if encoded(r['edge']) in selected}
+            selected.update(encoded(r['edge']) for r in active
+                            if r['edge']['target'] and self._node(r['edge']['target']) in sources)
+            if len(selected) == before:
+                break
         result = []
-        for row in rows:
-            if not any(path[:len(row['path'])] == row['path'] for path in paths):
+        for row in active:
+            check()
+            key = encoded(row['edge'])
+            if key not in selected:
                 continue
             item = dict(row)
             item['retry_refresh'] = needs_retry(row)
-            if not self._conditional(row) and not item['retry_refresh']:
+            if not self._conditional(row) and not item['retry_refresh'] and key not in fresh:
                 item['cached_check'] = row['check']
             else:
                 item.pop('cached_check', None)
@@ -590,29 +620,27 @@ class PFQueries:
         check = row.get('check')
         if not check or row['historical_only']:
             return result
-        below = [r for r in rows if _depth(r) > 1 and r['path'][:2] == row['path'] and r.get('check')
-                 and not r['historical_only'] and (r['edge']['target'] is None or
-                 (self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
-                  and not self._clock(r['edge']['target'])))]
-        # Shared ancestors may have been expanded under another path. Use propagated
-        # causes, not just this branch's displayed traversal, for failed predicates.
-        causes = {tuple(path[-2:]) for path in check['affected_paths'] if len(path) > 2}
-        missing = {path[-1] for path in check['affected_paths'] if len(path) > 1}
-        problems = {encoded(r['edge']): r for r in rows if not r['historical_only']
-                    and r['check']['predicate_result'] in ('fails', 'cannot_check') and
-                    ((r['edge']['source'], r['edge']['target']) in causes or
-                     (r['edge']['target'] is None and r['edge']['source'] in missing))}
+        causes = {(self._node(path[-2]), self._node(path[-1]))
+                  for path in check['affected_paths'] if len(path) > 2}
+        missing = {self._node(path[-1]) for path in check['affected_paths'] if len(path) > 1}
+        below = {encoded(r['edge']): r for r in rows if r is not row and not r['historical_only']
+                 and ((r['edge']['target'] is not None
+                       and (self._node(r['edge']['source']), self._node(r['edge']['target'])) in causes)
+                      or (r['edge']['target'] is None and self._node(r['edge']['source']) in missing))}
+        problems = {key: r for key, r in below.items()
+                    if r['check']['predicate_result'] in ('fails', 'cannot_check')}
         failed = [r for r in problems.values() if r['check']['predicate_result'] == 'fails']
-        changed = [r for r in below if r['check']['version_changed'] and r['check']['predicate_result'] in
+        changed = [r for r in below.values() if r['edge']['target']
+                   and self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
+                   and not self._clock(r['edge']['target']) and r['check']['version_changed'] and r['check']['predicate_result'] in
                    ('not_declared', 'not_checked')]
         changed.sort(key=lambda r: r['check'].get('change_kind') == 'append_only')
         unknown = [r for r in problems.values() if r['check']['predicate_result'] == 'cannot_check']
-        source_count = len({encoded(r['edge']) for r in below} | problems.keys())
         parts = []
         for rows_, head in ((failed, 'PREDICATE FAILS on'), (changed, 'changed:')):
             if rows_:
                 example = self._describe_edge(rows_[0])
-                parts.append(f"{len(rows_)} of {source_count} underlying sources {head} "
+                parts.append(f"{pf_render.plural(len(rows_), 'underlying source')} {head} "
                              f"{example['target']['what']}: {example['check'].get('summary', 'changed')}")
         if unknown:
             reasons = ', '.join(sorted({str(r['check']['reason']) for r in unknown}))
@@ -642,7 +670,8 @@ class PFQueries:
             self._codes, self._private_pending = defaultdict(set), {}
             self._edge_keys, self._pending_events = set(), set()
             self._graph_versions, self._traces = defaultdict(int), {}
-            self._indexed = self._event_cutoff = self._last_day = 0
+            self._indexed = self._event_cutoff = 0
+            self._last_day = None
         day = self._last_day
         added_events = 0
         with closing(self.store.connect()) as conn:
@@ -662,9 +691,8 @@ class PFQueries:
                     except KeyError:
                         continue
                 request = json.loads(row['request'])
-                # The server records each weekly dashboard with its simulated day; later
-                # events happen on that day. Agents reason in simulated days, not clock time.
-                if row['event_id'] not in self.events and request['kind'] == 'dashboard_generation':
+                # Host day stamps provide context; file observation dates require stamped ancestry.
+                if row['event_id'] not in self.events and request['kind'] in evidence_handles.HOST_DAY_KINDS:
                     day = (request.get('request') or {}).get('day', day)
                 self.event_day.setdefault(row['event_id'], day)
                 self.events[row['event_id']] = dict(request=request,
@@ -678,7 +706,7 @@ class PFQueries:
             versions = conn.execute('SELECT rowid,* FROM versions WHERE rowid>? AND rowid<=? ORDER BY rowid',
                                     (self._indexed, self.cutoff)).fetchall()
         self._last_day = day
-        self._check_day = max(day, self.registry.sim_day() or 0)
+        self._check_day = self.registry.sim_day()
         new_nodes = {}
         for row in versions:
             check()
@@ -954,25 +982,28 @@ class PFQueries:
                 else 'json' if (meta.get('object_id') or '').endswith('.json') else 'text')
         return pf_render.change(kind, self.resolver.content(before)[1], self.resolver.content(after)[1])
 
-    def _value(self, before, after, reference):
+    def _value(self, before, after, reference, check):
         """The cited cell(s) then and now, e.g. '>= 770: now 721 (was 812)'."""
         from .pf_stale import cell
         meta = self.resolver.content(before)[0]
         kind = 'csv' if (meta.get('object_id') or '').endswith('.csv') else 'json'
+        now = 'now' if check.get('evaluation_scope') == 'refreshed_read' else (
+            'stored bytes' if check.get('evaluation_scope') == 'stored_artifact' else 'captured value')
+        was = 'was' if now == 'now' else 'cited'
         try:
             predicate = reference.get('predicate') or {}
             if predicate.get('type') == 'compare':
                 left, right = (cell(self.resolver.content(after)[1], predicate[k], kind) for k in ('left', 'right'))
-                return f"{pf_render.number(left)} {predicate['op']} {pf_render.number(right)} now"
+                return f"{pf_render.number(left)} {predicate['op']} {pf_render.number(right)} {now}"
             old, new = (cell(self.resolver.content(v)[1], reference['select'], kind) for v in (before, after))
         except (ValueError, KeyError, TypeError, IndexError):
             return 'value unavailable'
         n = pf_render.number
         if predicate.get('type') == 'threshold':
-            return f"{predicate['op']} {n(predicate['value'])}: now {n(new)} (was {n(old)})"
+            return f"{predicate['op']} {n(predicate['value'])}: {now} {n(new)} ({was} {n(old)})"
         if predicate.get('type') == 'tolerance':
-            return f"within {n(predicate['amount'])} of {n(old)}: now {n(new)}"
-        return f'now {n(new)} (was {n(old)})'
+            return f"within {n(predicate['amount'])} of {n(old)}: {now} {n(new)}"
+        return f'{now} {n(new)} ({was} {n(old)})'
 
     def _node(self, version):
         return self.same_bytes.get(version, version)
@@ -1035,7 +1066,7 @@ class PFQueries:
             if edge['target'] and current:
                 if 'reference' in edge and (edge['reference'].get('select') or edge['reference'].get('predicate')) \
                         and check['predicate_result'] in ('holds', 'fails'):
-                    check['summary'] = self._value(edge['target'], current, edge['reference'])
+                    check['summary'] = self._value(edge['target'], current, edge['reference'], check)
                 elif check['version_changed']:
                     check['summary'] = self._change(edge['target'], current)
             check['current_version'] = self.resolver.handle(current) if current else None
@@ -1128,14 +1159,14 @@ class PFQueries:
         name = handles.name(target)
         out = [f"{name}: the version and day that introduced each line"]
         previous = None
-        width = max((len(f"v{g['k']} d{g['day']}") for g in origins), default=0)
+        width = max((len(f"v{g['k']} d{g['day'] if g['day'] is not None else 'unknown'}") for g in origins), default=0)
         for origin_group, line in zip(origins, lines):
-            label = f"v{origin_group['k']} d{origin_group['day']}" if origin_group is not previous else ''
+            label = f"v{origin_group['k']} d{origin_group['day'] if origin_group['day'] is not None else 'unknown'}" if origin_group is not previous else ''
             out.append(f'{label:<{width}} | {line}')
             previous = origin_group
         notes = [g for g in {id(g): g for g in origins}.values() if g.get('note')]
         if notes:
-            out.append('Notes: ' + ' · '.join(f"v{g['k']} (day {g['note'][0]}): \"{pf_render.short(g['note'][1], 120)}\""
+            out.append('Notes: ' + ' · '.join(f"v{g['k']} (day {g['note'][0] if g['note'][0] is not None else 'unknown'}): \"{pf_render.short(g['note'][1], 120)}\""
                                               for g in sorted(notes, key=lambda g: g['k'])))
         text = '\n'.join(out)
         if len(text) > 30000:
@@ -1183,7 +1214,7 @@ class PFQueries:
         text = f"pf search --text {self.values['text']!r}: {page['total']} matching objects/content versions, newest first."
         sources = []
         for item in page['items']:
-            text += f"\n{item['version']} · day {item['day']} · excerpt:\n"
+            text += f"\n{item['version']} · day {item['day'] if item['day'] is not None else 'unknown'} · excerpt:\n"
             sources.append(dict(version_id=item['source_version'], source_range=item['source_range'],
                                 request_range=[len(text), len(text) + len(item['snippet'])], full_source=False))
             text += item['snippet']

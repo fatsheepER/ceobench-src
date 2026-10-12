@@ -19,6 +19,7 @@ import threading
 
 from .sql_evidence import digest, encoded
 from .role_policy import READABLE_ROLES
+from .pf_deadline import check
 
 
 # Private state name of the per-kind object number table, e.g. {"query": {key: 7}}.
@@ -29,6 +30,7 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
 STREAMS = {'stdout': 'out', 'stderr': 'err', 'executed_code': 'code'}
 # Calls that may carry an agent note (design 3.2); mirrors bash_agent.tools.NOTE_TOOLS.
 NOTE_KINDS = frozenset({'bash', 'write_file', 'edit_file'})
+HOST_DAY_KINDS = frozenset({'dashboard_generation', 'registered_script_execution'})
 VERSIONED = re.compile(r'(.+)@v([1-9][0-9]*)')
 RAW_VERSION = re.compile(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*:.+')
 SINGLE = re.compile(r'([a-z_]+?)([1-9][0-9]*)')
@@ -59,7 +61,7 @@ class HandleIndex:
         self.store = store
         self.lock = threading.RLock()
         self.version_rowid = self.request_rowid = 0
-        self.day = 0
+        self.day = None
         self.events = {}                    # visible event -> (kind, request record, day)
         self.model_requests = []            # visible model sends, in acquisition order
         self.notes = {}                     # visible event -> (day, note) the agent attached to that call
@@ -73,27 +75,29 @@ class HandleIndex:
     def _ancestry(self, conn):
         chain, branch, limit = {}, self.store.identity['branch_id'], None
         while branch and branch not in chain:
+            check()
             chain[branch] = limit
             row = conn.execute('SELECT parent,fork_seq FROM branches WHERE id=?', (branch,)).fetchone()
             branch, limit = (row[0], row[1]) if row else (None, None)
         return chain
 
     def refresh(self):
+        check()
         with self.lock, closing(self.store.connect()) as conn:
             conn.execute('BEGIN')
             if self.chain is None:
                 self.chain = self._ancestry(conn)
             for row in conn.execute('SELECT rowid,event_id,branch,seq,request FROM requests WHERE rowid>? '
                                     'ORDER BY rowid', (self.request_rowid,)):
+                check()
                 self.request_rowid = row['rowid']
                 if not self.store.identity.get('role') and (row['branch'] not in self.chain or
                         (self.chain[row['branch']] is not None and row['seq'] > self.chain[row['branch']])):
                     continue
                 record = json.loads(row['request'])
-                if record['kind'] == 'dashboard_generation':
-                    # Later events happen on the simulated day of the latest weekly dashboard.
-                    self.day = (record.get('request') or {}).get('day', self.day)
                 args = record.get('request') if isinstance(record.get('request'), dict) else {}
+                if record['kind'] in HOST_DAY_KINDS:
+                    self.day = args.get('day', self.day)
                 if record['kind'] == 'model_request' and record.get('role') == self.store.identity.get('role') and record.get('session_id') == self.store.identity.get('session_id'):
                     self.model_requests.append((row['event_id'], args.get('context_id')))
                 # Keep only what names an object; commands and wire bodies stay in the store.
@@ -115,6 +119,7 @@ class HandleIndex:
                        if row['version_id'].endswith(':comparison')}
         with self.lock:
             for row in rows:
+                check()
                 self.version_rowid = max(self.version_rowid, row['rowid'])
                 if row['event_id'] in self.events:
                     meta = json.loads(row['metadata'])

@@ -142,7 +142,9 @@ class StaleCheck:
 
     def run(self, rows, day=None):
         started = time.monotonic()
-        current, failures, representatives = {}, {}, {}
+        current, failures, representatives, scopes = {}, {}, {}, {}
+        checked_day = day if day is not None else self.q.registry.sim_day()
+        self.q._check_day = checked_day
         retry = self.store.load_state('pf_refresh_failures') or {}
         diagnostics, compared, events = {}, {}, dict(self.q.events)
         for row in rows:
@@ -157,6 +159,8 @@ class StaleCheck:
             event = self.store.read_event(meta['created_by_event'], evidence=True)
             if meta['layer'] == 'file_bytes':
                 current[key], failures[key] = self._file(meta['object_id'], meta.get('owner_role'))
+                if not failures[key]:
+                    scopes[key] = 'stored_artifact'
             elif meta['layer'] == 'server_public_response' and replayable(event):
                 retry_key = encoded(key).decode()
                 previous = retry.get(retry_key, {})
@@ -179,6 +183,7 @@ class StaleCheck:
                 diagnostics[key] = dict(previous, source=source)
             else:
                 current[key] = self.q.latest[key]
+                scopes[key] = 'captured_value'
         refreshing = time.monotonic()
         if remote:
             try:
@@ -192,14 +197,13 @@ class StaleCheck:
                     receipt = self.store.read_event(meta['created_by_event'], evidence=True)
                     events[meta['created_by_event']] = receipt
                     result = receipt['result']
-                    self.q._check_day = max(self.q._check_day, result.get('day') or 0)
                     mark = encoded(key).decode()
                     if result.get('status') == 'succeeded':
+                        scopes[key] = 'refreshed_read'
                         retry.pop(mark, None)
                     else:
                         previous = diagnostics[key]
                         attempts = previous.get('attempts', 0) + 1
-                        checked_day = day if day is not None else self.q._check_day
                         retry[mark] = dict(source=previous['source'], attempts=attempts,
                             last_day=checked_day, retry_day=(checked_day or 0) + 7 * min(8, 2 ** min(attempts - 1, 3)),
                             permanent=result.get('permanent_error', False), result=current[key])
@@ -215,7 +219,8 @@ class StaleCheck:
             edge, target = row['edge'], row['edge']['target']
             ref = edge.get('reference', {})
             check = dict(current_version=None, version_changed=None, predicate_result='not_checked',
-                         notice=None, reason=None, affected=False, affected_paths=[])
+                         notice=None, reason=None, affected=False, affected_paths=[],
+                         evaluation_scope='not_checked', checked_day=checked_day)
             row['check'] = check
             if 'cached_check' in row:
                 row['check'] = dict(row['cached_check'])
@@ -234,6 +239,24 @@ class StaleCheck:
                 check.update(current_version=target, reason='write_receipt')
                 continue
             check['current_version'] = current.get(key)
+            check['evaluation_scope'] = scopes.get(key, 'not_checked')
+            if meta['layer'] == 'file_bytes':
+                group = next((g['members'] for g in self.q._groups(target) if target in g['members']), [target])
+                observed = next((v for v in group if v in self.q.nodes and not self.q._rerun(v)
+                    and self.q.events[self.q.nodes[v]['event_id']]['request']['kind'] != 'stale_file_read'), None)
+                event_id = self.q.nodes[observed]['event_id'] if observed else None
+                check['cited_observed_day'] = None
+                check['cited_context_day'] = self.q.event_day.get(event_id)
+                visited = set()
+                while event_id in self.q.events and event_id not in visited:
+                    check_budget()
+                    visited.add(event_id)
+                    request = self.q.events[event_id]['request']
+                    if request['kind'] == 'registered_script_execution':
+                        check['cited_observed_day'] = (request.get('request') or {}).get('day')
+                        break
+                    event_id = request.get('parent_event_id')
+                check['computation'] = 'not_reexecuted'
             kind = ('query' if key[0] == 'query' else 'record' if target in self.q.records else
                     'public' if meta['layer'] == 'server_public_response' else
                     'csv' if meta['layer'] == 'file_bytes' and meta['object_id'].endswith('.csv') else 'other')
@@ -314,9 +337,11 @@ class StaleCheck:
             target, check = row['edge']['target'], row['check']
             if check['reason'] in ('historical_only', 'write_receipt'):
                 return []
-            if check['predicate_result'] == 'holds':
+            if check['predicate_result'] == 'holds' and check.get('evaluation_scope') == 'refreshed_read':
                 return []
-            found = [path + ([target] if target else [])] if check['affected'] else []
+            local = check['predicate_result'] in ('fails', 'cannot_check') or (
+                check['version_changed'] and check['predicate_result'] != 'holds')
+            found = [path + ([target] if target else [])] if local else []
             if target and node(target) not in {node(v) for v in path}:
                 for child in outgoing[node(target)]:
                     found.extend(causes(child, path + [target]))

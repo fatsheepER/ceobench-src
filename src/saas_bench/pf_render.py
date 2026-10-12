@@ -248,10 +248,11 @@ def render_list(page, title, wanted=None):
 
 def log_line(item):
     """MEMORY.md@v9 · day 49 · +44 −48 lines · note (day 49): "..."."""
+    day = item['day'] if item.get('day') is not None else 'unknown'
     if item.get('record'):
-        return (f"{item['record']} · day {item['day']} · {item['text_status']}: \"{short(item.get('text', ''), 90)}\""
+        return (f"{item['record']} · day {day} · {item['text_status']}: \"{short(item.get('text', ''), 90)}\""
                 + (f" · reason: {short(item['reason'], 80)}" if item.get('reason') else ''))
-    parts = [item['version'], f"day {item['day']}"]
+    parts = [item['version'], f"day {day}"]
     if item.get('rows') is not None:
         parts.append(plural(item['rows'], 'row'))
     if item.get('size'):
@@ -307,18 +308,38 @@ def status(check, row):
         return 'not checked'
     if check.get('reason') == 'write_receipt':
         return 'write receipt, not compared'
-    now = f" (now {check['current_version']})" if check.get('version_changed') and check.get('current_version') else ''
+    scope = check.get('evaluation_scope')
+    day = check.get('checked_day')
+    checked = str(day) if day is not None else 'unknown'
+    prefix = ''
+    if scope == 'stored_artifact':
+        observed = check.get('cited_observed_day')
+        context = check.get('cited_context_day')
+        cited = (f'cited observation day {observed}' if observed is not None else
+                 f"cited observation day unknown; cited version context day {context if context is not None else 'unknown'}")
+        prefix = (f"stored artifact; {cited}; "
+                  f"checked day {checked}; not recomputed by PF; current-world metric unverified; ")
+    elif scope == 'captured_value':
+        prefix = f'captured value; checked day {checked}; current-world value unverified; '
+    elif scope is None:
+        prefix = f'evaluation scope unknown; checked day {checked}; '
+    current = 'now' if scope == 'refreshed_read' else 'stored version'
+    now = f" ({current} {check['current_version']})" if check.get('version_changed') and check.get('current_version') else ''
     if check['predicate_result'] == 'fails':
-        return f'PREDICATE FAILS{now}: ' + check.get('summary', '')
-    if check['predicate_result'] == 'holds':
-        return (f'predicate holds{now}: ' if check['version_changed'] else 'unchanged; predicate holds: ') + check.get('summary', '')
-    if check['predicate_result'] == 'cannot_check':
-        return 'cannot check: ' + str(check.get('reason'))
-    if check['version_changed']:
-        return f'changed{now}: ' + check.get('summary', 'changed')
-    if check['affected']:
-        return 'unchanged itself; ' + check.get('sources', 'a source changed')
-    return 'unchanged'
+        result = f'PREDICATE FAILS{now}: ' + check.get('summary', '')
+    elif check['predicate_result'] == 'holds':
+        result = (f'predicate holds{now}: ' if check['version_changed'] else 'unchanged; predicate holds: ') + check.get('summary', '')
+    elif check['predicate_result'] == 'cannot_check':
+        result = 'cannot check: ' + str(check.get('reason'))
+    elif check['version_changed']:
+        result = f'changed{now}: ' + check.get('summary', 'changed')
+    else:
+        result = 'unchanged itself' if check['affected'] else 'unchanged'
+    if check.get('sources'):
+        result += '; ' + check['sources']
+    elif check['affected'] and check['predicate_result'] not in ('fails', 'cannot_check') and not check['version_changed']:
+        result += '; a source changed'
+    return prefix + result
 
 
 def dependency_line(row, relation=True):
@@ -342,7 +363,7 @@ def render_dependencies(page):
     root, detail = page['root'], page.get('detail')
     checked = page.get('stale_check') == 'performed'
     lines = [item_line(root),
-             (f"Checked day {page.get('checked_day')}, against the current world within the expanded dependencies; advisory." if checked else
+             (f"Checked day {page.get('checked_day') if page.get('checked_day') is not None else 'unknown'}; within expanded dependencies; scopes below describe what was evaluated; advisory." if checked else
               'Not checked (--history lists history only).')]
     if page.get('unexpanded'):
         lines.append('Incomplete: depth limit reached at ' + ', '.join(page['unexpanded']) +
@@ -396,6 +417,8 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     Show changes to existing data even behind a cited output. Pure additions share a line.
     """
     flagged = [e for e in entries if e['changed']]
+    stored = list({row['target']['version']: row for e in entries
+                   for row in e.get('stored_conditions', [])}.values())
     lines = [f'=== Check of your registered texts (day {day}) ===']
     if active is not None:
         lines.append(f'Registered texts: {active} active; {eligible} within their applies window.')
@@ -404,6 +427,8 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         lines.append(checked + '; no new freshness conclusion.')
     elif not flagged and pending:
         lines.append(f'{checked}; {condition_only} for continuing conditions or read retries. No new direct issues in these checks.')
+    elif not flagged and stored:
+        lines.append(checked + '; no condition fails in the evaluated scope.')
     elif not flagged:
         lines.append(checked + '; cited files and texts are unchanged' +
                      (' and no predicate fails.' if pf and predicates_checked else '.'))
@@ -411,6 +436,12 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         lines.append(f'{checked}; {len(flagged)} with changed evidence:')
     if pf and entries and not predicates_checked:
         lines.append('No structured predicates were checked.')
+    if stored:
+        lines.append('Stored artifact conditions use file bytes; not recomputed by PF; current-world metrics unverified.')
+        for row in stored[:3]:
+            check = row['check']
+            observed = check.get('cited_observed_day')
+            lines.append(f"  {row['target']['version']}: cited observation day {observed if observed is not None else 'unknown'}; checked day {check.get('checked_day')}; {check['predicate_result']} on stored bytes.")
     seen, displayed, shared = set(), 0, 0
     for entry in flagged:
         rows = [row if isinstance(row, str) else dependency_line(row, relation=False) for row in entry['changed']]
@@ -425,6 +456,9 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         text = entry['text']
         lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\"")
         lines.extend('  - ' + short(row, 320) for row in distinct[:3])
+        for row in entry['changed'][:3]:
+            if isinstance(row, dict) and row.get('check', {}).get('sources'):
+                lines.append('    ' + short(row['check']['sources'], 240))
         if len(distinct) > 3:
             lines.append(f"  - and {len(distinct) - 3} more source changes")
     if shared:
@@ -448,9 +482,9 @@ def render_pending(items, day):
     lines = [f'Last findings: {plural(additions, "text")} with only added rows; {len(items) - additions} with other changes or unavailable evidence.']
     changed = [p for p in items if p['first_day'] != day
                and p['reason']['check'].get('change_kind') == 'content_changed']
-    changed.sort(key=lambda p: (-p['last_day'], p['record']))
+    changed.sort(key=lambda p: (-(p['last_day'] or 0), p['record']))
     for p in changed[:3]:
-        lines.append(f"{p['record']} (last verified day {p['last_day']}): "
+        lines.append(f"{p['record']} (last verified day {p['last_day'] if p['last_day'] is not None else 'unknown'}): "
                      + short(dependency_line(p['reason'], relation=False), 240))
     if len(changed) > 3:
         lines.append(f'{len(changed) - 3} more texts have earlier content-change findings.')

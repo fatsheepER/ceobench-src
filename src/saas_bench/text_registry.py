@@ -263,7 +263,7 @@ class TextRegistry:
             return f"{cite_text(evidence)} (commit only: those bytes never reached you{seen})"
         handles = evidence_handles.index(self.store)
         group = handles.group(binding['version_id'])
-        text = shown['version'] + (f" (day {group['day']})" if group else '')
+        text = shown['version'] + (f" (day {group['day'] if group['day'] is not None else 'unknown'})" if group else '')
         meta, _ = self.resolver.content(binding['version_id'])
         event = self.store.read_event(meta['created_by_event'], evidence=True)
         record, result = event['request'], event['result']

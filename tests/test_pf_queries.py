@@ -207,8 +207,9 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
         store.finish(event, 200, '', encoded(dict(success=True, columns=['x'], rows=rows, row_count=len(rows))), {})
         store.delivered(event, 'sent')
     hist = query(executor, 'pf_read', mode='history', target={'sql': 'SELECT x'})['items'][::-1]
-    # Reordered but equal rows are the same content: one handle, marked as acquired again.
-    assert hist[0]['version'] == hist[1]['version'] and hist[1]['unchanged_since_day'] == 0
+    # Reordered but equal rows share one handle; undated captures do not invent a day.
+    assert hist[0]['version'] == hist[1]['version']
+    assert 'unchanged_since_day' not in hist[1]
     assert hist[2]['version'].endswith('@v2') and hist[2]['previous_version'] == hist[0]['version']
     head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[2]['version']})
     assert head['raw_equal'] is False and head['rows_equal'] is False
@@ -383,7 +384,7 @@ def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspac
     assert again.endswith('[pf: cmd3@v1 | wrote one.txt@v2]'), again
     (workspace / 'one.txt').write_text('1')
     assert executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'}).endswith(
-        '[pf: cmd3@v1 (same as day 0) | wrote one.txt@v4]')
+        '[pf: cmd3@v1 | wrote one.txt@v4]')
     history = query(executor, 'pf_read', mode='history', target={'path': 'one.txt'})['items']
     assert history[0]['same_content_as'] == 'one.txt@v2'
 
@@ -443,6 +444,8 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     """Agents run SDK scripts and read printed summaries, never the raw query response."""
     runner = offline_runner(text_registration='pf')
     runner.agent.current_day = 0
+    stamp = runner.evidence_store.begin_event('dashboard_generation', {'day': 0})
+    runner.evidence_store.complete(stamp)
     script = ("cat > calc.py <<'EOF'\nimport novamind_api as nm\n"
               "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
     runner._execute_tool('bash', {'command': script})

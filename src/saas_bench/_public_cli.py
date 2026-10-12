@@ -98,7 +98,7 @@ def _get_latest_session() -> str:
 
 
 def _resolve_session(session_id: str = None) -> str:
-    if os.environ.get("NOVAMIND_API_PORT"):
+    if os.environ.get("NOVAMIND_API_PORT") or os.environ.get("NOVAMIND_API_SOCKET"):
         return "__env__"
     if session_id:
         return session_id
@@ -118,7 +118,7 @@ def _session_meta(session_id: str) -> dict:
 
 
 def _ensure_server_running(session_id: str) -> int:
-    env_port = os.environ.get("NOVAMIND_API_PORT")
+    env_port = os.environ.get("NOVAMIND_API_PORT") or ("1" if os.environ.get("NOVAMIND_API_SOCKET") else None)
     if env_port:
         return int(env_port)
 
@@ -176,7 +176,7 @@ def _ensure_server_running(session_id: str) -> int:
 @observed
 def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
     url = f"http://127.0.0.1:{port}{path}"
-    data = json.dumps(body or {}).encode() if method == "POST" else None
+    data = json.dumps(body or {}).encode() if method in ("POST", "DELETE") else None
     req = urllib.request.Request(
         url,
         data=data,
@@ -469,6 +469,71 @@ def cmd_stop(args):
         print(json.dumps({"success": True, "message": "Server was not running"}))
 
 
+def _script_request(args, method, body=None):
+    session_id = _resolve_session(getattr(args, "session", None))
+    port = _ensure_server_running(session_id)
+    try:
+        result = _api_call(port, method, "/daily-scripts", body)
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(result))
+    if result.get("success") is not True:
+        sys.exit(1)
+
+
+@observed
+def cmd_register_daily_script(args):
+    """Register a Python source snapshot for the start of each week.
+
+    Usage: ./novamind-operation register-daily-script <script_path> [--session ID]
+
+    The legacy command name says daily; execution is weekly, in insertion order.
+    Registration uses the source filename. Re-register that filename to replace
+    its snapshot; editing the local file alone does not update it.
+    Scripts must explicitly import novamind_api, for example
+    `import novamind_api as nm`. Print the results you need in your weekly input.
+    In teams, scripts and outputs belong to their registering role. CEO scripts
+    can change business settings; analyst scripts can only read public data.
+    ask_analyst follow-ups do not rerun scripts.
+    The server receipt includes name, registered and sha256. Exit code 0 requires
+    server success; file, connection and server errors exit nonzero.
+    """
+    source = Path(args.script_path)
+    try:
+        content = source.read_text()
+    except (OSError, UnicodeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    _script_request(args, "POST", {"name": source.name, "content": content})
+
+
+@observed
+def cmd_list_daily_scripts(args):
+    """List the current role's server snapshots in insertion order.
+
+    Usage: ./novamind-operation list-daily-scripts [--session ID]
+
+    Returns the server's scripts list with name, size and sha256 for each entry.
+    These snapshots run at the start of each week. Local files are not a registry.
+    Exit code 0 requires server success; connection and server errors exit nonzero.
+    """
+    _script_request(args, "GET")
+
+
+@observed
+def cmd_remove_daily_script(args):
+    """Remove a registered server snapshot by filename, preserving local files.
+
+    Usage: ./novamind-operation remove-daily-script <script_name> [--session ID]
+
+    Returns the server's removed filename. In teams, only your role's registry
+    is affected. Exit code 0 requires server success; missing registrations,
+    connection failures and rejected removals exit nonzero.
+    """
+    _script_request(args, "DELETE", {"name": args.script_name})
+
+
 def main():
     import argparse
 
@@ -554,6 +619,17 @@ Examples:
     p = subparsers.add_parser("stop", help="Stop the simulation server")
     p.add_argument("--session", type=str, default=None, help="Session ID (default: latest)")
 
+    p = subparsers.add_parser("register-daily-script", help="Register a script snapshot for weekly execution")
+    p.add_argument("script_path", help="Path to the Python script")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
+    p = subparsers.add_parser("list-daily-scripts", help="List registered weekly script snapshots")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
+    p = subparsers.add_parser("remove-daily-script", help="Remove a registered weekly script snapshot")
+    p.add_argument("script_name", help="Registered filename")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
     args = parser.parse_args()
 
     cmd_map = {
@@ -566,6 +642,9 @@ Examples:
         "history": cmd_history,
         "list-sessions": cmd_list_sessions,
         "stop": cmd_stop,
+        "register-daily-script": cmd_register_daily_script,
+        "list-daily-scripts": cmd_list_daily_scripts,
+        "remove-daily-script": cmd_remove_daily_script,
     }
 
     cmd_map[args.command](args)
