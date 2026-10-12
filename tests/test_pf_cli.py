@@ -157,7 +157,8 @@ def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
     assert lines[2].startswith('Business writes this week touching S1: day 0 set_targeted_dev_spend(') and '500' in lines[2]
     other = runner._execute_tool('text_create', dict(text='About S2', objects=[dict(kind='customer_group', id='S2')],
                                                      applies='0-', reason='plan', references=[]))
-    assert other == 'Registered r2.1 (active).'
+    assert other == ('Registered r2.1 (active).\n'
+                     'Next weekly check if the run continues: day 7; applies: yes.')
 
 
 @pytest.mark.parametrize('mode', ['prefix', 'pf'])

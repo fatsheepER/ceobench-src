@@ -137,6 +137,7 @@ tests/*
 !tests/test_text_registry.py
 !tests/test_pf_queries.py
 !tests/test_pf_stale.py
+!tests/test_pf_weekly_ledger.py
 !tests/test_pf_read.py
 !tests/test_pf_acceptance.py
 !tests/test_pf_cli.py

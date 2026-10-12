@@ -29,6 +29,7 @@ class TextRegistry:
         self.git_run = subprocess.run
         self.identity = identity
         self.role = identity.role if identity else "ceo"
+        self.automatic_pf_checks = None
         self.workspace = Path(workspace).resolve()
         self.path = self.workspace / 'registrations.json'
         self.mode, self.store, self.sim_day = mode, store, sim_day
@@ -152,6 +153,15 @@ class TextRegistry:
                 raise RuntimeError('Text saved, but private capture failed; collection stopped') from exc
         # Structured form for audits and tests; the agent receives the text receipt.
         self.last_result = result = dict(id=record_id, version=record['version'], status=record['status'])
+        if self.mode == 'pf' and operation in ('create', 'revise'):
+            for ref, binding in zip(record['references'], bindings):
+                version_id = binding.get('version_id')
+                if ref.get('purpose') != 'current' or not ref.get('predicate') or not version_id:
+                    continue
+                meta, _ = self.resolver.content(version_id)
+                if meta['layer'] == 'file_bytes' and (meta.get('object_id') or '').lower().endswith(('.json', '.csv')):
+                    warnings.append('Stored-file predicate: PF checks saved JSON/CSV bytes; it does not rerun the producer or advance fixed query windows. For current metrics, cite a replayable direct query or register a weekly read-only script that uses the current simulated day and updates the file.')
+                    break
         if warnings:
             result['warnings'] = list(dict.fromkeys(warnings))
         retained = (operation == 'revise' and record['text'] != previous['text']
@@ -173,6 +183,21 @@ class TextRegistry:
             lines.append('Cited: ' + ' · '.join(cited))
         if self.mode == 'pf' and operation != 'retire' and (writes := self._week_writes(record)):
             lines.append('Business writes this week touching ' + ', '.join(writes[0]) + ': ' + ' · '.join(writes[1]))
+        if self.mode == 'pf' and operation in ('create', 'revise'):
+            enabled = self.automatic_pf_checks() if callable(self.automatic_pf_checks) else self.automatic_pf_checks
+            day = record['sim_day']
+            if enabled is False:
+                lines.append('Automatic PF weekly checks: disabled.')
+            elif enabled is None or type(day) is not int:
+                lines.append('Next automatic PF weekly check: unknown.')
+            else:
+                next_day = day + 7
+                applies = record.get('applies_at') or {}
+                start = applies.get('start_day', applies.get('day', 0))
+                end = applies.get('end_day', applies.get('day'))
+                included = 'unknown' if 'unknown' in applies else ('yes' if start <= next_day and (end is None or next_day <= end) else 'no')
+                result['next_weekly_check'] = dict(day=next_day, applies=included)
+                lines.append(f'Next weekly check if the run continues: day {next_day}; applies: {included}.')
         lines += result.get('warnings', [])
         return '\n'.join(lines)
 

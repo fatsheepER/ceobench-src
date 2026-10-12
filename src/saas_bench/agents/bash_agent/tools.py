@@ -273,6 +273,10 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
             'A notice only guides subsequent work and does not require a rerun. '
             'After a hard timeout, inspect partial output and the reported termination status.')
             if t['name'] == 'bash' else t for t in definitions]
+    if pf_queries:
+        definitions = [dict(t, description=t['description'] +
+            ' Run PF directly as `pf`, for example `pf depend r1`; never `novamind-operation pf`.')
+            if t['name'] == 'bash' else t for t in definitions]
     if text_registration or pf_queries:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.
         definitions = [dict(t, parameters=dict(t['parameters'], properties=dict(
@@ -365,6 +369,8 @@ class BashAgentToolExecutor:
         if text_registry and text_registry.mode == 'pf':
             from saas_bench.pf_queries import PFQueries
             self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh)
+        if text_registry:
+            text_registry.automatic_pf_checks = lambda: bool(self.pf_queries and self.pf_queries.stale_checks)
         self.capture = None
         self.world_status = None
         self.authorize = None

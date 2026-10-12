@@ -12,6 +12,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from .execution_capture import CapturedText, CURRENT_EVENT, OBJECT_FIELDS, origin
 from .pf_deadline import budget_scope, check
+from .run_lifecycle import RunCancelled
 from . import evidence_handles, pf_render
 from .registration_evidence import covered
 from .registration_schema import Input, Text
@@ -417,7 +418,7 @@ class PFQueries:
         try:
             with budget_scope(), self.resolver.cached():
                 return self._weekly_check(day)
-        except TimeoutError:
+        except (TimeoutError, RunCancelled):
             self.__dict__.pop('_indexed', None)
             raise
 
@@ -425,52 +426,65 @@ class PFQueries:
         """Week-start digest of new issues, pending review and continuing conditions."""
         if not self.stale_checks:
             return None
-        self._index(None)
-        tracing = time.monotonic()
-        self.operation = 'pf_dependencies'
-        # The digest covers every reachable dependency; explicit queries remain depth-limited.
-        self.values = dict(depth=len(self.nodes), purpose='current', include_execution=False, detail=False, limit=100)
-        self.follow_execution = True
-        state = self.store.load_state('pf_review') or {'pending': {}, 'ended': []}
-        self.review_pending = state['pending']
-        owner = self.store.identity.get('role')
-        active = sorted((v for v, record in self.records.items()
-                         if (not owner or self.nodes[v]['meta'].get('owner_role') == owner)
-                         and record['status'] == 'active' and self.latest[self._key(v)] == v),
-                        key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
-        traced, ended, continuing = {}, [], set()
-        eligible = set()
-        for version in active:
-            check()
-            record = self.records[version]
-            if applies_ended(record, day):
-                ended.append(record['version'])
-                continue
-            if record.get('applies_at', {}).get('start_day', 0) > day:
-                continue
-            eligible.add(version)
-            if version in self.review_pending:
-                # Keep ordinary findings dated, but retry transient source failures
-                # alongside explicit conditions and their propagation paths.
-                rows = self.review_pending[version]['conditions']
-                if rows:
-                    traced[version] = rows
-                    continuing.add(version)
-                continue
-            rows = self._cached_trace(version)
-            if any(_weekly(r) for r in rows):
-                traced[version] = rows
-        self.review_pending = {v: p for v, p in self.review_pending.items() if v in eligible}
-        new_ended = [v for v in ended if v not in state['ended']]
-        if not traced and not new_ended and not self.review_pending:
-            if state != {'pending': {}, 'ended': ended}:
-                self.store.save_state('pf_review', dict(pending={}, ended=ended))
-            return None
-        traced_at = time.monotonic()
-        skipped_pending = len(self.review_pending) - len(continuing)
+        latest_records = None
+        traced, ended, continuing, previous_checks = {}, [], set(), {}
+        self.review_pending = {}
         event = self.store.begin_event('pf_weekly_check', {'day': day})
         token = CURRENT_EVENT.set(event)
         try:
+            self._index(None)
+            tracing = time.monotonic()
+            self.operation = 'pf_dependencies'
+            # The digest covers every reachable dependency; explicit queries remain depth-limited.
+            self.values = dict(depth=len(self.nodes), purpose='current', include_execution=False, detail=False, limit=100)
+            self.follow_execution = True
+            state = self.store.load_state('pf_review') or {'pending': {}, 'ended': []}
+            self.review_pending = state['pending']
+            owner = self.store.identity.get('role')
+            active = sorted((v for v, record in self.records.items()
+                             if (not owner or self.nodes[v]['meta'].get('owner_role') == owner)
+                             and record['status'] == 'active' and self.latest[self._key(v)] == v),
+                            key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
+            latest_records = [v for v in self.records if self.latest[self._key(v)] == v
+                              and (not owner or self.nodes[v]['meta'].get('owner_role') == owner)]
+            if not latest_records:
+                self.store.complete(event, check_complete=True, inventory_complete=True,
+                                    conditions=[], digest_version=None, checked_texts=0, pending_texts=0)
+                return None
+            eligible = set()
+            for version in active:
+                check()
+                record = self.records[version]
+                if applies_ended(record, day):
+                    ended.append(record['version'])
+                    continue
+                if record.get('applies_at', {}).get('start_day', 0) > day:
+                    continue
+                eligible.add(version)
+                if version in self.review_pending:
+                    # Keep ordinary findings dated, but retry transient source failures
+                    # alongside explicit conditions and their propagation paths.
+                    rows = [dict(r) for r in self._indexed_references(self.review_pending[version]['conditions'])]
+                    for row in rows:
+                        if 'cached_check' not in row and 'check' in row:
+                            previous_checks[id(row)] = row.pop('check')
+                    if rows:
+                        traced[version] = rows
+                        continuing.add(version)
+                    continue
+                rows = self._cached_trace(version)
+                if any(_weekly(r) for r in rows):
+                    traced[version] = rows
+            self.review_pending = {v: p for v, p in self.review_pending.items() if v in eligible}
+            new_ended = [v for v in ended if v not in state['ended']]
+            if not traced and not new_ended and not self.review_pending:
+                if state != {'pending': {}, 'ended': ended}:
+                    self.store.save_state('pf_review', dict(pending={}, ended=ended))
+                self.store.complete(event, check_complete=True, inventory_complete=True, conditions=self._weekly_conditions(latest_records, {}, day),
+                                    checked_texts=0, pending_texts=0, digest_version=None)
+                return None
+            traced_at = time.monotonic()
+            skipped_pending = len(self.review_pending) - len(continuing)
             self._check([row for rows in traced.values() for row in rows], day=day)
             check()
             rendering = time.monotonic()
@@ -510,7 +524,8 @@ class PFQueries:
                 else:
                     # Do not advance the ordinary problem's last verification date.
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
-            text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
+            rendered = {}
+            text = pf_render.render_weekly(entries, day, pf=True, rendered=rendered, ended=new_ended, underlying=underlying,
                                           condition_only=len(continuing), pending=len(self.review_pending),
                                           active=len(active), eligible=len(eligible), predicates_checked=predicates_checked)
             if self.review_pending:
@@ -524,18 +539,102 @@ class PFQueries:
                     dict(record=self.resolver.handle(v), **p) for v, p in self.review_pending.items()], day)
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
-            self.store.complete(event, index=self.index_stats, check=self.check_stats,
+            self.store.complete(event, check_complete=True, inventory_complete=True, index=self.index_stats, check=self.check_stats,
                                 trace_seconds=traced_at-tracing, render_seconds=time.monotonic()-rendering,
                                 skipped_pending_texts=skipped_pending,
                                 content_reads=self.resolver.read_stats,
-                                checked_texts=len(traced), pending_texts=len(self.review_pending))
+                                checked_texts=len(traced), pending_texts=len(self.review_pending),
+                                digest_version=version, conditions=self._weekly_conditions(latest_records, traced, day, rendered))
         except TimeoutError as exc:
             self.store.complete(event, 'timed_out', error=str(exc), check_complete=False,
-                                pending_texts=len(self.review_pending))
+                                pending_texts=len(self.review_pending),
+                                digest_version=None, inventory_complete=latest_records is not None,
+                                coverage='complete' if latest_records is not None else 'unavailable',
+                                conditions=self._weekly_conditions(latest_records, traced, day, interrupted=True, previous_checks=previous_checks) if latest_records is not None else [])
+            raise
+        except (Exception, RunCancelled) as exc:
+            self.store.complete(event, 'cancelled' if isinstance(exc, RunCancelled) else 'failed', error=str(exc), check_complete=False,
+                                digest_version=None, inventory_complete=latest_records is not None,
+                                coverage='complete' if latest_records is not None else 'unavailable',
+                                conditions=self._weekly_conditions(latest_records, traced, day, interrupted=True, previous_checks=previous_checks) if latest_records is not None else [])
             raise
         finally:
             CURRENT_EVENT.reset(token)
         return CapturedText(text, [origin(version, text)])
+
+    def _indexed_references(self, rows):
+        result = []
+        for row in rows:
+            edge = row['edge']
+            if edge['origin'] == 'agent_declaration' and 'reference_index' not in edge:
+                matches = [e for e in self.outgoing[edge['source']]
+                           if {k: v for k, v in e.items() if k != 'reference_index'} == edge]
+                result.extend(dict(row, edge=e) for e in matches)
+                if matches:
+                    continue
+            result.append(row)
+        return result
+
+    def _weekly_conditions(self, versions, traced, day, rendered=None, interrupted=False, previous_checks=None):
+        conditions = []
+        for version in versions:
+            record = self.records[version]
+            rows = traced.get(version, [])
+            binding = self.store.load_state('declaration:' + record['version']) or {}
+            bindings = binding.get('references', [])
+            for index, reference in enumerate(record['references']):
+                identity = self._condition_id(version, index)
+                direct = next((r for r in rows if r['edge']['source'] == version
+                               and r['edge'].get('reference_index') == index), None)
+                previous_check = dict(direct.get('check') or {}) if direct else {}
+                pending_rows = self.review_pending.get(version, {}).get('conditions', [])
+                pending_recheck = any(r['edge']['source'] == version and
+                    (r['edge'].get('reference_index') == index or
+                     'reference_index' not in r['edge'] and r['edge'].get('reference') == reference)
+                    for r in pending_rows)
+                completed = (direct is not None and 'cached_check' not in direct and
+                             previous_check.get('predicate_result') in ('holds', 'fails', 'cannot_check', 'not_declared'))
+                reason = ('retired' if record['status'] == 'retired' else
+                          'applies_ended' if applies_ended(record, day) else
+                          'not_yet_applicable' if record.get('applies_at', {}).get('start_day', 0) > day else
+                          'historical_only' if reference.get('purpose') == 'historical_only' else
+                          'explicit_unknown' if direct is None and 'unknown' in reference.get('evidence', {}) else
+                          'pending_not_rechecked' if (direct is not None and 'cached_check' in direct) or
+                          (direct is None and version in self.review_pending and not pending_recheck) else
+                          'check_interrupted' if interrupted and not completed else
+                          'pending_not_rechecked' if version in self.review_pending and direct is None else
+                          'not_selected' if direct is None else None)
+                outcome = previous_check
+                last_verification = (previous_checks or {}).get(id(direct)) if direct else None
+                if reason == 'pending_not_rechecked':
+                    pending = self.review_pending[version]
+                    last_verification = previous_check or dict(checked_day=pending['last_day'], finding=pending['reason'])
+                if reason:
+                    outcome = dict(predicate_result='not_checked', reason=reason, evaluation_scope='not_checked', checked_day=None)
+                dependencies = []
+                if direct:
+                    target = direct['edge']['target']
+                    dependencies = [dict(edge=r['edge'], path=r['path'], historical_only=r['historical_only'],
+                                         check=r.get('check')) for r in rows if r is direct or
+                                    (target is not None and len(r['path']) > 2 and r['path'][1] == target)]
+                source = direct['edge']['target'] if direct else (bindings[index].get('version_id') if index < len(bindings) else None)
+                conditions.append(dict(condition_id=identity, declaration_version=version,
+                    record=record['version'], role=record.get('author'), reference_index=index,
+                    reference=reference, applies_at=record.get('applies_at'), weekly_day=day,
+                    checked_day=outcome.get('checked_day'), last_verification=last_verification,
+                    status='skipped' if reason else outcome.get('predicate_result', 'not_checked'),
+                    source_version=source,
+                    current_source_version=outcome.get('current_version'),
+                    cited_observation_day=outcome.get('cited_observed_day'),
+                    computation_day=outcome.get('checked_day') if outcome.get('evaluation_scope') == 'refreshed_read' else None,
+                    check=outcome, dependencies=dependencies,
+                    digest_ranges=(rendered or {}).get(identity, [])))
+        return conditions
+
+    def _condition_id(self, version, index):
+        owner = self.records[version].get('author', self.registry.role)
+        record = self.resolver.handle(version).split(':')[-1]
+        return f'{owner}:{record}:{index}'
 
     def _ordinary_changes(self, rows):
         paths = {tuple(p) for r in rows if _weekly(r) for p in r['check']['affected_paths']}
@@ -793,7 +892,7 @@ class PFQueries:
                     reason = ('inaccessible' if resolved and target not in self.nodes else None if resolved else 'git_content_mismatch' if binding.get('git_content_matches') is False
                               else binding.get('reason', 'not_captured_in_prefix'))
                     self._edge(source, target, 'reference', origin='agent_declaration',
-                               reference=({k: v for k, v in ref.items() if k in ('purpose',)} if reason == 'inaccessible' else ref), reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
+                               reference_index=i, reference=({k: v for k, v in ref.items() if k in ('purpose',)} if reason == 'inaccessible' else ref), reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
                                missing=target not in self.nodes)
             elif layer in ('model_source_occurrences', 'model_reconstructions'):
                 if self.store.identity.get('role') and (self.events[event_id]['request'].get('role') != self.store.identity['role'] or self.events[event_id]['request'].get('session_id') != self.store.identity['session_id']):
@@ -1060,6 +1159,8 @@ class PFQueries:
                       traversal_only=item['traversal_only'])
         if 'reference' in edge:
             result.update(edge['reference'])
+            result['condition_id'] = self._condition_id(edge['source'], edge.get('reference_index', 'legacy'))
+            result['reference_index'] = edge.get('reference_index')
         if 'check' in item:
             check = dict(item['check'])
             current = check['current_version']
@@ -1315,3 +1416,51 @@ class PFQueries:
         from .pf_read import capture_read
         return capture_read(self, target, prefix + content[offset:end] + more,
                             offset, end, len(content))
+
+
+def weekly_condition_visibility(store, event_id):
+    """Private audit: exact digest ranges and successful model-request delivery.
+
+    Summary-only delivery has no condition ranges. A rendered condition counts as
+    delivered when a successful request includes one complete result line.
+    Each rendered range retains its own delivery facts.
+    """
+    event = store.read_event(event_id)
+    digest = event['result'].get('digest_version')
+    occurrences = []
+    if digest:
+        with closing(store.connect()) as conn:
+            versions = conn.execute("""SELECT v.version_id, v.event_id FROM versions v
+                JOIN results r USING(event_id)
+                WHERE json_extract(v.metadata, '$.layer')='model_source_occurrences'
+                AND json_extract(r.record, '$.status')='succeeded'
+                AND json_extract(r.record, '$.send_state')='response_received'""").fetchall()
+        for version in versions:
+            try:
+                store.read_event(version['event_id'])
+                _, raw = store.get_content(version['version_id'])
+            except (KeyError, PermissionError):
+                continue
+            occurrences.extend(dict(item, model_event=version['event_id']) for item in json.loads(raw)
+                               if item['version_id'] == digest)
+    results = []
+    for condition in event['result'].get('conditions', []):
+        ranges = condition.get('digest_ranges', [])
+        requests, range_deliveries = [], [dict(source_range=r, delivered_requests=[]) for r in ranges]
+        for request in dict.fromkeys(o['model_event'] for o in occurrences):
+            intervals = sorted(o['source_range'] for o in occurrences if o['model_event'] == request)
+            covered = []
+            for start, end in intervals:
+                if covered and start <= covered[-1][1]:
+                    covered[-1][1] = max(end, covered[-1][1])
+                else:
+                    covered.append([start, end])
+            for delivery in range_deliveries:
+                start, end = delivery['source_range']
+                if any(a <= start and end <= b for a, b in covered):
+                    delivery['delivered_requests'].append(request)
+                    if request not in requests:
+                        requests.append(request)
+        results.append(dict(condition_id=condition['condition_id'], digest_ranges=ranges,
+                            rendered=bool(ranges), range_deliveries=range_deliveries, delivered_requests=requests))
+    return results

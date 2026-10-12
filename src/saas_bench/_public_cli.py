@@ -534,8 +534,17 @@ def cmd_remove_daily_script(args):
     _script_request(args, "DELETE", {"name": args.script_name})
 
 
+def reject_pf_route():
+    if len(sys.argv) > 1 and sys.argv[1] == 'pf':
+        import shlex
+        print('Error: PF is a separate Bash command. Run: ' +
+              shlex.join(['pf', *sys.argv[2:]]), file=sys.stderr)
+        raise SystemExit(2)
+
 def main():
     import argparse
+    reject_pf_route()
+
 
     parser = argparse.ArgumentParser(
         prog="novamind-operation",

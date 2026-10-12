@@ -106,6 +106,9 @@ def operation_main():
             1800000 1400000 2300000 \\
             3000000 2000000 4500000
     """
+    from ._public_cli import reject_pf_route
+    reject_pf_route()
+
     parser = argparse.ArgumentParser(
         prog='novamind-operation',
         description='NovaMind simulator operation commands',

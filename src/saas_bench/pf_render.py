@@ -411,14 +411,15 @@ def plural(n, noun):
 
 
 def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0,
-                  *, active=None, eligible=None, predicates_checked=False):
+                  *, active=None, eligible=None, predicates_checked=False, rendered=None):
     """Week-start check: texts whose directly cited evidence changed, then short summaries.
 
     Show changes to existing data even behind a cited output. Pure additions share a line.
     """
     flagged = [e for e in entries if e['changed']]
-    stored = list({row['target']['version']: row for e in entries
+    stored = list({row.get('condition_id', row['target']['version']): row for e in entries
                    for row in e.get('stored_conditions', [])}.values())
+    marks = []
     lines = [f'=== Check of your registered texts (day {day}) ===']
     if active is not None:
         lines.append(f'Registered texts: {active} active; {eligible} within their applies window.')
@@ -441,7 +442,11 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         for row in stored[:3]:
             check = row['check']
             observed = check.get('cited_observed_day')
-            lines.append(f"  {row['target']['version']}: cited observation day {observed if observed is not None else 'unknown'}; checked day {check.get('checked_day')}; {check['predicate_result']} on stored bytes.")
+            if row.get('condition_id'):
+                marks.append((len(lines), row['condition_id']))
+            label = (f"{row['source'].get('record', row['source']['version'])} reference {row['reference_index'] + 1}: "
+                     if row.get('reference_index') is not None else '')
+            lines.append(f"  {label}{row['target']['version']}: cited observation day {observed if observed is not None else 'unknown'}; checked day {check.get('checked_day')}; {check['predicate_result']} on stored bytes.")
     seen, displayed, shared = set(), 0, 0
     for entry in flagged:
         rows = [row if isinstance(row, str) else dependency_line(row, relation=False) for row in entry['changed']]
@@ -455,7 +460,14 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         displayed += 1
         text = entry['text']
         lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\"")
-        lines.extend('  - ' + short(row, 320) for row in distinct[:3])
+        for row_text in distinct[:3]:
+            row = next((r for r, text in zip(entry['changed'], rows) if text == row_text), None)
+            label = ''
+            if isinstance(row, dict) and row.get('condition_id'):
+                marks.append((len(lines), row['condition_id']))
+                outcome = row.get('check', {}).get('predicate_result', 'not_checked').replace('_', ' ')
+                label = f"reference {row['reference_index'] + 1} ({outcome}): "
+            lines.append('  - ' + label + short(row_text, 320))
         for row in entry['changed'][:3]:
             if isinstance(row, dict) and row.get('check', {}).get('sources'):
                 lines.append('    ' + short(row['check']['sources'], 240))
@@ -473,6 +485,13 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if flagged:
         example = flagged[0]['text']['record'].split('.')[0]
         lines.append(f'Details: pf depend {example}.' if pf else 'Details: run the git diff shown on each line.')
+    if rendered is not None:
+        offsets, offset = [], 0
+        for line in lines:
+            offsets.append(offset)
+            offset += len(line) + 1
+        for line_index, identity in marks:
+            rendered.setdefault(identity, []).append([offsets[line_index], offsets[line_index] + len(lines[line_index])])
     return '\n'.join(lines)
 
 
