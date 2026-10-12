@@ -62,7 +62,6 @@ PF_HISTORY = '''Choose PF operations for the evidence question:
   text_create instead of treating every content change as a broken condition.
 show reads saved content. depend replays permitted SQL and public read-only API
 calls, never analyst scripts.
-pf help gives complete examples, check boundaries and stopping conditions.
 '''
 
 CEO_DECISIONS = '''## Team decisions

@@ -137,5 +137,10 @@ def test_help_is_on_demand_and_usage_errors_stay_short(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     assert executor.execute('bash', {'command': 'pf help'}) == pf_cli.HELP
     error = executor.execute('bash', {'command': 'pf depend'})
-    assert pf_cli.USAGE in error and '1. Read exact peer evidence' not in error
+    assert error == '[stderr]\npf depend: wrong number of arguments\n\n[exit code: 2]'
+    for flag in ('--help', '-h'):
+        error = executor.execute('bash', {'command': 'pf ' + flag})
+        assert error == f'[stderr]\npf: unknown command {flag}\n\n[exit code: 2]'
+        with pytest.raises(pf_cli.Usage, match='unknown command'):
+            pf_cli.parse('pf ' + flag, {'/workspace'})
     assert not registry.path.exists()

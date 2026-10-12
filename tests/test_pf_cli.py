@@ -29,12 +29,25 @@ def test_pf_command_parsing_views_and_refusals():
     assert pf_cli.parse('pf search S1 --kind customer_group', ROOTS)[1] == dict(
         object={'id': 'S1', 'kind': 'customer_group'}, all=False)
     assert pf_cli.parse('pf more c3 | tail -n 5', ROOTS) == ('pf_more', {'cursor': 'c3'}, ('tail', 5))
-    for command in ('pf', 'pf help', 'pf frobnicate x', 'pf log', 'pf log a b', 'pf depend r1 --bogus',
-                    'pf log MEMORY.md && ls', 'ls && pf log MEMORY.md', 'pf log MEMORY.md > out.txt',
-                    'pf log MEMORY.md | grep x', 'pf more 3'):
+    for command in ('pf', 'pf help'):
         with pytest.raises(pf_cli.Usage) as error:
             pf_cli.parse(command, ROOTS)
-        assert 'usage: pf <command>' in str(error.value), command
+        assert str(error.value) == pf_cli.USAGE
+    refusals = {
+        'pf frobnicate x': 'pf: unknown command frobnicate',
+        'pf log': 'pf log: wrong number of arguments',
+        'pf log a b': 'pf log: wrong number of arguments',
+        'pf depend r1 --bogus': 'pf: unknown option --bogus',
+        'pf log MEMORY.md && ls': 'pf: run pf on its own in a bash call, not together with other commands',
+        'ls && pf log MEMORY.md': 'pf: run pf on its own in a bash call, not together with other commands',
+        'pf log MEMORY.md > out.txt': 'pf: run pf on its own in a bash call, not together with other commands',
+        'pf log MEMORY.md | grep x': 'pf: only | head -N and | tail -N can follow pf',
+        'pf more 3': 'pf more: give the cursor from a previous result, e.g. pf more c2',
+    }
+    for command, message in refusals.items():
+        with pytest.raises(pf_cli.Usage) as error:
+            pf_cli.parse(command, ROOTS)
+        assert str(error.value) == message
 
 
 def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_path):
