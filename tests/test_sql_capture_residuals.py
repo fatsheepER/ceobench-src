@@ -47,6 +47,37 @@ def test_shared_fault_during_wire_capture_blocks_model_transport(captured, monke
     assert sent == []
 
 
+def test_completed_missing_receive_blocks_model_despite_other_pending_event(captured):
+    import httpx
+    from openai import APIConnectionError, OpenAI
+    from saas_bench.model_usage import ModelUsage
+    from saas_bench.public_sql import PUBLIC_POLICY_VERSION
+    from test_preflight_usage import reply
+    _, store, _ = captured
+    bash = store.begin_event('bash')
+    query = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION, parent=bash)
+    store.bind_client(query, 'a' * 32)
+    store.finish(query, 200, [], b'{"success":true,"columns":[],"rows":[]}', {})
+    store.delivered(query, 'sent')
+    store.complete(bash)
+    store.begin_event('bash')
+    sent = []
+
+    def transport(request):
+        sent.append(request.read())
+        return httpx.Response(200, json=reply('chat'))
+
+    usage = ModelUsage(None, 'agent', evidence_store=store)
+    with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
+        payload = dict(model='test-model', messages=[dict(role='user', content='hello')])
+        with pytest.raises(APIConnectionError) as raised:
+            usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+        assert 'Unconfirmed client receive outcome' in str(raised.value.__cause__)
+    assert sent == []
+    assert 'Unconfirmed client receive outcome' in store.fault['reason']
+
+
 @pytest.mark.parametrize('timeout_kind', ['gnu', 'bash'])
 @pytest.mark.parametrize('settlement', ['late', 'pending'])
 def test_model_usage_waits_or_pauses_for_interrupted_sql(captured, monkeypatch, timeout_kind, settlement):

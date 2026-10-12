@@ -14,7 +14,7 @@ import pytest
 
 from saas_bench.api_server import NovaMindAPIServer
 from saas_bench.public_sql import PUBLIC_POLICY_VERSION
-from saas_bench.sql_evidence import FORMAT, SQLEvidenceStore, whole_rows
+from saas_bench.sql_evidence import EvidencePending, FORMAT, SQLEvidenceStore, whole_rows
 from test_public_sql import server
 
 
@@ -301,11 +301,11 @@ os._exit(0)
             store.assert_healthy()
 
 
-def test_settle_waits_only_for_late_send_records(tmp_path):
+def test_settle_waits_for_pending_results_and_send_records(tmp_path):
     store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
     event = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     store.complete(event)
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome'):
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome'):
         store.assert_healthy()
     late = threading.Timer(.2, store.delivered, (event, 'sent'))
     late.start()
@@ -314,15 +314,50 @@ def test_settle_waits_only_for_late_send_records(tmp_path):
     lost = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     store.complete(lost)
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + lost):
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome: ' + lost):
         store.assert_healthy(settle=.3)
     assert time.monotonic() - started >= .3
     store.delivered(lost, 'sent')
     running = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + running):
-        store.assert_healthy(settle=5)
-    assert time.monotonic() - started < 1
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome: ' + running):
+        store.assert_healthy(settle=.3)
+    assert time.monotonic() - started >= .3
+
+
+def test_unknown_execution_wins_over_pending_evidence(tmp_path):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
+    unknown = store.begin_event('bash')
+    store.complete(unknown, 'result_unknown')
+    with pytest.raises(RuntimeError, match='Unconfirmed execution outcome: ' + unknown) as raised:
+        store.assert_healthy(settle=.3)
+    assert not isinstance(raised.value, EvidencePending)
+
+
+@pytest.mark.parametrize('parent_pending', [False, True])
+@pytest.mark.parametrize('python_parent', [False, True])
+def test_missing_receive_distinguishes_pending_ancestors(tmp_path, parent_pending, python_parent):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    bash = store.begin_event('bash')
+    parent = store.begin_event('cli_python', parent=bash) if python_parent else bash
+    if python_parent:
+        store.complete(parent)
+    query = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION, parent=parent)
+    token = 'a' * 32
+    store.bind_client(query, token)
+    store.finish(query, 200, [], b'{"success":true,"columns":[],"rows":[]}', {})
+    store.delivered(query, 'sent')
+    if not parent_pending:
+        store.complete(bash)
+        store.begin_event('bash')
+    if parent_pending:
+        with pytest.raises(EvidencePending):
+            store.assert_healthy()
+    else:
+        with pytest.raises(RuntimeError, match='Unconfirmed client receive outcome: ' + token) as raised:
+            store.assert_healthy(settle=.3)
+        assert not isinstance(raised.value, EvidencePending)
 
 
 def test_snapshot_branch_visibility_and_tampering(captured, tmp_path):

@@ -725,9 +725,9 @@ def test_paused_and_failed_outcomes_still_freeze_final_state(managed_team, tmp_p
 
 @pytest.mark.parametrize('operation', ['covered', 'new_completed', 'unknown'])
 def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_path, monkeypatch, operation):
+    from contextlib import closing
     from saas_bench import api_server
     from test_sql_evidence import settled
-    from test_execution_capture import records
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
     manifest = batch.validate_manifest(path)
     entry = next(row for row in manifest['runs'] if row['group'] == 'pf')
@@ -776,7 +776,9 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert result['recovery_validation']['eligible'] is (operation == 'covered')
             assert growth.store.fault is None and not growth.store.fault_path.exists()
             assert 'growth' not in sent and 'ceo' not in sent
-            rows = records(growth.store)
+            with closing(growth.store.connect()) as conn:
+                rows = [growth.store.read_event(row[0]) for row in conn.execute(
+                    'SELECT event_id FROM requests WHERE branch=?', (growth.store.identity['branch_id'],))]
             assert any(row['request']['kind'] == 'sql_query' for row in rows)
             assert not any(row['request']['kind'] == 'model_request' for row in rows)
             release.set()

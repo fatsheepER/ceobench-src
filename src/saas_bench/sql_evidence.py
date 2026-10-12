@@ -72,6 +72,10 @@ def whole_rows(body, losses=()):
     return {'status': 'available', 'scope': 'returned_subset' if data.get('truncated') else 'complete_for_query'}, content
 
 
+class EvidencePending(RuntimeError):
+    """Required evidence has not finished recording yet."""
+
+
 class SQLEvidenceStore:
     WRITE_TIMEOUT_SECONDS = 30
 
@@ -173,7 +177,7 @@ class SQLEvidenceStore:
         return self.identity.get('capture_scope') == 'execution'
 
     def assert_healthy(self, quiescent=True, settle=0):
-        """With settle, wait that long for server threads to record sends already observed by the client."""
+        """With settle, wait that long for pending results and sends to be recorded."""
         deadline = time.monotonic() + settle
         while True:
             if self.fault or self.fault_path.exists():
@@ -188,17 +192,18 @@ class SQLEvidenceStore:
                     ORDER BY 2 LIMIT 1''', (self.identity.get('role'), self.identity.get('role'))).fetchone()
                 missing = self._settle_interrupted_clients(conn)
                 unknown = conn.execute("SELECT event_id FROM results JOIN requests USING(event_id) WHERE json_extract(record, '$.status') = 'result_unknown' AND (? IS NULL OR json_extract(request,'$.role')=?) LIMIT 1", (self.identity.get('role'), self.identity.get('role'))).fetchone()
-            # The response bytes reach the client before its handler records the send.
-            if pending and pending[1] and time.monotonic() < deadline:
+            if self.fault or self.fault_path.exists():
+                raise RuntimeError('SQL evidence capture failed; collection stopped')
+            if unknown:
+                raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
+            if missing:
+                raise RuntimeError('Unconfirmed client receive outcome: ' + missing)
+            if pending and time.monotonic() < deadline:
                 time.sleep(.01)
                 continue
             break
         if pending:
-            raise RuntimeError('Unconfirmed SQL evidence outcome: ' + pending[0])
-        if missing:
-            raise RuntimeError('Unconfirmed client receive outcome: ' + missing)
-        if unknown:
-            raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
+            raise EvidencePending('Unconfirmed SQL evidence outcome: ' + pending[0])
 
     def actor_fields(self):
         fields = {k: self.identity[k] for k in ('run_id', 'world_id', 'role', 'agent_id', 'session_id') if k in self.identity}
@@ -317,8 +322,15 @@ class SQLEvidenceStore:
         from .execution_capture import sql_client_interruption
         missing = None
         rows = conn.execute('''SELECT c.token,c.event_id,i.record FROM client_calls c
-            JOIN requests r USING(event_id) LEFT JOIN client_interruptions i USING(token)
-            WHERE c.received IS NULL AND (? IS NULL OR json_extract(r.request,'$.role')=?)''',
+            JOIN requests r USING(event_id) JOIN results qr USING(event_id)
+            JOIN deliveries d USING(event_id) LEFT JOIN client_interruptions i USING(token)
+            LEFT JOIN requests p ON p.event_id=json_extract(r.request, '$.parent_event_id')
+            LEFT JOIN results pr ON pr.event_id=p.event_id
+            LEFT JOIN requests b ON b.event_id=json_extract(p.request, '$.parent_event_id')
+            LEFT JOIN results br ON br.event_id=b.event_id
+            WHERE c.received IS NULL AND (? IS NULL OR json_extract(r.request,'$.role')=?)
+                AND (p.event_id IS NULL OR pr.event_id IS NOT NULL)
+                AND (b.event_id IS NULL OR br.event_id IS NOT NULL)''',
             (self.identity.get('role'), self.identity.get('role'))).fetchall()
         for row in rows:
             proof = sql_client_interruption(conn, row['event_id'])

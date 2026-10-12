@@ -252,10 +252,14 @@ class ModelUsage:
             capture_done = False
             if recorder.evidence_store:
                 from .execution_capture import model_request
+                from .run_lifecycle import RunCancelled
+                from .sql_evidence import EvidencePending
                 # Required evidence is durable before sending a model request.
                 try:
                     capture_event = model_request(recorder.evidence_store, raw_body, recorder.source_records,
                                                   call_id, attempt_id, recorder.context_id, recorder.message_ids)
+                except EvidencePending as exc:
+                    raise RunCancelled('sql_evidence_pending') from exc
                 except Exception as exc:
                     recorder.evidence_store.fail(exc)
                     raise
