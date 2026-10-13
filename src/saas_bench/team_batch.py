@@ -304,8 +304,8 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     seeds = list(d0_sources)
     if any(type(seed) is not int or seed < 0 for seed in seeds) or len(seeds) != len(set(seeds)):
         raise ValueError('Seeds must be unique nonnegative integers')
-    if category == 'formal' and (len(seeds) != 3 or not selection_rule.strip() or set(seeds) & set(excluded_seeds)):
-        raise ValueError('Formal batches require three unused seeds and a recorded selection rule')
+    if category == 'formal' and (len(seeds) not in (2, 3) or not selection_rule.strip() or set(seeds) & set(excluded_seeds)):
+        raise ValueError('Formal batches require two or three unused seeds and a recorded selection rule')
     if category == 'engineering' and seeds != [42]:
         raise ValueError('D28 engineering verification uses seed 42')
     check_prices(prices, price_source)
@@ -388,7 +388,7 @@ def validate_manifest(path):
     if any(type(seed) is not int or seed < 0 for seed in seeds):
         raise ValueError('Frozen seeds must be nonnegative integers')
     if category == 'formal':
-        if len(seeds) != 3 or len(set(seeds)) != 3 or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
+        if len(seeds) not in (2, 3) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
             raise ValueError('Formal batch seed selection mismatch')
         expected = {(seed, repeat, group) for seed in seeds for repeat in (1, 2) for group in ('git', 'pf')}
     elif category == 'engineering' and seeds == [42]:

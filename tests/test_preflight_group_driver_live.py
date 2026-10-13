@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from saas_bench import team_batch as batch
 from saas_bench.run_state import file_hash, write_json
 from test_preflight_team_batch import frozen
@@ -106,12 +108,20 @@ runpy.run_path(target, run_name='__main__')
 '''
 
 
-def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen, tmp_path):
+@pytest.mark.parametrize('two_seeds', [False, True])
+def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen, tmp_path, two_seeds):
     base, original, _, sources = frozen
+    sources = dict(sources)
+    seeds = [1044, 1045] if two_seeds else original['seeds']
+    if two_seeds:
+        for seed in seeds:
+            sources[seed] = tmp_path / f'd0-{seed}'
+            batch.seal_d0(seed, sources[seed], original['pricing'],
+                price_source=original['price_source'], public_dir=base / 'public')
     manifest = batch.freeze_batch(tmp_path / 'formal',
-        {seed: sources[seed] for seed in original['seeds']}, original['pricing'],
+        {seed: sources[seed] for seed in seeds}, original['pricing'],
         price_source=original['price_source'], public_dir=base / 'public',
-        selection_rule=original['seed_selection_rule'], excluded_seeds=original['excluded_debug_seeds'],
+        selection_rule=original['seed_selection_rule'], excluded_seeds=(*original['excluded_debug_seeds'], 1043),
         scheduling='group_independent')
     path = tmp_path / 'formal/manifest.json'
     expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
@@ -134,6 +144,9 @@ def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen,
     assert paused['status'] == 'paused' and paused['recovery_validation']['eligible']
     first_pf = batch.selected(manifest, manifest['scheduling']['queues']['pf'][0])
     second_pf = batch.selected(manifest, manifest['scheduling']['queues']['pf'][1])
+    if two_seeds:
+        assert first_pf['seed'] != second_pf['seed'] and set(manifest['seeds']) == {1044, 1045}
+        assert all(row['seed'] != 1043 for row in manifest['runs'])
     assert batch.read(batch.attempts(first_pf)[0] / 'attempt.json')['status'] == 'finished'
     assert batch.read(batch.attempts(second_pf)[0] / 'attempt.json')['status'] == 'paused'
     assert not batch.attempts(batch.selected(manifest, manifest['scheduling']['queues']['pf'][2]))

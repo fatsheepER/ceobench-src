@@ -294,3 +294,50 @@ def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, t
     write_json(path.parent / 'freeze.json', dict(manifest_sha256=file_hash(path)))
     with pytest.raises(ValueError, match='scheduling queues'):
         batch.validate_manifest(path)
+
+
+def test_two_seed_group_freeze_cli_and_driver_check(tmp_path):
+    from saas_bench import team_batch as batch
+    from saas_bench.run_state import file_hash
+    from test_preflight_team_batch import PRICES
+    prices = tmp_path / 'prices.json'
+    write_json(prices, PRICES)
+    env = dict(os.environ, PYTHONPATH=str(batch.ROOT / 'src'), PYTHONHASHSEED='0',
+        PYTHONDONTWRITEBYTECODE='1', PYTHON_DOTENV_DISABLED='1')
+    command = [sys.executable, str(batch.ROOT / 'scripts/team_batch.py')]
+    sources = []
+    for seed in (1044, 1045):
+        destination = tmp_path / f'd0-{seed}'
+        subprocess.run([*command, 'seal-d0', '--seed', str(seed), '--output', str(destination),
+            '--pricing', str(prices), '--price-source', PRICES['source']],
+            env=env, capture_output=True, text=True, check=True, timeout=60)
+        sources.extend(['--d0', f'{seed}={destination}'])
+    directory = tmp_path / 'formal'
+    result = subprocess.run([*command, 'freeze', *sources, '--output', str(directory),
+        '--pricing', str(prices), '--price-source', PRICES['source'],
+        '--excluded-debug-seed', '1043', '--seed-selection-rule', 'User selected 1044 and 1045',
+        '--scheduling', 'group_independent'], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    path = directory / 'manifest.json'
+    manifest = json.loads(result.stdout)
+    validated = subprocess.run([*command, 'validate', '--manifest', str(path)],
+        env=env, capture_output=True, text=True, check=True, timeout=60)
+    assert json.loads(validated.stdout) == manifest['runs']
+    assert manifest['seeds'] == [1044, 1045] and manifest['excluded_debug_seeds'] == [1043]
+    assert {(row['seed'], row['repeat'], row['group']) for row in manifest['runs']} == {
+        (seed, repeat, group) for seed in (1044, 1045) for repeat in (1, 2) for group in ('git', 'pf')}
+    expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
+    expected.update(manifest=str(path), manifest_sha256=file_hash(path), host_logs=str(tmp_path / 'host-logs'),
+        runs=[{key: row[key] for key in ('run_id', 'output_dir')} for row in manifest['runs']])
+    policy = tmp_path / 'policy.json'
+    write_json(policy, dict(identity=expected))
+    checked = subprocess.run([sys.executable, str(batch.ROOT / 'scripts/team_driver.py'),
+        '--policy', str(policy), '--check'], env=env, capture_output=True, text=True, check=True, timeout=60)
+    receipt = json.loads(checked.stdout)
+    assert receipt['scheduling'] == manifest['scheduling']
+    assert receipt['model_requests'] == receipt['new_attempts'] == 0 and receipt['credential_read'] is False
+    assert not (directory / 'runs').exists()
+    with pytest.raises(ValueError, match='unused seeds'):
+        batch.freeze_batch(tmp_path / 'excluded', {1043: tmp_path / 'absent', 1044: tmp_path / 'absent'}, PRICES,
+            price_source=PRICES['source'], excluded_seeds=(1043,), selection_rule='User exclusion',
+            scheduling='group_independent')

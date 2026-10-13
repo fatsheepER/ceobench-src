@@ -22,6 +22,7 @@ ALLOWED = {'src/saas_bench/run_lifecycle.py', 'src/saas_bench/team_batch.py',
 
 REPAIR_BODIES = {
     'src/saas_bench/api_server.py': {'_APIHandler.handle_one_request', '_APIHandler.parse_request',
+        '_APIHandler.end_headers',
         '_APIHandler._expire_request_input', '_APIHandler._start_public_request', '_APIHandler._read_request_bytes',
         '_APIHandler._capture_sql', '_APIHandler._capture_response', '_APIHandler._capture_delivery',
         '_TrackedHTTPServer.get_request', '_TrackedHTTPServer.shutdown_request', 'registered_script_classification',
@@ -32,7 +33,8 @@ REPAIR_BODIES = {
     'src/saas_bench/multi_agent.py': {'MultiAgentRuntime.checkpoint', 'MultiAgentRuntime.restore',
         'MultiAgentRuntime._begin_operation', 'MultiAgentRuntime._workspace_fingerprint',
         'MultiAgentRuntime._finish_operation', 'MultiAgentRuntime._guard_business_operations',
-        'MultiAgentRuntime.request_pause', 'MultiAgentRuntime._check', 'MultiAgentRuntime.close'},
+        'MultiAgentRuntime.request_pause', 'MultiAgentRuntime._check', 'MultiAgentRuntime._check_model_send',
+        'MultiAgentRuntime.close'},
     'src/saas_bench/team_batch.py': {'close_team', 'wall_time', 'mark_interrupted', 'register_attempt',
         'prune_checkpoints', 'save_checkpoint'},
     'src/saas_bench/execution_capture.py': {'sql_client_interruption', 'capture_http', 'finish_http',
@@ -43,6 +45,19 @@ REPAIR_BODIES = {
     'scripts/team_driver.py': set(),
     'scripts/team_batch.py': set(),
 }
+
+
+def without_import_cache(node):
+    class CacheHygiene(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'env'
+                    and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == 'dict'):
+                node.value.keywords = [keyword for keyword in node.value.keywords
+                    if not (keyword.arg == 'PYTHONDONTWRITEBYTECODE' and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value == '1')]
+            return node
+    return CacheHygiene().visit(node)
 
 
 def source_files(root):
@@ -94,7 +109,8 @@ def declared_fix(record, old, actual):
             continue
         def definitions(root):
             tree = ast.parse((Path(root) / name).read_text())
-            return {symbol: ast.dump(node, include_attributes=False) for node in ast.walk(tree)
+            return {symbol: ast.dump(without_import_cache(node) if name == 'src/saas_bench/multi_agent.py'
+                    and symbol == '__init__' else node, include_attributes=False) for node in ast.walk(tree)
                     for symbol in ([node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else
                         [target.id for target in node.targets if isinstance(target, ast.Name)]
                         if isinstance(node, ast.Assign) else []) if symbol in symbols}
@@ -153,6 +169,8 @@ def declared_fix(record, old, actual):
                     symbol = '.'.join([*self.classes, node.name])
                     if symbol in REPAIR_BODIES[name]:
                         node.body = [ast.Pass()]
+                    elif name == 'src/saas_bench/multi_agent.py' and symbol == 'MultiAgentRuntime.__init__':
+                        node = without_import_cache(node)
                     elif name == 'src/saas_bench/multi_agent.py' and symbol in (
                             'MultiAgentRuntime._run_ceo', 'MultiAgentRuntime._script_output'):
                         node = WithoutOperationJournal().visit(node)

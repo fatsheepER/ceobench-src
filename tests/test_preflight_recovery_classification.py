@@ -32,6 +32,61 @@ def committed_source(tmp_path):
     return root, target, commit
 
 
+def harness_revision(tmp_path, repair):
+    old, root = tmp_path / 'original', tmp_path / 'revision'
+    for directory in ('src', 'scripts'):
+        shutil.copytree(batch.ROOT / directory, root / directory,
+            ignore=shutil.ignore_patterns('__pycache__', '.env', '.env.*'))
+    shutil.copytree(root, old)
+    filename, before, after = {
+        'model_send': ('src/saas_bench/multi_agent.py',
+            'def _check_model_send(self):\n        deadline = time.monotonic() + 3',
+            'def _check_model_send(self):\n        deadline = time.monotonic() + 0'),
+        'reply': ('src/saas_bench/api_server.py',
+            "api._active_requests[id(self.connection)]['outcome_known'] = True\n                api._request_lock.notify_all()",
+            "api._active_requests[id(self.connection)]['outcome_known'] = True"),
+        'cache': ('src/saas_bench/multi_agent.py', "PYTHONDONTWRITEBYTECODE='1', ", ''),
+    }[repair]
+    target = old / filename
+    text = target.read_text()
+    assert text.count(before) == 1
+    target.write_text(text.replace(before, after))
+    for source in (old, root):
+        subprocess.run(['git', 'init', '--quiet'], cwd=source, check=True)
+        subprocess.run(['git', 'add', 'src', 'scripts'], cwd=source, check=True)
+        tree = subprocess.check_output(['git', 'write-tree'], cwd=source, text=True).strip()
+        commit = subprocess.check_output(['git', '-c', 'user.name=Offline', '-c', 'user.email=offline@example.invalid',
+            'commit-tree', tree, '-m', 'fix: offline harness repair'], cwd=source, text=True).strip()
+        subprocess.run(['git', 'update-ref', '--no-deref', 'HEAD', commit], cwd=source, check=True)
+        assert subprocess.check_output(['git', 'for-each-ref', 'refs/heads'], cwd=source) == b''
+    return old, root, commit, filename
+
+
+@pytest.mark.parametrize('repair', ['model_send', 'reply', 'cache'])
+def test_real_approval_cli_accepts_harness_send_reply_and_cache_repairs(tmp_path, repair):
+    old, root, commit, filename = harness_revision(tmp_path, repair)
+    manifest = tmp_path / 'manifest.json'
+    write_json(manifest, dict(source_root=str(old), source_sha256=tree_hash(old / 'src')))
+    evidence = tmp_path / 'evidence.json'
+    write_json(evidence, dict(offline=True, repair=repair))
+    declaration = tmp_path / 'declaration.json'
+    write_json(declaration, dict(fix_classification='harness_fix', fix_commit=commit,
+        affected_files=[filename], reason='Repair runtime confirmation or cache hygiene without changing inputs',
+        evidence=[str(evidence)]))
+    original = manifest.read_bytes()
+    result = subprocess.run([os.sys.executable, str(root / 'scripts/team_recovery.py'),
+        '--manifest', str(manifest), '--output', str(tmp_path / 'approval'), '--declaration', str(declaration),
+        '--source-root', str(root), '--approve'], cwd=root,
+        env=dict(os.environ, PYTHONPATH=str(root / 'src'), PYTHONDONTWRITEBYTECODE='1',
+            PYTHON_DOTENV_DISABLED='1'), capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    saved = batch.read(receipt['path'])
+    assert saved['fix_classification'] == 'harness_fix' and saved['fix_commit'] == commit
+    assert saved['affected_files'] == [filename] and saved['status'] == 'approved'
+    assert manifest.read_bytes() == original and not (tmp_path / 'HOLD').exists()
+
+
 def test_approval_requires_declared_repair_classification(approved_revision, monkeypatch):
     path, record, manifest = approved_revision
     record.pop('fix_classification')
@@ -241,6 +296,9 @@ def test_approval_cli_preserves_manifest_and_records_explicit_declaration(tmp_pa
 
 
 @pytest.mark.parametrize('filename,before,after', [
+    ('src/saas_bench/multi_agent.py', "PYTHONDONTWRITEBYTECODE='1'", "PYTHONDONTWRITEBYTECODE='0'"),
+    ('src/saas_bench/multi_agent.py', "PYTHONHASHSEED='0'", "PYTHONHASHSEED='1'"),
+    ('src/saas_bench/multi_agent.py', 'def _check_model_send(self):', 'def _check_model_send(self, bypass=False):'),
     ('src/saas_bench/api_server.py', 'return self._last_dashboard',
         "return 'Changed model instructions\\n' + self._last_dashboard"),
     ('src/saas_bench/api_server.py', 'response = json.dumps(data, default=str).encode()',
@@ -288,4 +346,120 @@ def test_real_approval_cli_rejects_mixed_module_design_changes(tmp_path, filenam
     assert result.returncode != 0, result.stdout
     assert 'design' in result.stderr, result.stderr
     assert manifest.read_bytes() == original and not output.exists()
+
+
+@pytest.mark.parametrize('group', ['git', 'pf'])
+def test_real_harness_approval_resumes_d7_checkpoint_through_model_usage(tmp_path, group):
+    from saas_bench.run_state import build_manifest
+    old, root, commit, filename = harness_revision(tmp_path, 'model_send')
+    for source in (old, root):
+        shutil.copytree(batch.ROOT / 'public', source / 'public')
+        shutil.copytree(batch.ROOT / 'public_sources', source / 'public_sources')
+        write_json(source / 'public/build.json', build_manifest(source, source / 'public'))
+    bootstrap = tmp_path / 'offline-recovery.py'
+    bootstrap.write_text(r'''
+import json, socket, sys
+from pathlib import Path
+import httpx
+from saas_bench import team_batch as batch
+from saas_bench.run_state import file_hash, write_json
+sys.path.insert(0, str(Path(sys.argv[4]) / 'tests'))
+from test_preflight_team_batch import PRICES
+from test_preflight_team_checkpoint import fast_simulator
+from test_preflight_team_flow import ADVANCE, calls, completion, final
+from saas_bench.agents.bash_agent import run_test
+def no_env(*args, **kwargs):
+    raise AssertionError('Offline recovery cannot read credentials')
+run_test.load_env_file = no_env
+connect = socket.socket.connect
+def local_only(sock, address):
+    if isinstance(address, tuple) and address[0] not in ('127.0.0.1', '::1', 'localhost'):
+        raise AssertionError('Offline recovery cannot access external network')
+    return connect(sock, address)
+socket.socket.connect = local_only
+mode, directory, group = sys.argv[1:4]
+directory = Path(directory)
+manifest_path = directory / 'batch/manifest.json'
+if mode == 'pause':
+    batch.seal_d0(42, directory / 'd0', PRICES, price_source=PRICES['source'])
+    manifest = batch.freeze_batch(directory / 'batch', {42: directory / 'd0'}, PRICES,
+        price_source=PRICES['source'], category='engineering')
+else:
+    manifest = batch.read(manifest_path)
+entry = next(row for row in manifest['runs'] if row['group'] == group)
+wire = []
+def client(role):
+    def respond(request):
+        body = json.loads(request.content)
+        wire.append(dict(role=role, request=body))
+        message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Use public data.')
+        return completion(message, body.get('stream', False))
+    return batch.checked_client(role, 'offline', transport=httpx.MockTransport(respond))
+save = batch.save_checkpoint
+def save_and_pause(team, attempt, record, boundary):
+    snapshot = save(team, attempt, record, boundary)
+    if mode == 'pause' and boundary == 'week_boundary' and team.server.tools.current_day == 7:
+        (manifest_path.parent / 'HOLD').touch()
+    return snapshot
+batch.save_checkpoint = save_and_pause
+def offline_simulator(conn, config, rng):
+    fast = fast_simulator(conn, config, rng)
+    original = batch.simulator(conn, config, rng)
+    fast.customer_simulator = original.customer_simulator
+    fast.shock_manager = original.shock_manager
+    return fast
+record = batch.prepare(manifest_path, entry['run_id'], resume=mode == 'resume', live=True,
+    client_factory=client, simulator_factory=offline_simulator)
+write_json(directory / (mode + '-receipt.json'), dict(record=record, wire=wire))
+''')
+    directory = tmp_path / 'offline'
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PYTHON_DOTENV_DISABLED='1',
+        PYTHONHASHSEED='0', OPENCODE_API_KEY='OFFLINE-ONLY')
+    def run(source, mode, **extra):
+        result = subprocess.run([os.sys.executable, str(bootstrap), mode, str(directory), group, str(batch.ROOT)],
+            cwd=source, env=dict(env, PYTHONPATH=str(source / 'src'), **extra),
+            capture_output=True, text=True, timeout=180)
+        assert result.returncode == 0, result.stderr
+        return batch.read(directory / (mode + '-receipt.json'))
+    paused = run(old, 'pause')['record']
+    assert paused['status'] == 'paused' and paused['day'] == 7
+    manifest_path = directory / 'batch/manifest.json'
+    manifest = batch.read(manifest_path)
+    entry = next(row for row in manifest['runs'] if row['group'] == group)
+    first = batch.attempts(entry)[0]
+    snapshot = Path(paused['checkpoint'])
+    immutable = {path: path.read_bytes() for path in (manifest_path, first / 'attempt.json', snapshot / 'checkpoint.json')}
+    snapshot_hash = tree_hash(snapshot, exact=True)
+    evidence = directory / 'pause-receipt.json'
+    declaration = tmp_path / 'declaration.json'
+    write_json(declaration, dict(fix_classification='harness_fix', fix_commit=commit,
+        affected_files=[filename], reason='Fix confirmation wait without changing the experiment',
+        evidence=[str(evidence)], attempts={entry['run_id']: {}}))
+    design = tmp_path / 'design-change.json'
+    write_json(design, dict(batch.read(declaration), fix_classification='design_change'))
+    refused = subprocess.run([os.sys.executable, str(root / 'scripts/team_recovery.py'),
+        '--manifest', str(manifest_path), '--output', str(tmp_path / 'design-approval'),
+        '--declaration', str(design), '--source-root', str(root), '--approve'], cwd=root,
+        env=dict(env, PYTHONPATH=str(root / 'src')), capture_output=True, text=True, timeout=45)
+    assert refused.returncode != 0 and 'design_change requires a new frozen batch' in refused.stderr
+    assert not (tmp_path / 'design-approval').exists() and batch.attempts(entry) == [first]
+    approved = subprocess.run([os.sys.executable, str(root / 'scripts/team_recovery.py'),
+        '--manifest', str(manifest_path), '--output', str(tmp_path / 'approval'),
+        '--declaration', str(declaration), '--source-root', str(root), '--approve'], cwd=root,
+        env=dict(env, PYTHONPATH=str(root / 'src')), capture_output=True, text=True, timeout=45)
+    assert approved.returncode == 0, approved.stderr
+    receipt = json.loads(approved.stdout)
+    resumed = run(root, 'resume', CEOBENCH_RECOVERY_APPROVAL=receipt['path'],
+        CEOBENCH_RECOVERY_APPROVAL_SHA256=receipt['sha256'])
+    record = resumed['record']
+    assert record['status'] == 'finished' and record['day'] == 28 and record['attempt'] == 2
+    assert record['source_checkpoint'] == str(snapshot) and resumed['wire']
+    later = batch.attempts(entry)[-1]
+    assert batch.read(later / 'runtime/recovery.json')['source_revision_sha256'] == receipt['sha256']
+    rows = [json.loads(line) for line in (later / 'runtime/private/ceo/model-usage.jsonl').read_text().splitlines()]
+    assert any(row['event'] == 'http_request' for row in rows)
+    assert any(row['event'] == 'response' and row['usage']['input_tokens'] == 20 for row in rows)
+    assert all(path.read_bytes() == original for path, original in immutable.items())
+    assert tree_hash(snapshot, exact=True) == snapshot_hash
+    assert (manifest_path.parent / 'HOLD').exists()
 
