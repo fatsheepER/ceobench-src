@@ -196,10 +196,9 @@ def validate_recovery_source(snapshot, state, *, current_root=None):
             if links != frozen_links or unsafe_links:
                 raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
             modes = [{str(path.relative_to(workspace)): path.lstat().st_mode
-                for path in (workspace, *workspace.rglob('*'))
-                if '__pycache__' not in path.parts and path.suffix != '.pyc'}
+                for path in (workspace, *workspace.rglob('*'))}
                 for workspace in (roles, frozen_roles)]
-            if modes[0] != modes[1] or tree_hash(roles) != tree_hash(frozen_roles):
+            if modes[0] != modes[1] or tree_hash(roles, exact=True) != tree_hash(frozen_roles, exact=True):
                 raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
         current = {}
         for path in (root / 'private' / 'operations').glob('*.json'):
@@ -324,7 +323,7 @@ def _freeze(runtime, directory):
     if server.event_logger:
         server.event_logger.save_incremental()
     save_session_db(server.conn, directory / 'world.nmdb')
-    copy_workspace(runtime.root / 'roles', directory / 'roles')
+    copy_workspace(runtime.root / 'roles', directory / 'roles', exact=True)
     copy_workspace(runtime.root / 'private', directory / 'private')
     evidence = None
     if runtime.roles['ceo'].store:
@@ -380,7 +379,8 @@ def _freeze(runtime, directory):
     write_json(directory / 'team.json', state)
     write_json(directory / 'checkpoint.json', dict(version=1, files={
         'team.json': file_hash(directory / 'team.json'), 'world.nmdb': file_hash(directory / 'world.nmdb')},
-        roles_sha256=tree_hash(directory / 'roles'), private_sha256=tree_hash(directory / 'private'),
+        roles_hash_policy='all_files', roles_sha256=tree_hash(directory / 'roles', exact=True),
+        private_sha256=tree_hash(directory / 'private'),
         log_cutoffs={str(path.relative_to(directory)): path.stat().st_size
             for path in (directory / 'private').rglob('*.jsonl')}))
 
@@ -390,11 +390,13 @@ def validate_snapshot(snapshot):
     receipt = json.loads((snapshot / 'checkpoint.json').read_text())
     if receipt.get('version') != 1 or set(receipt.get('files', {})) != {'team.json', 'world.nmdb'}:
         raise ValueError('Incomplete team checkpoint')
+    if receipt.get('roles_hash_policy') not in (None, 'all_files'):
+        raise ValueError('Unknown role checkpoint hash policy')
     for name, checksum in receipt['files'].items():
         if file_hash(snapshot / name) != checksum:
             raise ValueError('Team checkpoint checksum mismatch for ' + name)
     for name in ('roles', 'private'):
-        if tree_hash(snapshot / name) != receipt[name + '_sha256']:
+        if tree_hash(snapshot / name, exact=name == 'roles') != receipt[name + '_sha256']:
             raise ValueError('Team checkpoint checksum mismatch for ' + name)
     state = json.loads((snapshot / 'team.json').read_text())
     _known_operation(snapshot)
@@ -443,7 +445,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     if state['live_customer'] and simulator_factory is None:
         raise ValueError('Live simulator recovery requires its frozen customer client factory')
     root.mkdir(parents=True)
-    copy_workspace(snapshot / 'roles', root / 'roles')
+    copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
     copy_workspace(snapshot / 'private', root / 'private')
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,

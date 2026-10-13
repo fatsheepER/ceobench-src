@@ -336,11 +336,12 @@ def test_refresh_sources_share_deadline_and_next_call_can_continue(workspace, tm
     slow = record_sql(store, slow_sql, {'success': True, 'columns': ['n'], 'rows': [{'n': 0}], 'row_count': 1})
     fast = record_sql(store, 'SELECT amount FROM ledger', execute_query(server, 'SELECT amount FROM ledger'))
     parent = store.begin_event('pf_weekly_check', {'day': 0})
-    monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', .025)
+    monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', 2)
     result = refresh(server, [slow, fast], parent)
     receipts = [store.read_event(store.get_content(result[v])[0]['created_by_event'])['result'] for v in (slow, fast)]
     assert [r['http_status'] for r in receipts] == [504, 504]
     assert [r['attempted'] for r in receipts] == [True, False]
+    assert receipts[0]['attempted_sql'] == slow_sql
     resumed = refresh(server, [fast], parent)
     receipt = store.read_event(store.get_content(resumed[fast])[0]['created_by_event'])['result']
     assert receipt['http_status'] == 200 and receipt['attempted'] is True

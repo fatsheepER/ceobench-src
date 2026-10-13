@@ -79,6 +79,11 @@ def test_checkpoint_copy_omits_only_current_session_world(tmp_path):
     (current / 'session.json').write_text('{}')
     (other / 'world.nmdb').write_bytes(b'other')
     (workspace / 'world.nmdb').write_bytes(b'workspace')
+    (workspace / 'saved.pid').write_text('123')
+    (workspace / '.server.port').write_text('456')
+    (workspace / 'compiled.pyc').write_bytes(b'cached')
+    (workspace / '__pycache__').mkdir()
+    (workspace / '__pycache__/cached.pyc').write_bytes(b'cached')
 
     snapshot = tmp_path / 'snapshot'
     copy_workspace(workspace, snapshot, omit_session_world='current')
@@ -88,3 +93,7 @@ def test_checkpoint_copy_omits_only_current_session_world(tmp_path):
     assert (snapshot / 'sessions' / 'current' / 'session.json').read_text() == '{}'
     assert (snapshot / 'sessions' / 'other' / 'world.nmdb').read_bytes() == b'other'
     assert (snapshot / 'world.nmdb').read_bytes() == b'workspace'
+    assert not (snapshot / 'saved.pid').exists()
+    assert not (snapshot / '.server.port').exists()
+    assert not (snapshot / 'compiled.pyc').exists()
+    assert not (snapshot / '__pycache__').exists()

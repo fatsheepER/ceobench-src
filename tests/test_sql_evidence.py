@@ -239,6 +239,8 @@ def test_begin_failure_and_send_failure_preserve_observed_facts(captured, monkey
     handler = _APIHandler.__new__(_APIHandler)
     handler.server = SimpleNamespace(_api_server=api, _role="ceo")
     handler.connection = SimpleNamespace(settimeout=lambda _: None)
+    with api._request_lock:
+        api._active_requests[id(handler.connection)] = dict(read_only=True, method='POST', path='/query')
     handler.request_version = 'HTTP/1.1'
     handler._sql_event = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION)
     handler._sql_execution = {}
@@ -251,6 +253,8 @@ def test_begin_failure_and_send_failure_preserve_observed_facts(captured, monkey
     handler.wfile = SimpleNamespace(write=broken)
     with pytest.raises(BrokenPipeError):
         handler._send_query_json(dict(success=True, columns=['x'], rows=[dict(x=1)]))
+    with api._request_lock:
+        assert api._active_requests.pop(id(handler.connection))['outcome_known'] is True
     assert statuses == [200]
     event = handler._sql_event
     assert store.read_event(event)['result']['status'] == 'succeeded'

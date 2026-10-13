@@ -137,7 +137,7 @@ def test_analyst_failure_cancels_partner_bash_before_publication(tmp_path, monke
     assert time.monotonic() - started < 5
     assert outcome.reason == 'failed'
     assert runtime.server.team_phase == 'paused'
-    assert executor.last_status == 'result_unknown'
+    assert executor.last_status == 'cancelled'
     assert executor._bash_facts['boundary_closed']
     assert executor._bash_facts['process_boundary']['descendants_closed']
     assert executor._bash_facts['cancelled'] == 'analyst_failure'

@@ -526,6 +526,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             api = self.server._api_server
             with api._request_lock:
                 api._active_requests[id(self.connection)]['outcome_known'] = True
+                api._request_lock.notify_all()
         super().end_headers()
 
     def _capture_delivery(self, state):

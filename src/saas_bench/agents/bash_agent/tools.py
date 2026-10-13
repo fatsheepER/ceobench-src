@@ -526,9 +526,10 @@ class BashAgentToolExecutor:
                     'Task terminated; descendant cleanup and output stream closure verified. '
                     f'Output is partial; processing the captured output failed: {exc}')
         except BaseException as exc:
+            from saas_bench.run_lifecycle import RunCancelled
             self._bash_error = exc
             result = None
-            status = ('cancelled' if getattr(self, 'registered_execution', False) and
+            status = ('cancelled' if (isinstance(exc, RunCancelled) or getattr(self, 'registered_execution', False)) and
                       self._bash_facts.get('boundary_closed') is True else 'result_unknown')
             raise
         finally:

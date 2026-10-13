@@ -253,8 +253,16 @@ time.sleep(float(sys.argv[2]))
     def status(unit, **kwargs):
         return dict(unit=unit, invocation_id=unit, exit_code=kwargs.get('exit_code'),
             result='oom-kill' if roles[unit] == 'git' else 'success', source='journal')
+    def signal_scope(saved, signum):
+        child = children[0 if roles[saved['unit']] == 'git' else 1]
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+        return saved
     monkeypatch.setattr(controller.module.subprocess, 'Popen', launch)
     monkeypatch.setattr(controller.module, 'unit_status', status)
+    monkeypatch.setattr(controller.module, 'signal_scope', signal_scope)
     from saas_bench import systemd_guard
     monkeypatch.setattr(systemd_guard, 'unit_status', status)
     results = controller.module.supervise(controller.policy)

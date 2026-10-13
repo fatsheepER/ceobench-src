@@ -141,6 +141,23 @@ def snapshot(team):
             copy.deepcopy(team.server.tools.rng.bit_generator.state), team.server.world_state_id, files)
 
 
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_readonly_sdk_import_keeps_exact_team_workspaces(mode):
+    with make_team(mode, lambda team, sender, body: final('Existing data checked.'), 'readonly-sdk-cache') as team:
+        for role in ROLES:
+            runtime = team.roles[role]
+            for executor in (runtime.executor, team.server.role_executors[role]):
+                before = {str(path.relative_to(runtime.workspace)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in runtime.workspace.rglob('*') if path.is_file()}
+                output = executor.execute('bash', dict(command=
+                    'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\'); print(\'QUERY_DONE\')"'))
+                assert 'QUERY_DONE' in output
+                after = {str(path.relative_to(runtime.workspace)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in runtime.workspace.rglob('*') if path.is_file()}
+                assert sorted(set(after) - set(before)) == [], (role, sorted(set(after) - set(before)))
+                assert after == before
+
+
 def register(team, role, name, code):
     path = team.roles[role].workspace / name
     path.write_text(code)

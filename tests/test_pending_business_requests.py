@@ -37,6 +37,55 @@ except Exception:
 """
 
 
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_model_waits_for_parallel_registration_then_continues(mode, cancelled, monkeypatch):
+    entered, checked, release = threading.Event(), threading.Event(), threading.Event()
+    read_body = api_server._APIHandler._read_body
+
+    def delayed_registration(handler):
+        if handler.path == '/daily-scripts' and handler.role == 'ops_finance':
+            entered.set()
+            assert release.wait(10)
+        return read_body(handler)
+
+    monkeypatch.setattr(api_server._APIHandler, '_read_body', delayed_registration)
+    with make_team(mode, lambda team, sender, body: final('Confirmed data checked.'), 'parallel-registration') as team:
+        team._set_phase('analysis')
+        runtime = team.roles['growth']
+        check = runtime.usage.request_check
+        def record_check():
+            checked.set()
+            check()
+        runtime.usage.request_check = record_check
+        payload = dict(model=batch.MODEL, messages=[dict(role='user', content='Check the current world.')],
+            stream=True, stream_options={'include_usage': True})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            registration = pool.submit(raw, team, 'ops_finance', '/daily-scripts',
+                dict(name='weekly.py', content="print('registered')\n"))
+            try:
+                assert entered.wait(5)
+                sending = pool.submit(runtime.usage.call, 'chat', payload,
+                    lambda: _stream_chat_completion(runtime.agent.client, payload))
+                assert checked.wait(5)
+                threading.Event().wait(.1)
+                assert not sending.done(), 'A normal parallel write caused premature pause'
+                assert team.test_wire == [], 'Model transport crossed an unconfirmed write'
+                if cancelled:
+                    team._lifecycle.cancel('requested_pause')
+                    with pytest.raises(RunCancelled, match='^requested_pause$'):
+                        sending.result(timeout=1)
+            finally:
+                release.set()
+            status, result = registration.result(timeout=5)
+            assert status == 200 and result['success']
+            if not cancelled:
+                response = sending.result(timeout=5)
+                assert response.choices[0].message.content == 'Confirmed data checked.'
+        assert len(team.test_wire) == int(not cancelled)
+        assert team.server.get_daily_scripts('ops_finance') == {'weekly.py': "print('registered')\n"}
+
+
 @pytest.mark.parametrize('managed_git', ['git', 'pf'], indirect=True)
 @pytest.mark.parametrize('entrypoint', ['bash', 'public_cli'])
 def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_path, monkeypatch, entrypoint):

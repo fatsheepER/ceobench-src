@@ -118,9 +118,11 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         assert 'Error:' not in executor.execute('write_file', dict(path='weekly.py', content=code))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
         source = team.checkpoint()
+        script_timeout = team.server.role_executors[role].bash_timeout
         if failure == 'timeout':
             team.server.role_executors[role].bash_timeout = .3
         outcome = team.run(stop_after_day=7)
+        team.server.role_executors[role].bash_timeout = script_timeout
         assert (outcome.day, outcome.reason) == (0, 'paused'), team.failure
         assert team.failure == 'registered_script_transient_infrastructure'
         record = team.server.role_script_results[role][0]
@@ -130,8 +132,17 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'PARTIAL-OUT\n'
         assert all(not executor.preserved_process for executor in team.server.role_executors.values())
         from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+        from saas_bench.run_state import tree_hash
         _, state = validate_snapshot(source)
-        validate_recovery_source(source, state, current_root=team.root)
+        if tree_hash(source / 'roles', exact=True) != tree_hash(team.root / 'roles', exact=True):
+            with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
+                validate_recovery_source(source, state, current_root=team.root)
+        else:
+            validate_recovery_source(source, state, current_root=team.root)
+        paused = team.checkpoint()
+        assert tree_hash(paused / 'roles', exact=True) == tree_hash(team.root / 'roles', exact=True)
+        _, state = validate_snapshot(paused)
+        validate_recovery_source(paused, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])

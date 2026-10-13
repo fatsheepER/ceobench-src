@@ -37,7 +37,7 @@ def managed_git(frozen, tmp_path, request):
 
 
 @pytest.mark.parametrize('managed_git,interruption', [(group, case) for group in ('git', 'pf')
-    for case in ('completed', 'cancelled', 'pending_query', 'pending_write', 'registered_write', 'local_write')]
+    for case in ('completed', 'cancelled', 'cancelled_write', 'pending_query', 'pending_write', 'registered_write', 'local_write')]
     + [('pf', 'pending_capture'), ('git', 'symlink'), ('pf', 'symlink')], indirect=['managed_git'])
 def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monkeypatch, interruption):
     from saas_bench import api_server
@@ -63,7 +63,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return receive(handler)
         monkeypatch.setattr(execution_capture, 'receive_client', delayed_capture)
     command = 'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'
-    blocked = interruption in ('pending_write', 'registered_write', 'local_write', 'symlink')
+    blocked = interruption in ('pending_write', 'registered_write', 'local_write', 'cancelled_write', 'symlink')
     hashed_symlinks = []
     if interruption == 'symlink':
         from saas_bench import run_state
@@ -89,7 +89,9 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return read_body(handler)
         monkeypatch.setattr(api_server._APIHandler, '_read_body', delayed_body)
         command = 'python -c "from novamind_api._client import call; call(\'set_prices\', {\'A\':29})"'
-    if interruption == 'cancelled':
+    if interruption == 'cancelled_write':
+        command = 'printf changed > changed.txt; ' + command
+    if interruption in ('cancelled', 'cancelled_write'):
         command += '; sleep 60'
 
     def transport(request):
@@ -121,7 +123,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
     with ThreadPoolExecutor(max_workers=1) as pool:
         running = pool.submit(batch.execute, team, manifest, entry, directory, record, hold)
         try:
-            if interruption == 'cancelled':
+            if interruption in ('cancelled', 'cancelled_write'):
                 audit = role.audit.path
                 for _ in range(500):
                     if audit.exists() and any(json.loads(line).get('kind') == 'public_http' and
@@ -146,6 +148,10 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
                 assert bash['recovery']['process_boundary']['descendants_closed'] is True
             else:
                 assert role.executor._bash_facts['boundary_closed'] is True
+            if entry['group'] == 'pf' and interruption in ('cancelled', 'cancelled_write', 'pending_query', 'pending_write'):
+                assert role.executor.last_status == 'cancelled'
+                assert role.executor.evidence_store.fault is None
+                assert not role.executor.evidence_store.fault_path.exists()
             if interruption in ('pending_query', 'pending_write', 'pending_capture'):
                 assert entered.is_set() and not release.is_set()
             if interruption in ('pending_query', 'pending_capture'):

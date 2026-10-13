@@ -581,8 +581,15 @@ finally:
     ('timeout', 'execute', 'timeout', sqlite3.SQLITE_INTERRUPT),
     ('unavailable', 'setup', 'service', None),
 ])
-def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch, capfd,
+def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch,
                                                         failure, stage, kind, code):
+    from saas_bench import public_sql
+    diagnostics = []
+    log_query = public_sql.log_query
+    def capture_diagnostic(metadata):
+        diagnostics.append(dict(metadata))
+        log_query(metadata)
+    monkeypatch.setattr(public_sql, 'log_query', capture_diagnostic)
     connect = sqlite3.connect
     class Reader(sqlite3.Connection):
         def execute(self, sql, *args):
@@ -612,8 +619,6 @@ def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch, c
     status, body = request(server, {'sql': sql})
     assert status >= 400 and not body['success']
     assert 'sqlite_errorcode' not in body and 'SQLITE_IOERR_WRITE' not in json.dumps(body)
-    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
-                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
     record, = diagnostics
     assert record['failure_stage'] == stage and record['error_kind'] == kind
     assert record['sqlite_errorcode'] == code

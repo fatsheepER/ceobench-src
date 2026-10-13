@@ -31,10 +31,10 @@ def file_hash(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def tree_hash(path):
+def tree_hash(path, *, exact=False):
     path = Path(path)
     files = {str(p.relative_to(path)): file_hash(p) for p in sorted(path.rglob('*'))
-             if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'}
+             if p.is_file() and (exact or '__pycache__' not in p.parts and p.suffix != '.pyc')}
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 
@@ -79,14 +79,14 @@ def verify_build(public, root=None):
     return manifest
 
 
-def copy_workspace(source, destination, *, omit_session_world=None):
+def copy_workspace(source, destination, *, omit_session_world=None, exact=False):
     source = Path(source).resolve()
     for path in source.rglob('*'):
         if path.is_symlink() and (Path(os.readlink(path)).is_absolute() or not path.resolve().is_relative_to(source)):
             raise ValueError('Workspace symlink escapes a portable checkpoint: ' + str(path.relative_to(source)))
     base_ignore = shutil.ignore_patterns('__pycache__', '*.pyc', '*.pid', '.server.port')
     def ignore(directory, names):
-        ignored = base_ignore(directory, names)
+        ignored = set() if exact else base_ignore(directory, names)
         if omit_session_world is not None and Path(directory) == source / 'sessions' / omit_session_world:
             ignored.add('world.nmdb')
         return ignored

@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 import shutil
 import tempfile
+import time
 from types import MappingProxyType
 import uuid
 
@@ -131,7 +132,7 @@ class MultiAgentRuntime:
             audit = audits[role] = RoleAudit(role_private / 'audit.jsonl', identity)
             registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day, identity=identity)
             env = dict(NOVAMIND_API_PORT='1', NOVAMIND_API_SOCKET='/run/novamind-api/api.sock',
-                       PYTHONHASHSEED='0', PYTHONPATH=str(workspace / 'docs'))
+                       PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(workspace / 'docs'))
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
                 require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role],
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
@@ -265,7 +266,7 @@ class MultiAgentRuntime:
         workspace = self.roles['ceo'].workspace
         if workspace.is_symlink() or any(path.is_symlink() for path in workspace.rglob('*')):
             return None
-        return tree_hash(workspace)
+        return tree_hash(workspace, exact=True)
 
     @staticmethod
     def _operation_finalization(executor):
@@ -386,10 +387,18 @@ class MultiAgentRuntime:
         self._lifecycle.check()
 
     def _check_model_send(self):
-        requests = self.server.public_request_state()
-        if requests['queued'] or any(request.get('read_only') is not True and
-                request.get('outcome_known') is not True for request in requests['active']):
-            raise RunCancelled('business_operation_pending')
+        deadline = time.monotonic() + 3
+        while True:
+            self._lifecycle.check(retry=True)
+            with self.server._request_lock:
+                requests = self.server.public_request_state()
+                if not requests['queued'] and not any(request.get('read_only') is not True and
+                        request.get('outcome_known') is not True for request in requests['active']):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RunCancelled('business_operation_pending')
+                self.server._request_lock.wait(min(remaining, .1))
         self._check()
 
     def _rotate_sessions(self):

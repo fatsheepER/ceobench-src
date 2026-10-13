@@ -16,6 +16,7 @@ from saas_bench.config import BenchmarkConfig
 from saas_bench.database import init_database
 from saas_bench.execution_capture import text_sources
 from saas_bench.multi_agent import MultiAgentRuntime
+from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
 from saas_bench.role_policy import ROLES
 from saas_bench.run_state import write_json
 from saas_bench.simulation import DayResult, Simulator
@@ -205,6 +206,79 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
         for fork in forks:
             dispose(fork)
         dispose(continuous)
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_checkpoint_restores_bash_files_with_host_runtime_names(tmp_path, mode):
+    original = make_team(tmp_path / 'source', mode)
+    restored = None
+    try:
+        for role in original.roles.values():
+            role.executor.execute('bash', dict(command="printf 'role data' > saved.pid; printf 'role port' > .server.port"))
+            code = "from pathlib import Path; import py_compile; p=Path('weekly_rules.py'); p.write_text('PRICE = 29\\n'); py_compile.compile(str(p), cfile='weekly_rules.pyc', doraise=True); p.unlink(); Path('__pycache__').mkdir(exist_ok=True); Path('__pycache__/artifact.bin').write_bytes(b'role artifact')"
+            role.executor.execute('bash', dict(command='python -c ' + shlex.quote(code)))
+            assert (role.workspace / 'saved.pid').read_text() == 'role data'
+        snapshot = original.checkpoint()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        for role in restored.roles.values():
+            assert (role.workspace / 'saved.pid').read_text() == 'role data'
+            assert (role.workspace / '.server.port').read_text() == 'role port'
+            assert role.executor.execute('bash', dict(command='python -c "import weekly_rules; print(weekly_rules.PRICE)"')).strip() == '29'
+            assert (role.workspace / '__pycache__/artifact.bin').read_bytes() == b'role artifact'
+        assert restored.run(stop_after_day=7).reason == 'observation_end', restored.failure
+    finally:
+        if restored:
+            dispose(restored)
+        dispose(original)
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+@pytest.mark.parametrize('filename', ['weekly_rules.pyc', '__pycache__/artifact.bin'])
+def test_checkpoint_refuses_later_bytecode_or_cache_writes(tmp_path, mode, filename):
+    runtime = make_team(tmp_path / 'bytecode-write', mode)
+    try:
+        snapshot = runtime.checkpoint()
+        _, state = validate_snapshot(snapshot)
+        runtime.roles['growth'].executor.execute('bash', dict(
+            command='mkdir -p __pycache__; printf changed > ' + shlex.quote(filename)))
+        with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
+            validate_recovery_source(snapshot, state, current_root=runtime.root)
+        assert (runtime.roles['growth'].workspace / filename).read_bytes() == b'changed'
+    finally:
+        dispose(runtime)
+
+
+def test_legacy_role_checksum_refuses_unchecked_bytecode(tmp_path):
+    from saas_bench.run_state import tree_hash, write_json
+    runtime = make_team(tmp_path / 'legacy-role-hash', 'git')
+    restored = rejected = None
+    try:
+        snapshot = runtime.checkpoint()
+        receipt = json.loads((snapshot / 'checkpoint.json').read_text())
+        receipt.pop('roles_hash_policy', None)
+        write_json(snapshot / 'checkpoint.json', receipt)
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        path = runtime.roles['growth'].workspace / 'weekly_rules.pyc'
+        path.write_bytes(b'uncheckpointed')
+        with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
+            rejected = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-rejected', client_factory=clients())
+        assert not (tmp_path / 'legacy-rejected').exists()
+        (snapshot / 'roles/growth/weekly_rules.pyc').write_bytes(b'unchecked')
+        assert tree_hash(snapshot / 'roles') == receipt['roles_sha256']
+        with pytest.raises(ValueError, match='checksum mismatch for roles'):
+            validate_snapshot(snapshot)
+        receipt['roles_hash_policy'] = 'unknown'
+        write_json(snapshot / 'checkpoint.json', receipt)
+        with pytest.raises(ValueError, match='Unknown role checkpoint hash policy'):
+            validate_snapshot(snapshot)
+    finally:
+        if restored:
+            dispose(restored)
+        if rejected:
+            dispose(rejected)
+        dispose(runtime)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
