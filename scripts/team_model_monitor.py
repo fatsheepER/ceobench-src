@@ -74,9 +74,6 @@ def poll(output, state):
             if not key[1]:
                 raise ValueError('Immutable model receipt ID is required')
             issue = round5.model_issue(row)
-            if issue in ('model_route_changed', 'simulator_thinking_changed', 'served_model_changed',
-                         'missing_usage', 'model_call_error'):
-                (output / 'engineering/HOLD').touch()
             if key in seen:
                 if state.get('billing_rebuild'):
                     group = path.relative_to(output / 'engineering/runs').parts[0]

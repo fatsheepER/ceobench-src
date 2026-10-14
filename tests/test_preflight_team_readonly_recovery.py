@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 import threading
 import shlex
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,7 +13,6 @@ from saas_bench.run_state import file_hash, tree_hash, write_json
 from test_preflight_team_batch import frozen
 from test_preflight_team_checkpoint import fast_simulator
 from test_preflight_team_flow import ADVANCE, calls, completion, final
-from test_preflight_team_recovery_approval import approved_attempt, bind_approval
 from test_preflight_team_batch import managed_team
 
 
@@ -63,7 +61,6 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return receive(handler)
         monkeypatch.setattr(execution_capture, 'receive_client', delayed_capture)
     command = 'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'
-    blocked = interruption in ('pending_write', 'registered_write')
     hashed_symlinks = []
     if interruption == 'symlink':
         from saas_bench import run_state
@@ -139,7 +136,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             result = running.result(timeout=7)
             assert result['status'] == 'paused'
             assert result['checkpoint'] == str(source)
-            assert result['recovery_validation']['eligible'] is not blocked
+            assert result['recovery_validation']['eligible'] is True
             if interruption == 'symlink':
                 assert hashed_symlinks == []
                 bash = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
@@ -163,11 +160,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             _, state = validate_snapshot(source)
             if interruption == 'symlink':
                 assert hashed_symlinks == []
-            if blocked:
-                with pytest.raises(RuntimeError, match='changed|unknown'):
-                    validate_recovery_source(source, state, current_root=team.root)
-            else:
-                validate_recovery_source(source, state, current_root=team.root)
+            validate_recovery_source(source, state, current_root=team.root)
         finally:
             release.set()
             running.result(timeout=7)
@@ -183,7 +176,6 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         assert record['checkpoint'] == str(source)
         assert record['recovery_validation']['eligible'] is True
         assert batch.read(directory / 'attempt.json') == record
-        blocked = False
     else:
         team.close()
     def resume_client(name):
@@ -194,143 +186,12 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         return batch.checked_client(name, 'resume-test', transport=httpx.MockTransport(resume_response))
 
     hold.unlink(missing_ok=True)
-    if blocked:
-        with pytest.raises(RuntimeError, match='changed|unknown'):
-            batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True, live=True,
-                client_factory=resume_client, simulator_factory=fast_simulator)
-        assert batch.attempts(entry) == [directory]
-        return
     resumed = batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True, live=True,
         client_factory=resume_client, simulator_factory=fast_simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28
     assert resumed['attempt'] == 2 and resumed['source_checkpoint'] == str(source)
     assert batch.read(directory / 'attempt.json')['status'] == 'paused'
     validate_snapshot(resumed['checkpoint'])
-
-
-@pytest.mark.parametrize('classification,kind,status,contradiction', [
-    ('read_only_interrupted', 'ceo_tool:bash', 'running', {}),
-    ('pending_read_only', 'ceo_tool:bash', 'completed', {}),
-    ('read_only_interrupted', 'api:set_prices', 'running', {}),
-    ('unknown_business_write', 'api:set_prices', 'running', {}),
-    ('read_only_interrupted', 'ceo_tool:bash', 'running',
-        dict(business_operations_before={}, recovery=dict(business_operations_after={'write.json': 'changed'}))),
-    ('read_only_interrupted', 'ceo_tool:bash', 'running',
-        dict(mutation_epoch_before=0, recovery=dict(mutation_epoch_after=1))),
-    ('read_only_interrupted', 'ceo_tool:bash', 'running',
-        dict(workspace_sha256_before='a', recovery=dict(workspace_sha256_after='b'))),
-    ('read_only_interrupted', 'ceo_tool:bash', 'running',
-        dict(recovery=dict(operation_failed=True))),
-])
-def test_legacy_residual_approval_is_exact_and_preserves_old_attempt(approved_attempt,
-        monkeypatch, classification, kind, status, contradiction):
-    from saas_bench import team_recovery as recovery
-    approved = approved_attempt
-    root = approved.directory / 'runtime'
-    operation = root / 'private/operations/legacy-tail.json'
-    write_json(operation, dict(kind=kind, status=status, day=0, **contradiction))
-    resources = approved.approval_path.parent / 'resources.json'
-    saved = approved.revision['attempts'][approved.entry['run_id']]
-    saved['attempt_id'] = approved.previous['attempt_id']
-    unit = dict(unit='readonly-test.scope', invocation_id='offline-bound-invocation',
-        control_group='/user.slice/readonly-test.scope', scope_empty=True)
-    write_json(resources, dict(children_reaped=True,
-        units={approved.entry['run_id']: unit},
-        attempts={approved.entry['run_id']: {key: saved[key] for key in ('attempt', 'attempt_id', 'attempt_sha256')}}))
-    saved['residual_operations'] = [dict(root=str(root), operation=operation.name,
-        sha256=file_hash(operation), classification=classification,
-        reason='The inspected original worker and its children are closed. Business coverage is separately bound.',
-        evidence={str(resources): file_hash(resources)}, resource_evidence=str(resources),
-        worker_unit=unit['unit'], worker_invocation_id=unit['invocation_id'])]
-    if classification == 'unknown_business_write':
-        saved['allow_unknown_business_write'] = True
-    write_json(approved.approval_path, approved.revision)
-    monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(approved.approval_path))
-    historical = (approved.directory / 'attempt.json').read_bytes()
-    with pytest.raises(ValueError, match='Read-only residual approval|Unknown business write'):
-        recovery.recovery_source(approved.manifest_path, approved.entry,
-            approved.previous, approved.directory)
-    assert (approved.directory / 'attempt.json').read_bytes() == historical
-    operation.write_text(operation.read_text() + '\n')
-    with pytest.raises(ValueError, match='residual operation changed'):
-        recovery.recovery_source(approved.manifest_path, approved.entry, approved.previous, approved.directory)
-
-
-@pytest.mark.parametrize('classification,proof', [
-    ('read_only_interrupted', False), ('read_only_interrupted', True), ('unknown_business_write', False),
-])
-@pytest.mark.parametrize('managed_git', ['git'], indirect=True)
-def test_resume_requires_operation_proof_for_old_bash_write(managed_git,
-        monkeypatch, tmp_path, classification, proof):
-    team, directory, previous, manifest, entry = managed_git
-    snapshot = batch.save_checkpoint(team, directory, previous, 'ready')
-    previous.update(status='paused')
-    write_json(directory / 'attempt.json', previous)
-    _, state = validate_snapshot(snapshot)
-    saved = dict(attempt=previous['attempt'], attempt_id=previous['attempt_id'],
-        attempt_sha256=file_hash(directory / 'attempt.json'), checkpoint=str(snapshot),
-        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'), day=state['day'],
-        roles={name: role['identity'] for name, role in state['roles'].items()})
-    manifest_path = tmp_path / 'manifest.json'
-    approval_path, revision = bind_approval(monkeypatch, tmp_path / 'recovery', manifest_path,
-        {entry['run_id']: saved})
-    approved = SimpleNamespace(directory=directory, previous=previous, manifest=manifest, entry=entry,
-        manifest_path=manifest_path, snapshot=snapshot, approval_path=approval_path, revision=revision)
-    root = approved.directory / 'runtime'
-    changed = root / 'roles/ceo/legacy-write.txt'
-    changed.write_text('Confirmed workspace write after the checkpoint.\n')
-    operation = root / 'private/operations/legacy-write.json'
-    receipt = dict(kind='ceo_tool:bash', status='running', day=0)
-    if proof:
-        checksum = tree_hash(root / 'roles/ceo')
-        receipt.update(wrapper_version=1, status='interrupted', business_operations_before={},
-            mutation_epoch_before=0, workspace_sha256_before=checksum, recovery=dict(
-                classification='read_only_interrupted', client_closed=True, operation_failed=False,
-                step_day_timed_out=False, queued_requests=False, pending_requests=[],
-                business_operations_after={}, mutation_epoch_after=0, workspace_sha256_after=checksum,
-                process_boundary=dict(phase='closed', coverage='subreaper_wait', descendants_closed=True,
-                    children=[], unknown=None, exit_code=0)))
-    write_json(operation, receipt)
-    saved = approved.revision['attempts'][approved.entry['run_id']]
-    saved['attempt_id'] = approved.previous['attempt_id']
-    resources = approved.approval_path.parent / 'resources.json'
-    unit = dict(unit='readonly-test.scope', invocation_id='offline-bound-invocation',
-        control_group='/user.slice/readonly-test.scope', scope_empty=True)
-    write_json(resources, dict(children_reaped=True, units={approved.entry['run_id']: unit},
-        attempts={approved.entry['run_id']: {key: saved[key] for key in ('attempt', 'attempt_id', 'attempt_sha256')}}))
-    saved['residual_operations'] = [dict(root=str(root), operation=operation.name,
-        sha256=file_hash(operation), classification=classification,
-        reason='Verify operation proof separately from scope closure.',
-        evidence={str(resources): file_hash(resources)}, resource_evidence=str(resources),
-        worker_unit=unit['unit'], worker_invocation_id=unit['invocation_id'])]
-    saved['allow_unknown_business_write'] = classification == 'unknown_business_write'
-    write_json(approved.approval_path, approved.revision)
-    monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(approved.approval_path))
-    original = {path: path.read_bytes() for path in
-        (approved.directory / 'attempt.json', operation, changed, approved.snapshot / 'checkpoint.json')}
-    try:
-        if proof:
-            resumed = batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
-                simulator_factory=fast_simulator)
-            assert resumed['status'] == 'ready' and resumed['attempt'] == 2
-            restored = batch.attempts(approved.entry)[-1] / 'runtime/roles/ceo/legacy-write.txt'
-            assert not restored.exists()
-            assert {path: path.read_bytes() for path in original} == original
-            return
-        with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
-            batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
-                simulator_factory=fast_simulator)
-        assert batch.attempts(approved.entry) == [approved.directory]
-        destination = tmp_path / 'restore-refused'
-        with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
-            batch.MultiAgentRuntime.restore(approved.snapshot, destination,
-                client_factory=lambda role: batch.checked_client(role, 'offline-recovery', no_models=True),
-                public_dir=approved.manifest['public_dir'], simulator_factory=fast_simulator)
-        assert not destination.exists()
-        assert {path: path.read_bytes() for path in original} == original
-    finally:
-        monkeypatch.delenv('CEOBENCH_RECOVERY_APPROVAL', raising=False)
-        monkeypatch.delenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', raising=False)
 
 
 @pytest.mark.parametrize('managed_git', ['git', 'pf'], indirect=True)

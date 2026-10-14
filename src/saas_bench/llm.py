@@ -9,6 +9,7 @@ from openai import OpenAI
 
 from .config import BenchmarkConfig
 from .database import add_api_cost, get_total_api_cost
+from .model_usage import ModelUsage
 
 
 # Default AGENT.md content (can be overridden by loading from file)
@@ -218,7 +219,8 @@ class AgentLLM:
     def __init__(self, client: OpenAI, conn: sqlite3.Connection,
                  config: BenchmarkConfig, cost_tracker: CostTracker,
                  agent_md_path: Optional[Path] = None):
-        self.client = client
+        self.usage_recorder = ModelUsage(None, 'agent', config.model_pricing)
+        self.client = self.usage_recorder.attach(client)
         self.conn = conn
         self.config = config
         self.cost_tracker = cost_tracker
@@ -229,6 +231,12 @@ class AgentLLM:
 
         # Load AGENT.md content (from file if provided, otherwise use default)
         self.agent_md_content = self._load_agent_md(agent_md_path)
+
+    def _request(self, input_items, tools, day):
+        request = dict(model=self.model, input=input_items, tools=tools,
+                       reasoning={"effort": self.reasoning_effort, "summary": "detailed"})
+        return self.usage_recorder.call('responses', request,
+            lambda: self.client.responses.create(**request), day=day)
 
     def _load_agent_md(self, agent_md_path: Optional[Path] = None) -> str:
         """Load AGENT.md content from file or use default."""
@@ -316,14 +324,12 @@ Inbox ({len(observation.get('inbox', []))} items):
 What actions will you take today?"""
 
         # Use Responses API with tools
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
+        response = self._request(
+            [
                 {"role": "developer", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            tools=tools,
-            reasoning={"effort": self.reasoning_effort, "summary": "detailed"},
+            tools, day,
         )
 
         input_tokens = response.usage.input_tokens
@@ -371,12 +377,7 @@ What actions will you take today?"""
                 "output": result['output']
             })
 
-        response = self.client.responses.create(
-            model=self.model,
-            input=input_items,
-            tools=tools,
-            reasoning={"effort": self.reasoning_effort, "summary": "detailed"},
-        )
+        response = self._request(input_items, tools, day)
 
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
@@ -469,12 +470,7 @@ What actions will you take today?"""
             {"role": "user", "content": user_prompt}
         ]
 
-        response = self.client.responses.create(
-            model=self.model,
-            input=conversation_history,
-            tools=tools,
-            reasoning={"effort": self.reasoning_effort, "summary": "detailed"},
-        )
+        response = self._request(conversation_history, tools, day)
 
         # Store system and user prompts for continuation (but don't accumulate responses)
         conversation_history_base = [

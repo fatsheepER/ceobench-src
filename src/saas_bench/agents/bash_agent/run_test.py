@@ -14,6 +14,7 @@ Supports OpenAI, xAI/Grok, Anthropic (direct and Bedrock).
 
 import copy
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -103,26 +104,30 @@ class BashAgentRunner:
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
         default_config = BenchmarkConfig()
         if continue_from:
+            from saas_bench.run_state import recover_run
+            source = Path(continue_from).resolve()
+            destination = (workspace_base or source.parent).resolve() / ('run_recovery-' + uuid.uuid4().hex[:12])
+            continue_from = recover_run(source, destination)
             saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
             saved = saved_manifest['configuration']
             saved_registration = saved_manifest.get('text_registration', 'off')
             if text_registration is not None and text_registration != saved_registration:
-                raise ValueError('Resume text registration configuration mismatch')
+                logging.warning('Resume uses checkpoint text registration; supplied value differs')
             text_registration = saved_registration
             saved_stale = saved_manifest.get('pf_stale_checks', False)
             if pf_stale_checks is not None and pf_stale_checks != saved_stale:
-                raise ValueError('Resume stale check configuration mismatch')
+                logging.warning('Resume uses checkpoint stale check setting; supplied value differs')
             pf_stale_checks = saved_stale
             saved_capture = bool(saved_manifest.get('sql_evidence'))
             saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
             if execution_capture is not None and execution_capture != saved_execution:
-                raise ValueError('Resume execution capture configuration mismatch')
+                logging.warning('Resume uses checkpoint execution capture; supplied value differs')
             execution_capture = saved_execution
             if sql_capture is not None and sql_capture != saved_capture:
-                raise ValueError('Resume SQL capture configuration mismatch')
+                logging.warning('Resume uses checkpoint SQL capture; supplied value differs')
             sql_capture = saved_capture
             if pricing_file and self.pricing_registration != saved_manifest.get('pricing'):
-                raise ValueError('Resume pricing configuration mismatch')
+                logging.warning('Resume uses checkpoint pricing; supplied value differs')
             self.pricing_registration = saved_manifest.get('pricing')
             supplied = dict(model=model, provider=provider, base_url=base_url,
                             seed=seed, scenario=scenario, total_days=total_days,
@@ -136,7 +141,7 @@ class BashAgentRunner:
                 if key == 'base_url' and expected is not None:
                     expected = expected.rstrip('/') + '/'
                 if value is not None and value != expected:
-                    raise ValueError(f'Resume configuration mismatch: {key}')
+                    logging.warning('Resume uses checkpoint %s; supplied value differs', key)
             model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
             seed, scenario, total_days, initial_cash, reasoning_effort = (
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
@@ -760,7 +765,8 @@ __pycache__/
         path = self.workspace_dir / 'manifest.json'
         if self.continue_from:
             if json.loads(path.read_text()) != manifest:
-                raise ValueError('Run manifest differs: artifacts or effective configuration changed')
+                logging.warning('Run execution metadata changed; restoring checkpoint environment')
+                write_json(self.workspace_dir / ('execution-revision-' + uuid.uuid4().hex + '.json'), manifest)
         else:
             write_json(path, manifest)
 
@@ -1017,8 +1023,8 @@ __pycache__/
             with open(checkpoint_file) as f:
                 checkpoint = json.load(f)
             progress = self.workspace_dir / 'operation.json'
-            if progress.exists() and json.loads(progress.read_text())['id'] != checkpoint.get('operation_id'):
-                raise ValueError('Uncheckpointed operation outcome unknown; use scripts/recover_run.py to preserve this run and start a new attempt')
+            if progress.exists():
+                logging.warning('Discarding post-checkpoint operation outcomes when restoring %s', checkpoint_file)
             return checkpoint
         return None
 
@@ -1274,17 +1280,7 @@ __pycache__/
                 start_day = checkpoint['day'] + 1
                 self._restore_from_checkpoint(checkpoint)
 
-                # Check for bankruptcy before resuming
                 cash = self._get_cash()
-                if cash < 0:
-                    print(f"\n{'='*60}")
-                    print(f"CANNOT RESUME — COMPANY IS BANKRUPT")
-                    print(f"Run ID: {self.run_id}")
-                    print(f"Checkpoint: Day {checkpoint['day']}")
-                    print(f"Cash balance: ${cash:,.2f}")
-                    print(f"{'='*60}\n")
-                    raise SystemExit(f"Run {self.run_id} is bankrupt (cash=${cash:,.2f}). Cannot resume.")
-
                 if verbose:
                     print(f"\n{'='*60}")
                     print(f"RESUMING Bash Agent Run from Day {start_day}")

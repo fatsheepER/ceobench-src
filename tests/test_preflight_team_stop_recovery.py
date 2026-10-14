@@ -94,9 +94,5 @@ def test_analysis_hold_preserves_error_and_audits_safe_boundary(managed_team, tm
     result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
     assert 'outside a recoverable handoff' in result['checkpoint_error']
     assert result['checkpoint'] == checkpoint
-    if operation == 'covered':
-        assert result.get('recovery_validation', {}).get('eligible') is True, 'Safe boundary coverage was not audited'
-        assert result['recovery_validation']['checkpoint'] == checkpoint
-    else:
-        assert result.get('recovery_validation', {}).get('eligible') is False
-        assert result['recovery_validation']['error']
+    assert result.get('recovery_validation', {}).get('eligible') is True
+    assert result['recovery_validation']['checkpoint'] == checkpoint

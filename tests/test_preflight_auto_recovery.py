@@ -1,0 +1,75 @@
+import importlib.util
+import json
+from pathlib import Path
+
+from saas_bench.run_state import write_json
+from saas_bench.systemd_guard import scope_command
+from test_preflight_team_controller import controller
+from test_preflight_team_observer import observer
+
+
+def test_failure_count_uses_checkpoint_position_and_resets_after_progress(controller):
+    failures = {}
+    count = controller.module.record_failure
+    assert [count(failures, 'pf', [70, 'boundary']) for _ in range(3)] == [1, 2, 3]
+    assert count(failures, 'git', [21, 'boundary']) == 1
+    assert count(failures, 'pf', [77, 'boundary']) == 1
+    assert failures == {
+        'pf': {'position': [77, 'boundary'], 'count': 1},
+        'git': {'position': [21, 'boundary'], 'count': 1},
+    }
+
+
+def test_scope_and_historical_hold_observations_do_not_block_requests(observer, controller, monkeypatch):
+    observer.hold.touch()
+    write_json(observer.output / 'health.json', dict(status='hold', batch_id='old', time='old'))
+    controller.gate.scope = dict(unit='own.scope')
+    monkeypatch.setattr(controller.module, 'check_worker_cgroup',
+                        lambda proof: ['Worker cgroup limit changed: memory.high'])
+    controller.gate(None)
+    rows = [json.loads(line) for line in
+            (observer.host_logs / 'worker-scope-observations.jsonl').read_text().splitlines()]
+    assert rows[0]['observations'] == ['Worker cgroup limit changed: memory.high']
+    assert not (controller.policy.parent / 'HOLD').exists()
+
+
+def test_single_group_can_use_an_old_paired_manifest_and_ignore_control_freeze(observer):
+    observer.expected['runs'] = [{key: observer.manifest['runs'][1][key] for key in ('run_id', 'output_dir')}]
+    path = Path(__file__).resolve().parents[1] / 'scripts/team_driver.py'
+    spec = importlib.util.spec_from_file_location('auto_team_driver', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    policy = observer.output.parent / 'single-group.json'
+    write_json(policy, dict(identity=observer.expected, control_freeze='/absent/old.json',
+                            control_freeze_sha256='old'))
+    config, manifest = module.verify_controls(policy)
+    assert [row['run_id'] for row in manifest['runs']] == ['pf']
+    assert config['identity']['source_commit'] == 'frozen-commit'
+
+
+def test_worker_memory_defaults_and_driver_forwarding(observer, monkeypatch):
+    command = scope_command([], 'one.scope')
+    assert '--property=MemoryHigh=17179869184' in command
+    assert '--property=MemoryMax=21474836480' in command
+    path = Path(__file__).resolve().parents[1] / 'scripts/team_driver.py'
+    spec = importlib.util.spec_from_file_location('memory_team_driver', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    policy = observer.output.parent / 'memory-policy.json'
+    write_json(policy, dict(identity=observer.expected))
+    calls = []
+
+    def supervise(path, **kwargs):
+        calls.append(kwargs)
+        write_json(path.parent / 'controller-exit.json', dict(children_reaped=True, hold=False, failed=False))
+        write_json(path.parent / 'controller-terminal.json',
+            {kwargs['run_id']: {}} if kwargs.get('run_id') else dict(git={}, pf={}))
+
+    monkeypatch.setattr(module.controller, 'supervise', supervise)
+    assert module.main(['--policy', str(policy), '--live']) == 0
+    assert calls == [dict(resume=False, memory_high=17179869184,
+                          memory_max=21474836480, memory_swap_max=0)]
+    assert json.loads((policy.parent / 'driver-exit.json').read_text())['auto_resume'] is True
+    assert module.main(['--policy', str(policy), '--live', '--run-id', 'pf', '--week', '1']) == 0
+    assert calls[-1] == dict(resume=False, memory_high=17179869184,
+                            memory_max=21474836480, memory_swap_max=0, run_id='pf', week=1)

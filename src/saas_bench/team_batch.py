@@ -86,44 +86,11 @@ def check_prices(prices, source):
 
 def checked_client(role, session, *, transport=None, no_models=False, config=None,
                    request_guard=None, response_guard=None, hold=None):
-    def check_frozen(request):
+    def request_check(request):
         if no_models:
             raise AssertionError('Preparation must not request a model')
-        body = json.loads(request.content)
-        if str(request.url) != ENDPOINT + 'chat/completions' or body.get('model') != MODEL:
-            raise ValueError('Frozen model endpoint or requested model changed')
-        expected = 'none' if role == 'simulator' else 'high'
-        thinking = 'disabled' if role == 'simulator' else 'enabled'
-        if body.get('reasoning_effort') != expected or body.get('thinking') != {'type': thinking}:
-            raise ValueError('Frozen reasoning or thinking changed')
-        if role != 'simulator' and any(body.get(key) != value for key, value in
-                dict(temperature=1.0, max_tokens=16384, stream=True, stream_options={'include_usage': True}).items()):
-            raise ValueError('Frozen business request parameters changed')
-        if role == 'simulator':
-            cfg = config or BenchmarkConfig()
-            allowed = {(cfg.social_post_llm_max_tokens, cfg.social_media_temperature),
-                       (300, cfg.social_media_temperature),
-                       (cfg.competitor_post_llm_max_tokens, cfg.social_media_temperature),
-                       (cfg.enterprise_llm_max_tokens, cfg.enterprise_llm_temperature),
-                       (150, cfg.enterprise_llm_temperature), (100, 0.3), (150, 0.9)}
-            if (body.get('max_tokens'), body.get('temperature')) not in allowed:
-                raise ValueError('Frozen simulator request parameters changed')
-
-    def request_check(request):
         if request_guard:
-            from .agents.bash_agent.agent import _pause_model_deadline
-            with _pause_model_deadline():
-                request_guard(request)
-        try:
-            check_frozen(request)
-            if request.extensions.get('timeout') != PARAMETERS['timeout_seconds']:
-                raise ValueError('Frozen phase timeouts changed')
-        except ValueError:
-            if hold:
-                from .run_lifecycle import RunCancelled
-                Path(hold).touch()
-                raise RunCancelled('frozen_identity_changed')
-            raise
+            request_guard(request)
 
     key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get('OPENCODE_API_KEY')
     if not key:
@@ -234,28 +201,15 @@ def close_team(runtime, record=None):
         path = runtime.root.parent / 'attempt.json'
         if path.exists():
             record = record if record is not None else read(path)
-            if record.get('status') == 'paused' and record.get('checkpoint'):
-                from .team_checkpoint import validate_recovery_source, validate_snapshot
-                snapshot, state = validate_snapshot(record['checkpoint'])
+            if record.get('checkpoint'):
+                from .team_checkpoint import validate_snapshot
                 try:
-                    validate_recovery_source(snapshot, state, current_root=runtime.root)
-                except RuntimeError as exc:
-                    record['recovery_validation'] = dict(eligible=False, error=str(exc))
-                    if runtime.failure == 'business_operation_pending':
-                        try:
-                            snapshot = save_checkpoint(runtime, path.parent, record, 'settled')
-                        except (ValueError, RuntimeError) as unsettled:
-                            record['recovery_validation'] = dict(eligible=False, error=str(unsettled))
-                        else:
-                            snapshot, state = validate_snapshot(snapshot)
-                            validate_recovery_source(snapshot, state, current_root=runtime.root)
-                            record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
-                                checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
-                                day=state['day'], stage=state['stage'], current_operation_coverage=True)
-                else:
+                    snapshot, state = validate_snapshot(record['checkpoint'])
                     record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
                         checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
-                        day=state['day'], stage=state['stage'], current_operation_coverage=True)
+                        day=state['day'], stage=state['stage'], discard_post_checkpoint_operations=True)
+                except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                    record['recovery_validation'] = dict(eligible=False, error=str(exc))
                 write_json(path, record)
 
 
@@ -287,8 +241,6 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
 
 def analyst_bash_settings(manifest):
     parameters = manifest['parameters']
-    if parameters.get('analyst_bash_scope') != PARAMETERS['analyst_bash_scope']:
-        raise ValueError('Frozen analyst Bash scope changed')
     return {key: parameters[key] for key in ('analyst_bash_timeout', 'analyst_bash_warn_after')}
 
 
@@ -333,7 +285,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
         controller_sha256={name: file_hash(root / name) for name in controllers},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
-        price_source=price_source, attempt_policy='explicit_resume', d0=d0, runs=runs)
+        price_source=price_source, attempt_policy='automatic_checkpoint_recovery', d0=d0, runs=runs)
     if scheduling == 'group_independent':
         manifest['scheduling'] = dict(mode=scheduling, queues={group:
             [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
@@ -359,30 +311,9 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
 
 def validate_manifest(path):
     path = Path(path).resolve()
-    frozen = read(path.parent / 'freeze.json')
-    if file_hash(path) != frozen['manifest_sha256']:
-        raise ValueError('Frozen manifest changed')
     manifest = read(path)
-    if manifest.get('version') != 1 or manifest.get('parameters') != PARAMETERS:
-        raise ValueError('Frozen model parameters or manifest version mismatch')
-    # Historical limits stay in the immutable manifest but no longer cap resumes.
-    if 'max_attempts' in manifest:
-        if type(manifest['max_attempts']) is not int or manifest['max_attempts'] < 1:
-            raise ValueError('Historical attempt limit metadata is invalid')
-    elif manifest.get('attempt_policy') != 'explicit_resume':
-        raise ValueError('Frozen attempt policy is invalid')
-    root, public = Path(manifest['source_root']), Path(manifest['public_dir'])
-    from .team_recovery import approval
-    revision = approval(path)
-    if ROOT != root and not revision:
-        raise ValueError('Executing batch is outside the frozen source root')
-    if verify_build(public, root=root) != manifest['build'] or tree_hash(root / 'src') != manifest['source_sha256']:
-        raise ValueError('Frozen source or public build changed')
-    if file_hash(root / 'scripts' / 'team_batch.py') != manifest['host_script_sha256']:
-        raise ValueError('Frozen batch entry changed')
-    controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling_policy(manifest) == 'group_independent' else CONTROLLER_SCRIPTS
-    if manifest.get('controller_sha256') != {name: file_hash(root / name) for name in controllers}:
-        raise ValueError('Frozen controller or observer changed')
+    if manifest.get('version') != 1:
+        raise ValueError('Unsupported batch manifest version')
     check_prices(manifest['pricing'], manifest['price_source'])
     category, seeds = manifest['category'], manifest['seeds']
     if any(type(seed) is not int or seed < 0 for seed in seeds):
@@ -454,22 +385,93 @@ def attempts(entry):
 
 
 def wall_time(history, current=None):
-    known, missing = 0.0, []
+    records, errors = {}, []
     for directory in history:
-        value = current[1] if current and directory == current[0] else read(directory / 'attempt.json').get('wall_seconds')
-        if value is None:
+        try:
+            records[directory] = read(directory / 'attempt.json')
+        except (OSError, ValueError) as exc:
+            records[directory] = {}
+            errors.append(dict(attempt=directory.name, error=str(exc)))
+    retained = {}
+    if history:
+        last = records[history[-1]]
+        source = (last.get('checkpoint') or last.get('source_checkpoint')) if last.get('status') in ('failed', 'paused') else last.get('source_checkpoint')
+        while source:
+            try:
+                state = read(Path(source) / 'team.json')
+                owner = Path(state['source_root']).parent
+                if owner not in records or owner in retained:
+                    raise ValueError('Checkpoint time lineage is outside this run or cyclic')
+            except (OSError, ValueError, KeyError) as exc:
+                errors.append(dict(checkpoint=str(source), error=str(exc)))
+                break
+            record = records[owner]
+            duration = current[1] if current and owner == current[0] else record.get('wall_seconds')
+            start = record.get('execution_started_at')
+            if not start and record.get('finished_at') and duration is not None:
+                start = (datetime.fromisoformat(record['finished_at']) - timedelta(seconds=duration)).isoformat()
+            start = start or record.get('started_at')
+            saved = state.get('saved_at')
+            retained[owner] = (min(duration, max(0.0, (datetime.fromisoformat(saved) -
+                datetime.fromisoformat(start)).total_seconds()))
+                if duration is not None and start and saved else None)
+            source = record.get('source_checkpoint')
+    known, missing, wasted, waste_missing = 0.0, [], 0.0, []
+    for directory, record in records.items():
+        duration = current[1] if current and directory == current[0] else record.get('wall_seconds')
+        inherited = bool(retained)
+        kept = (retained.get(directory, 0.0) if inherited else duration)
+        if directory == history[-1] and records[directory].get('status') not in ('failed', 'paused'):
+            kept = duration
+        if kept is None:
             missing.append(directory.name)
         else:
-            known += value
-    return dict(wall_seconds=None if missing else known, wall_seconds_known=known,
-                wall_seconds_missing_attempts=missing)
+            known += kept
+        if duration is None or kept is None:
+            waste_missing.append(directory.name)
+        else:
+            wasted += max(0.0, duration - kept)
+    result = dict(wall_seconds=None if missing or errors else known, wall_seconds_known=known,
+                wall_seconds_missing_attempts=missing,
+                waste_wall_seconds=None if waste_missing or errors else wasted,
+                waste_wall_seconds_known=wasted, waste_wall_seconds_missing_attempts=waste_missing)
+    if errors:
+        result['time_metadata_errors'] = errors
+    return result
 
 
-def mark_interrupted(directory, record):
-    if record['status'] in ('preparing', 'ready', 'running'):
-        record.update(status='failed', reason='host_interrupted', error='Previous host stopped before finalizing the attempt')
-        write_json(directory / 'attempt.json', record)
-    return record
+def run_usage(entry, prices):
+    from .team_usage import aggregate
+    from .team_recovery import latest_checkpoint
+    history = attempts(entry)
+    def logs(private_roots):
+        result = {entry['category']: [], 'simulator': []}
+        for private in private_roots:
+            result[entry['category']].extend(private.glob('*/model-usage.jsonl'))
+            simulator = private / 'simulator-model-usage.jsonl'
+            if simulator.exists():
+                result['simulator'].append(simulator)
+        return result
+    all_roots = [directory / 'runtime/private' for directory in history]
+    valid_root = all_roots[-1] if all_roots else None
+    last = read(history[-1] / 'attempt.json') if history and (history[-1] / 'attempt.json').exists() else {}
+    if last.get('status') in ('failed', 'paused', 'preparing'):
+        checkpoint = latest_checkpoint(entry)
+        if checkpoint:
+            valid_root = checkpoint / 'private'
+    retained_logs = logs([valid_root] if valid_root else [])
+    valid = aggregate(retained_logs, prices, category=entry['category'])
+    valid['retained_logs'] = {key: [str(path) for path in paths] for key, paths in retained_logs.items()}
+    try:
+        waste = aggregate(logs(all_roots), prices, category=entry['category'],
+                          exclude_calls={record['call_id'] for record in valid['records']})
+    except (OSError, ValueError) as exc:
+        waste = aggregate([], prices, category=entry['category'])
+        waste['missing_receipts'].append(dict(reason='discarded_log_unreadable', error=str(exc)))
+        for summary in (waste['team'], waste['all_resources'], *waste['roles'].values(), *waste['resources'].values()):
+            summary['missing'] = dict.fromkeys(summary['missing'], 1)
+            summary['wall_seconds_missing_calls'] = ['discarded_log_unreadable']
+    return valid, waste
 
 
 def evidence_fault(directory, record):
@@ -478,45 +480,21 @@ def evidence_fault(directory, record):
         (Path(directory) / 'runtime/private/evidence.fault.json').exists())
 
 
-def register_attempt(path, manifest, entry, *, resume=False):
-    from .team_recovery import approval, hold_path, recovery_source
-    if hold_path(path).exists():
-        raise ValueError('Batch HOLD marker is active')
+def register_attempt(path, manifest, entry, *, resume=False, week=None):
+    from .team_recovery import latest_checkpoint
     history = attempts(entry)
     source = None
     if history:
-        previous = read(history[-1] / 'attempt.json')
-        if not resume:
-            raise ValueError('Run already registered; use explicit resume for paused or failed attempts')
-        audited = recovery_source(path, entry, previous, history[-1])
-        if not audited and evidence_fault(history[-1], previous):
-            raise ValueError('Permanent evidence fault requires explicit recovery approval')
-        if not audited:
-            previous = mark_interrupted(history[-1], previous)
-        if not audited and previous['status'] not in ('paused', 'failed'):
-            raise ValueError('Resume requires a paused or failed attempt with a safe checkpoint')
-        if previous['manifest_sha256'] != file_hash(path) or file_hash(history[-1] / 'manifest.json') != file_hash(path):
-            raise ValueError('Resume must retain the original immutable manifest')
-        if previous.get('checkpoint'):
-            source = audited or Path(previous['checkpoint'])
-            owner = next((directory for directory in history
-                if source.is_relative_to(directory / 'runtime' / 'checkpoints')), None)
-            if owner is None:
-                raise ValueError('Resume checkpoint belongs to another run')
-            if file_hash(owner / 'manifest.json') != file_hash(path):
-                raise ValueError('Resume must retain the checkpoint original manifest')
-            from .team_checkpoint import validate_recovery_source, validate_snapshot
+        try:
+            previous = read(history[-1] / 'attempt.json')
+        except (OSError, ValueError):
+            previous = dict(attempt=int(history[-1].name.removeprefix('attempt-')))
+        source = latest_checkpoint(entry, previous, week=week)
+        if source is None and previous.get('execution_started') is not False:
+            raise RuntimeError('No complete checkpoint available to restore')
+        if source:
+            from .team_checkpoint import validate_snapshot
             _, state = validate_snapshot(source)
-            latest_root = history[-1] / 'runtime'
-            # Preparation can fail before creating a runtime; no execution started there.
-            current_root = latest_root if latest_root.exists() or previous.get('execution_started') is not False else None
-            validate_recovery_source(source, state, current_root=current_root)
-            if state['roles']['ceo']['identity']['run_id'] != entry['run_id']:
-                raise ValueError('Resume checkpoint belongs to another run')
-        elif previous.get('execution_started') is not False:
-            raise ValueError('Resume requires a safe checkpoint once execution has started')
-    elif resume:
-        raise ValueError('Resume requires an original attempt')
     number = int(history[-1].name.removeprefix('attempt-')) + 1 if history else 1
     directory = Path(entry['output_dir']) / f'attempt-{number:03}'
     temporary = Path(tempfile.mkdtemp(prefix='.registration-', dir=directory.parent))
@@ -525,7 +503,10 @@ def register_attempt(path, manifest, entry, *, resume=False):
     record = dict(run_id=entry['run_id'], category=entry['category'], attempt=number,
         attempt_id=uuid.uuid4().hex, status='preparing', execution_started=False, manifest_sha256=file_hash(path),
         source_checkpoint=str(source) if source else None, checkpoint=str(source) if source else None,
-        started_at=datetime.now(timezone.utc).isoformat())
+        replay_week=week,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        execution_source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+        execution_source_sha256=tree_hash(ROOT / 'src'))
     if source:
         checkpoint_at = state.get('saved_at') or datetime.fromtimestamp(
             (source / 'team.json').stat().st_mtime, timezone.utc).isoformat()
@@ -551,11 +532,7 @@ def register_attempt(path, manifest, entry, *, resume=False):
         if type(previous.get('day')) is int and previous['day'] >= state['day']:
             rollback['discarded_simulation_days'] = previous['day'] - state['day']
         record['checkpoint_rollback'] = rollback
-        revision = approval(path)
-        record['decisions'] = [decision for decision in (revision or {}).get('decisions', [])
-            if decision.get('run_id') == entry['run_id'] or
-                (decision.get('kind') == 'paired_recovery_alignment' and
-                    (decision.get('seed'), decision.get('repeat')) == (entry['seed'], entry['repeat']))]
+        record['decisions'] = []
         record['decisions'].append(dict(kind='checkpoint_rollback', run_id=entry['run_id'], **rollback))
     write_json(temporary / 'attempt.json', record)
     temporary.rename(directory)
@@ -567,7 +544,7 @@ def prune_checkpoints(parent, ledger, directory):
             not isinstance(ledger['snapshots'], list) or not ledger['snapshots']):
         raise ValueError('Invalid checkpoint retention ledger')
     snapshots = {}
-    latest_boundary = None
+    boundaries = set()
     for item in ledger['snapshots']:
         if not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or item['snapshot'] in snapshots:
             raise ValueError('Invalid checkpoint retention entry')
@@ -579,12 +556,10 @@ def prune_checkpoints(parent, ledger, directory):
             raise ValueError('Checkpoint retention state checksum mismatch')
         state = read(state_path)
         day = state['day']
-        if (type(day) is int and day > 0 and day % 7 == 0 and state['stage'] == 'boundary' and
-                state['phase'] == 'boundary' and state['failure'] is None and state['week'] == {}):
-            latest_boundary = item['snapshot']
+        if type(day) is int and day >= 0 and day % 7 == 0 and state['stage'] == 'boundary':
+            boundaries.add(item['snapshot'])
     protected = {item['snapshot'] for item in ledger['snapshots'][-2:]}
-    if latest_boundary is not None:
-        protected.add(latest_boundary)
+    protected.update(boundaries)
     pins_path = parent / '.retention-pins.json'
     if pins_path.is_symlink():
         raise ValueError('Checkpoint retention pins cannot be a symlink')
@@ -665,28 +640,26 @@ def save_checkpoint(team, directory, record, boundary):
         return snapshot
 
 
-def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simulator_factory=None,
+def prepare(path, run_id, *, resume=False, week=None, live=False, client_factory=None, simulator_factory=None,
             request_guard=None, response_guard=None, parent_pid=None):
     path = Path(path).resolve()
     manifest = validate_manifest(path)
     if live and (os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1'
             or os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'):
         raise ValueError('Frozen team execution cannot enable replay, oracle or read-only overrides')
-    from .team_recovery import hold_path
     entry = selected(manifest, run_id)
     output = Path(entry['output_dir'])
     with run_lock(output):
-        directory, record, source = register_attempt(path, manifest, entry, resume=resume)
+        directory, record, source = register_attempt(path, manifest, entry, resume=resume, week=week)
         team = None
         try:
             counter = load_counter('opencode', MODEL)
-            if canonical(counter.metadata if counter else None) != manifest['tokenizer']:
-                raise ValueError('Frozen tokenizer changed')
+            record['tokenizer_changed'] = canonical(counter.metadata if counter else None) != manifest['tokenizer']
             session = record['attempt_id']
             def guarded_request(request):
                 request_guard(request, check=team._lifecycle.check if team else lambda: None)
             guard_options = dict(request_guard=guarded_request if request_guard else None, response_guard=response_guard,
-                hold=hold_path(path) if request_guard else None)
+                hold=None)
             factory = client_factory or (lambda role: checked_client(role, session, no_models=not live,
                 **guard_options))
             def world_factory(conn, config, rng):
@@ -698,25 +671,30 @@ def prepare(path, run_id, *, resume=False, live=False, client_factory=None, simu
             sim_factory = simulator_factory or world_factory
             if source:
                 team = MultiAgentRuntime.restore(source, directory / 'runtime', client_factory=factory,
-                    public_dir=manifest['public_dir'], token_counter=counter, simulator_factory=sim_factory,
+                    public_dir=ROOT / 'public', token_counter=counter, simulator_factory=sim_factory,
                     model=MODEL, reasoning_effort='high', total_days=500, model_pricing=manifest['pricing'],
                     **analyst_bash_settings(manifest))
             else:
                 team = make_team(manifest, entry, directory, client_factory=factory,
                                  simulator_factory=sim_factory, token_counter=counter)
-            if canonical(prompt_templates(team)) != manifest['prompts'][entry['group']]:
-                raise ValueError('Frozen role prompts or tools changed')
+            record['prompt_templates_changed'] = canonical(prompt_templates(team)) != manifest['prompts'][entry['group']]
             team._lifecycle.parent_pid = parent_pid
             for runtime in team.roles.values():
-                runtime.usage.expected_model = MODEL
+                runtime.usage.expected_model = runtime.agent.model
+                runtime.usage.lifecycle = team._lifecycle
+            customer = team.server.simulator.customer_simulator
+            if customer and customer.usage_recorder:
+                customer.usage_recorder.lifecycle = team._lifecycle
+                customer.usage_recorder.expected_model = team.server.tools.config.social_post_llm_model
             write_json(team.root / 'private' / 'frozen-run.json', dict(entry=entry, manifest_sha256=file_hash(path)))
             record['status'] = 'ready'
             save_checkpoint(team, directory, record, 'ready')
             if not live:
                 return record
-            return execute(team, manifest, entry, directory, record, hold_path(path))
+            return execute(team, manifest, entry, directory, record, directory / 'STOP')
         except BaseException as exc:
-            record.update(status='failed', error_type=type(exc).__name__, error=str(exc))
+            record.update(status='failed', error_type=type(exc).__name__, error=str(exc),
+                finished_at=datetime.now(timezone.utc).isoformat())
             write_json(directory / 'attempt.json', record)
             raise
         finally:
@@ -733,7 +711,7 @@ def _execute(team, manifest, entry, directory, record, hold):
     from .team_usage import aggregate
     from .team_results import summarize_run
     start = time.monotonic()
-    record.update(status='running', execution_started=True)
+    record.update(status='running', execution_started=True, execution_started_at=datetime.now(timezone.utc).isoformat())
     write_json(directory / 'attempt.json', record)
     last_boundary = None
     def checkpoint(runtime, boundary):
@@ -758,7 +736,7 @@ def _execute(team, manifest, entry, directory, record, hold):
                 file_hash(Path(last_boundary['snapshot']) / 'checkpoint.json') == last_boundary['sha256'])
         except (OSError, ValueError):
             reuse = False
-    if not reuse:
+    if not reuse and reason not in ('failed', 'paused'):
         try:
             save_checkpoint(team, directory, record, 'final')
         except (ValueError, RuntimeError) as exc:
@@ -773,19 +751,17 @@ def _execute(team, manifest, entry, directory, record, hold):
             except (OSError, ValueError, RuntimeError, KeyError) as validation:
                 record['recovery_validation'] = dict(eligible=False, error=str(validation))
     record['checkpoint_reused_at_stop'] = reuse
-    logs = {entry['category']: [], 'simulator': []}
-    for previous in attempts(entry):
-        logs[entry['category']].extend(previous.glob('runtime/private/*/model-usage.jsonl'))
-        if (previous / 'runtime/private/simulator-model-usage.jsonl').exists():
-            logs['simulator'].append(previous / 'runtime/private/simulator-model-usage.jsonl')
-    usage = aggregate(logs, manifest['pricing'], category=entry['category'])
     elapsed = time.monotonic() - start
+    record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
+        wall_seconds=elapsed, finished_at=datetime.now(timezone.utc).isoformat())
+    write_json(directory / 'attempt.json', record)
+    usage, waste = run_usage(entry, manifest['pricing'])
     timing = wall_time(attempts(entry), current=(directory, elapsed))
     result = summarize_run(team.server.conn, run_id=entry['run_id'], group=entry['group'],
         seed=entry['seed'], repeat=entry['repeat'], day=outcome.day, reason=reason,
         usage=usage, attempt=record['attempt'], stop_after_day=entry['stop_after_day'],
         wall_seconds=timing['wall_seconds'])
-    result.update(timing)
+    result.update(timing, waste=waste)
     write_json(directory / 'result.json', result)
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
         day=outcome.day, reason=reason, runtime_failure=team.failure, result=result,
@@ -807,24 +783,18 @@ def summarize(path, resource_paths=None):
             rows.append(dict(entry, status='not_started', missing_reason='No attempt registered'))
             continue
         last = read(history[-1] / 'attempt.json')
-        if last['status'] in ('preparing', 'ready', 'running'):
-            try:
-                with run_lock(Path(entry['output_dir'])):
-                    last = mark_interrupted(history[-1], read(history[-1] / 'attempt.json'))
-            except ValueError:
-                pass
         result = last.get('result', {})
-        fault = any(evidence_fault(directory, read(directory / 'attempt.json')) for directory in history)
+        fault = evidence_fault(history[-1], last)
         row = dict(entry, **{k: v for k, v in result.items() if k not in entry})
         row.update(status='technical_failure' if last['status'] == 'failed' else result.get('status', last['status']),
                    attempt_status=last['status'], evidence_fault=fault,
                    attempt=last['attempt'], reason=last.get('reason'))
         row.update(wall_time(history))
+        usage, waste = run_usage(entry, manifest['pricing'])
+        row.update(usage=usage, waste=waste)
         rows.append(row)
-        for directory in history:
-            categorized[manifest['category']].extend(directory.glob('runtime/private/*/model-usage.jsonl'))
-            if (directory / 'runtime/private/simulator-model-usage.jsonl').exists():
-                categorized['simulator'].append(directory / 'runtime/private/simulator-model-usage.jsonl')
+        for category, paths in usage['retained_logs'].items():
+            categorized[category].extend(Path(value) for value in paths)
     for source in manifest['d0'].values():
         usage = Path(source['path']) / 'model-usage.jsonl'
         if usage.exists():
@@ -869,6 +839,7 @@ def main(argv=None):
         sub.add_argument('--manifest', type=Path, required=True)
         if name in ('start', 'run', 'resume'):
             sub.add_argument('--run-id', required=True)
+            sub.add_argument('--week', type=int, help='Replay week N from its saved D(7*(N-1)) boundary.')
         if name == 'summarize':
             sub.add_argument('--resources', type=Path, help='JSON mapping resource categories to receipt log paths')
     args = parser.parse_args(argv)
@@ -891,7 +862,7 @@ def main(argv=None):
     else:
         if os.environ.get('PYTHONHASHSEED') != '0':
             parser.error('Set PYTHONHASHSEED=0 before team execution')
-        result = prepare(args.manifest, args.run_id, resume=args.command == 'resume', live=True)
+        result = prepare(args.manifest, args.run_id, resume=args.command == 'resume', week=args.week, live=True)
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
 

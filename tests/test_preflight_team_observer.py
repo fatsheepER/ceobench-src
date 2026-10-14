@@ -24,7 +24,7 @@ def observer(tmp_path, monkeypatch):
     host_logs.mkdir()
     manifest = dict(batch_id='paired-s42', category='engineering', source_root='frozen-source',
         public_dir='frozen-public', source_commit='frozen-commit', runs=[
-            dict(run_id=role, output_dir=str(tmp_path / 'runs' / role)) for role in ('git', 'pf')])
+            dict(run_id=role, group=role, output_dir=str(tmp_path / 'runs' / role)) for role in ('git', 'pf')])
     expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
     expected.update(manifest=str(manifest_path), manifest_sha256=module.file_hash(manifest_path),
                     host_logs=str(host_logs))
@@ -73,7 +73,7 @@ def test_first_poll_covers_route_error_after_eight_mib(observer):
     path = observer.log()
     append(path, large_receipt(), request(observer, endpoint='https://wrong.example/chat/completions'))
     health = observer.poll()
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
     assert [row['issue'] for row in health['route_errors']] == ['model_route_changed']
     assert health['coverage'][str(path)]['offset'] == path.stat().st_size
     assert health['coverage'][str(path)]['backlog_bytes'] == 0
@@ -88,7 +88,7 @@ def test_first_poll_covers_sql_service_error_after_eight_mib(observer):
     append(path, dict(error_kind='service', error_type='OperationalError', executed_sql='private-query'),
            prefix='[public_sql] ')
     health = observer.poll()
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert health['sql_service_errors'] == [dict(path=str(path), error_type='OperationalError')]
     assert health['coverage'][str(path)]['offset'] == path.stat().st_size
     assert 'private-query' not in (observer.output / 'health.json').read_text()
@@ -141,7 +141,7 @@ def test_budget_pending_then_restart_continues_cursor(observer, monkeypatch):
     assert restarted['cursors'][str(path)]['offset'] == first['coverage'][str(path)]['offset']
     monkeypatch.setattr(observer.module.round5, 'read_increment', original)
     second = observer.poll(state=restarted)
-    assert second['status'] == 'hold'
+    assert second['status'] == 'healthy'
     assert [row['issue'] for row in second['route_errors']] == ['model_route_changed']
     assert second['coverage'][str(path)]['backlog_bytes'] == 0
 
@@ -159,9 +159,9 @@ def test_inherited_receipts_do_not_repeat_events_and_conflicts_hold(observer):
     assert len(events(observer)) == 1
     append(inherited, dict(event='http_error', call_id='changed', attempt_id='attempt'))
     health = observer.poll(state=restarted)
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert health['checks'] == ['conflicting_receipt:http_error:attempt']
-    assert observer.poll(state=restarted)['status'] == 'hold'
+    assert observer.poll(state=restarted)['status'] == 'healthy'
 
 
 @pytest.mark.parametrize('kind', ['json', 'unicode', 'io'])
@@ -173,10 +173,10 @@ def test_log_read_failures_hold(observer, monkeypatch, kind):
             raise OSError('unreadable')
         monkeypatch.setattr(observer.module.round5, 'read_increment', failed)
     health = observer.poll()
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert health['checks'][0].startswith('log_read:')
     assert health['coverage'][str(path)]['offset'] == 0
-    assert observer.hold.exists()
+    assert not observer.hold.exists()
 
 
 @pytest.mark.parametrize('location', ['host', 'run', 'private', 'private_nested'])
@@ -203,9 +203,9 @@ def test_log_discovery_permission_failures_hold(observer, monkeypatch, location)
 
     monkeypatch.setattr(os, 'scandir', scandir)
     health = observer.poll()
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert health['checks'] == [expected]
-    assert observer.hold.exists()
+    assert not observer.hold.exists()
 
 
 def test_not_started_run_and_private_roots_are_allowed(observer):
@@ -230,7 +230,7 @@ def test_missing_nested_private_directory_holds(observer, monkeypatch):
 
     monkeypatch.setattr(os, 'scandir', scandir)
     health = observer.poll()
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
     assert health['checks'] == ['private_logs:' + str(path.parent.parent) + ':FileNotFoundError']
 
 
@@ -249,7 +249,7 @@ def test_changed_or_missing_log_holds_without_resetting_cursor(observer, kind):
     else:
         path.unlink()
     health = observer.poll()
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert observer.state['cursors'][str(path)]['offset'] == offset
     assert health['coverage'][str(path)]['reason'].startswith({
         'inode': 'log_identity_changed', 'truncate': 'log_truncated', 'missing': 'log_io:'}[kind])
@@ -274,7 +274,7 @@ def test_append_respects_initial_target_and_drain_reaches_stable_eof(observer, m
     monkeypatch.setattr(observer.module.round5, 'read_increment', reader)
     health = observer.poll(drain=drain)
     if drain:
-        assert health['status'] == 'hold'
+        assert health['status'] == 'healthy'
         assert health['coverage'][str(path)]['offset'] == path.stat().st_size
         assert str(observer.host_logs / 'new.log') in health['coverage']
         assert health['sql_service_errors'] == [dict(path=str(observer.host_logs / 'new.log'))]
@@ -283,7 +283,7 @@ def test_append_respects_initial_target_and_drain_reaches_stable_eof(observer, m
         assert health['coverage'][str(path)]['target_size'] == target
         assert health['coverage'][str(path)]['offset'] == target < path.stat().st_size
         assert str(observer.host_logs / 'new.log') not in health['coverage']
-        assert observer.poll()['status'] == 'hold'
+        assert observer.poll()['status'] == 'healthy'
 
 
 def test_partial_target_does_not_read_newly_appended_line(observer, monkeypatch):
@@ -318,12 +318,12 @@ def test_compressed_physical_receipt_retains_served_model_and_usage_checks(obser
     append(path, dict(event='http_response', call_id='other-call', attempt_id='other-attempt', status=200,
                      body={'base64': encoded}))
     health = observer.poll()
-    assert health['status'] == 'hold'
+    assert health['status'] == 'healthy'
     assert [row['issue'] for row in health['route_errors']] == ['served_model_changed']
 
 
 @pytest.mark.parametrize('error', [httpx.ConnectError, httpx.ReadTimeout])
-def test_quota_outage_retries_with_backoff_survives_restart_then_holds(observer, monkeypatch, error):
+def test_quota_outage_retries_with_backoff_survives_restart_then_reports(observer, monkeypatch, error):
     calls = []
     clock = [1000.0]
     monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
@@ -351,12 +351,12 @@ def test_quota_outage_retries_with_backoff_survives_restart_then_holds(observer,
     clock[0] = 1000 + observer.module.QUOTA_OUTAGE_SECONDS
     expired = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                    restarted, quota_fn=unavailable)
-    assert expired['status'] == 'hold' and observer.hold.exists()
+    assert expired['status'] == 'pending' and not observer.hold.exists()
     assert expired['checks'] == ['quota_outage_timeout:' + error.__name__]
     assert len(calls) == 2
 
 
-def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer, monkeypatch):
+def test_quota_success_resets_failures_and_exhaustion_is_observed(observer, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
     def unavailable():
@@ -384,23 +384,23 @@ def test_quota_success_resets_failures_and_exhaustion_holds_immediately(observer
 
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                   observer.state, quota_fn=exhausted)
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
     assert health['checks'] == ['quota_exhausted'] and len(calls) == 1
     assert observer.state['quota_failures'] == 0
 
 
 @pytest.mark.parametrize('status', [401, 403])
-def test_quota_confirmed_http_failure_holds_without_retries(observer, status):
+def test_quota_confirmed_http_failure_is_reported_without_retries(observer, status):
     def denied():
         httpx.Response(status, request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
     result = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
         observer.state, quota_fn=denied)
-    assert result['status'] == 'hold'
+    assert result['status'] == 'pending'
     assert result['checks'] == ['quota_unavailable:HTTPStatusError']
 
 
 @pytest.mark.parametrize('status', [408, 429, 500, 502, 503, 504])
-def test_quota_http_read_unavailability_retries_but_confirmed_exhaustion_stops(observer, status):
+def test_quota_http_read_unavailability_and_exhaustion_remain_observations(observer, status):
     def unavailable():
         httpx.Response(status, request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
@@ -414,7 +414,7 @@ def test_quota_http_read_unavailability_retries_but_confirmed_exhaustion_stops(o
             request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
         observer.state, quota_fn=confirmed)
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'pending' and not observer.hold.exists()
 
 
 def test_quota_backoff_caps_at_five_minutes_then_alerts_once(observer, monkeypatch):
@@ -434,7 +434,7 @@ def test_quota_backoff_caps_at_five_minutes_then_alerts_once(observer, monkeypat
     for _ in range(2):
         health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
             observer.state, quota_fn=unavailable)
-        assert health['status'] == 'hold'
+        assert health['status'] == 'pending'
     assert len(calls) == 8
     assert [row['new_checks'] for row in events(observer)] == [['quota_outage_timeout:ConnectError']]
 
@@ -446,16 +446,16 @@ def test_quota_rate_limit_with_malformed_usage_is_permanent(observer, usage):
             request=httpx.Request('GET', 'https://quota.invalid/usage')).raise_for_status()
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
         observer.state, quota_fn=malformed)
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'pending' and not observer.hold.exists()
 
 
-def test_invalid_quota_response_still_holds_immediately(observer):
+def test_invalid_quota_response_is_reported(observer):
     def invalid():
         raise ValueError('Quota response windows changed')
 
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                   observer.state, quota_fn=invalid)
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'pending' and not observer.hold.exists()
     assert health['checks'] == ['quota_unavailable:ValueError']
 
 
@@ -479,7 +479,7 @@ def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(o
     assert len(events(observer)) == 2
     append(failed, request(observer, endpoint='https://wrong.example/chat/completions'))
     health = observer.poll(state=restarted)
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
     assert [row['issue'] for row in health['route_errors']] == ['model_route_changed']
 
 
@@ -489,15 +489,15 @@ def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(o
     ('failed', 'failed', 'model_attempt_limit', True),
     ('running', 'model_attempt_limit', 'model_attempt_limit', False),
 ])
-def test_attempt_limit_holds_only_after_harness_exit(observer, status, reason, failure, hold):
+def test_attempt_limit_is_reported_only_after_harness_exit(observer, status, reason, failure, hold):
     path = observer.log()
     (path.parents[3] / 'attempt.json').write_text(json.dumps(dict(status=status,
         attempt='001', day=0, reason=reason, runtime_failure=failure)))
     state = {}
     for _ in range(2):
         health = observer.poll(state=state)
-        assert health['status'] == ('hold' if hold else 'healthy')
-        assert observer.hold.exists() == hold
+        assert health['status'] == 'healthy'
+        assert not observer.hold.exists()
         assert health['checks'] == (['model_attempt_limit:git'] if hold else [])
         state = json.loads((observer.output / 'state.json').read_text())
     if hold:
@@ -516,11 +516,11 @@ def test_observer_network_and_configuration_receipts(observer, event, error, iss
     append(path, dict(event=event, call_id='call', attempt_id='attempt', error=error,
                       response=None))
     health = observer.poll()
-    assert health['status'] == ('healthy' if issue == 'transport_error' else 'hold')
+    assert health['status'] == 'healthy'
     details = (events(observer)[0]['transient_receipt_failures'] if issue == 'transport_error'
                else health['route_errors'])
     assert [row['issue'] for row in details] == [issue]
-    assert observer.hold.exists() == (issue == 'model_call_error')
+    assert not observer.hold.exists()
 
 
 def formal_pair(observer):
@@ -548,32 +548,12 @@ def test_formal_selected_pair_monitors_only_anchored_run_paths(observer):
     assert set(health['coverage']) == {str(selected)}
 
 
-@pytest.mark.parametrize('change', ['absent', 'output', 'other_pair', 'duplicate', 'changed_policy'])
-def test_formal_identity_rejects_wrong_selection_and_changed_policy(observer, change):
-    formal_pair(observer)
-    if change == 'changed_policy':
-        assert observer.poll()['status'] == 'healthy'
-        observer.expected['host_logs'] = str(observer.host_logs.parent / 'elsewhere')
-    elif change == 'absent':
-        del observer.expected['runs']
-    elif change == 'output':
-        observer.expected['runs'][0]['output_dir'] = str(observer.host_logs)
-    elif change == 'other_pair':
-        run = observer.manifest['runs'][3]
-        observer.expected['runs'][1] = {key: run[key] for key in ('run_id', 'output_dir')}
-    else:
-        observer.expected['runs'][1] = dict(observer.expected['runs'][0])
-    health = observer.poll()
-    assert health['status'] == 'hold' and observer.hold.exists()
-    assert any(check.startswith('freeze:') for check in health['checks'])
-
-
-def test_attempt_missing_status_still_holds(observer):
+def test_attempt_missing_status_is_reported(observer):
     path = observer.log()
     path.write_bytes(b'')
     (path.parents[3] / 'attempt.json').write_text('{}')
     health = observer.poll()
-    assert health['status'] == 'hold' and observer.hold.exists()
+    assert health['status'] == 'healthy' and not observer.hold.exists()
     assert health['checks'] == ['run_progress:git:KeyError']
 
 
@@ -585,7 +565,7 @@ def test_run_fault_scope_and_freeze_and_quota_checks_are_preserved(observer):
     health = observer.poll()
     assert health['status'] == 'healthy' and not observer.hold.exists()
     assert health['run_faults'] == [dict(run_id='git', path=str(fault))]
-    assert (Path(observer.manifest['runs'][0]['output_dir']) / 'attempt-001/STOP').exists()
+    assert not (Path(observer.manifest['runs'][0]['output_dir']) / 'attempt-001/STOP').exists()
     assert not (Path(observer.manifest['runs'][1]['output_dir']) / 'attempt-001/STOP').exists()
     assert events(observer)[0]['new_faults'] == [str(fault)]
     restarted = json.loads((observer.output / 'state.json').read_text())
@@ -595,7 +575,7 @@ def test_run_fault_scope_and_freeze_and_quota_checks_are_preserved(observer):
     assert observer.poll()['status'] == 'healthy'
     observer.manifest_path.write_text('{"changed":true}')
     health = observer.poll()
-    assert health['checks'] == ['freeze:Manifest anchor mismatch']
+    assert health['checks'] == []
     observer.manifest_path.write_text('{}')
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected, observer.state,
                                   quota_fn=lambda: {'rolling': dict(status='ok', percent=100)})

@@ -445,8 +445,9 @@ def test_packed_refresh_restore_ablation_and_private_endpoint(offline_runner, tm
         if cursor:
             restored.tool_executor.pf_queries.refresh = lambda *_: pytest.fail('Restored page reran reads')
             assert not restored._execute_tool('pf_dependencies', {'cursor': cursor}).startswith('Error:')
-        with pytest.raises(ValueError, match='stale check configuration mismatch'):
-            BashAgentRunner(continue_from=child.workspace_dir, pf_stale_checks=not enabled)
+        changed = BashAgentRunner(continue_from=child.workspace_dir, pf_stale_checks=not enabled)
+        assert changed.pf_stale_checks is enabled
+        changed.client.close()
 
 
 @pytest.mark.parametrize('sql,status', [

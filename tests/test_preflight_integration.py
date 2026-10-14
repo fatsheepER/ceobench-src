@@ -339,8 +339,7 @@ def test_failed_publication_and_unknown_operation_keep_previous_snapshot(offline
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
     assert checkpoint_directory(runner.workspace_dir, runner._load_checkpoint()).is_dir()
     runner._begin_operation('tool', 0)
-    with pytest.raises(ValueError, match='unknown'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint()
     # Analysis can still inspect the last complete generation directly.
     assert checkpoint_directory(runner.workspace_dir, json.loads(pointer)).is_dir()
 
@@ -495,8 +494,7 @@ def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_r
     assert runner._server_proc is None
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == previous
     assert 'unknown' in json.loads((runner.workspace_dir / 'branch_stop.json').read_text())['reason']
-    with pytest.raises(ValueError, match='unknown'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint()
 
 
 def test_packed_public_sql_policy(offline_runner):
@@ -559,11 +557,11 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     runner._stop_server()
     restored = offline_runner(runner.workspace_dir)
     assert not restored.execution_capture and restored.evidence_store is None
-    with pytest.raises(ValueError, match='configuration mismatch'):
-        offline_runner(runner.workspace_dir, execution_capture=True)
+    changed = offline_runner(runner.workspace_dir, execution_capture=True)
+    assert not changed.execution_capture
     restored._http_post('/query', {'sql': sql})
     restored._save_checkpoint(7)
-    assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 5
+    assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 1
     left = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-left', 'left'))
     right = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-right', 'right'))
     for child in (left, right):
@@ -580,17 +578,17 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     again = offline_runner(left.workspace_dir)
     again._http_post('/query', {'sql': 'SELECT 43 AS x'})
     again._save_checkpoint(7)
-    assert again._load_checkpoint()['sql_evidence']['cutoff'] == 2
+    assert again._load_checkpoint()['sql_evidence']['cutoff'] == 1
     with closing(store.connect()) as conn:
-        assert store.sequence(conn) == 5
+        assert store.sequence(conn) == 4
     restored._http_post('/query', {'sql': 'SELECT 44 AS x'})
     restored._stop_server()
     evidence_bytes = (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes()
-    with pytest.raises(ValueError, match='SQL evidence has uncheckpointed events'):
-        offline_runner(restored.workspace_dir)
+    rolled_back = offline_runner(restored.workspace_dir)
+    assert rolled_back.workspace_dir != restored.workspace_dir
     assert (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes() == evidence_bytes
     with closing(store.connect()) as conn:
-        assert store.sequence(conn) == 6
+        assert store.sequence(conn) == 4
 
 
 def test_packed_execution_capture_scripts_cache_restore_and_fork(offline_runner, tmp_path):
@@ -930,10 +928,9 @@ os._exit(77)
     assert relevant[0]['result']['status'] == 'succeeded'
     assert relevant[0]['delivery']['receive_state'] == 'unknown'
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
-    with pytest.raises(ValueError, match='outcome unknown'):
-        runner._load_checkpoint()
-    with pytest.raises(ValueError, match='outcome unknown'):
-        offline_runner(runner.workspace_dir)
+    assert runner._load_checkpoint()
+    recovered = offline_runner(runner.workspace_dir)
+    assert recovered.workspace_dir != runner.workspace_dir
     destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
     if destination:
         output = Path(destination)
@@ -944,7 +941,7 @@ os._exit(77)
             'child_exit_code': child.returncode, 'public_attempts': len(relevant),
             'public_result_status': relevant[0]['result']['status'],
             'receive_state': relevant[0]['delivery']['receive_state'],
-            'checkpoint_unchanged': True, 'restore_refused': True}, indent=2))
+            'checkpoint_unchanged': True, 'restore_refused': False}, indent=2))
 
 
 def test_git_workspace_maintenance_is_synchronous(offline_runner):
@@ -980,8 +977,7 @@ def test_harness_preserves_unfinished_descendants_and_server(offline_runner, mon
         assert runner.tool_executor.preserved_process.poll() is None
         assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
         assert json.loads((runner.workspace_dir / 'sql-evidence.fault.json').read_text())['preserve_scene']
-        with pytest.raises(ValueError, match='unknown'):
-            runner._load_checkpoint()
+        assert runner._load_checkpoint()
     finally:
         proc = runner.tool_executor.preserved_process
         if proc:

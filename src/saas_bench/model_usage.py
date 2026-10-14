@@ -9,12 +9,17 @@ import math
 import os
 from pathlib import Path
 import threading
+import time
 import uuid
 
 import httpx
 
+from .run_lifecycle import WorkerLifecycle
+
 
 _CALL = ContextVar('model_call', default=None)
+_DEADLINE = ContextVar('model_request_deadline', default=None)
+MODEL_REQUEST_SECONDS = 600
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
@@ -223,8 +228,9 @@ def add_billing(totals, cost):
 
 
 class _Stream(httpx.SyncByteStream):
-    def __init__(self, source, finish, require_done=False):
+    def __init__(self, source, finish, require_done=False, check=lambda: None):
         self.source, self.finish = source, finish
+        self.check = check
         self.chunks = []
         self.finished = False
         self.require_done = require_done
@@ -238,6 +244,7 @@ class _Stream(httpx.SyncByteStream):
         try:
             for chunk in self.source:
                 self.chunks.append(chunk)
+                self.check()
                 yield chunk
         except BaseException as exc:
             self._finish(type(exc).__name__)
@@ -275,6 +282,8 @@ class ModelUsage:
         self.pricing = pricing or {}
         self.lock = threading.RLock()
         self.call_lock = threading.RLock()
+        self.lifecycle = WorkerLifecycle()
+        self._clients = []
         self.summary = {'calls': 0, 'errors': 0, 'known': {k: None for k in FIELDS},
                         'missing': {k: 0 for k in FIELDS}, 'known_cost_usd': None, 'missing_cost': 0,
                         'costs': billing_totals(),
@@ -298,6 +307,8 @@ class ModelUsage:
         http_client = getattr(client, '_client', None)
         if not isinstance(http_client, httpx.Client):
             return client
+        if client not in self._clients:
+            self._clients.append(client)
         if getattr(http_client, '_ceobench_recorded', False):
             return client
         send = http_client.send
@@ -305,7 +316,12 @@ class ModelUsage:
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
             recorder, call_id = _CALL.get() or (self, None)
+            recorder._check_deadline()
             recorder.request_check()
+            if deadline := _DEADLINE.get():
+                remaining = max(.001, deadline - time.monotonic())
+                request.extensions['timeout'] = {phase: min(value, remaining) if value is not None else remaining
+                    for phase, value in request.extensions.get('timeout', {}).items()}
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
             with recorder.lock:
@@ -373,7 +389,8 @@ class ModelUsage:
                 else:
                     require_done = (streaming and request.url.path.endswith('/chat/completions')
                                     and response.headers.get('content-type', '').startswith('text/event-stream'))
-                    response.stream = _Stream(response.stream, finish, require_done=require_done)
+                    response.stream = _Stream(response.stream, finish, require_done=require_done,
+                                              check=recorder._check_deadline)
                     if not streaming:
                         response.read()
                 return response
@@ -395,8 +412,45 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
-        with self.call_lock:
-            return self._call(api, request, invoke, **context)
+        deadline = time.monotonic() + MODEL_REQUEST_SECONDS
+        token = _DEADLINE.set(deadline)
+        timer = threading.Timer(MODEL_REQUEST_SECONDS, self.lifecycle.cancel, args=('model_request_deadline',))
+        timer.daemon = True
+        acquired = False
+        policies = []
+        timer.start()
+        try:
+            while not acquired:
+                self._check_deadline()
+                acquired = self.call_lock.acquire(timeout=max(.001, min(.1, deadline - time.monotonic())))
+            self._check_deadline()
+            for client in self._clients:
+                policies.append((client, client.max_retries))
+                client.max_retries = 0
+                self.lifecycle.watch_client(client)
+            with self.lifecycle.model_call():
+                return self._call(api, request, invoke, **context)
+        finally:
+            for client, retries in policies:
+                client.max_retries = retries
+            if acquired:
+                self.call_lock.release()
+            timer.cancel()
+            timer.join(timeout=1)
+            _DEADLINE.reset(token)
+
+    def _check_deadline(self):
+        if (deadline := _DEADLINE.get()) is not None and time.monotonic() >= deadline:
+            self.lifecycle.cancel('model_request_deadline')
+        self.lifecycle.check()
+
+    @staticmethod
+    def _retryable(exc):
+        from openai import APIConnectionError as OpenAIConnectionError
+        from anthropic import APIConnectionError as AnthropicConnectionError
+        status = getattr(exc, 'status_code', 0) or 0
+        return isinstance(exc, (httpx.TransportError, OpenAIConnectionError, AnthropicConnectionError)) or (
+            status in (408, 409, 429) or status >= 500)
 
     def _call(self, api, request, invoke, **context):
         self.request_check()
@@ -418,13 +472,26 @@ class ModelUsage:
         response, error = None, None
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:
-            response = invoke()
-            raw = plain(response)
-            if message := response_error(raw, api):
-                raise ValueError(message)
-            if self.expected_model is not None and raw.get('model') != self.expected_model:
-                raise ValueError('Returned model differs from frozen configuration')
-            return response
+            retries = 0
+            while True:
+                self._check_deadline()
+                response = None
+                try:
+                    response = invoke()
+                    self._check_deadline()
+                    raw = plain(response)
+                    if message := response_error(raw, api):
+                        raise ValueError(message)
+                    if self.expected_model is not None and raw.get('model') != self.expected_model:
+                        raise ValueError('Returned model differs from frozen configuration')
+                    return response
+                except Exception as exc:
+                    if not self._retryable(exc):
+                        raise
+                    self._check_deadline()
+                    retries += 1
+                    self.lifecycle.sleep(min(40, 10 * 2 ** min(retries - 1, 2),
+                                             _DEADLINE.get() - time.monotonic()))
         except BaseException as exc:
             error = type(exc).__name__
             raise

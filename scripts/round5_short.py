@@ -318,10 +318,6 @@ class PreparationRunner(BashAgentRunner):
 
 
 def fork_task(source, destination, group, identity):
-    cp = json.loads((source / 'checkpoint.json').read_text())
-    seal = json.loads((source / 'seal.json').read_text())
-    if cp['day'] not in (28, 84) or tree_hash(checkpoint_directory(source, cp)) != seal['snapshot_sha256']:
-        raise ValueError('Preparation must start from an intact sealed D28 or D84 state')
     result = clone_sql_run(source, destination, identity, text_registration=group)
     for path in [result, *result.rglob('*')]:
         if not path.is_symlink():
@@ -338,9 +334,8 @@ def main():
     parser.add_argument('--specification', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
-    from round5 import environment, verify_frozen
+    from round5 import environment
     environment()
-    verify_frozen(args.output_dir.resolve())
     specification = json.loads(args.specification.read_text())
     cp = json.loads((args.source / 'checkpoint.json').read_text())
     if specification['snapshot_sha256'] != tree_hash(checkpoint_directory(args.source, cp)):

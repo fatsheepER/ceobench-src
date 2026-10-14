@@ -149,6 +149,8 @@ tests/*
 !tests/test_pf_pipeline_receipts.py
 !tests/test_prefix_week_binding.py
 !tests/test_simulator_service_failures.py
+!tests/test_model_recovery_retry.py
+!tests/test_recovery_waste.py
 !tests/test_round4.py
 !tests/test_public_result_contracts.py
 !tests/test_stage5_prep.py

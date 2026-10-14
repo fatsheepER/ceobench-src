@@ -309,7 +309,7 @@ def test_independent_clones_execute_unstarted_scripts_and_preserve_attempts(tmp_
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_unknown_business_write_refuses_checkpoint_and_old_safe_restore(tmp_path, mode, monkeypatch):
+def test_unknown_business_write_rejects_new_snapshot_and_restores_old_checkpoint(tmp_path, mode, monkeypatch):
     runtime = make_team(tmp_path / 'unknown', mode)
     snapshot = runtime.checkpoint()
     original = runtime.server.tools.set_prices
@@ -322,11 +322,40 @@ def test_unknown_business_write_refuses_checkpoint_and_old_safe_restore(tmp_path
         assert status == 500, result
         with pytest.raises(RuntimeError, match='unknown'):
             runtime.checkpoint()
-        with pytest.raises(RuntimeError, match='unknown'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'forbidden',
-                client_factory=clients(), simulator_factory=fast_simulator)
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        try:
+            assert restored.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] != 29
+            assert restored.server.tools.current_day == 0
+        finally:
+            dispose(restored)
         assert list((runtime.root / 'private' / 'operations').glob('*.json'))
     finally:
+        dispose(runtime)
+
+
+def test_restore_records_execution_revision_without_approval(tmp_path, monkeypatch):
+    from saas_bench import team_checkpoint
+    runtime = make_team(tmp_path / 'source', 'git')
+    restored = None
+    try:
+        snapshot = runtime.checkpoint()
+        checksum = team_checkpoint.tree_hash
+        package = Path(team_checkpoint.__file__).parent
+        monkeypatch.setattr(team_checkpoint, 'tree_hash', lambda path, **options:
+            'changed-source' if Path(path) == package else checksum(path, **options))
+        monkeypatch.setattr(team_checkpoint, 'artifact_hashes', lambda path: {'revision': 'changed-public'})
+        before = {path: path.read_bytes() for path in snapshot.rglob('*') if path.is_file()}
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        receipt = json.loads((restored.root / 'recovery.json').read_text())
+        assert receipt['source_revision_changed'] and receipt['public_build_changed']
+        assert restored.server.tools.current_day == 0
+        assert {path: path.read_bytes() for path in before} == before
+        assert not (snapshot.parent / '.retention-pins.json').exists()
+    finally:
+        if restored:
+            dispose(restored)
         dispose(runtime)
 
 

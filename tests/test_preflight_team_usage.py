@@ -201,6 +201,7 @@ def test_real_sdk_retry_counts_known_failed_http_usage_once(tmp_path, monkeypatc
         return httpx.Response(503 if len(requests) == 1 else 200,
             json=body(5, 1, 2, 1, bill=.01) if len(requests) == 1 else body(bill=.02))
     recorder = ModelUsage(tmp_path / 'ceo.jsonl', 'ceo', PRICES['rates'])
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: None)
     client = recorder.attach(OpenAI(api_key='offline', max_retries=1,
         http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[dict(role='user', content='offline')])

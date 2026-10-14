@@ -828,6 +828,7 @@ def test_model_retries_identical_sources_and_unsent_result(captured, monkeypatch
         attempts.append(request.read())
         return httpx.Response(500, json={'error': {'message': 'retry'}}) if len(attempts) == 1 else httpx.Response(200, json=reply('chat'))
     usage = ModelUsage(None, 'agent', evidence_store=store)
+    monkeypatch.setattr(usage.lifecycle, 'sleep', lambda seconds: None)
     with usage.attach(OpenAI(api_key='offline-only', max_retries=1,
             http_client=httpx.Client(transport=httpx.MockTransport(handle)))) as client:
         request = dict(model='test-model', messages=[dict(role='user', content=x) for x in texts[:2]])

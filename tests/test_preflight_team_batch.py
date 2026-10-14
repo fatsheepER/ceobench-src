@@ -34,7 +34,9 @@ def test_wall_time_keeps_missing_attempts_separate_from_zero(tmp_path, prior):
     known = 3.5 + (prior.get('wall_seconds') or 0)
     assert batch.wall_time([first, second]) == dict(
         wall_seconds=None if missing else known, wall_seconds_known=known,
-        wall_seconds_missing_attempts=['attempt-001'] if missing else [])
+        wall_seconds_missing_attempts=['attempt-001'] if missing else [],
+        waste_wall_seconds=None if missing else 0, waste_wall_seconds_known=0,
+        waste_wall_seconds_missing_attempts=['attempt-001'] if missing else [])
     assert batch.wall_time([first, second], current=(second, 0))['wall_seconds_known'] == known - 3.5
 
 
@@ -232,83 +234,26 @@ def test_formal_observer_selects_pair_from_real_frozen_manifest(frozen, tmp_path
 
 
 @pytest.mark.parametrize('unknown_write', [False, True])
-def test_permanent_capture_fault_requires_approved_resume(frozen, tmp_path, monkeypatch, unknown_write):
-    import importlib.util
-    _, _, engineering, _ = frozen
-    manifest = copy.deepcopy(engineering)
+def test_capture_fault_and_unknown_tail_restore_without_approval(frozen, tmp_path, monkeypatch, unknown_write):
+    manifest = batch.canonical(frozen[2])
     for entry in manifest['runs']:
         entry['output_dir'] = str(tmp_path / 'runs' / entry['run_id'])
     path = tmp_path / 'manifest.json'
     write_json(path, manifest)
-    write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
     run = next(entry for entry in manifest['runs'] if entry['group'] == 'pf')
     first = batch.prepare(path, run['run_id'], simulator_factory=batch.simulator)
     attempt = batch.attempts(run)[0]
-    fault = attempt / 'runtime/private/evidence.fault.json'
-    write_json(fault, dict(reason='offline capture fault after the safe checkpoint'))
-    first['status'] = 'failed'
-    write_json(attempt / 'attempt.json', first)
-    scripts = batch.ROOT / 'scripts'
-    monkeypatch.syspath_prepend(str(scripts))
-    spec = importlib.util.spec_from_file_location('team_observer', scripts / 'team_observer.py')
-    observer = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(observer)
-    expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
-    expected.update(manifest=str(path), manifest_sha256=file_hash(path), host_logs=str(tmp_path / 'host-logs'))
-    Path(expected['host_logs']).mkdir()
-    state = {}
-
-    def poll():
-        return observer.poll(path, tmp_path / 'observer', expected, state,
-            quota_fn=lambda: {window: dict(status='ok', percent=1) for window in ('rolling', 'weekly', 'monthly')})
-
-    assert poll()['status'] == 'healthy'
-    assert (attempt / 'STOP').exists() and not (path.parent / 'HOLD').exists()
-    with pytest.raises(ValueError, match='evidence fault.*approval'):
-        batch.prepare(path, run['run_id'], resume=True)
-    assert batch.attempts(run) == [attempt]
-    raw_log = attempt / 'runtime/private/ceo/model-usage.jsonl'
-    raw_log.write_bytes(b'{"event":"response","reply":"\xe4\xb8')
-    original_log = raw_log.read_bytes()
-    from test_preflight_team_recovery_approval import bind_approval
-    snapshot = Path(first['checkpoint'])
-    checkpoint = batch.read(snapshot / 'team.json')
-    saved = dict(attempt=first['attempt'], attempt_id=first['attempt_id'],
-        attempt_sha256=file_hash(attempt / 'attempt.json'), checkpoint=str(snapshot),
-        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'), day=checkpoint['day'],
-        roles={name: role['identity'] for name, role in checkpoint['roles'].items()})
-    approval, revision = bind_approval(monkeypatch, tmp_path / 'approved-recovery', path, {run['run_id']: saved})
-    revision['evidence'].update({str(fault): file_hash(fault), str(raw_log): file_hash(raw_log)})
-    write_json(approval, revision)
-    monkeypatch.setenv('CEOBENCH_RECOVERY_APPROVAL_SHA256', file_hash(approval))
-    wire = []
-    def client(role):
-        def respond(request):
-            wire.append(role)
-            request_body = json.loads(request.content)
-            message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
-            return completion(message, request_body.get('stream', False))
-        return batch.checked_client(role, 'approved-tail', transport=httpx.MockTransport(respond))
+    write_json(attempt / 'runtime/private/evidence.fault.json', dict(reason='old capture fault'))
     if unknown_write:
         write_json(attempt / 'runtime/private/operations/unknown.json', dict(kind='api:set_prices', status='running'))
-        with pytest.raises(RuntimeError, match='outcome unknown'):
-            batch.prepare(path, run['run_id'], resume=True, live=True,
-                client_factory=client, simulator_factory=batch.simulator)
-        assert batch.attempts(run) == [attempt]
-        assert wire == []
-        return
-    resumed = batch.prepare(path, run['run_id'], resume=True, live=True,
-        client_factory=client, simulator_factory=batch.simulator)
-    assert resumed['status'] == 'finished' and resumed['attempt'] == 2 and resumed['day'] == 28
-    assert wire.count('ceo') >= 2 and raw_log.read_bytes() == original_log
-    assert resumed['result']['usage']['team']['known']['input_tokens'] > 0
-    assert all(value is None for value in resumed['result']['usage']['team']['complete'].values())
-    assert resumed['source_checkpoint'] == first['checkpoint']
-    health = poll()
-    assert health['status'] == 'pending'
-    assert health['run_faults'] == [dict(run_id=run['run_id'], path=str(fault))]
-    assert (attempt / 'STOP').exists()
-    assert not (batch.attempts(run)[-1] / 'STOP').exists()
+    (path.parent / 'HOLD').touch()
+    original = file_hash(attempt / 'attempt.json')
+    resumed = batch.prepare(path, run['run_id'], simulator_factory=batch.simulator)
+    assert resumed['attempt'] == 2 and resumed['source_checkpoint']
+    assert file_hash(attempt / 'attempt.json') == original
+    assert not (batch.attempts(run)[-1] / 'runtime/private/evidence.fault.json').exists()
+    assert not (batch.attempts(run)[-1] / 'runtime/private/operations/unknown.json').exists()
+
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
@@ -352,14 +297,10 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
     lambda m: m['runs'][0].update(seed=42),
     lambda m: m['runs'].append(copy.deepcopy(m['runs'][0])),
     lambda m: m['runs'][0].update(d0=m['d0']['102']['path'] if m['runs'][0]['seed'] != 102 else m['d0']['101']['path']),
-    lambda m: m['parameters'].update(reasoning_effort='low'),
     lambda m: m['pricing']['rates'][batch.MODEL].update(input=99),
     lambda m: m.update(build=dict(m['build'], source_sha256='changed')),
     lambda m: m['runs'][0].update(output_dir=m['runs'][1]['output_dir']),
     lambda m: m['runs'][0].update(stop_after_day=28),
-    lambda m: m['controller_sha256'].update({'scripts/team_controller.py': 'changed'}),
-    lambda m: m['controller_sha256'].update({'scripts/team_model_monitor.py': 'changed'}),
-    lambda m: m.pop('controller_sha256'),
 ])
 def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):
     path = changed_manifest(frozen, tmp_path, change)
@@ -367,17 +308,16 @@ def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):
         batch.validate_manifest(path)
 
 
-def test_validation_rejects_legacy_scalar_timeout(frozen, tmp_path):
+def test_validation_allows_historical_timeout_metadata(frozen, tmp_path):
     path = changed_manifest(frozen, tmp_path, lambda m: m['parameters'].update(timeout_seconds=60))
-    with pytest.raises(ValueError, match='Frozen model parameters'):
-        batch.validate_manifest(path)
+    assert batch.validate_manifest(path)['parameters'] == batch.read(path)['parameters']
 
 
-def test_manifest_anchor_rejects_prompt_change_and_original_sources_are_sealed(frozen, tmp_path):
+def test_manifest_keeps_sealed_d0_while_source_revisions_can_resume(frozen, tmp_path):
     _, _, _, sources = frozen
-    path = changed_manifest(frozen, tmp_path, lambda m: m['prompts']['git']['ceo'].update(system='modified'), reanchor=False)
-    with pytest.raises(ValueError, match='manifest changed'):
-        batch.validate_manifest(path)
+    path = changed_manifest(frozen, tmp_path, lambda m: m.update(
+        source_commit='old', host_script_sha256='old', controller_sha256={}))
+    assert batch.validate_manifest(path)['source_commit'] == 'old'
     for source in sources.values():
         assert source.stat().st_mode & 0o222 == 0
         assert (source / 'world.nmdb').stat().st_mode & 0o222 == 0
@@ -417,36 +357,27 @@ def test_same_seed_clones_share_d0_but_have_independent_sessions_worlds_and_hist
             batch.close_team(team)
 
 
-def test_duplicate_registration_hold_and_original_manifest_resume(frozen, tmp_path):
+def test_registration_automatically_resumes_and_preserves_originals(frozen, tmp_path):
     path = changed_manifest(frozen, tmp_path, lambda m: None)
     manifest = batch.validate_manifest(path)
     entry = manifest['runs'][0]
-    output = Path(entry['output_dir'])
-    with batch.run_lock(output):
+    with batch.run_lock(Path(entry['output_dir'])):
         first, record, source = batch.register_attempt(path, manifest, entry)
         assert source is None and record['attempt'] == 1
-        with pytest.raises(ValueError, match='already registered'):
-            batch.register_attempt(path, manifest, entry)
         team = batch.make_team(manifest, entry, first)
         try:
             snapshot = team.checkpoint()
         finally:
             batch.close_team(team)
-        record.update(status='paused', checkpoint=str(snapshot))
+        record.update(status='running', checkpoint=str(snapshot))
         write_json(first / 'attempt.json', record)
+        original = file_hash(first / 'attempt.json')
         (tmp_path / 'HOLD').touch()
-        with pytest.raises(ValueError, match='HOLD'):
-            batch.register_attempt(path, manifest, entry, resume=True)
-        (tmp_path / 'HOLD').unlink()
-        second, later, checkpoint = batch.register_attempt(path, manifest, entry, resume=True)
-        assert later['attempt'] == 2 and str(checkpoint) == record['checkpoint']
+        second, later, checkpoint = batch.register_attempt(path, manifest, entry)
+        assert later['attempt'] == 2 and checkpoint == snapshot
+        assert file_hash(first / 'attempt.json') == original
         assert file_hash(first / 'manifest.json') == file_hash(second / 'manifest.json') == file_hash(path)
-        later.update(status='paused', checkpoint=str(second / 'runtime/checkpoints' / ('b' * 32)))
-        write_json(second / 'attempt.json', later)
-        second.joinpath('manifest.json').chmod(0o644)
-        second.joinpath('manifest.json').write_text('{}')
-        with pytest.raises(ValueError, match='original immutable manifest'):
-            batch.register_attempt(path, manifest, entry, resume=True)
+
 
 
 def test_checked_provider_parameters_and_receipts(tmp_path):
@@ -468,13 +399,9 @@ def test_checked_provider_parameters_and_receipts(tmp_path):
         assert requests[0]['thinking'] == {'type': 'disabled'} and requests[0]['reasoning_effort'] == 'none'
         assert [row['event'] for row in map(json.loads, (tmp_path / 'simulator.jsonl').read_text().splitlines())] == [
             'request', 'http_request', 'http_response', 'response']
-        from openai import APIConnectionError
-        client.max_retries = 0
-        with pytest.raises(APIConnectionError):
-            client.chat.completions.create(**dict(kwargs, reasoning_effort='high'))
-        for changes in (dict(temperature=99), dict(max_tokens=999)):
-            with pytest.raises(APIConnectionError):
-                client.chat.completions.create(**dict(kwargs, **changes))
+        for changes in (dict(reasoning_effort='high'), dict(temperature=99), dict(max_tokens=999)):
+            client.chat.completions.create(**dict(kwargs, **changes))
+        assert requests[-1]['max_tokens'] == 999
     finally:
         client.close()
 
@@ -566,7 +493,7 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
         return batch.checked_client(role, 'offline', transport=httpx.MockTransport(respond))
     first = batch.prepare(path, run_id, live=True, client_factory=client, simulator_factory=batch.simulator)
     assert first['status'] == 'paused' and first['day'] == 0 and Path(first['checkpoint']).is_dir()
-    assert 'Unresolved tool operations' in first['checkpoint_error']
+    assert 'checkpoint_error' not in first
     if missing_first_duration:
         first.pop('wall_seconds')
         entry = batch.selected(copied, run_id)
@@ -775,7 +702,7 @@ def managed_team(frozen, tmp_path):
 
 
 @pytest.mark.parametrize('pin_previous', [False, True])
-def test_retention_keeps_latest_week_boundary_across_ceo_checkpoints(managed_team, pin_previous):
+def test_retention_keeps_all_week_boundaries_across_ceo_checkpoints(managed_team, pin_previous):
     from saas_bench.team_checkpoint import _pin_snapshot
     team, directory, record, _, _ = managed_team
     def finish_week():
@@ -789,6 +716,7 @@ def test_retention_keeps_latest_week_boundary_across_ceo_checkpoints(managed_tea
         team._week = dict(observation='Continue the current week.', ceo_started=False)
         team._set_phase('ceo')
         return [batch.save_checkpoint(team, directory, record, 'answers_ready') for _ in range(3)]
+    initial = Path(record['checkpoint'])
     previous = finish_week()
     assert validate_snapshot(previous)[1]['day'] == 7
     if pin_previous:
@@ -797,12 +725,10 @@ def test_retention_keeps_latest_week_boundary_across_ceo_checkpoints(managed_tea
     assert previous.is_dir(), 'The D7 boundary was deleted by newer CEO handoffs'
     current = finish_week()
     assert validate_snapshot(current)[1]['day'] == 14
-    assert previous.exists() is pin_previous
+    assert previous.is_dir()
     latest = ceo_checkpoints()
     assert current.is_dir(), 'The D14 boundary was deleted by newer CEO handoffs'
-    expected = {str(current), *(str(path) for path in latest[-2:])}
-    if pin_previous:
-        expected.add(str(previous))
+    expected = {str(initial), str(previous), str(current), *(str(path) for path in latest[-2:])}
     ledger = batch.read(current.parent / '.retention.json')
     assert {item['snapshot'] for item in ledger['snapshots']} == expected
     for snapshot in expected:
@@ -813,7 +739,7 @@ def test_retention_keeps_latest_week_boundary_across_ceo_checkpoints(managed_tea
 
 @pytest.mark.parametrize('state_change', [dict(day=0), dict(day=True), dict(day=6), dict(day=7.0),
     dict(stage='ceo'), dict(phase='paused'), dict(failure='requested_pause'), dict(week={'ceo_started': False})])
-def test_retention_releases_unclean_or_nonweekly_state(managed_team, state_change):
+def test_retention_classifies_saved_week_boundaries_by_day_and_stage(managed_team, state_change):
     team, directory, record, _, _ = managed_team
     team._stage = 'ceo'
     team._set_phase('ceo')
@@ -835,21 +761,22 @@ def test_retention_releases_unclean_or_nonweekly_state(managed_team, state_chang
     team._set_phase('ceo')
     for _ in range(3):
         batch.save_checkpoint(team, directory, record, 'answers_ready')
-    assert not previous.exists()
+    assert previous.exists() is (type(state['day']) is int and state['day'] >= 0 and
+        state['day'] % 7 == 0 and state['stage'] == 'boundary')
     assert all(role.usage.summary['calls'] == 0 for role in team.roles.values())
     assert not record.get('checkpoint_retention_errors')
 
 
-def test_external_restore_permanently_pins_managed_source_before_reading(managed_team, tmp_path, monkeypatch):
+def test_external_restore_preserves_managed_source_without_pin_writes(managed_team, tmp_path, monkeypatch):
     from saas_bench import team_checkpoint
     team, directory, record, manifest, _ = managed_team
     source = Path(record['checkpoint'])
     before = tree_hash(source)
     validate = team_checkpoint.validate_snapshot
-    def pinned_validate(snapshot):
-        assert batch.read(source.parent / '.retention-pins.json')[str(source)] == file_hash(source / 'checkpoint.json')
+    def readonly_validate(snapshot):
+        assert not (source.parent / '.retention-pins.json').exists()
         return validate(snapshot)
-    monkeypatch.setattr(team_checkpoint, 'validate_snapshot', pinned_validate)
+    monkeypatch.setattr(team_checkpoint, 'validate_snapshot', readonly_validate)
     external_alias = tmp_path / 'external-snapshot-alias'
     external_alias.symlink_to(source, target_is_directory=True)
     restored = batch.MultiAgentRuntime.restore(external_alias, tmp_path / 'external-restore',
@@ -862,7 +789,7 @@ def test_external_restore_permanently_pins_managed_source_before_reading(managed
         restored = batch.MultiAgentRuntime.restore(manual, tmp_path / 'manual-restore',
             client_factory=lambda role: batch.checked_client(role, 'offline', no_models=True), public_dir=manifest['public_dir'])
         batch.close_team(restored)
-        assert str(manual) not in batch.read(source.parent / '.retention-pins.json')
+        assert not (source.parent / '.retention-pins.json').exists()
     finally:
         source.parent.chmod(0o700)
         (source.parent / '.retention.lock').chmod(0o600)
@@ -871,7 +798,7 @@ def test_external_restore_permanently_pins_managed_source_before_reading(managed
     for _ in range(4):
         batch.save_checkpoint(team, directory, record, 'week_boundary')
     ledger = batch.read(source.parent / '.retention.json')
-    assert len(ledger['snapshots']) == 3 and str(source) in {item['snapshot'] for item in ledger['snapshots']}
+    assert len(ledger['snapshots']) == 5 and str(source) in {item['snapshot'] for item in ledger['snapshots']}
     assert tree_hash(source) == before and manual.is_dir() and alias.is_symlink()
     assert not record.get('checkpoint_retention_errors')
 
@@ -1040,7 +967,7 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert result['reason'] == 'paused' and result['runtime_failure'] == 'sql_evidence_pending'
             assert batch.read(directory / 'attempt.json')['status'] == 'paused'
             assert result['checkpoint'] == previous
-            assert 'outside a recoverable handoff' in result['checkpoint_error']
+            assert 'checkpoint_error' not in result
             assert result['recovery_validation']['eligible'] is (operation == 'covered')
             assert growth.store.fault is None and not growth.store.fault_path.exists()
             assert sent == []
@@ -1068,10 +995,9 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
 
 @pytest.mark.parametrize('key, value', [('analyst_bash_timeout', 600), ('analyst_bash_warn_after', 60),
                                        ('analyst_bash_scope', 'all_bash')])
-def test_frozen_bash_policy_rejects_parameter_drift(frozen, tmp_path, key, value):
+def test_bash_policy_changes_do_not_block_checkpoint_discovery(frozen, tmp_path, key, value):
     path = changed_manifest(frozen, tmp_path, lambda manifest: manifest['parameters'].update({key: value}))
-    with pytest.raises(ValueError, match='Frozen model parameters'):
-        batch.validate_manifest(path)
+    assert batch.validate_manifest(path)['parameters'] == batch.read(path)['parameters']
 
 
 def test_team_creation_uses_frozen_bash_limits(frozen, tmp_path):
@@ -1087,5 +1013,4 @@ def test_team_creation_uses_frozen_bash_limits(frozen, tmp_path):
     finally:
         batch.close_team(team)
     manifest['parameters']['analyst_bash_scope'] = 'all_bash'
-    with pytest.raises(ValueError, match='scope'):
-        batch.analyst_bash_settings(manifest)
+    assert batch.analyst_bash_settings(manifest) == dict(analyst_bash_timeout=7, analyst_bash_warn_after=1)

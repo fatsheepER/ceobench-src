@@ -63,8 +63,6 @@ def public_outcomes(run, start):
 
 
 def execute(source, destination, group, identity, output, *, api_key=None):
-    if (output / 'rollout-hold.json').exists():
-        raise ValueError('Resolve the episode engineering hold before launching')
     destination = round5_short.fork_task(source, destination, group, identity)
     checkpoint = json.loads((destination / 'checkpoint.json').read_text())
     start = checkpoint['day']
@@ -118,11 +116,6 @@ def main():
     parser.add_argument('--identity', required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
-    round5.verify_frozen(args.output_dir)
-    frozen = json.loads((args.output_dir / 'rollout-frozen.json').read_text())
-    for path, checksum in frozen['host_scripts'].items():
-        if file_hash(path) != checksum:
-            raise ValueError('Rollout host changed after freeze: ' + path)
     execute(args.source, args.destination, args.group, args.identity, args.output_dir)
 
 

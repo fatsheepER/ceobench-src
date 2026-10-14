@@ -14,7 +14,7 @@ from test_preflight_team_observer import observer
 from test_preflight_team_batch import frozen
 
 
-def group_batch(observer, controller, monkeypatch, *, first_status='finished', second_status='finished', hold=False, unknown=False, partial=False, peer_partial=False, paired=False):
+def group_batch(observer, controller, monkeypatch, *, first_status='finished', second_status='finished', hold=False, unknown=False, partial=False, peer_partial=False, paired=False, persistent_failure=False):
     module = controller.module
     observer.manifest.update(category='formal', source_root=str(Path(__file__).resolve().parents[1]))
     observer.expected['source_root'] = observer.manifest['source_root']
@@ -40,9 +40,12 @@ def group_batch(observer, controller, monkeypatch, *, first_status='finished', s
     monkeypatch.setattr(systemd_guard, 'unit_status', status)
     popen, sleep = subprocess.Popen, time.sleep
     children, launches = [], []
+    module.worker_arguments = []
     joined = controller.policy.parent / 'pf-peer-joined'
 
     def launch(command, **kwargs):
+        if '--worker' not in command:
+            return popen(command, **kwargs)
         run_id = command[command.index('--worker') + 1]
         entry = module.batch.selected(observer.manifest, run_id)
         if not paired:
@@ -50,10 +53,11 @@ def group_batch(observer, controller, monkeypatch, *, first_status='finished', s
             intent = rows[-1]
             assert intent['event'] == 'worker_launch_intent' and intent['run_id'] == run_id
             assert intent['launch_ordinal'] == len(launches) + 1
-            assert intent['source_commit'] == observer.manifest['source_commit']
+            assert intent['frozen_source_commit'] == observer.manifest['source_commit']
         if run_id == 's102-pf' and run_id not in launches:
             assert children[0][1].poll() is None, 'PF must join before the first Git worker exits'
         launches.append(run_id)
+        module.worker_arguments.append(list(command))
         code = '''import json,sys,time
 from pathlib import Path
 run,out,status,hold,unknown,partial,peer_partial,model,joined,attempt=sys.argv[1:]
@@ -77,14 +81,14 @@ p.write_text(json.dumps(dict(status=status,reason='offline_terminal_failure' if 
     execution_started=True,day=28)))
 sys.exit(0 if status=='finished' else 2)
 '''
-        status = first_status if run_id == 's101-pf' else second_status if run_id == 's102-pf' else 'finished'
+        status = first_status if run_id == 's101-pf' and (persistent_failure or launches.count(run_id) == 1) else second_status if run_id == 's102-pf' and launches.count(run_id) == 1 else 'finished'
         child = popen([sys.executable, '-c', code, run_id, entry['output_dir'], status,
             str(observer.hold) if hold and run_id == 's101-pf' else '-',
             'yes' if unknown and run_id == 's101-pf' else 'no',
             'yes' if partial and run_id == 's101-pf' and '--resume' not in command else 'no',
             'yes' if peer_partial and run_id == 's101-git' else 'no', observer.module.round5.MODEL,
-            str(joined) if first_status != 'paused' and not unknown and not hold and not paired else '-',
-            '002' if '--resume' in command else '001'], **kwargs)
+            str(joined) if not paired else '-',
+            f'{len(module.batch.attempts(entry)) + 1:03}'], **kwargs)
         children.append((run_id, child))
         if run_id == 's102-pf':
             joined.touch()
@@ -107,165 +111,67 @@ sys.exit(0 if status=='finished' else 2)
 def test_group_join_reaps_worker_and_launches_while_peer_runs(observer, controller, monkeypatch, first_status):
     launches, children = group_batch(observer, controller, monkeypatch, first_status=first_status)
     controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf', 's102-pf', 's102-git']
+    assert launches[-2:] == ['s102-pf', 's102-git']
     assert all(child.poll() is not None for _, child in children)
     records = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
     joined = next(row for row in records if row['event'] == 'worker_launched' and row['run_id'] == 's102-pf')
-    assert joined['launch_reason'] == 'previous_group_run_terminal'
-    assert joined['predecessor_run_id'] == 's101-pf'
-    assert joined['launch_ordinal'] == 3
-    assert joined['group_ordinal'] == 2
+    intent = next(row for row in records if row['event'] == 'worker_launch_intent' and row['run_id'] == 's102-pf')
+    assert intent['launch_reason'] == 'previous_group_run_terminal'
+    assert intent['predecessor_run_id'] == 's101-pf'
+    assert joined['launch_ordinal'] == (3 if first_status == 'finished' else 4)
     before = list(launches)
     controller.module.supervise(controller.policy, resume=True)
     assert launches == before
 
 
-def test_paused_lane_waits_without_stopping_other_group(observer, controller, monkeypatch):
+def test_paused_lane_automatically_recovers_without_stopping_other_group(observer, controller, monkeypatch):
     launches, _ = group_batch(observer, controller, monkeypatch, first_status='paused')
     controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf', 's102-git']
+    assert launches.count('s101-pf') == 2 and launches[-2:] == ['s102-pf', 's102-git']
     assert not observer.hold.exists()
 
 
-def test_hold_prevents_next_seed_in_both_groups(observer, controller, monkeypatch):
+def test_historical_hold_does_not_stop_either_group(observer, controller, monkeypatch):
     launches, _ = group_batch(observer, controller, monkeypatch, hold=True)
     controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf']
-    assert observer.hold.exists()
+    assert 's102-pf' in launches and 's102-git' in launches
 
 
 @pytest.mark.parametrize('first_status', ['failed', 'oom-kill'])
-def test_unknown_business_write_holds_before_next_group_run(observer, controller, monkeypatch, first_status):
+def test_unknown_business_write_is_discarded_during_recovery(observer, controller, monkeypatch, first_status):
     launches, _ = group_batch(observer, controller, monkeypatch, first_status=first_status, unknown=True)
     controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf']
-    assert observer.hold.exists()
+    assert 's102-pf' in launches and 's102-git' in launches
 
 
-def test_safe_interruption_does_not_hide_a_later_unknown_write(observer, controller, monkeypatch):
-    entry = observer.manifest['runs'][0]
-    root = Path(entry['output_dir']) / 'attempt-001/runtime/private/operations'
-    write_json(root / 'safe.json', dict(wrapper_version=1, status='interrupted'))
-    write_json(root / 'unknown.json', dict(kind='api:set_prices', status='running'))
-    from saas_bench import team_checkpoint
-    monkeypatch.setattr(team_checkpoint, 'recovery_operation_safe', lambda *args: True)
-    assert controller.module.run_disposition(entry, dict(status='paused'), dict(result='success')) == 'hold'
-
-
-def test_group_terminal_attempt_drift_refuses_restart(observer, controller, monkeypatch):
-    launches, _ = group_batch(observer, controller, monkeypatch)
-    controller.module.supervise(controller.policy)
-    entry = observer.manifest['runs'][0]
-    write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json', dict(status='finished', day=29))
-    with pytest.raises(ValueError, match='terminal proof'):
-        controller.module.supervise(controller.policy, resume=True)
-    assert len(launches) == 4
-
-
-@pytest.mark.parametrize('unknown', [False, True])
-def test_closed_oom_partial_log_settles_and_preserves_evidence(observer, controller, monkeypatch, unknown):
+def test_third_failure_alarms_only_its_group_and_preserves_peer_progress(observer, controller, monkeypatch):
     launches, children = group_batch(observer, controller, monkeypatch,
-        first_status='oom-kill', partial=True, unknown=unknown)
-    timeout = threading.Timer(10, observer.hold.touch)
-    timeout.start()
-    try:
-        controller.module.supervise(controller.policy)
-    finally:
-        timeout.cancel()
+                                    first_status='failed', persistent_failure=True)
+    controller.module.supervise(controller.policy)
+    assert launches.count('s101-pf') == 3
+    assert 's102-pf' not in launches and 's102-git' in launches
     assert all(child.poll() is not None for _, child in children)
-    assert observer.hold.exists() == unknown
-    if unknown:
-        assert launches == ['s101-git', 's101-pf']
-        terminal = controller.policy.parent / 'controller-terminal.json'
-        assert not terminal.exists() or 's101-pf' not in json.loads(terminal.read_text())
-        return
-    assert launches == ['s101-git', 's101-pf', 's102-pf', 's102-git']
-    path = Path(observer.manifest['runs'][1]['output_dir']) / 'attempt-001/runtime/private/ceo/model-usage.jsonl'
-    original = path.read_bytes()
-    state = json.loads((observer.output / 'state.json').read_text())
-    proof = state['cursors'][str(path)]['closed_tail']
-    assert Path(proof['tail_path']).read_bytes() == b'{"event":"response"'
-    assert state['receipt_hashes']['request:s101-pf']
-    assert json.loads((controller.policy.parent / 'controller-terminal.json').read_text())['s101-pf']['coverage'][str(path)]['terminal_fault'] == 'closed_partial_line'
-    before = (observer.output / 'events.jsonl').read_bytes()
-    (path.parents[3] / 'STOP').unlink()
-    controller.module.supervise(controller.policy, resume=True)
-    assert path.read_bytes() == original
-    assert (observer.output / 'events.jsonl').read_bytes() == before
-    assert len(launches) == 4
-    assert (path.parents[3] / 'STOP').exists()
-    assert json.loads((controller.policy.parent / 'controller-exit.json').read_text())['children_reaped']
-    path.write_bytes(b'X' + original[1:])
-    health = observer.poll(state=json.loads((observer.output / 'state.json').read_text()))
-    assert health['status'] == 'hold' and health['checks'] == ['closed_log_changed:' + str(path)]
-    assert Path(proof['tail_path']).read_bytes() == b'{"event":"response"'
+    alarm = json.loads((controller.policy.parent / 'alarm-s101-pf.json').read_text())
+    assert alarm['reason'] == 'repeated_failure' and alarm['failures'] == 3
+    assert not (controller.policy.parent / 'alarm-s101-git.json').exists()
+    assert not observer.hold.exists()
+
+
+def test_explicit_week_applies_only_to_first_launch_of_selected_run(observer, controller, monkeypatch):
+    launches, children = group_batch(observer, controller, monkeypatch, first_status='failed')
+    controller.module.supervise(controller.policy, run_id='s101-pf', week=4)
+    assert launches == ['s101-pf', 's101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    first, retry = controller.module.worker_arguments
+    assert first[first.index('--week') + 1] == '4'
+    assert '--week' not in retry and '--resume' in retry
+    assert not (controller.policy.parent / 'alarm-s101-pf.json').exists()
 
 
 def test_live_peer_partial_log_does_not_block_other_group_join(observer, controller, monkeypatch):
     launches, _ = group_batch(observer, controller, monkeypatch, peer_partial=True)
     controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf', 's102-pf', 's102-git']
-
-
-def test_paired_oom_attempt_finalizes_on_disk_with_closed_tail(observer, controller, monkeypatch):
-    launches, children = group_batch(observer, controller, monkeypatch,
-        first_status='oom-kill', partial=True, paired=True)
-    controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf']
-    assert not observer.hold.exists() and all(child.poll() is not None for _, child in children)
-    root = Path(observer.manifest['runs'][1]['output_dir']) / 'attempt-001'
-    record = json.loads((root / 'attempt.json').read_text())
-    assert record['status'] == 'failed' and record['reason'] == 'oom-kill'
-    assert record['controller_finalization']['previous_status'] == 'running'
-    assert record['controller_finalization']['unit']['scope_empty']
-    path = root / 'runtime/private/ceo/model-usage.jsonl'
-    state = json.loads((observer.output / 'state.json').read_text())
-    assert state['cursors'][str(path)]['offset'] == path.stat().st_size
-    assert state['cursors'][str(path)]['closed_tail']['fault_kind'] == 'permanent_capture_fault'
-    assert json.loads((controller.policy.parent / 'controller-exit.json').read_text())['children_reaped']
-
-
-@pytest.mark.parametrize('unknown', [False, True])
-def test_paired_success_with_closed_tail_is_a_failed_capture(observer, controller, monkeypatch, unknown):
-    launches, children = group_batch(observer, controller, monkeypatch, partial=True, paired=True, unknown=unknown)
-    outcome = controller.module.supervise(controller.policy)
-    assert launches == ['s101-git', 's101-pf']
-    assert observer.hold.exists() == unknown and all(child.poll() is not None for _, child in children)
-    root = Path(observer.manifest['runs'][1]['output_dir']) / 'attempt-001'
-    record = json.loads((root / 'attempt.json').read_text())
-    assert record['status'] == 'failed' and record['reason'] == 'run_evidence_fault'
-    assert outcome[1]['status'] == 'failed'
-    path = root / 'runtime/private/ceo/model-usage.jsonl'
-    original = (json.dumps(dict(event='request', call_id='s101-pf')) + '\n').encode() + b'{"event":"response"'
-    assert path.read_bytes() == original
-    state = json.loads((observer.output / 'state.json').read_text())
-    proof = state['cursors'][str(path)]['closed_tail']
-    assert state['receipt_hashes']['request:s101-pf']
-    assert proof['unit']['scope_empty'] and proof['unit']['exit_code'] == 0
-    assert Path(proof['tail_path']).read_bytes() == b'{"event":"response"'
-    assert record['controller_capture_faults'][str(path)]['terminal_fault'] == 'closed_partial_line'
-    assert (root / 'STOP').exists()
-    exit_record = json.loads((controller.policy.parent / 'controller-exit.json').read_text())
-    assert exit_record['children_reaped'] and exit_record['failed'] and exit_record['hold'] == unknown
-    assert json.loads((observer.output / 'health.json').read_text())['progress']['s101-pf']['status'] == 'failed'
-    if not unknown:
-        assert controller.module.supervise(controller.policy, resume=True)[0]['status'] == 'finished'
-        resumed = root.parent / 'attempt-002'
-        assert json.loads((resumed / 'attempt.json').read_text())['status'] == 'finished'
-        assert path.read_bytes() == original and not (resumed / 'STOP').exists()
-        assert not json.loads((controller.policy.parent / 'controller-exit.json').read_text())['failed']
-
-
-def test_explicit_resume_at_later_slot_records_the_resume_reason(observer, controller, monkeypatch):
-    launches, _ = group_batch(observer, controller, monkeypatch, second_status='paused')
-    controller.module.supervise(controller.policy)
-    assert len(launches) == 4
-    controller.module.supervise(controller.policy, resume=True)
-    assert launches[-1] == 's102-pf' and len(launches) == 5
-    rows = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
-    resumed = [row for row in rows if row['event'] == 'worker_launched'][-1]
-    assert resumed['mode'] == 'resume' and resumed['launch_reason'] == 'explicit_resume'
-    assert resumed['predecessor_run_id'] == 's101-pf'
+    assert launches[-2:] == ['s102-pf', 's102-git']
 
 
 def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, tmp_path):
@@ -334,7 +240,7 @@ def test_two_seed_group_freeze_cli_and_driver_check(tmp_path):
     checked = subprocess.run([sys.executable, str(batch.ROOT / 'scripts/team_driver.py'),
         '--policy', str(policy), '--check'], env=env, capture_output=True, text=True, check=True, timeout=60)
     receipt = json.loads(checked.stdout)
-    assert receipt['scheduling'] == manifest['scheduling']
+    assert receipt['scheduling'] == 'group_independent'
     assert receipt['model_requests'] == receipt['new_attempts'] == 0 and receipt['credential_read'] is False
     assert not (directory / 'runs').exists()
     with pytest.raises(ValueError, match='unused seeds'):

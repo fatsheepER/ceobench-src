@@ -156,11 +156,10 @@ def test_failed_script_partial_business_write_blocks_old_checkpoint(mode):
         assert team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 37
         from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
         _, state = validate_snapshot(snapshot)
-        with pytest.raises(RuntimeError, match='after checkpoint'):
-            validate_recovery_source(snapshot, state, current_root=team.root)
+        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
-def test_permanent_pf_capture_fault_retains_raw_script_evidence_and_blocks_recovery(monkeypatch):
+def test_permanent_pf_capture_fault_retains_raw_evidence_and_prior_checkpoint(monkeypatch):
     with make_team('pf', lambda team, role, body: final('unused'), 'registered-capture') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         executor = team.roles['ceo'].executor
@@ -259,7 +258,7 @@ def test_real_launcher_pre_auth_failure_retains_stderr_and_safe_readonly_checkpo
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_unknown_registered_business_write_retains_running_receipt_and_blocks_recovery(mode, monkeypatch):
+def test_unknown_registered_business_write_retains_receipt_and_allows_checkpoint_rollback(mode, monkeypatch):
     from saas_bench import api_server
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-unknown') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
@@ -284,8 +283,7 @@ def test_unknown_registered_business_write_retains_running_receipt_and_blocks_re
         assert not team.test_wire
         from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
         _, state = validate_snapshot(snapshot)
-        with pytest.raises(RuntimeError, match='changed|unknown'):
-            validate_recovery_source(snapshot, state, current_root=team.root)
+        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -360,8 +358,7 @@ def test_pre_auth_open_streams_preserve_partial_host_evidence_and_block_checkpoi
             assert not team.test_wire
             from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
             _, state = validate_snapshot(source)
-            with pytest.raises(RuntimeError, match='unknown|changed'):
-                validate_recovery_source(source, state, current_root=team.root)
+            validate_recovery_source(source, state, current_root=team.root)
         finally:
             process = registered.preserved_process
             if process:

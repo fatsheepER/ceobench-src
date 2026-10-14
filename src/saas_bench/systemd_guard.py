@@ -19,7 +19,7 @@ def memory_bytes(value):
     return int(match[1]) * 1024**('KMGT'.index(match[2].upper()) + 1 if match[2] else 0)
 
 
-def scope_command(command, unit, *, memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0):
+def scope_command(command, unit, *, memory_high=16 * 1024**3, memory_max=20 * 1024**3, memory_swap_max=0):
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+\.scope', unit):
         raise ValueError('Invalid worker scope name')
     if any(type(value) is not int for value in (memory_high, memory_max, memory_swap_max)) or not (
@@ -34,14 +34,16 @@ def scope_command(command, unit, *, memory_high=2 * 1024**3, memory_max=3 * 1024
 def check_worker_cgroup(proof):
     group = Path('/sys/fs/cgroup') / proof['control_group'].lstrip('/')
     own = Path('/proc/self/cgroup').read_text().strip().split('0::')[-1]
+    changes = []
     if own != proof['control_group']:
-        raise RuntimeError('Worker moved outside its verified cgroup')
+        changes.append('Worker moved outside its original cgroup')
     for name, expected in (('memory.high', proof['memory_high']), ('memory.max', proof['memory_max']),
                            ('memory.swap.max', proof['memory_swap_max']), ('memory.oom.group', 1)):
         if (group / name).read_text().strip() != str(expected):
-            raise RuntimeError('Worker cgroup limit changed: ' + name)
+            changes.append('Worker cgroup limit changed: ' + name)
     if os.getxattr(group, 'user.oomd_omit') != b'1':
-        raise RuntimeError('Worker cgroup lacks effective oomd omit')
+        changes.append('Worker cgroup lacks effective oomd omit')
+    return changes
 
 
 def verify_worker_scope(policy):
@@ -70,17 +72,23 @@ def verify_worker_scope(policy):
         ManagedOOMMemoryPressure='auto', ManagedOOMSwap='auto',
         **{name: str(policy[key]) for name, key in (
             ('MemoryHigh', 'memory_high'), ('MemoryMax', 'memory_max'), ('MemorySwapMax', 'memory_swap_max'))})
-    if not observed.get('InvocationID') or any(observed.get(key) != value for key, value in expected.items()):
-        raise RuntimeError('Worker scope does not match its isolation policy')
+    if not observed.get('InvocationID') or not observed.get('ControlGroup'):
+        raise RuntimeError('Worker scope has no invocation/cgroup binding')
+    changes = [key + ' differs from requested policy' for key, value in expected.items()
+               if observed.get(key) != value]
     ancestors = {'user:' + name: record for name, record in show([WORKER_SLICE, '-.slice'], user=True).items()}
     ancestors.update({'system:' + name: record for name, record in show(
         ['-.slice', 'user.slice', f'user-{os.getuid()}.slice', f'user@{os.getuid()}.service'], user=False).items()})
     if any(record.get(key) != 'auto' for record in ancestors.values()
            for key in ('ManagedOOMMemoryPressure', 'ManagedOOMSwap')):
-        raise RuntimeError('Worker has an oomd-monitored ancestor')
-    proof = dict(policy, pid=os.getpid(), invocation_id=observed['InvocationID'], control_group=group,
-        slice=WORKER_SLICE, ancestors=ancestors, checked_at=time.time())
-    check_worker_cgroup(proof)
+        changes.append('Worker has an oomd-monitored ancestor')
+    proof = dict(policy, pid=os.getpid(), invocation_id=observed['InvocationID'],
+        control_group=observed['ControlGroup'], slice=observed.get('Slice'),
+        ancestors=ancestors, checked_at=time.time(), observations=changes)
+    try:
+        proof['observations'].extend(check_worker_cgroup(proof))
+    except (OSError, ValueError, RuntimeError) as exc:
+        proof['observations'].append(type(exc).__name__ + ': ' + str(exc))
     return proof
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise a frozen Git/PF pair or independent group queues; explicit resume only."""
+"""Supervise independent group workers and automatically restore failed attempts."""
 
 import argparse
 from datetime import datetime, timezone
@@ -15,9 +15,9 @@ import uuid
 
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
-from saas_bench.run_state import file_hash, write_json
+from saas_bench.run_state import write_json
 from saas_bench.host_memory import MemorySampler
-from saas_bench.team_recovery import execution_root, hold_path, recovery_source
+from saas_bench.team_recovery import execution_root
 from saas_bench.systemd_guard import check_worker_cgroup, memory_bytes, scope_command, unit_status, verify_worker_scope
 from team_observer import identity, poll
 
@@ -83,7 +83,7 @@ class RequestGate:
     def __init__(self, policy, *, run_id=None, parent_pid=None):
         self.directory = Path(policy).resolve().parent
         self.expected = batch.read(policy)['identity']
-        self.hold = hold_path(self.expected['manifest'])
+        self.hold = self.directory / 'HOLD'
         self.parent_pid = parent_pid
         self.scope = None
         self.entry = None
@@ -91,17 +91,24 @@ class RequestGate:
             self.entry = batch.selected(self.manifest(), run_id)
 
     def stop(self, reason):
-        self.hold.touch()
         raise RunCancelled(reason)
 
     def check_stop(self):
         if self.scope is not None:
             try:
-                check_worker_cgroup(self.scope)
-            except (OSError, ValueError, RuntimeError):
-                self.stop('worker_scope_changed')
-        if any(path.exists() for path in (self.hold, self.directory / 'STOP',
-                                         self.directory / 'QUOTA_EXHAUSTED')):
+                changes = check_worker_cgroup(self.scope)
+            except (OSError, ValueError, RuntimeError) as exc:
+                changes = [type(exc).__name__ + ': ' + str(exc)]
+            if changes and changes != getattr(self, '_scope_changes', None):
+                self._scope_changes = changes
+                path = Path(self.expected['host_logs']) / 'worker-scope-observations.jsonl'
+                try:
+                    with path.open('a') as stream:
+                        stream.write(json.dumps(dict(time=datetime.now(timezone.utc).isoformat(),
+                            run_id=(self.entry or {}).get('run_id'), observations=changes)) + '\n')
+                except OSError as exc:
+                    print('Worker scope observation unavailable: ' + str(exc), file=sys.stderr)
+        if (self.directory / 'STOP').exists():
             self.stop('supervisor_cancelled')
         if self.entry and run_stopped(self.entry):
             raise RunCancelled('run_evidence_fault')
@@ -109,40 +116,11 @@ class RequestGate:
             raise RunCancelled('supervisor_exited')
 
     def manifest(self):
-        try:
-            manifest = identity(self.expected['manifest'], self.expected)
-            if manifest.get('controller_sha256') and Path(__file__).resolve() != execution_root(self.expected['manifest'], manifest) / 'scripts/team_controller.py':
-                raise ValueError('Controller is outside the frozen source root')
-            return manifest
-        except (OSError, ValueError, KeyError, TypeError):
-            self.stop('frozen_identity_changed')
+        return identity(self.expected['manifest'], self.expected)
 
     def __call__(self, request, *, check=lambda: None):
-        while True:
-            check()
-            self.check_stop()
-            try:
-                health = batch.read(self.directory / 'observer/health.json')
-            except (OSError, ValueError):
-                time.sleep(.25)
-                continue
-            if not isinstance(health, dict):
-                self.stop('frozen_identity_changed')
-            for key in ('manifest', 'manifest_sha256', 'batch_id'):
-                if health.get(key) != self.expected[key]:
-                    self.stop('frozen_identity_changed')
-            if self.expected.get('runs') is not None and health.get('runs') != self.expected['runs']:
-                self.stop('frozen_identity_changed')
-            status = health.get('status')
-            if status not in ('healthy', 'pending'):
-                self.stop('supervisor_cancelled')
-            try:
-                age = (datetime.now(timezone.utc) - datetime.fromisoformat(health['time'])).total_seconds()
-            except (KeyError, TypeError, ValueError):
-                self.stop('frozen_identity_changed')
-            if status == 'healthy' and 0 <= age <= 330:
-                return
-            time.sleep(.25)
+        check()
+        self.check_stop()
 
     def response(self, response):
         if response.status_code != 429:
@@ -150,8 +128,9 @@ class RequestGate:
         response.read()
         if any(word in response.text.lower() for word in (
                 'usage limit', 'quota', 'weekly limit', 'monthly limit', 'rolling limit', 'subscription limit')):
-            (self.directory / 'QUOTA_EXHAUSTED').touch()
-            self.hold.touch()
+            with (self.directory / 'quota-observations.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(time=datetime.now(timezone.utc).isoformat(),
+                    status=response.status_code, run_id=(self.entry or {}).get('run_id'))) + '\n')
 
 
 def latest(entry):
@@ -164,91 +143,27 @@ def run_stopped(entry):
     return bool(history and (history[-1] / 'STOP').exists())
 
 
-def finalize_oom(entry, unit):
-    history = batch.attempts(entry)
-    record = latest(entry)
-    binding = ('unit', 'invocation_id', 'control_group')
-    previous = (record or {}).get('controller_finalization')
-    if previous and any(previous['unit'].get(key) != unit.get(key) for key in binding):
-        raise RuntimeError('Conflicting OOM worker finalization')
-    if (not record or unit.get('result') != 'oom-kill' or
-            unit.get('scope_empty') is not True or unit.get('cleanup_error')):
-        return record
-    if any(not unit.get(key) for key in binding):
-        raise RuntimeError('OOM finalization requires a bound closed worker scope')
-    if previous and record.get('recovery_validation') is not None:
-        return record
-    if record['status'] not in ('preparing', 'ready', 'running') and not (
-            record['status'] == 'failed' and record.get('reason') == 'oom-kill'):
-        return record
-    directory = history[-1]
-    try:
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        if batch.evidence_fault(directory, record):
-            raise RuntimeError('Permanent evidence fault prevents OOM recovery')
-        if not record.get('checkpoint'):
-            raise ValueError('OOM attempt has no safe checkpoint')
-        snapshot, state = validate_snapshot(record['checkpoint'])
-        if not any(snapshot.is_relative_to(path / 'runtime/checkpoints') for path in history):
-            raise ValueError('OOM checkpoint belongs to another run')
-        if (type(state['day']) is not int or state['day'] < 0 or state['stage'] not in ('boundary', 'ceo') or
-                set(state['roles']) != {'ceo', 'growth', 'ops_finance'} or
-                any(role['identity']['run_id'] != entry['run_id'] for role in state['roles'].values())):
-            raise ValueError('OOM checkpoint has invalid run or recovery state')
-        validate_recovery_source(snapshot, state, current_root=directory / 'runtime')
-        validation = dict(eligible=True, checkpoint=str(snapshot),
-            checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'), day=state['day'], stage=state['stage'],
-            current_operation_coverage=True)
-    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-        validation = dict(eligible=False, error_type=type(exc).__name__, error=str(exc))
-    finalization = previous or dict(previous_status=record['status'], previous_reason=record.get('reason'),
-        previous_runtime_failure=record.get('runtime_failure'), unit=unit)
-    record = dict(record, status='failed', reason='oom-kill', controller_finalization=finalization,
-        recovery_validation=validation, finished_at=datetime.now(timezone.utc).isoformat())
-    write_json(directory / 'attempt.json', record)
-    return record
+def retry_position(entry):
+    from saas_bench.team_recovery import latest_checkpoint
+    from saas_bench.team_checkpoint import validate_snapshot
+    checkpoint = latest_checkpoint(entry, latest(entry))
+    if checkpoint is None:
+        return [None, None], None
+    _, state = validate_snapshot(checkpoint)
+    return [state['day'], state['stage']], str(checkpoint)
 
 
-def run_disposition(entry, record, unit):
-    """Only a proved final outcome releases a group slot; pauses retain it."""
-    if not record or record.get('status') in ('preparing', 'ready', 'running'):
-        return 'hold'
-    history = batch.attempts(entry)
-    read_interrupted = False
-    if history:
-        for path in (history[-1] / 'runtime/private/operations').glob('*.json'):
-            operation = batch.read(path)
-            if operation.get('status') != 'completed':
-                if operation.get('wrapper_version') == 1:
-                    from saas_bench.team_checkpoint import recovery_operation_safe
-                    if recovery_operation_safe(history[-1] / 'runtime', operation):
-                        read_interrupted = True
-                        continue
-                return 'hold'
-    failure = str(record.get('runtime_failure', '')) + str(record.get('error', ''))
-    if 'world_operation_failed' in failure or 'outcome unknown' in failure:
-        return 'hold'
-    if read_interrupted or record.get('status') == 'paused':
-        return 'blocked'
-    if record.get('status') == 'finished' and unit.get('result') == 'success':
-        return 'terminal'
-    if record.get('status') != 'failed' and unit.get('result') != 'oom-kill':
-        return 'hold'
-    if unit.get('result') not in ('success', 'failed', 'exit-code', 'oom-kill'):
-        return 'hold'
-    if unit.get('result') == 'oom-kill' or 'run_evidence_fault' in failure or record.get('reason') == 'run_evidence_fault':
-        return 'terminal'
-    if (record.get('execution_started') is False or
-            record.get('reason') in ('host_interrupted', 'sql_evidence_pending', 'supervisor_exited') or
-            record.get('recovery_validation', {}).get('eligible') or
-            record.get('checkpoint') and not record.get('checkpoint_error')):
-        return 'blocked'
-    return 'terminal'
+def record_failure(failures, run_id, position):
+    previous = failures.get(run_id, {})
+    count = previous.get('count', 0) + 1 if previous.get('position') == position else 1
+    failures[run_id] = dict(position=position, count=count)
+    return count
 
 
-def worker(policy, run_id, *, resume, parent_pid):
+def worker(policy, run_id, *, resume, parent_pid, week=None):
     gate = RequestGate(policy, run_id=run_id, parent_pid=parent_pid)
-    scope_receipt = Path(gate.expected['host_logs']) / f'worker-scope-{run_id}-{"resume" if resume else "run"}.json'
+    launch_id = os.environ.get("CEOBENCH_WORKER_LAUNCH_ID", uuid.uuid4().hex)
+    scope_receipt = Path(gate.expected["host_logs"]) / f"worker-scope-{run_id}-{launch_id}.json"
     try:
         gate.scope = verify_worker_scope(json.loads(os.environ.pop('CEOBENCH_WORKER_SCOPE_POLICY', 'null')))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -259,10 +174,9 @@ def worker(policy, run_id, *, resume, parent_pid):
     entry = batch.selected(manifest, run_id)
     from saas_bench.runtime_temp import prepare_tmpdir
     import tempfile
-    os.environ['TMPDIR'] = str(prepare_tmpdir(Path(entry['output_dir']) / 'tmp'))
+    os.environ['TMPDIR'] = str(prepare_tmpdir(Path(gate.expected['host_logs']) / 'tmp' / launch_id))
     tempfile.tempdir = os.environ['TMPDIR']
-    from saas_bench.agents.bash_agent.run_test import load_env_file
-    key = os.environ.get('OPENCODE_API_KEY') or load_env_file(Path(manifest['source_root']) / '.env').get('OPENCODE_API_KEY')
+    key = os.environ.get('OPENCODE_API_KEY')
     if not key:
         raise ValueError('Existing OPENCODE_API_KEY is unavailable')
     os.environ['OPENCODE_API_KEY'] = key
@@ -272,337 +186,300 @@ def worker(policy, run_id, *, resume, parent_pid):
         os.environ.pop(name, None)
     os.environ['CEOBENCH_SIMULATOR_LLM_PROVIDER'] = 'opencode'
     os.environ['CEOBENCH_SIMULATOR_LLM_MODEL'] = batch.MODEL
-    record = batch.prepare(gate.expected['manifest'], run_id, resume=resume, live=True,
-        request_guard=gate, response_guard=gate.response, parent_pid=parent_pid)
+    options = dict(resume=resume, live=True, request_guard=gate,
+                   response_guard=gate.response, parent_pid=parent_pid)
+    if week is not None:
+        options['week'] = week
+    record = batch.prepare(gate.expected['manifest'], run_id, **options)
     print(json.dumps({key: record.get(key) for key in ('run_id', 'attempt', 'status', 'day', 'reason')}), flush=True)
     return 0 if record['status'] == 'finished' else 2
 
 
-def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0):
+def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 * 1024**3,
+              memory_swap_max=0, week=None, run_id=None):
+    if week is not None and (type(week) is not int or week < 1):
+        raise ValueError('Week must be a positive integer; week 1 starts at day 0')
     scope_command([], 'ceobench-validation.scope', memory_high=memory_high,
                   memory_max=memory_max, memory_swap_max=memory_swap_max)
     policy = Path(policy).resolve()
     gate = RequestGate(policy)
     manifest = gate.manifest()
-    independent = batch.scheduling_policy(manifest) == 'group_independent'
+    if run_id is not None:
+        manifest = dict(manifest, runs=[batch.selected(manifest, run_id)])
+    source_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+        cwd=execution_root(gate.expected['manifest'], manifest), text=True).strip()
     directory = policy.parent
     host_logs = Path(gate.expected['host_logs'])
     if not host_logs.is_absolute() or host_logs.resolve() != host_logs:
         raise ValueError('Host logs must have a canonical absolute path')
     host_logs.mkdir(parents=True, exist_ok=True)
-    terminal_path = directory / 'controller-terminal.json'
-    terminal = batch.read(terminal_path) if independent and terminal_path.exists() else {}
-    entries = []
-    for entry in manifest['runs']:
-        saved = latest(entry)
-        if independent and saved and entry['run_id'] in terminal:
-            proof = terminal[entry['run_id']]
-            if (file_hash(batch.attempts(entry)[-1] / 'attempt.json') != proof['attempt_sha256'] or
-                    not proof['unit'].get('scope_empty') or proof['disposition'] != 'terminal'):
-                raise ValueError('Group terminal proof or attempt changed')
-            if not resume:
-                raise ValueError('Existing group batch requires explicit --resume')
-            continue
-        if resume and saved and saved['status'] == 'finished':
-            if independent:
-                raise ValueError('Finished group run lacks terminal cleanup audit')
-            continue
-        if bool(saved) != resume and not (independent and resume and not saved):
-            raise ValueError('Use fresh execution or explicit --resume for existing attempts')
-        audited = recovery_source(gate.expected['manifest'], entry, saved, batch.attempts(entry)[-1]) if saved and resume else None
-        if saved and not audited and saved['status'] not in ('paused', 'failed'):
-            raise ValueError('Explicit resume requires a paused or failed attempt')
-        entries.append(entry)
-    statefile = directory / 'observer/state.json'
-    state = batch.read(statefile) if statefile.exists() else {}
-    children, streams = [], []
-    units = batch.read(directory / 'controller-units.json') if independent and (directory / 'controller-units.json').exists() else {}
-    if independent:
-        for saved in units.values():
-            if not saved.get('scope_empty'):
-                current = scope_state(saved, exit_code=saved.get('exit_code'))
-                if not current.get('scope_empty') or current.get('cleanup_error'):
-                    gate.hold.touch()
-                    raise ValueError('Previous group worker resources are not proved closed')
-    stopped_at, signaled, exited = {}, set(), set()
+    queues = {group: [entry for entry in manifest['runs'] if entry['group'] == group]
+              for group in ('git', 'pf')}
+    events_path = directory / 'controller-events.jsonl'
+    failures, terminal, children, streams = {}, {}, [], []
+    units_path = directory / 'controller-units.json'
+    units = batch.read(units_path) if units_path.exists() else {}
+    launch_ordinal = 0
+    launched_runs = set()
+    if events_path.exists():
+        for line in events_path.read_text().splitlines():
+            row = json.loads(line)
+            launch_ordinal = max(launch_ordinal, row.get('launch_ordinal', 0))
+            if row.get('event') == 'recovery_failure':
+                failures[row['run_id']] = dict(position=row['position'], count=row['count'])
+    state = {}
+    stop_requested = False
     sampler = MemorySampler(host_logs / 'host-memory.jsonl')
-    settled = set()
-    queues = {group: [entry for entry in entries if entry['group'] == group]
-              for group in ('git', 'pf')} if independent else {}
-    launch_ordinal = sum(1 for row in (directory / 'controller-events.jsonl').read_text().splitlines()
-        if json.loads(row).get('event') == ('worker_launch_intent' if independent else 'worker_launched')) if (directory / 'controller-events.jsonl').exists() else 0
+    sampler_receipt = dict(closed=True, skipped=True)
+    sampler_active = False
+    last_poll = 0
 
     def event(kind, **fields):
-        with (directory / 'controller-events.jsonl').open('a') as stream:
-            stream.write(json.dumps(dict(time=datetime.now(timezone.utc).isoformat(), event=kind, **fields)) + '\n')
+        with events_path.open('a') as stream:
+            stream.write(json.dumps(dict(fields, time=datetime.now(timezone.utc).isoformat(), event=kind)) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
 
-    def stopped():
-        return any(path.exists() for path in (gate.hold, directory / 'STOP', directory / 'QUOTA_EXHAUSTED'))
+    def alarm(entry, reason, **details):
+        record = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
+                      time=datetime.now(timezone.utc).isoformat(), **details)
+        write_json(directory / ('alarm-' + entry['run_id'] + '.json'), record)
+        terminal[entry['run_id']] = dict(disposition='alarm', **record)
+        event('group_alarm', **record)
+
+    def observe(slot):
+        try:
+            observed = scope_state(slot['unit'], exit_code=slot['child'].returncode)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            observed = dict(slot['unit'], scope_empty=False, cleanup_error=str(exc))
+        slot['unit'] = observed
+        run_id = slot['entry']['run_id']
+        if units.get(run_id) != observed:
+            units[run_id] = observed
+            write_json(directory / 'controller-units.json', units)
+        return observed
+
+    def close_previous(entry):
+        saved = units.get(entry['run_id'])
+        if not saved or saved.get('scope_empty'):
+            return
+        deadline = time.monotonic() + 45
+        signaled = False
+        while True:
+            observed = scope_state(saved, exit_code=saved.get('exit_code'))
+            units[entry['run_id']] = observed
+            write_json(directory / 'controller-units.json', units)
+            if observed.get('scope_empty'):
+                event('previous_scope_closed', run_id=entry['run_id'], unit=observed)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('Previous worker scope did not close')
+            if not signaled or remaining < 15:
+                signal_scope(observed, signal.SIGTERM if not signaled else signal.SIGKILL)
+                signaled = True
+            time.sleep(.25)
 
     def launch(entry, predecessor=None):
         nonlocal launch_ordinal
-        sampler.check()
-        saved = latest(entry)
-        mode = 'resume' if resume and saved else 'run'
-        ready = host_logs / f'ready-{entry["run_id"]}-{mode}.json'
-        ready.unlink(missing_ok=True)
+        close_previous(entry)
+        history = batch.attempts(entry)
+        mode = 'resume' if history else 'run'
+        launch_ordinal += 1
+        launch_id = str(launch_ordinal) + '-' + uuid.uuid4().hex[:8]
+        ready = host_logs / f'ready-{entry["run_id"]}-{launch_id}.json'
         from saas_bench.runtime_temp import prepare_tmpdir
-        temporary = prepare_tmpdir(Path(entry['output_dir']) / 'tmp')
+        temporary = prepare_tmpdir(host_logs / 'tmp' / launch_id)
+        root = execution_root(gate.expected['manifest'], manifest)
         env = dict(os.environ, TMPDIR=str(temporary), PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
-            PYTHONPATH=str(execution_root(gate.expected['manifest'], manifest) / 'src'),
-            CEOBENCH_LIFECYCLE_READY=str(ready))
-        stream = (host_logs / f'{entry["run_id"]}-{mode}.log').open('a')
+            PYTHONPATH=str(root / 'src'), CEOBENCH_LIFECYCLE_READY=str(ready),
+            CEOBENCH_WORKER_LAUNCH_ID=launch_id)
+        stream = (host_logs / f'{entry["run_id"]}-{mode}-{launch_id}.log').open('a')
         streams.append(stream)
         command = [sys.executable, str(Path(__file__).resolve()), '--policy', str(policy),
             '--live', '--worker', entry['run_id'], '--parent-pid', str(os.getpid())]
-        if mode == 'resume':
+        if history:
             command.append('--resume')
+        if week is not None and entry['run_id'] not in launched_runs:
+            command.extend(['--week', str(week)])
         unit = 'ceobench-worker-' + uuid.uuid4().hex + '.scope'
         env['CEOBENCH_WORKER_SCOPE_POLICY'] = json.dumps(dict(unit=unit,
             memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max))
         command = scope_command(command, unit, memory_high=memory_high,
             memory_max=memory_max, memory_swap_max=memory_swap_max)
-        units[entry['run_id']] = dict(unit=unit)
-        write_json(directory / 'controller-units.json', units)
-        launch_ordinal += 1
-        fields = {}
-        if independent:
-            from saas_bench.team_recovery import approval
-            revision = approval(gate.expected['manifest'])
-            queue = manifest['scheduling']['queues'][entry['group']]
-            fields = dict(launch_ordinal=launch_ordinal, group=entry['group'], pair_id=entry['pair_id'],
-                group_ordinal=queue.index(entry['run_id']) + 1,
-                launch_reason='explicit_resume' if mode == 'resume' else 'previous_group_run_terminal' if predecessor else 'initial_group_slot',
-                predecessor_run_id=predecessor, manifest_sha256=gate.expected['manifest_sha256'],
-                source_commit=revision['fix_commit'] if revision else manifest['source_commit'],
-                recovery_approval_sha256=os.environ.get('CEOBENCH_RECOVERY_APPROVAL_SHA256') if revision else None)
-            event('worker_launch_intent', run_id=entry['run_id'], mode=mode, unit=unit, **fields)
-        child = subprocess.Popen(command, cwd=manifest['source_root'], env=env,
-            stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        children.append((entry, child, ready))
-        deadline = time.monotonic() + 5
-        while not observe_unit(entry, child).get('invocation_id') and child.poll() is None:
-            if units[entry['run_id']].get('cleanup_error'):
-                raise RuntimeError(units[entry['run_id']]['cleanup_error'])
-            if time.monotonic() >= deadline:
-                raise RuntimeError('Worker scope invocation did not become observable')
-            time.sleep(.01)
-        event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode, unit=unit,
-            memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max,
-            scope=units[entry['run_id']], **fields)
+        event('worker_launch_intent', run_id=entry['run_id'], mode=mode, unit=unit,
+            launch_ordinal=launch_ordinal, group=entry['group'], pair_id=entry.get('pair_id'),
+            launch_reason='checkpoint_recovery' if history else 'previous_group_run_terminal' if predecessor else 'initial_group_slot',
+            predecessor_run_id=predecessor, source_commit=source_commit,
+            frozen_source_commit=manifest.get('source_commit'))
+        child = subprocess.Popen(command, cwd=root, env=env, stdout=stream,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+        launched_runs.add(entry['run_id'])
+        slot = dict(entry=entry, child=child, ready=ready, unit=dict(unit=unit),
+                    closed=False, stopping_at=None, signaled=False)
+        children.append(slot)
+        event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode,
+            launch_ordinal=launch_ordinal, unit=unit, memory_high=memory_high,
+            memory_max=memory_max, memory_swap_max=memory_swap_max, scope=observe(slot))
+        return slot
 
-    def finish_oom(entry, unit):
-        before = latest(entry)
-        record = finalize_oom(entry, unit)
-        if record != before:
-            event('attempt_finalized_after_oom', run_id=entry['run_id'], unit=unit)
-        return record
-
-    def coverage_for(entry, health):
-        roots = batch.attempts(entry)
-        return {name: value for name, value in health['coverage'].items()
-            if any(Path(name).is_relative_to(root) for root in roots) or
-            Path(name).parent == host_logs and Path(name).name.startswith(entry['run_id'] + '-')}
-
-    def finalize_capture_fault(entry, record, coverage):
-        roots = batch.attempts(entry)
-        capture_faults = {name: value for name, value in coverage.items() if value.get('terminal_fault') and
-            roots and state['cursors'][name]['closed_tail'].get('attempt_dir') == str(roots[-1])}
-        if record and capture_faults and not record.get('controller_capture_faults'):
-            record = dict(record, status='failed', reason=record.get('reason') if record['status'] == 'failed'
-                else 'run_evidence_fault', controller_capture_faults=capture_faults)
-            if record.get('recovery_validation') is not None:
-                record['recovery_validation'] = dict(record['recovery_validation'], eligible=False,
-                    error=record['recovery_validation'].get('error') or 'Terminal model log capture fault',
-                    capture_faults=sorted(capture_faults))
-            write_json(roots[-1] / 'attempt.json', record)
-            event('attempt_finalized_after_capture_fault', run_id=entry['run_id'], coverage=capture_faults)
-        return record
-
-    def join_next(entry, child):
-        if child.pid in settled:
-            return
-        unit = observe_unit(entry, child)
-        if not unit.get('scope_empty'):
-            return
-        child.wait()
-        record = finish_oom(entry, unit)
-        disposition = run_disposition(entry, record, unit)
-        if disposition == 'hold':
-            gate.hold.touch()
-        if disposition != 'terminal':
-            settled.add(child.pid)
-            event('group_blocked', run_id=entry['run_id'], disposition=disposition)
-            return
-        health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-        roots = batch.attempts(entry)
-        coverage = coverage_for(entry, health)
-        if (health['status'] == 'hold' or health['quota_error'] or
-                any(value.get('backlog_bytes') or value.get('reason') for value in coverage.values())):
-            return
-        record = finalize_capture_fault(entry, record, coverage)
-        settled.add(child.pid)
-        terminal[entry['run_id']] = dict(disposition=disposition, status=record['status'],
-            reason=record.get('runtime_failure') or record.get('reason'), unit=unit, coverage=coverage,
-            attempt_sha256=file_hash(roots[-1] / 'attempt.json'), time=datetime.now(timezone.utc).isoformat())
-        write_json(terminal_path, terminal)
-        event('group_run_terminal', run_id=entry['run_id'], proof=terminal[entry['run_id']])
-        queue = queues[entry['group']]
-        if queue and not stopped():
-            launch(queue.pop(0), predecessor=entry['run_id'])
-
-    def observe_unit(entry, child):
-        saved = units[entry['run_id']]
-        if saved.get('cleanup_error'):
-            return saved
+    def failed(entry, *, reason, unit=None):
         try:
-            record = scope_state(saved, exit_code=child.returncode)
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-            record = dict(saved, scope_empty=False, cleanup_error=str(exc))
-            gate.hold.touch()
-            event('scope_cleanup_refused', run_id=entry['run_id'], unit=record)
-        units[entry['run_id']] = record
-        write_json(directory / 'controller-units.json', units)
-        return record
+            position, checkpoint = retry_position(entry)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            position, checkpoint = [None, None], None
+            reason += '; checkpoint: ' + str(exc)
+        count = record_failure(failures, entry['run_id'], position)
+        event('recovery_failure', run_id=entry['run_id'], group=entry['group'], position=position,
+              checkpoint=checkpoint, count=count, reason=reason, unit=unit)
+        if count >= 3:
+            alarm(entry, 'repeated_failure', position=position, failures=count, failure_reason=reason)
+            return None
+        try:
+            return launch(entry)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            return failed(entry, reason=type(exc).__name__ + ': ' + str(exc))
 
-    def workers_running():
-        return any(child.poll() is None or (not observe_unit(entry, child)['scope_empty'] and
-                   not units[entry['run_id']].get('cleanup_error')) for entry, child, _ in children)
-
-    def stop_children(*, global_stop=False):
-        if global_stop:
-            gate.hold.touch()
-        for entry, child, ready in children:
-            unit = observe_unit(entry, child)
-            if unit.get('cleanup_error'):
-                if child.poll() is None:
-                    child.kill()
-                continue
-            residual = child.poll() is not None and not unit['scope_empty']
-            if unit['scope_empty'] or not (residual or global_stop or run_stopped(entry)):
-                continue
-            elapsed = time.monotonic() - stopped_at.setdefault(child.pid, time.monotonic())
+    def next_entry(group, predecessor=None):
+        while queues[group]:
+            entry = queues[group].pop(0)
+            saved = latest(entry)
             try:
-                if child.poll() is None and ready.exists() and child.pid not in signaled:
-                    os.kill(child.pid, signal.SIGUSR1)
-                    signaled.add(child.pid)
-                if elapsed > FORCE_STOP_SECONDS or residual and elapsed > 30:
-                    signal_scope(unit, signal.SIGKILL)
-                elif elapsed > COOPERATIVE_STOP_SECONDS or residual:
-                    signal_scope(unit, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                unit.update(cleanup_error=str(exc), scope_empty=False)
-                gate.hold.touch()
-                event('scope_cleanup_refused', run_id=entry['run_id'], unit=unit)
+                close_previous(entry)
+                if week is None and saved and saved.get('status') == 'finished' and units.get(entry['run_id'], {}).get('result') != 'oom-kill':
+                    terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
+                                                    attempt=saved.get('attempt'))
+                    continue
+                return launch(entry, predecessor)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                return failed(entry, reason=type(exc).__name__ + ': ' + str(exc))
+        return None
+
+    def cleanup(slot, *, requested=False):
+        observed = observe(slot)
+        child = slot['child']
+        residual = child.poll() is not None and not observed.get('scope_empty')
+        if observed.get('scope_empty'):
+            return True
+        if not (requested or residual):
+            return False
+        if slot['stopping_at'] is None:
+            slot['stopping_at'] = time.monotonic()
+        elapsed = time.monotonic() - slot['stopping_at']
+        try:
+            if child.poll() is None and slot['ready'].exists() and not slot['signaled']:
+                os.kill(child.pid, signal.SIGUSR1)
+                slot['signaled'] = True
+            if elapsed > FORCE_STOP_SECONDS or residual and elapsed > 30:
+                signal_scope(observed, signal.SIGKILL)
+            elif elapsed > COOPERATIVE_STOP_SECONDS or residual:
+                signal_scope(observed, signal.SIGTERM)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            if elapsed > FORCE_STOP_SECONDS:
+                alarm(slot['entry'], 'resources_not_closed', error=str(exc), unit=observed)
+                slot['closed'] = True
                 if child.poll() is None:
                     child.kill()
+                child.wait(timeout=10)
+                return False
+        if elapsed > FORCE_STOP_SECONDS + 30:
+            alarm(slot['entry'], 'resources_not_closed', unit=observed)
+            slot['closed'] = True
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+        return observe(slot).get('scope_empty', False)
+
+    def telemetry():
+        nonlocal last_poll, sampler_active, sampler_receipt
+        if sampler_active:
+            try:
+                sampler.check()
+            except (OSError, ValueError, RuntimeError) as exc:
+                event('memory_sampler_warning', error=str(exc))
+                sampler_receipt = sampler.stop()
+                sampler_active = False
+        if time.monotonic() - last_poll >= 300:
+            try:
+                poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+            except Exception as exc:
+                event('observer_warning', error_type=type(exc).__name__, error=str(exc))
+            last_poll = time.monotonic()
 
     with (directory / 'controller.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        handlers = {sig: signal.signal(sig, lambda *_: gate.hold.touch())
-                    for sig in (signal.SIGTERM, signal.SIGINT)}
+        def request_stop(*_):
+            nonlocal stop_requested
+            stop_requested = True
+        handlers = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+        active = {}
         try:
-            event('memory_sampler_started', sample=sampler.start())
-            health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-            sampler.check()
-            last_poll = time.monotonic()
-            while health['status'] == 'pending' and not stopped():
-                sampler.check()
+            try:
+                event('memory_sampler_started', sample=sampler.start())
+                sampler_active = True
+            except (OSError, ValueError, RuntimeError) as exc:
+                event('memory_sampler_warning', error=str(exc))
+            for group in queues:
+                active[group] = next_entry(group)
+            while any(slot is not None for slot in active.values()):
+                telemetry()
+                stopping = stop_requested or (directory / 'STOP').exists()
+                for group, slot in list(active.items()):
+                    if slot is None:
+                        continue
+                    child, entry = slot['child'], slot['entry']
+                    child.poll()
+                    own_stop = run_stopped(entry)
+                    closed = cleanup(slot, requested=stopping or own_stop)
+                    if slot['closed']:
+                        active[group] = None
+                        continue
+                    if child.poll() is None or not closed:
+                        continue
+                    child.wait()
+                    slot['closed'] = True
+                    saved = latest(entry) or {}
+                    event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
+                        status=saved.get('status'), day=saved.get('day'), unit=slot['unit'])
+                    if stopping or own_stop or saved.get('runtime_failure') in ('requested_pause', 'supervisor_cancelled'):
+                        active[group] = None
+                    elif saved.get('status') == 'finished' and child.returncode == 0 and slot['unit'].get('result') != 'oom-kill':
+                        terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
+                            unit=slot['unit'], attempt=saved.get('attempt'))
+                        event('group_run_terminal', run_id=entry['run_id'], proof=terminal[entry['run_id']])
+                        active[group] = next_entry(group, predecessor=entry['run_id'])
+                    else:
+                        active[group] = failed(entry, reason=str(saved.get('runtime_failure') or
+                            saved.get('reason') or 'worker_exit:' + str(child.returncode)), unit=slot['unit'])
+                    write_json(directory / 'controller-terminal.json', terminal)
                 time.sleep(1)
-                if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
-                    health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-                    last_poll = time.monotonic()
-            if health['status'] == 'hold' or stopped():
-                gate.hold.touch()
-                return []
-            initial = [queue.pop(0) for queue in queues.values() if queue] if independent else entries
-            for entry in initial:
-                if stopped():
-                    break
-                predecessor = None
-                if independent:
-                    queue = manifest['scheduling']['queues'][entry['group']]
-                    ordinal = queue.index(entry['run_id'])
-                    if ordinal and queue[ordinal - 1] in terminal:
-                        predecessor = queue[ordinal - 1]
-                launch(entry, predecessor=predecessor)
-            while workers_running() or independent and any(child.pid not in settled for _, child, _ in children):
-                sampler.check()
-                if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
-                    health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-                    last_poll = time.monotonic()
-                for entry, child, _ in list(children):
-                    if child.poll() is not None and child.pid not in exited:
-                        exited.add(child.pid)
-                        record = latest(entry) or {}
-                        unit = observe_unit(entry, child)
-                        event('worker_exited', run_id=entry['run_id'], exit_code=child.returncode,
-                            status=record.get('status'), day=record.get('day'), unit=unit)
-                    if independent and child.poll() is not None:
-                        if stopped():
-                            settled.add(child.pid)
-                        else:
-                            join_next(entry, child)
-                stop_children(global_stop=stopped())
-                time.sleep(1)
-            for entry, child, _ in children:
-                child.wait()
-                unit = observe_unit(entry, child)
-                record = finish_oom(entry, unit) or {}
-                event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
-                    status=record.get('status'), day=record.get('day'), unit=unit)
-            if stopped():
-                gate.hold.touch()
-            health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-            for run_id, observed in health.get('units', {}).items():
-                units[run_id] = dict(units.get(run_id, {}), **observed)
-            finalized_capture = False
-            for entry, _, _ in children:
-                saved = latest(entry)
-                record = finalize_capture_fault(entry, saved, coverage_for(entry, health))
-                finalized_capture |= record is not saved
-                if not independent and record and record.get('controller_capture_faults') and run_disposition(entry, record, units[entry['run_id']]) == 'hold':
-                    gate.hold.touch()
-            if finalized_capture:
-                poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
-            sampler.check()
-            return [dict(latest(entry) or {}, status='failed', reason='oom-kill')
-                    if units[entry['run_id']]['result'] == 'oom-kill' else latest(entry)
-                    for entry, _, _ in children]
-        except BaseException:
-            gate.hold.touch()
-            raise
+            return [latest(entry) for entry in manifest['runs']]
         finally:
-            while workers_running():
-                stop_children(global_stop=True)
-                time.sleep(1)
-            for _, child, _ in children:
-                child.wait()
+            for slot in children:
+                if slot['closed']:
+                    continue
+                while not cleanup(slot, requested=True) and not slot['closed']:
+                    time.sleep(1)
+                slot['child'].wait(timeout=10)
             for stream in streams:
                 stream.close()
-            sampler_receipt = sampler.stop()
-            if (not sampler_receipt['closed'] or sampler_receipt.get('exit_code', 0) != 0 or
-                    sampler_receipt.get('forced') or sampler_receipt.get('unexpected_exit')):
-                gate.hold.touch()
+            if sampler_active:
+                sampler_receipt = sampler.stop()
+            try:
+                poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+            except Exception as exc:
+                event('observer_warning', error_type=type(exc).__name__, error=str(exc))
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
-            write_json(directory / 'controller-exit.json', dict(hold=gate.hold.exists(),
-                failed=gate.hold.exists() or any(record.get('result') != 'success' or record.get('cleanup_error')
-                    for record in units.values()) or
-                    any(child.returncode != 0 or
-                    (latest(entry) or {}).get('status') != 'finished' for entry, child, _ in children),
-                children_reaped=all(child.returncode is not None and units[entry['run_id']].get('scope_empty')
-                    for entry, child, _ in children),
-                memory_sampler=sampler_receipt,
-                units=units, attempts={entry['run_id']: dict(
-                    attempt=(latest(entry) or {}).get('attempt'), attempt_id=(latest(entry) or {}).get('attempt_id'),
-                    attempt_sha256=file_hash(batch.attempts(entry)[-1] / 'attempt.json'))
-                    for entry, _, _ in children if batch.attempts(entry)},
-                batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']]))
+            write_json(directory / 'controller-terminal.json', terminal)
+            write_json(directory / 'controller-exit.json', dict(hold=False,
+                failed=any(record.get('disposition') == 'alarm' for record in terminal.values()) or
+                    any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
+                children_reaped=all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
+                                    for slot in children) and all(unit.get('scope_empty') for unit in units.values()),
+                memory_sampler=sampler_receipt, units=units,
+                batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
+                auto_resume=True))
 
 
 def main(argv=None):
@@ -610,13 +487,15 @@ def main(argv=None):
     parser.add_argument('--policy', type=Path, required=True,
         help='Policy identity anchors the manifest and selected git/PF run IDs and output paths.')
     parser.add_argument('--live', action='store_true', help='Explicitly enable model requests.')
-    parser.add_argument('--resume', action='store_true', help='Explicitly resume paused or failed runs; skip finished runs.')
+    parser.add_argument('--resume', action='store_true', help='Compatibility flag; existing attempts resume automatically.')
+    parser.add_argument('--run-id', help='Run only this group run from the policy selection.')
+    parser.add_argument('--week', type=int, help='Replay a saved week boundary; week 1 starts at day 0.')
     parser.add_argument('--worker', help=argparse.SUPPRESS)
     parser.add_argument('--parent-pid', type=int, help=argparse.SUPPRESS)
-    parser.add_argument('--memory-high', type=memory_bytes, default=2 * 1024**3,
-        help='Per-worker cgroup MemoryHigh in bytes or K/M/G/T (default 2G).')
-    parser.add_argument('--memory-max', type=memory_bytes, default=3 * 1024**3,
-        help='Per-worker cgroup MemoryMax (default 3G). Each group gets a separate scope.')
+    parser.add_argument('--memory-high', type=memory_bytes, default=16 * 1024**3,
+        help='Per-worker cgroup MemoryHigh in bytes or K/M/G/T (default 16G).')
+    parser.add_argument('--memory-max', type=memory_bytes, default=20 * 1024**3,
+        help='Per-worker cgroup MemoryMax (default 20G). Each group gets a separate scope.')
     parser.add_argument('--memory-swap-max', type=memory_bytes, default=0,
         help='Per-worker cgroup MemorySwapMax (default 0).')
     parser.add_argument('--bash-memory-max', type=memory_bytes,
@@ -630,9 +509,14 @@ def main(argv=None):
     if args.worker:
         if args.parent_pid is None:
             parser.error('Workers require their controller parent PID')
-        return worker(args.policy, args.worker, resume=args.resume, parent_pid=args.parent_pid)
-    supervise(args.policy, resume=args.resume, memory_high=args.memory_high,
+        return worker(args.policy, args.worker, resume=args.resume, parent_pid=args.parent_pid, week=args.week)
+    options = dict(resume=args.resume, memory_high=args.memory_high,
         memory_max=args.memory_max, memory_swap_max=args.memory_swap_max)
+    if args.week is not None:
+        options['week'] = args.week
+    if args.run_id is not None:
+        options['run_id'] = args.run_id
+    supervise(args.policy, **options)
     return 2 if batch.read(args.policy.resolve().parent / 'controller-exit.json')['failed'] else 0
 
 

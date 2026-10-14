@@ -14,6 +14,7 @@ Commands:
 
 import argparse
 import json
+import logging
 import uuid
 import os
 import signal
@@ -197,8 +198,8 @@ def _session_config(seed, total_days, initial_cash, meta=None):
     if manifest_path:
         requested = json.loads(Path(manifest_path).read_text())['benchmark_config']
         if frozen and frozen != requested:
-            raise ValueError('Session configuration differs from run manifest')
-        frozen = requested
+            logging.warning('Session uses checkpoint configuration; execution metadata differs')
+        frozen = frozen or requested
     config = BenchmarkConfig(**frozen) if frozen else BenchmarkConfig(
         seed=seed, total_days=total_days, initial_cash=initial_cash)
     for name, value in normalize_runtime_config(
@@ -209,7 +210,9 @@ def _session_config(seed, total_days, initial_cash, meta=None):
     before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
     effective = _apply_simulator_llm_config(config)
     if frozen and effective != before:
-        raise ValueError('Simulator environment would change frozen model configuration')
+        logging.warning('Simulator uses checkpoint model configuration; current environment differs')
+        for field, value in before.items():
+            setattr(config, field, value)
     return config
 
 

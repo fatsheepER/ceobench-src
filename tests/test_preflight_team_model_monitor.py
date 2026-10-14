@@ -66,7 +66,7 @@ def test_copied_prefix_retry_partial_line_and_restart_alert_once(tmp_path, monke
     assert str(invalid) not in state['offsets']
 
 
-def test_freeze_still_holds_billing_only_warns_with_copied_receipts(tmp_path, monkeypatch):
+def test_route_and_billing_warn_with_copied_receipts(tmp_path, monkeypatch):
     monitor = load_monitor(monkeypatch)
     route = dict(event='http_request', call_id='route-call', attempt_id='route-attempt',
                  endpoint=monitor.round5.ENDPOINT + 'chat/completions', body={'model': 'changed-model'})
@@ -85,11 +85,11 @@ def test_freeze_still_holds_billing_only_warns_with_copied_receipts(tmp_path, mo
         'billing_fields_missing']
     assert errors[-1]['missing_fields'] == ['cache_creation_tokens', 'cost_usd']
     hold = tmp_path / 'engineering/HOLD'
-    assert hold.exists()
+    assert not hold.exists()
     resumed = tmp_path / 'engineering/runs/pf/attempt-002/runtime/private/ceo/model-usage.jsonl'
     resumed.parent.mkdir(parents=True)
     resumed.write_text(original.read_text())
-    hold.unlink()
+    hold.touch()
     assert monitor.poll(tmp_path, json.loads(json.dumps(state))) == []
     assert hold.exists()
 
@@ -105,4 +105,4 @@ def test_logical_network_failure_does_not_hold_independent_monitor(tmp_path, mon
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(dict(event='response', call_id='call', error=error, response=None)) + '\n')
     assert monitor.poll(tmp_path, {})[0]['issue'] == issue
-    assert (tmp_path / 'engineering/HOLD').exists() == hold
+    assert not (tmp_path / 'engineering/HOLD').exists()

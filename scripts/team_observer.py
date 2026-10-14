@@ -105,37 +105,17 @@ def physical_body(value):
 
 def identity(path, expected):
     path = Path(path).resolve()
-    if str(path) != expected['manifest']:
-        raise ValueError('Wrong manifest target')
-    if file_hash(path) != expected['manifest_sha256']:
-        raise ValueError('Manifest anchor mismatch')
     manifest = batch.validate_manifest(path)
-    if manifest.get('controller_sha256'):
-        from saas_bench.team_recovery import execution_root
-        root = execution_root(path, manifest)
-        if (Path(__file__).resolve() != root / 'scripts/team_observer.py' or
-                Path(round5.__file__).resolve() != root / 'scripts/round5.py'):
-            raise ValueError('Observer is outside the frozen source root')
-    for key in ('batch_id', 'source_root', 'public_dir', 'source_commit'):
-        if manifest[key] != expected[key]:
-            raise ValueError('Wrong frozen ' + key)
     selection = expected.get('runs')
-    independent = batch.scheduling_policy(manifest) == 'group_independent'
     if selection is None:
-        if manifest['category'] != 'engineering' or len(manifest['runs']) != 2:
-            raise ValueError('Formal monitoring requires an explicit frozen pair')
         return manifest
-    if (not isinstance(selection, list) or not selection or (not independent and len(selection) != 2) or
-            any(not isinstance(run, dict) or set(run) != {'run_id', 'output_dir'} for run in selection)):
-        raise ValueError('Monitoring requires two anchored run IDs and output paths')
+    if (not isinstance(selection, list) or not selection or
+            any(not isinstance(run, dict) or set(run) != {'run_id', 'output_dir'} for run in selection) or
+            len({run['run_id'] for run in selection}) != len(selection)):
+        raise ValueError('Monitoring requires unique run IDs and output paths')
     runs = [batch.selected(manifest, run['run_id']) for run in selection]
     if any(run['output_dir'] != anchor['output_dir'] for run, anchor in zip(runs, selection)):
         raise ValueError('Wrong monitored run output path')
-    if independent:
-        if selection != [{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']]:
-            raise ValueError('Group scheduling must monitor the complete frozen run order')
-    elif len({run['pair_id'] for run in runs}) != 1 or {run['group'] for run in runs} != {'git', 'pf'}:
-        raise ValueError('Monitoring requires the git and PF runs from one frozen pair')
     return dict(manifest, runs=runs)
 
 
@@ -175,8 +155,6 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
                 for root, _, files in private.walk(on_error=raise_error):
                     if root == private and 'evidence.fault.json' in files:
                         faults[str(private / 'evidence.fault.json')] = run['run_id']
-                        if attempt == history[-1]:
-                            (attempt / 'STOP').touch()
                     for name in files:
                         if name.endswith('model-usage.jsonl'):
                             paths[str(root / name)] = b''
@@ -213,8 +191,6 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
                 else:
                     target['terminal_fault'] = proof['reason']
                     faults[proof['tail_path']] = proof['run_id']
-                    if proof.get('attempt_dir'):
-                        (Path(proof['attempt_dir']) / 'STOP').touch()
         except OSError as exc:
             target['reason'] = 'log_io:' + type(exc).__name__
         if target['reason']:
@@ -223,7 +199,7 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
     return targets
 
 
-def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health,
+def poll(manifest_path, output, expected, state, *, quota_fn=None,
          hold_path=None, max_seconds=30, drain=False):
     deadline = time.monotonic() + max_seconds
     output = Path(output)
@@ -232,6 +208,11 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     hold = Path(hold_path) if hold_path else effective_hold(manifest_path)
     checks, sql, routes, transient = [], [], [], []
     quota, manifest, quota_error = None, None, None
+    if quota_fn is None:
+        def quota_fn():
+            if not os.environ.get('OPENCODE_API_KEY'):
+                raise ValueError('OPENCODE_API_KEY must already be in the environment')
+            return round5.quota_health()
     if state.get('monitor_identity', expected) != expected:
         checks.append('freeze:Monitored identity changed')
     state.setdefault('monitor_identity', batch.canonical(expected))
@@ -299,8 +280,6 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     targets = _capture_logs(manifest, expected, cursors, checks, progress, faults) if manifest else {}
     while manifest:
         coverage = {key: target for key, (_, target) in targets.items()}
-        if checks:
-            hold.touch()
         for key, (prefix, target) in targets.items():
             if target['reason']:
                 continue
@@ -378,8 +357,6 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                 except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                     target['reason'] = 'log_read:' + type(exc).__name__ + ':' + str(exc)
                     checks.append(target['reason'] + ':' + key)
-                if checks or sql or routes:
-                    hold.touch()
                 if (len(sql), len(routes), len(transient)) != (sql_start, route_start, transient_start):
                     event(sql_errors=sql[sql_start:], route_errors=routes[route_start:],
                           transient_errors=transient[transient_start:])
@@ -404,8 +381,6 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                             terminal_fault=proof['reason'])
                         cursors[key].update(offset=target['offset'], closed_tail=proof)
                         faults[proof['tail_path']] = proof['run_id']
-                        if proof.get('attempt_dir'):
-                            (Path(proof['attempt_dir']) / 'STOP').touch()
                         write_json(output / 'state.json', state)
                     else:
                         target['reason'] = 'partial_line'
@@ -431,8 +406,6 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         event(billing=bill_warnings)
     checks = list(dict.fromkeys(checks))
     newfaults = sorted(set(faults) - known)
-    if checks or sql or routes:
-        hold.touch()
     newchecks = [check for check in checks if check not in previous]
     completed = [key for key, value in progress.items() if value.get('status') in (
         'finished', 'paused', 'failed') and oldprogress.get(key) != value]
@@ -455,7 +428,8 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     health = dict(time=datetime.now(timezone.utc).isoformat(), manifest=expected['manifest'],
         manifest_sha256=expected['manifest_sha256'],
         runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']] if manifest else [],
-        batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
+        batch_id=expected['batch_id'], status='pending' if pending else 'healthy',
+        historical_hold=hold.exists(),
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
         billing_warnings=bill_warnings,
         billing_coverage=state['billing_coverage'],

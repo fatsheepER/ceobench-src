@@ -98,7 +98,12 @@ def _summary(records):
                 missing[field] += 1
             else:
                 known[field] = (known[field] or 0) + value
+    durations = {record['call_id']: record.get('wall_seconds') for record in records}
     return dict(billed_units=len(records), known=known, missing=missing, costs=costs,
+                wall_seconds=(sum(durations.values()) if durations and
+                    all(value is not None for value in durations.values()) else None),
+                wall_seconds_known=sum(value for value in durations.values() if value is not None),
+                wall_seconds_missing_calls=[key for key, value in durations.items() if value is None],
                 complete={field: known[field] if records and not missing[field] else None for field in METRICS},
                 failed_http_attempts=sum(record['failed_http_attempt'] for record in records),
                 unreturned_requests=len({r['call_id'] for r in records if r['unreturned']}),
@@ -131,7 +136,7 @@ def _attempt_order(attempt):
     return at, int(retry) if retry is not None else -1
 
 
-def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
+def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal', exclude_calls=()):
     """Read logs without changing them; categories map to paths when a resource ledger is supplied.
 
     An HTTP attempt is the billing unit. Its final logical receipt supplies parsed
@@ -211,6 +216,8 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                         call[event] = row
     records = []
     for call_id, call in calls.items():
+        if call_id in exclude_calls:
+            continue
         request, response = call.get('request', {}), call.get('response')
         day = request.get('day')
         if day is None:
@@ -221,6 +228,10 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
         if call['category'] == 'formal' and role not in ROLES:
             raise ValueError('Formal receipt requires a team role: ' + str(role))
         ordered = sorted(call['attempts'], key=lambda key: (_attempt_order(attempts[key]), key))
+        duration = None
+        if request.get('timestamp') and response and response.get('timestamp'):
+            duration = max(0.0, (datetime.fromisoformat(response['timestamp']) -
+                datetime.fromisoformat(request['timestamp'])).total_seconds())
         final_attempt = ordered[-1] if ordered else None
         if response and response.get('attempt_id'):
             final_attempt = response['attempt_id']
@@ -264,6 +275,7 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                 recorded_cost_usd=recorded)
             receipt = http or attempt.get('http_error') or logical or {}
             records.append(dict(call_id=call_id, attempt_id=attempt_id, role=role,
+                wall_seconds=duration,
                 category=call['category'], day=day, model=model, api=api, metrics=metrics, cost=cost,
                 failed_http_attempt=failed, unreturned=response is None,
                 no_response=response is None or response.get('response') is None,
@@ -271,7 +283,9 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                 response_receipt=dict(path=receipt.get('receipt_path'),
                     line=receipt.get('receipt_line'))))
     team_records = [r for r in records if r['category'] == category and r['role'] in ROLES]
-    result = dict(pricing=prices, primary_category=category, team=_summary(team_records),
+    result = dict(pricing=prices, primary_category=category,
+        role_time_basis='logical_model_request_elapsed_including_retries; roles_can_overlap',
+        team=_summary(team_records),
         roles={role: _summary([r for r in team_records if r['role'] == role]) for role in ROLES},
         resources={resource: _summary([r for r in records if r['category'] == resource]) for resource in CATEGORIES},
         all_resources=_summary(records), calls=len({r['call_id'] for r in records}),

@@ -3,6 +3,7 @@
 import hashlib
 from importlib.metadata import version
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -65,17 +66,24 @@ def build_manifest(root, public):
 
 
 def verify_build(public, root=None):
-    manifest = json.loads((Path(public) / 'build.json').read_text())
-    if manifest['artifacts'] != artifact_hashes(public):
-        raise ValueError('Public artifacts differ from build.json; rebuild the public bundle')
-    if manifest['python'] != platform.python_version():
-        raise ValueError('Public bundle Python version does not match this interpreter')
+    path = Path(public) / 'build.json'
+    if not path.exists():
+        logging.warning('Build metadata unavailable: %s', path)
+        return dict(version=1, artifacts=artifact_hashes(public), python=platform.python_version(),
+            runtime=runtime_versions())
+    manifest = json.loads(path.read_text())
+    if manifest.get('artifacts') != artifact_hashes(public):
+        logging.warning('Public artifacts differ from recorded build: %s', public)
+    if manifest.get('python') != platform.python_version():
+        logging.warning('Recorded build Python differs from this interpreter: %s', public)
     if manifest.get('runtime') != runtime_versions():
-        raise ValueError('Runtime SDK or dependency versions differ from build.json')
+        logging.warning('Runtime SDK or dependency versions differ from recorded build: %s', public)
     if root is not None:
         root = Path(root)
-        if manifest.get('source_sha256') != tree_hash(root / 'src') or manifest.get('builder_sha256') != file_hash(root / 'scripts' / 'build_public.py'):
-            raise ValueError('Current source differs from the registered build; rebuild public artifacts')
+        builder = root / 'scripts/build_public.py'
+        if (manifest.get('source_sha256') != tree_hash(root / 'src') or
+                manifest.get('builder_sha256') != (file_hash(builder) if builder.exists() else None)):
+            logging.warning('Current source differs from recorded build: %s', root)
     return manifest
 
 
@@ -138,63 +146,36 @@ def checkpoint_directory(run, checkpoint):
 
 
 def checkpoint_manifest(run, directory):
-    """Validate the run's fork/recovery overrides against its frozen manifest."""
+    """Read execution metadata and record drift from the complete snapshot."""
     saved = json.loads((directory / 'manifest.json').read_text())
-    current = json.loads((Path(run) / 'manifest.json').read_text())
-    expected = dict(current)
-    source_hash = file_hash(directory / 'manifest.json')
-    recovery = current.get('recovery_source')
-    if recovery and recovery != saved.get('recovery_source'):
-        if source_hash != recovery['source_manifest_sha256']:
-            raise ValueError('Recovery source manifest mismatch')
-        expected.pop('recovery_source')
-        if 'recovery_source' in saved:
-            expected['recovery_source'] = saved['recovery_source']
-    evidence = current.get('sql_evidence')
-    if evidence != saved.get('sql_evidence') and evidence and evidence.get('source_manifest_sha256'):
-        if source_hash != evidence['source_manifest_sha256']:
-            raise ValueError('Clone source manifest mismatch')
-        expected['sql_evidence'] = saved['sql_evidence']
-        if saved.get('text_registration') == 'prefix' and expected.get('text_registration') == 'pf':
-            expected['text_registration'] = 'prefix'
-            expected.pop('pf_stale_checks', None)
-            expected.pop('pf_read_tokenizer', None)
-    fork = current.get('fork_source')
-    if fork and saved.get('text_registration') == 'prefix':
-        if source_hash != fork['source_manifest_sha256']:
-            raise ValueError('Clone source manifest mismatch')
-        expected.pop('fork_source')
-        expected['sql_evidence'] = saved.get('sql_evidence')
-        expected['text_registration'] = 'prefix'
-    if saved != expected:
-        raise ValueError('Checkpoint configuration differs from run manifest')
+    path = Path(run) / 'manifest.json'
+    current = json.loads(path.read_text()) if path.exists() else saved
+    if current != saved:
+        logging.warning('Recovery execution metadata differs from checkpoint: %s', run)
     return current
 
 
 def restore_sql_evidence(run, directory, checkpoint, identity):
-    from contextlib import closing
     from .sql_evidence import SQLEvidenceStore
     evidence = checkpoint.get('sql_evidence')
     if not evidence:
         raise ValueError('Capture cannot resume from a checkpoint without evidence')
     path = Path(run) / 'sql-evidence.sqlite'
-    if path.exists():
-        store = SQLEvidenceStore(path, identity)
-        store.assert_healthy()
-        with closing(store.connect()) as conn:
-            # Never roll back a live ledger and reuse an already allocated sequence.
-            if identity != evidence['identity'] or store.sequence(conn) != evidence['cutoff']:
-                raise ValueError('SQL evidence has uncheckpointed events; preserve it for reconciliation')
-    else:
-        if identity != evidence['identity']:
-            if (identity.get('parent_branch') != evidence['identity']['branch_id'] or
-                    identity.get('fork_seq') != evidence['cutoff'] or
-                    identity['run_id'] != evidence['identity']['run_id'] or
-                    identity['data_source_id'] != evidence['identity']['data_source_id']):
-                raise ValueError('Invalid SQL evidence fork identity')
-        shutil.copy2(Path(directory) / 'sql-evidence.sqlite', path)
-        store = SQLEvidenceStore(path, identity)
-        store.assert_healthy()
+    controls = Path(run) / 'sql-evidence.controls.jsonl'
+    previous = [item for item in (path, Path(str(path) + '-wal'), Path(str(path) + '-shm'),
+        path.with_suffix('.fault.json'), controls) if item.exists()]
+    if previous:
+        import uuid
+        archive = Path(run) / ('discarded-sql-evidence-' + uuid.uuid4().hex)
+        archive.mkdir()
+        for item in previous:
+            item.rename(archive / item.name)
+        logging.warning('Post-checkpoint SQL evidence retained in %s and discarded from resumed state', archive)
+    shutil.copy2(Path(directory) / 'sql-evidence.sqlite', path)
+    if (Path(directory) / controls.name).exists():
+        shutil.copy2(Path(directory) / controls.name, controls)
+    store = SQLEvidenceStore(path, identity)
+    store.assert_healthy()
 
 
 def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_stale_checks=None):

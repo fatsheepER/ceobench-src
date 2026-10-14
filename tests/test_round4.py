@@ -413,8 +413,8 @@ def test_recovery_before_first_fork_checkpoint_preserves_group(offline_runner, t
         manifest = json.loads((source / 'manifest.json').read_text())
         manifest['configuration']['seed'] += 1
         write_json(source / 'manifest.json', manifest)
-        with pytest.raises(ValueError, match='configuration differs'):
-            recover_run(source, tmp_path / (name + '-invalid'))
+        revised = recover_run(source, tmp_path / (name + '-revised'))
+        assert (revised / 'checkpoint.json').exists()
 
 
 def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_path):

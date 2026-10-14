@@ -468,23 +468,16 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         assert [t['name'] for t in tools][-4:] == ['text_create', 'text_revise', 'text_retire', 'text_list']
 
 
-def test_runner_registration_mode_is_frozen_on_resume(tmp_path, monkeypatch):
+def test_runner_restores_checkpoint_registration_after_requested_change(offline_runner, tmp_path):
     from saas_bench.agents.bash_agent.run_test import BashAgentRunner
-    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', lambda _: {})
-    monkeypatch.setattr('saas_bench.run_state.verify_build', lambda *a, **k: {})
-    monkeypatch.setenv('OPENCODE_API_KEY', 'offline-only')
-    first = BashAgentRunner(provider='opencode', model='test-model', workspace_base=tmp_path, text_registration='prefix')
-    first._prepare_manifest()
+    first = offline_runner(text_registration='prefix')
+    first._save_checkpoint(0)
     assert first.execution_capture
-    restored = BashAgentRunner(continue_from=first.workspace_dir)
+    restored = offline_runner(first.workspace_dir, text_registration='pf')
     assert restored.text_registration == 'prefix'
-    restored._prepare_manifest()
-    with pytest.raises(ValueError, match='registration configuration mismatch'):
-        BashAgentRunner(continue_from=first.workspace_dir, text_registration='pf')
+    assert restored.workspace_dir != first.workspace_dir
     with pytest.raises(ValueError, match='requires execution capture'):
         BashAgentRunner(workspace_base=tmp_path, text_registration='prefix', execution_capture=False)
-    first.client.close()
-    restored.client.close()
 
 
 def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp_path):

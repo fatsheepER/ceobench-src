@@ -4,7 +4,7 @@ from .database import get_cash, get_mrr
 from .scoring import cash_at_advance, score_predictions
 
 
-PRIMARY_METRICS = ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd')
+PRIMARY_METRICS = ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd', 'wall_seconds')
 
 
 def summarize_run(conn, *, run_id, group, seed, repeat, day, reason, usage,
@@ -45,7 +45,8 @@ def summarize_pairs(runs):
         git, pf = pair.get('git'), pair.get('pf')
         comparison = {}
         for metric in PRIMARY_METRICS:
-            values = {group: (run.get('usage') or {}).get('team', {}).get('complete', {}).get(metric)
+            values = {group: (run.get('wall_seconds') if metric == 'wall_seconds' else
+                (run.get('usage') or {}).get('team', {}).get('complete', {}).get(metric))
                 for group, run in pair.items() if not run.get('evidence_fault')}
             left, right = values.get('git'), values.get('pf')
             missing = [group for group, value in (('git', left), ('pf', right)) if value is None]
@@ -62,6 +63,9 @@ def summarize_pairs(runs):
             statuses={g: r['status'] for g, r in pair.items()}, complete_d112=complete,
             cost_breakdown={group: (run.get('usage') or {}).get('team', {}).get('costs')
                             for group, run in pair.items()},
+            waste={group: dict(wall_seconds=run.get('waste_wall_seconds'),
+                wall_seconds_known=run.get('waste_wall_seconds_known'),
+                usage=run.get('waste')) for group, run in pair.items()},
             common_completed_week_end=common_day,
             comparison=comparison, missing_groups=[g for g in ('git', 'pf') if g not in pair]))
     return dict(runs=runs, pairs=pairs, allocated_runs=len(runs), complete_d112_pairs=sum(p['complete_d112'] for p in pairs),

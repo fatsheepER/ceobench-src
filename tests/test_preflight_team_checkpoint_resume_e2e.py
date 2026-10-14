@@ -232,7 +232,7 @@ def process_group_members(group):
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-def test_real_cli_midweek_sigkill_approved_resume_restores_week_boundary(tmp_path, group):
+def test_real_cli_midweek_sigkill_automatic_resume_restores_week_boundary(tmp_path, group):
     source = tmp_path / 'source'
     for name in ('src', 'scripts', 'public', 'public_sources'):
         shutil.copytree(batch.ROOT / name, source / name,
@@ -255,7 +255,7 @@ def test_real_cli_midweek_sigkill_approved_resume_restores_week_boundary(tmp_pat
     bootstrap.write_text(BOOTSTRAP)
     env = dict(os.environ, PYTHONPATH=str(source / 'src'), PYTHONDONTWRITEBYTECODE='1',
         PYTHON_DOTENV_DISABLED='1', PYTHONHASHSEED='0', OPENCODE_API_KEY='OFFLINE-ONLY')
-    for name in ('CEOBENCH_RECOVERY_APPROVAL', 'CEOBENCH_RECOVERY_APPROVAL_SHA256',
+    for name in ('CEOBENCH_RECOVERY_CHECKPOINTS',
                  'BOSSBENCH_LLM_REPLAY_DB', 'ORACLE_MODE', 'CEOBENCH_READ_ONLY_TASK'):
         env.pop(name, None)
 
@@ -294,18 +294,8 @@ def test_real_cli_midweek_sigkill_approved_resume_restores_week_boundary(tmp_pat
     assert tree_hash(first / 'runtime/roles', exact=True) != tree_hash(snapshot / 'roles', exact=True)
     immutable = {path: path.read_bytes() for path in (manifest_path, first / 'attempt.json')}
     source_before, snapshot_before = tree_hash(first, exact=True), tree_hash(snapshot, exact=True)
-    declaration = directory / 'declaration.json'
-    write_json(declaration, dict(fix_classification='harness_fix', fix_commit=commit, affected_files=[],
-        reason='Approve an isolated offline rollback after all tool clients closed and the worker was killed',
-        evidence=[str(directory / 'kill-ready.json')], attempts={entry['run_id']: dict(checkpoint=str(snapshot))}))
-    approval = subprocess.run([os.sys.executable, str(source / 'scripts/team_recovery.py'),
-        '--manifest', str(manifest_path), '--output', str(directory / 'approval'),
-        '--declaration', str(declaration), '--source-root', str(source), '--approve'],
-        cwd=source, env=env, capture_output=True, text=True, timeout=45)
-    assert approval.returncode == 0, approval.stderr
-    receipt = json.loads(approval.stdout)
     resumed = subprocess.run(command('resume'), cwd=source,
-        env=dict(env, CEOBENCH_RECOVERY_APPROVAL=receipt['path'], CEOBENCH_RECOVERY_APPROVAL_SHA256=receipt['sha256']),
+        env=dict(env, CEOBENCH_RECOVERY_CHECKPOINTS=json.dumps({entry['run_id']: str(snapshot)})),
         capture_output=True, text=True, timeout=180)
     assert resumed.returncode == 0, resumed.stderr
     observed = batch.read(directory / 'restored-ready.json')

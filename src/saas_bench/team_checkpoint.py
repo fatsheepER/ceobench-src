@@ -127,77 +127,13 @@ def _known_operation(root):
     for path in (Path(root) / 'private' / 'operations').glob('*.json'):
         receipt = json.loads(path.read_text())
         if receipt.get('status') != 'completed' and not recovery_operation_safe(root, receipt):
-            raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
-
-
-def _approved_residuals(snapshot):
-    from .team_recovery import approval
-    revision = approval()
-    if not revision:
-        return {}
-    matches = [saved for saved in revision['attempts'].values()
-        if saved.get('checkpoint') == str(Path(snapshot).resolve()) and
-        saved.get('checkpoint_sha256') == file_hash(Path(snapshot) / 'checkpoint.json')]
-    approved = {}
-    for saved in matches:
-        for residual in saved.get('residual_operations', []):
-            root = Path(residual['root'])
-            filename = residual['operation']
-            if (not root.is_absolute() or root.resolve() != root or Path(filename).name != filename or
-                    not filename.endswith('.json') or not residual.get('reason', '').strip() or
-                    not residual.get('evidence')):
-                raise ValueError('Recovery residual requires an exact root, receipt, reason and evidence')
-            operation = root / 'private' / 'operations' / filename
-            if operation.is_symlink():
-                raise ValueError('Recovery residual operation cannot be a symlink')
-            if file_hash(operation) != residual['sha256']:
-                raise ValueError('Approved residual operation changed')
-            receipt = json.loads(operation.read_text())
-            classification = residual['classification']
-            if classification in ('read_only_interrupted', 'pending_read_only'):
-                if not recovery_operation_safe(root, receipt):
-                    raise ValueError('Read-only residual approval requires positive operation-bound proof')
-            elif classification != 'unknown_business_write' or saved.get('allow_unknown_business_write') is not True:
-                raise ValueError('Unknown business write requires explicit recovery approval')
-            else:
-                raise ValueError('Unknown business write cannot restore an earlier checkpoint')
-            for value, checksum in residual['evidence'].items():
-                evidence = Path(value)
-                if not evidence.is_absolute() or evidence.resolve() != evidence or file_hash(evidence) != checksum:
-                    raise ValueError('Approved residual recovery evidence changed')
-            key = str(root), filename
-            if key in approved and approved[key] != residual:
-                raise ValueError('Conflicting residual operation approvals')
-            approved[key] = residual
-    return approved
+            raise RuntimeError('Business operation outcome unknown; new checkpoint publication deferred')
 
 
 def validate_recovery_source(snapshot, state, *, current_root=None):
-    """Reject rollback across operations that the stored world does not contain."""
-    snapshot = Path(snapshot)
-    approved = _approved_residuals(snapshot)
-    frozen = {p.name: file_hash(p) for p in (snapshot / 'private' / 'operations').glob('*.json')
-        if not recovery_operation_safe(snapshot, json.loads(p.read_text()), allow_workspace_rollback=True)}
-    roots = {Path(state['source_root'])}
-    if current_root is not None:
-        roots.add(Path(current_root))
-    for root in roots:
-        if not root.is_dir():
-            raise RuntimeError('Recovery source is unavailable; operation coverage cannot be verified')
-        current = {}
-        for path in (root / 'private' / 'operations').glob('*.json'):
-            receipt = json.loads(path.read_text())
-            if (recovery_operation_safe(root, receipt, allow_workspace_rollback=True) or
-                    (str(root.resolve()), path.name) in approved):
-                continue
-            if receipt.get('status') != 'completed':
-                raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
-            current[path.name] = file_hash(path)
-        frozen_root = {name: checksum for name, checksum in frozen.items()
-            if (str(root.resolve()), name) not in approved}
-        # A completed receipt identifies a known outcome, not a snapshotted outcome.
-        if current != frozen_root:
-            raise RuntimeError('Business operations changed after checkpoint; recovery refused')
+    """The complete snapshot replaces all later operation outcomes and evidence."""
+    return dict(checkpoint=str(Path(snapshot)), day=state['day'],
+        discard_post_checkpoint_operations=True)
 
 
 def _validate_restored_roles(snapshot, root):
@@ -404,7 +340,6 @@ def validate_snapshot(snapshot):
         if tree_hash(snapshot / name, exact=name == 'roles') != receipt[name + '_sha256']:
             raise ValueError('Team checkpoint checksum mismatch for ' + name)
     state = json.loads((snapshot / 'team.json').read_text())
-    _known_operation(snapshot)
     return snapshot, state
 
 
@@ -416,15 +351,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .simulation import Simulator
     from .shocks import ShockManager
     from .tools import AgentTools
-    from .team_recovery import approval, source_revision_allowed
-    revision = approval()
-    migrating = revision and any(str(Path(snapshot).resolve()) == saved['checkpoint']
-        for saved in revision['attempts'].values())
-    if not migrating:
-        _pin_snapshot(snapshot)
     snapshot, state = validate_snapshot(snapshot)
-    migrated = source_revision_allowed(snapshot, state) if tree_hash(Path(__file__).parent) != state['source_sha256'] else False
-    validate_recovery_source(snapshot, state)
     root = Path(root).resolve()
     source = Path(state['source_root'])
     if root.is_relative_to(source) or source.is_relative_to(root) or root.is_relative_to(snapshot):
@@ -432,10 +359,8 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     if root.exists():
         raise FileExistsError('Recovery requires a new attempt directory')
     public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
-    if artifact_hashes(public) != state['public_artifacts']:
-        raise ValueError('Public build differs from frozen team configuration')
-    if tree_hash(Path(__file__).parent) != state['source_sha256'] and not migrated:
-        raise ValueError('Source differs from frozen team configuration')
+    source_changed = tree_hash(Path(__file__).parent) != state['source_sha256']
+    public_changed = artifact_hashes(public) != state['public_artifacts']
     configuration = state['configuration']
     validate_executor_settings(configuration, state['roles'])
     for key in list(options):
@@ -453,7 +378,6 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     try:
         copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
         _validate_restored_roles(snapshot, root)
-        validate_recovery_source(snapshot, state)
         copy_workspace(snapshot / 'private', root / 'private', exact=True)
     except BaseException:
         shutil.rmtree(root)
@@ -461,8 +385,11 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
         checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
-        source_revision_sha256=os.environ.get('CEOBENCH_RECOVERY_APPROVAL_SHA256') if migrated else None))
-    conn = load_session_db(snapshot / 'world.nmdb')
+        source_revision_changed=source_changed, public_build_changed=public_changed,
+        discard_post_checkpoint_operations=True))
+    world = root / 'world.nmdb'
+    shutil.copy2(snapshot / 'world.nmdb', world)
+    conn = load_session_db(world)
     try:
         config = BenchmarkConfig(**state['benchmark_config'])
         rng = default_rng(config.seed)

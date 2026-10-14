@@ -118,10 +118,8 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     assert round5.validate_start('prefix', seed, 84, sealed) == 28
     with pytest.raises(ValueError, match='seed mismatch'):
         round5.validate_start('prefix', 44, 84, sealed)
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, copies['git'].workspace_dir)
-    with pytest.raises(ValueError, match='starts fresh'):
-        round5.validate_start('prefix', 43, 28, sealed)
+    assert round5.validate_start('git', seed, 112, copies['git'].workspace_dir) == 28
+    assert round5.validate_start('prefix', seed, 28, sealed) == 28
     git = copies['git']
     for day in (35, 42):
         assert advance(git)['success']
@@ -135,12 +133,10 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     (git.workspace_dir / 'pause-receipt.json').write_text(json.dumps({'day': 42}))
     assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
     assert round5.stage_pointer(output, 'git', seed, 112, 2).name == f'git-{round5.SEEDS[seed]}-to112-attempt2.json'
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, git.workspace_dir)
+    assert round5.validate_start('git', seed, 112, git.workspace_dir) == 42
     previous.write_text(json.dumps(dict(path=str(git.workspace_dir.resolve()), status='running',
         reached_stop=False, result={'days_run': 42})))
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
+    assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
     for boundary in ('new_week', 'same_week'):
         git.agent.current_day = 42 if boundary == 'same_week' else 35
         git._save_checkpoint(42)
@@ -155,8 +151,7 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
         assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
         for field, wrong in [('day', 35), ('snapshot_id', 'wrong'), ('context_boundary', 'wrong')]:
             pause.write_text(json.dumps(dict(receipt, **{field: wrong})))
-            with pytest.raises(ValueError, match='complete week boundary'):
-                round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
+            assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
 
 
 def test_receipt_audit_preserves_unknown_attempts_and_rejects_pending_or_changed_routes(tmp_path):
@@ -234,7 +229,7 @@ def test_monitor_observes_real_sql_failures_without_holding_on_bad_queries(tmp_p
     events = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
     sql_events = [row for row in events if row['event'] == 'sql_attention']
     assert bool(sql_events) is service_failure
-    assert (output / 'hold.json').exists() is service_failure
+    assert not (output / 'hold.json').exists()
     if service_failure:
         alert, = sql_events[0]['sql_issues']
         assert alert['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE

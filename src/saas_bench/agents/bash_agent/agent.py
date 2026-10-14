@@ -51,24 +51,6 @@ def _pause_model_deadline():
             signal.setitimer(signal.ITIMER_REAL, *timer)
 
 
-@contextmanager
-def _model_deadline(seconds=600):
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    def timeout(signum, frame):
-        raise LLMTimeoutError(f'LLM call exceeded {seconds}s wall-clock timeout')
-    old = signal.signal(signal.SIGALRM, timeout)
-    signal.alarm(seconds)
-    _MODEL_CLOCK.active = True
-    try:
-        yield
-    finally:
-        _MODEL_CLOCK.active = False
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
-
-
 @dataclass
 class Message:
     """A message in the conversation."""
@@ -511,18 +493,13 @@ class BashAgent(BaseAgent):
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
-            lifecycle.watch_client(self.client)
+            self.usage_recorder.lifecycle = lifecycle
             lifecycle.check(retry=getattr(self, '_llm_attempt', 0) > 0)
-            original = invoke
-            def invoke():
-                with lifecycle.model_call():
-                    return original()
         self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
         try:
             self.usage_recorder.message_ids = [m.message_id for m in self.conversation]
-            with _model_deadline():
-                response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
-                                                    turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+            response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
+                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
         except Exception as exc:
             status = getattr(exc, 'status_code', 0) or 0
             if 400 <= status < 500 and status not in (408, 409, 429):

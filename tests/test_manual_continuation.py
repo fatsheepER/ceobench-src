@@ -30,7 +30,7 @@ def test_manual_resumes_have_no_cumulative_limit(frozen, tmp_path, legacy_cap):
     assert len(batch.attempts(entry)) == 6
 
 
-def test_manual_resumes_keep_hold_lock_and_checkpoint_guards(managed_team):
+def test_resume_ignores_historical_hold_and_operation_tail_but_keeps_active_lock(managed_team):
     _, directory, record, manifest, entry = managed_team
     path = directory / 'manifest.json'
     record['status'] = 'paused'
@@ -43,19 +43,18 @@ def test_manual_resumes_keep_hold_lock_and_checkpoint_guards(managed_team):
     before = (directory / 'attempt.json').read_bytes()
     hold = path.parent / 'HOLD'
     hold.touch()
-    with pytest.raises(ValueError, match='HOLD'):
-        batch.register_attempt(path, manifest, entry, resume=True)
-    hold.unlink()
+    created, resumed, source = batch.register_attempt(path, manifest, entry, resume=True)
+    assert source == Path(record['checkpoint']) and created.name == 'attempt-005'
+    assert hold.exists()
     with pytest.raises(ValueError, match='already active'):
         with batch.run_lock(Path(entry['output_dir'])):
             pass
     operations = directory / 'runtime/private/operations'
     operations.mkdir(parents=True)
     write_json(operations / 'unsnapshotted.json', dict(status='completed'))
-    with pytest.raises(RuntimeError, match='after checkpoint'):
-        batch.register_attempt(path, manifest, entry, resume=True)
+    created, resumed, source = batch.register_attempt(path, manifest, entry, resume=True)
+    assert source == Path(record['checkpoint']) and created.name == 'attempt-006'
     assert (directory / 'attempt.json').read_bytes() == before
-    assert not (directory.parent / 'attempt-005').exists()
 
 
 def test_attempt_numbering_remains_monotonic_beyond_three_digits(tmp_path):
@@ -75,7 +74,6 @@ def test_attempt_numbering_remains_monotonic_beyond_three_digits(tmp_path):
 @pytest.mark.parametrize('policy', [
     dict(attempt_policy='automatic_retry'), dict(max_attempts=0), dict(max_attempts=True),
 ])
-def test_manual_resume_manifest_rejects_invalid_policy(frozen, tmp_path, policy):
+def test_historical_attempt_policy_does_not_block_recovery(frozen, tmp_path, policy):
     path = changed_manifest(frozen, tmp_path, lambda manifest: manifest.update(policy))
-    with pytest.raises(ValueError, match='attempt'):
-        batch.validate_manifest(path)
+    assert batch.validate_manifest(path)['attempt_policy'] == policy.get('attempt_policy', 'automatic_checkpoint_recovery')

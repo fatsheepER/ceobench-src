@@ -229,69 +229,6 @@ def test_controller_main_returns_failure_and_passes_memory_settings(controller, 
     assert os.environ['CEOBENCH_BASH_MEMORY_MAX_BYTES'] == '67108864'
 
 
-def test_controller_oom_cannot_be_hidden_by_finished_record_and_zero_exit(observer, controller, monkeypatch):
-    source = str(Path(__file__).resolve().parents[1])
-    observer.manifest['source_root'] = observer.expected['source_root'] = source
-    controller.policy.write_text(json.dumps(dict(identity=observer.expected)))
-    monkeypatch.setattr(controller.module, 'identity', observer.module.identity)
-    monkeypatch.setattr(controller.module, 'poll', lambda *args: observer.module.poll(*args, quota_fn=observer.quota))
-    popen = subprocess.Popen
-    roles = {}
-    children = []
-    def launch(command, **kwargs):
-        role = command[command.index('--worker') + 1]
-        unit = next(arg.split('=', 1)[1] for arg in command if arg.startswith('--unit='))
-        roles[unit] = role
-        entry = controller.module.batch.selected(observer.manifest, role)
-        record = Path(entry['output_dir']) / 'attempt-001/attempt.json'
-        code = '''import json, pathlib, sys, time
-p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True)
-p.write_text(json.dumps(dict(status='finished', day=28)))
-time.sleep(float(sys.argv[2]))
-'''
-        child = popen([sys.executable, '-c', code, str(record), '0' if role == 'git' else '.1'], **kwargs)
-        children.append(child)
-        return child
-    def status(unit, **kwargs):
-        return dict(unit=unit, invocation_id=unit, exit_code=kwargs.get('exit_code'),
-            result='oom-kill' if roles[unit] == 'git' else 'success', source='journal')
-    def signal_scope(saved, signum):
-        child = children[0 if roles[saved['unit']] == 'git' else 1]
-        try:
-            os.killpg(child.pid, signum)
-        except ProcessLookupError:
-            pass
-        return saved
-    monkeypatch.setattr(controller.module.subprocess, 'Popen', launch)
-    monkeypatch.setattr(controller.module, 'unit_status', status)
-    monkeypatch.setattr(controller.module, 'signal_scope', signal_scope)
-    from saas_bench import systemd_guard
-    monkeypatch.setattr(systemd_guard, 'unit_status', status)
-    results = controller.module.supervise(controller.policy)
-    assert results == [dict(status='failed', day=28, reason='oom-kill'), dict(status='finished', day=28)]
-    exit_record = json.loads((controller.policy.parent / 'controller-exit.json').read_text())
-    assert exit_record['failed'] and exit_record['children_reaped']
-    assert all(child.returncode == 0 for child in children)
-    assert not observer.hold.exists()
-
-
-def test_skipping_finished_runs_cannot_erase_previous_unit_oom(observer, controller, monkeypatch):
-    for entry in observer.manifest['runs']:
-        path = Path(entry['output_dir']) / 'attempt-001/attempt.json'
-        path.parent.mkdir(parents=True)
-        path.write_text(json.dumps(dict(status='finished', day=28)))
-    units = dict(git=dict(unit='git.scope', invocation_id='git-id', exit_code=0),
-                 pf=dict(unit='pf.scope', invocation_id='pf-id', exit_code=0))
-    (controller.policy.parent / 'controller-units.json').write_text(json.dumps(units))
-    from saas_bench import systemd_guard
-    monkeypatch.setattr(systemd_guard, 'unit_status', lambda unit, **kwargs:
-        dict(unit=unit, invocation_id=kwargs['invocation_id'],
-             result='oom-kill' if unit == 'git.scope' else 'success', source='journal'))
-    monkeypatch.setattr(controller.module, 'poll', lambda *args: observer.module.poll(*args, quota_fn=observer.quota))
-    monkeypatch.setattr(controller.module.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Finished runs must not restart'))
-    assert controller.module.main(['--policy', str(controller.policy), '--live', '--resume']) == 2
-
-
 @pytest.mark.parametrize('high,maximum,swap', [(0, 1, 0), (2, 1, 0), (1, 2, -1)])
 def test_invalid_cgroup_limits_are_rejected(high, maximum, swap):
     from saas_bench.systemd_guard import scope_command

@@ -38,7 +38,7 @@ def test_empty_ceo_script_pass_clears_results_and_preserves_recovery(tmp_path, m
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_nonempty_ceo_script_pass_keeps_receipt_and_blocks_old_restore(tmp_path, mode):
+def test_nonempty_ceo_script_pass_is_discarded_by_old_checkpoint_restore(tmp_path, mode):
     source = make_team(tmp_path / 'source', mode)
     try:
         snapshot = source.checkpoint()
@@ -50,16 +50,18 @@ def test_nonempty_ceo_script_pass_keeps_receipt_and_blocks_old_restore(tmp_path,
             dict(kind='ceo_scripts', day=0, status='completed')]
         assert wrappers[0]['wrapper_version'] == 1
         assert wrappers[0]['recovery']['classification'] == 'unproven'
-        with pytest.raises(RuntimeError, match='after checkpoint'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
-                client_factory=clients(), simulator_factory=fast_simulator)
-        assert not (tmp_path / 'restored').exists()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        try:
+            assert not (restored.roles['ceo'].workspace / 'script-days.txt').exists()
+        finally:
+            dispose(restored)
     finally:
         dispose(source)
 
 
 @pytest.mark.parametrize("mode", ["git", "pf"])
-def test_completed_post_checkpoint_write_cannot_be_replayed(tmp_path, mode):
+def test_completed_post_checkpoint_write_is_rolled_back(tmp_path, mode):
     source = make_team(tmp_path / "source", mode)
     restored = None
     try:
@@ -69,9 +71,10 @@ def test_completed_post_checkpoint_write_cannot_be_replayed(tmp_path, mode):
         operations = [json.loads(p.read_text()) for p in (source.root/"private/operations").glob("*.json")]
         assert operations and all(op["status"] == "completed" for op in operations)
         validate_snapshot(snapshot)
-        with pytest.raises(RuntimeError, match="after checkpoint"):
-            restored = MultiAgentRuntime.restore(snapshot, tmp_path/"restored", client_factory=clients(), simulator_factory=fast_simulator)
-        assert not (tmp_path/"restored").exists()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path/"restored", client_factory=clients(), simulator_factory=fast_simulator)
+        assert restored.server.conn.execute("SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1").fetchone()[0] != 29
+        dispose(restored)
+        restored = None
         fresh = source.checkpoint()
         _, state = validate_snapshot(fresh)
         validate_recovery_source(fresh, state)
@@ -84,7 +87,7 @@ def test_completed_post_checkpoint_write_cannot_be_replayed(tmp_path, mode):
 
 
 @pytest.mark.parametrize("change", ["added_completed", "changed_completed", "missing", "latest_attempt_tail"])
-def test_receipt_coverage_includes_completed_and_latest_attempt_operations(tmp_path, change):
+def test_post_checkpoint_receipts_do_not_block_complete_snapshot(tmp_path, change):
     from saas_bench.run_state import write_json
     snapshot = tmp_path/"checkpoint"
     source = tmp_path/"source"
@@ -92,7 +95,7 @@ def test_receipt_coverage_includes_completed_and_latest_attempt_operations(tmp_p
     receipt = dict(kind="api:research_market", day=7, status="completed")
     for root in (snapshot, source, latest):
         write_json(root/"private/operations/covered.json", receipt)
-    state = {"source_root":str(source)}
+    state = {"source_root":str(source), "day":7}
     validate_recovery_source(snapshot, state, current_root=latest)
     if change == "added_completed":
         write_json(source/"private/operations/new.json", receipt)
@@ -102,14 +105,13 @@ def test_receipt_coverage_includes_completed_and_latest_attempt_operations(tmp_p
         (source/"private/operations/covered.json").unlink()
     else:
         write_json(latest/"private/operations/new.json", receipt)
-    with pytest.raises(RuntimeError, match="after checkpoint"):
-        validate_recovery_source(snapshot, state, current_root=latest)
+    audit = validate_recovery_source(snapshot, state, current_root=latest)
+    assert audit['discard_post_checkpoint_operations'] is True
 
 
-def test_unavailable_source_refuses_automatic_recovery(tmp_path):
-    state = {"source_root":str(tmp_path/"missing-source")}
-    with pytest.raises(RuntimeError, match="unavailable"):
-        validate_recovery_source(tmp_path/"checkpoint", state)
+def test_recovery_does_not_need_old_live_source(tmp_path):
+    state = {"source_root":str(tmp_path/"missing-source"), "day":21}
+    assert validate_recovery_source(tmp_path/"checkpoint", state)['day'] == 21
 
 
 def test_real_restore_rolls_back_portable_link_targets(tmp_path):
@@ -143,7 +145,7 @@ from test_preflight_team_batch import frozen, changed_manifest
 
 
 @pytest.mark.parametrize('tail_owner', ['snapshot_source', 'latest_attempt'])
-def test_batch_refuses_uncovered_operations_before_new_attempt_registration(frozen, tmp_path, tail_owner):
+def test_batch_registers_new_attempt_and_discards_post_checkpoint_operations(frozen, tmp_path, tail_owner):
     from saas_bench import team_batch as batch
     from saas_bench.run_state import write_json
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
@@ -166,7 +168,8 @@ def test_batch_refuses_uncovered_operations_before_new_attempt_registration(froz
         write_json(target/'runtime/private/operations/tail.json',
             dict(kind='api:research_market', day=7, status='completed'))
         before = batch.attempts(entry)
-        with pytest.raises(RuntimeError, match='after checkpoint'):
-            batch.register_attempt(path, manifest, entry, resume=True)
-        assert batch.attempts(entry) == before
-        assert not (Path(entry['output_dir'])/f'attempt-{len(before)+1:03}').exists()
+        original = {directory / 'attempt.json': (directory / 'attempt.json').read_bytes() for directory in before}
+        created, resumed, source = batch.register_attempt(path, manifest, entry, resume=True)
+        assert source == snapshot and resumed['source_checkpoint'] == str(snapshot)
+        assert created.name == f'attempt-{len(before)+1:03}'
+        assert {path: path.read_bytes() for path in original} == original

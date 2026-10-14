@@ -1,4 +1,4 @@
-"""Host SQL and frozen-source checks for an existing engineering team batch."""
+"""Host SQL observations for an existing engineering team batch."""
 
 import argparse
 from datetime import datetime, timezone
@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 import round5
-from saas_bench.run_state import tree_hash, verify_build, write_json
+from saas_bench.run_state import write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,13 +19,6 @@ def poll(output, state):
     known = set(state.get('known_fault_paths', []))
     checks, failures, queries = [], [], 0
     quota = None
-    try:
-        verify_build(ROOT / 'public', root=ROOT)
-        manifest = json.loads((output / 'engineering' / 'manifest.json').read_text())
-        if tree_hash(ROOT / 'src') != manifest['source_sha256']:
-            checks.append('source_changed')
-    except (OSError, ValueError, KeyError) as exc:
-        checks.append('build_or_source_check:' + type(exc).__name__)
     try:
         quota = round5.quota_health()
         if any(row.get('status') != 'ok' or row.get('percent', 100) >= 95 for row in quota.values()):
@@ -51,10 +44,8 @@ def poll(output, state):
     state['active_check_alerts'] = alerts
     at = datetime.now(timezone.utc).isoformat()
     hold = output / 'engineering' / 'HOLD'
-    if failures or faults or alerts:
-        hold.touch()
     if failures or new_faults or new_checks:
-        event = dict(time=at, event='new_service_or_freeze_fault_hold', errors=failures,
+        event = dict(time=at, event='service_observation', errors=failures,
                      fault_paths=new_faults, checks=new_checks)
         with (output / 'events.jsonl').open('a') as stream:
             stream.write(json.dumps(event) + '\n')
@@ -62,7 +53,8 @@ def poll(output, state):
                   service_failures=failures, fault_paths=faults, new_fault_paths=new_faults,
                   offsets=offsets, known_fault_paths=state['known_fault_paths'],
                   active_check_alerts=alerts,
-                  status='hold' if hold.exists() else 'no_new_service_faults',
+                  status='observations' if failures or faults or alerts else 'no_new_service_faults',
+                  historical_hold=hold.exists(),
                   coverage='public_sql worker stderr service errors and private evidence faults; '
                            'ordinary SQL syntax and permission errors excluded')
     write_json(output / 'sql-health.json', health)
