@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 
-from .model_usage import FIELDS, cost_usd, load_pricing, usage_values
+from .model_usage import FIELDS, add_billing, billing_assessment, billing_totals, load_pricing, usage_values
 from .role_policy import ROLES
 
 
@@ -89,14 +89,16 @@ def _accounting_row(row):
 def _summary(records):
     known = {field: None for field in METRICS}
     missing = dict.fromkeys(METRICS, 0)
+    costs = billing_totals()
     for record in records:
+        add_billing(costs, record['cost'])
         for field in METRICS:
             value = record['metrics'][field]
             if value is None:
                 missing[field] += 1
             else:
                 known[field] = (known[field] or 0) + value
-    return dict(billed_units=len(records), known=known, missing=missing,
+    return dict(billed_units=len(records), known=known, missing=missing, costs=costs,
                 complete={field: known[field] if records and not missing[field] else None for field in METRICS},
                 failed_http_attempts=sum(record['failed_http_attempt'] for record in records),
                 unreturned_requests=len({r['call_id'] for r in records if r['unreturned']}),
@@ -244,11 +246,13 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
             model = ((logical or {}).get('response') or {}).get('model') or body.get('model')
             timestamp = http_request.get('timestamp') or request.get('timestamp')
             rates = prices['rates'].get(model)
-            timed = rates and any(key in rates for key in ('valid_from', 'valid_until', 'peak_schedule'))
             at = datetime.fromisoformat(timestamp) if timestamp else datetime.min.replace(tzinfo=timezone.utc)
             if timestamp and at.tzinfo is None:
                 raise ValueError('Receipt timestamp requires a timezone')
-            fee = cost_usd(usage, api, rates, at=at) if api and not (timed and not timestamp) else None
+            recorded = _number((logical or {}).get('cost_usd'))
+            cost = billing_assessment(usage, api, rates, at=at if timestamp else None,
+                                      recorded_cost=recorded)
+            fee = cost['usd']
             failed = bool(attempt_id and (http.get('error') or http.get('status', 0) >= 400 or attempt.get('http_error')))
             if attempt_id and not http_request:
                 gaps.append(dict(call_id=call_id, attempt_id=attempt_id, reason='missing_http_request'))
@@ -257,10 +261,10 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
             metrics = dict(usage, total_tokens=(usage['input_tokens'] + usage['output_tokens']
                 if usage['input_tokens'] is not None and usage['output_tokens'] is not None else None),
                 uniform_cost_usd=fee, raw_billed_cost_usd=_raw_cost(http or logical or {}, body),
-                recorded_cost_usd=_number((logical or {}).get('cost_usd')))
+                recorded_cost_usd=recorded)
             receipt = http or attempt.get('http_error') or logical or {}
             records.append(dict(call_id=call_id, attempt_id=attempt_id, role=role,
-                category=call['category'], day=day, model=model, api=api, metrics=metrics,
+                category=call['category'], day=day, model=model, api=api, metrics=metrics, cost=cost,
                 failed_http_attempt=failed, unreturned=response is None,
                 no_response=response is None or response.get('response') is None,
                 request_receipt=dict(path=request.get('receipt_path'), line=request.get('receipt_line')),

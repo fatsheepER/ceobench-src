@@ -146,6 +146,7 @@ tests/*
 !tests/test_pf_registration_scope.py
 !tests/test_pf_text_search.py
 !tests/test_pf_review_changes.py
+!tests/test_pf_pipeline_receipts.py
 !tests/test_prefix_week_binding.py
 !tests/test_simulator_service_failures.py
 !tests/test_round4.py
@@ -157,6 +158,7 @@ tests/*
 tests/fixtures/*
 !tests/fixtures/original_bash_agent.json
 !tests/fixtures/round4_pf_commands.json
+!tests/fixtures/pf_pipeline_d63_growth.json
 tools/
 variants/
 viz/

@@ -174,9 +174,13 @@ def test_published_condition_and_review_examples(workspace, tmp_path, server, te
     send(store, partial)
     saved = registry.path.read_bytes()
     rejected = executor.execute('text_create', args)
-    assert rejected.startswith('Error:') and 'not been delivered in this request' in rejected, rejected
+    assert rejected.startswith('Error: PF output was displayed'), rejected
+    assert 'pf_pipeline_source_ranges_unknown' in rejected and 'Selected fields cannot be registered' in rejected
     assert registry.path.read_bytes() == saved
-    send(store, executor.execute('bash', {'command': show_query}))
+    recovery = re.search(r'```bash\n(.*?)\n```', rejected, re.S)[1]
+    assert recovery == 'pf show --full -- query1@v1'
+    send(store, executor.execute('bash', {'command': recovery}))
+    assert executor.execute('text_create', args).startswith('Registered r2.1')
     revise = example(pf_cli.HELP)
     PF_REVISE.model_validate(revise)
     inherited = dict(revise)

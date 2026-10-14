@@ -276,13 +276,13 @@ def model_issue(row):
         return 'http_or_provider_error'
     if row['event'] == 'response':
         if row.get('error'):
+            if row['error'] == 'RunCancelled' and row.get('response') is None:
+                return 'model_call_interrupted'
             return 'model_call_error'
-        if any(row.get('usage', {}).get(k) is None for k in ('input_tokens', 'output_tokens', 'cached_tokens')):
-            return 'missing_usage'
-        if row.get('cost_usd') is None:
-            return 'missing_cost'
         if row.get('response', {}).get('model') != MODEL:
             return 'served_model_changed'
+        if any((row.get('usage') or {}).get(k) is None for k in ('input_tokens', 'output_tokens')):
+            return 'missing_usage'
     return None
 
 
@@ -389,11 +389,17 @@ def integrity(run, mode, expected_day=None, output=OUT):
 
 def monitor(args):
     """Five-minute local checks; stdout contains only new problems or stage completion."""
+    from team_model_monitor import finish_billing, record_billing
     output = args.output_dir.resolve()
     pointer = stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt)
     previous = read(output / f'{stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt - 1).stem}-cursor.json', {}) if args.attempt > 1 else {}
     state = dict(offsets=previous.get('offsets', {}), sql_cursor=previous.get('sql_cursor', {}),
+                 billing_requests=previous.get('billing_requests', {}),
+                 billing_groups=previous.get('billing_groups', {}),
+                 billing_pending=previous.get('billing_pending', []),
                  alerts=set(), milestones=set())
+    if previous.get('offsets') and 'billing_groups' not in previous:
+        state['offsets'] = dict.fromkeys(state['offsets'], 0)
     argv = [sys.executable, '-u', str(Path(__file__).resolve()), 'run', args.mode,
             '--seed', str(args.seed), '--stop-after-day', str(args.stop_after_day), '--output-dir', str(output),
             '--attempt', str(args.attempt)]
@@ -426,14 +432,22 @@ def monitor(args):
                       if run and (run / name).exists()]
             issues = []
             counts = {}
+            billing_changed = state['billing_pending']
+            billing_complete = True
             for role in ('agent', 'simulator'):
                 path = run / 'logs' / f'{role}_requests.jsonl' if run else None
                 if path:
                     rows, state['offsets'][role] = read_increment(path, state['offsets'].get(role, 0))
+                    if path.exists():
+                        billing_complete &= state['offsets'][role] == path.stat().st_size
                     new = [dict(role=role, issue=problem, call_id=row.get('call_id'), attempt_id=row.get('attempt_id'), path=str(path))
                            for row in rows if (problem := model_issue(row))]
                     counts[role] = len({row['call_id'] for row in new})
                     issues.extend(new)
+                    for row in rows:
+                        if recorded := record_billing(row, state, f'{args.mode}-s{args.seed}', path):
+                            billing_changed.append(recorded)
+            bill_warnings = finish_billing(state, billing_complete)
             sql_issues = []
             if run:
                 sql_issues, state['sql_cursor'] = sql_failures(run, state['sql_cursor'], drain=rc is not None)
@@ -459,15 +473,19 @@ def monitor(args):
                 day=week.get('day', cp.get('day', 0)), checkpoint_day=cp.get('day'), status=status,
                 idle_seconds=round(idle), warnings=warnings, new_errors=counts, issues=issues,
                 pointer=str(pointer), path=str(run) if run else None, quota=quota, sql_issues=sql_issues)
+            summary['billing_warnings'] = bill_warnings
+            summary['billing_coverage'] = state['billing_coverage']
             for warning in warnings:
                 if warning not in state['alerts']:
                     event('attention', dict(summary, warning=warning))
                     state['alerts'].add(warning)
             if issues:
                 event('model_attention', summary)
+            if bill_warnings:
+                event('billing_attention', summary)
             if sql_issues:
                 event('sql_attention', summary)
-            if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
+            if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
                 locked_write(output, 'hold.json', summary)
             for day in (210, 280, 350, 420):
                 if args.stop_after_day == 497 and cp.get('day', 0) >= day and day not in state['milestones']:
@@ -484,6 +502,9 @@ def monitor(args):
             with (output / 'health.jsonl').open('a') as stream:
                 stream.write(json.dumps(health) + '\n')
             write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], sql_cursor=state['sql_cursor'],
+                                                                 billing_requests=state['billing_requests'],
+                                                                 billing_groups=state['billing_groups'],
+                                                                 billing_pending=state['billing_pending'],
                                                                  alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
             if rc is not None:
                 event('stage_finished', summary)
