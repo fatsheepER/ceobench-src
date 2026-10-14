@@ -137,7 +137,8 @@ def test_help_peer_example_reads_exact_version_and_compares_one_object():
         assert '--- growth:notes.md@v1\n+++ growth:notes.md@v2' in changes
 
 
-def test_published_condition_and_review_examples(workspace, tmp_path, server):
+@pytest.mark.parametrize('team', [False, True])
+def test_published_condition_and_review_examples(workspace, tmp_path, server, team):
     store, registry, executor = captured(workspace, tmp_path)
     server.sql_evidence = store
     executor.pf_queries.refresh = lambda versions, parent: refresh(server, versions, parent)
@@ -145,7 +146,7 @@ def test_published_condition_and_review_examples(workspace, tmp_path, server):
     server.conn.execute('UPDATE ledger SET amount=60')
     server.conn.commit()
     version = record_sql(store, sql, execute_query(server, sql))
-    args = example(tool_definitions(pf=True)[0]['description'])
+    args = example(tool_definitions(pf=True, team=team)[0]['description'])
     assert set(args) == {'text', 'objects', 'references', 'applies', 'reason'}
     PF_CREATE.model_validate(args)
     assert args['references'][0]['cite'] == registry.resolver.handle(version)

@@ -80,9 +80,9 @@ All handles and cursors below illustrate formats only. Replace them with actual 
 - more: If a needed result continues, use `pf more c2` with its returned cursor. This continues the same snapshot.
 - help: At startup or when syntax is unclear, run `pf help` for examples.
 
-Use `--history` on depend for lineage without a current check. Zero checked sources, cannot_check, or an unrecomputed artifact leave the relevant issue open. Register reusable judgments with exact evidence and intended applies days. Use select/predicate when a specific observed value or condition matters; a passing condition covers only that scope. Revise or retire outdated judgments and hand the CEO the exact resulting version.
+Use `--history` on depend for lineage without a current check. Zero checked sources, cannot_check, or an unrecomputed artifact leave the relevant issue open. A passing condition covers only that scope. Revise or retire outdated judgments and hand the CEO the exact resulting version.
 When registering selected fields, run `pf show HANDLE --full` alone, without a pipe.
-Register a condition when a reusable judgment depends on a specific observed value or threshold. Within its applies window, weekly checks keep testing that condition and automatically flag failures or unavailable evidence, with the checked scope and day.
+For a reusable judgment tied to an observed value or threshold, register select/predicate. Within its applies window, weekly checks keep testing it and automatically flag failures or unavailable evidence, with scope and day.
 '''
 
 GIT_CEO_HISTORY = '''## Git evidence review
