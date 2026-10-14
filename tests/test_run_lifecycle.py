@@ -67,14 +67,17 @@ finally:
             parent.wait()
 
 
-def test_hold_only_interrupts_retry(tmp_path):
+def test_historical_hold_is_ignored_and_stop_interrupts_retry(tmp_path):
     hold = tmp_path/'hold.json'
     with WorkerLifecycle(hold) as control:
         hold.touch()
         control.check()
         with control.model_call():
             pass
-        with pytest.raises(RunCancelled, match='hold_during_retry'):
+        control.sleep(0)
+        control.hold = tmp_path / 'STOP'
+        control.hold.touch()
+        with pytest.raises(RunCancelled, match='requested_pause'):
             control.sleep(60)
 
 
@@ -94,16 +97,17 @@ def test_model_failure_pauses_without_supervisor_and_restores_context(offline_ru
     client = OpenAI(api_key='offline', base_url='https://api.deepseek.com/', max_retries=0,
                     http_client=httpx.Client(transport=httpx.MockTransport(respond)))
     runner.agent.client = runner.agent.usage_recorder.attach(client)
+    monkeypatch.setattr(runner.agent.usage_recorder.lifecycle, 'sleep', lambda _: None)
     try:
         result = runner.run(verbose=False)
         assert result['outcome'] == 'paused' and result['days_run'] == 0
-        assert result['reason'] == ('model_request_rejected:401' if rejected else 'model_attempt_limit')
-        assert len(requests) == (1 if rejected else 4)
+        assert result['reason'] == ('model_request_attempt_limit' if rejected else 'model_attempt_limit')
+        assert len(requests) == 5
         checkpoint = runner._load_checkpoint()
         assert checkpoint['context_boundary'] == 'same_week'
-        assert checkpoint['usage']['calls'] == len(requests)
+        assert checkpoint['usage']['calls'] == (1 if rejected else 5)
         assert checkpoint['usage']['errors'] == int(rejected)
-        assert checkpoint['usage']['missing_cost'] == len(requests)
+        assert checkpoint['usage']['missing_cost'] == (1 if rejected else 5)
         original = runner.agent._snapshot_path.read_bytes()
         restored = offline_runner(runner.workspace_dir)
         assert restored.agent._snapshot_path.read_bytes() == original
@@ -115,15 +119,16 @@ def test_model_failure_pauses_without_supervisor_and_restores_context(offline_ru
         client.close()
 
 
-def test_retry_hold_checkpoint_restores_exact_conversation(offline_runner, tmp_path, monkeypatch):
+def test_retry_stop_checkpoint_restores_exact_conversation(offline_runner, tmp_path, monkeypatch):
     runner = offline_runner()
     monkeypatch.setattr(runner, 'setup', lambda: None)
-    hold = tmp_path/'hold.json'
+    hold = tmp_path/'STOP'
     round5.install_pause(runner, hold)
+    runner.lifecycle.hold = hold
     requests = []
     def respond(request):
         requests.append(json.loads(request.content))
-        assert len(requests) == 1, 'hold must stop regeneration before another request'
+        assert len(requests) == 1, 'STOP must stop regeneration before another request'
         hold.touch()
         return httpx.Response(200, json=dict(id='offline', model='test-model', object='chat.completion', created=0,
             choices=[dict(index=0, finish_reason='stop', message=dict(role='assistant', content='No tool'))],
@@ -191,8 +196,8 @@ def test_model_cancellation_preserves_unknown_fee_and_stops_server(offline_runne
     client.close()
 
 
-def test_healthy_hold_finishes_week(offline_runner, tmp_path, monkeypatch):
-    runner = offline_runner()
+def test_historical_hold_does_not_prevent_requested_week_end(offline_runner, tmp_path, monkeypatch):
+    runner = offline_runner(stop_after_day=7)
     monkeypatch.setattr(runner, 'setup', lambda: None)
     hold = tmp_path/'hold.json'
     round5.install_pause(runner, tmp_path/'original-hold.json')
@@ -210,6 +215,6 @@ def test_healthy_hold_finishes_week(offline_runner, tmp_path, monkeypatch):
                     http_client=httpx.Client(transport=httpx.MockTransport(respond)))
     runner.agent.client = runner.agent.usage_recorder.attach(client)
     result = runner.run(verbose=False)
-    assert result['outcome'] == 'paused' and result['context_boundary'] == 'new_week'
+    assert result['outcome'] == 'stopped' and runner._load_checkpoint()['context_boundary'] == 'new_week'
     assert result['days_run'] == 7 and len(calls) == 1
     client.close()

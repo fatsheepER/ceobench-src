@@ -73,3 +73,39 @@ def test_worker_memory_defaults_and_driver_forwarding(observer, monkeypatch):
     assert module.main(['--policy', str(policy), '--live', '--run-id', 'pf', '--week', '1']) == 0
     assert calls[-1] == dict(resume=False, memory_high=17179869184,
                             memory_max=21474836480, memory_swap_max=0, run_id='pf', week=1)
+
+
+def test_driver_reports_clean_operator_stop_without_requiring_unstarted_runs(observer, monkeypatch):
+    path = Path(__file__).resolve().parents[1] / 'scripts/team_driver.py'
+    spec = importlib.util.spec_from_file_location('operator_stop_driver', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    policy = observer.output.parent / 'operator-policy.json'
+    write_json(policy, dict(identity=observer.expected))
+
+    def supervise(path, **kwargs):
+        write_json(path.parent / 'controller-exit.json', dict(children_reaped=True,
+            hold=False, failed=False, operator_stopped=True))
+        write_json(path.parent / 'controller-terminal.json', dict(pf=dict(disposition='paused',
+            status='paused', operator_stop=True, unit=dict(scope_empty=True))))
+
+    monkeypatch.setattr(module.controller, 'supervise', supervise)
+    assert module.main(['--policy', str(policy), '--live']) == 0
+    assert json.loads((policy.parent / 'driver-exit.json').read_text())['returncode'] == 0
+
+
+def test_driver_keeps_unclean_operator_stop_as_failure(observer, monkeypatch):
+    path = Path(__file__).resolve().parents[1] / 'scripts/team_driver.py'
+    spec = importlib.util.spec_from_file_location('unclean_stop_driver', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    policy = observer.output.parent / 'unclean-policy.json'
+    write_json(policy, dict(identity=observer.expected))
+
+    def supervise(path, **kwargs):
+        write_json(path.parent / 'controller-exit.json', dict(children_reaped=True,
+            hold=False, failed=True, operator_stopped=True))
+        write_json(path.parent / 'controller-terminal.json', dict(pf=dict(disposition='failed')))
+
+    monkeypatch.setattr(module.controller, 'supervise', supervise)
+    assert module.main(['--policy', str(policy), '--live']) == 2

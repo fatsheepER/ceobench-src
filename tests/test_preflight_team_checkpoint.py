@@ -382,14 +382,21 @@ def test_checkpoint_guards_and_frozen_configuration(tmp_path, monkeypatch):
         finally:
             runtime.server._sql_active = 0
         snapshot = runtime.checkpoint()
-        with pytest.raises(ValueError, match='configuration drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'wrong',
-                client_factory=clients(), model='different-model')
+        changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'wrong',
+            client_factory=clients(), model='different-model')
+        try:
+            assert changed.roles['ceo'].agent.model == runtime.roles['ceo'].agent.model
+        finally:
+            dispose(changed)
         with pytest.raises(FileExistsError):
             runtime.checkpoint(snapshot)
-        with pytest.raises(ValueError, match='client configuration drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'changed-client',
-                client_factory=lambda role: OpenAI(api_key='OFFLINE', max_retries=1))
+        changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'changed-client',
+            client_factory=lambda role: OpenAI(api_key='OFFLINE', max_retries=1))
+        try:
+            assert changed.roles['ceo'].agent.client.max_retries == 1
+            assert changed.server.tools.current_day == runtime.server.tools.current_day
+        finally:
+            dispose(changed)
         assert snapshot.exists()
     finally:
         dispose(runtime)
@@ -463,8 +470,11 @@ def test_bash_policy_checkpoint_roundtrip_and_save_drift(tmp_path, mode):
             description = next(tool['description'] for tool in role.agent.tool_descriptions if tool['name'] == 'bash')
             assert ('0.05 seconds' in description) == (name != 'ceo')
         assert '[Framework timing notice]' in restored.roles['growth'].executor.execute('bash', dict(command='sleep .08; echo 42'))
-        with pytest.raises(ValueError, match='configuration drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'drift', client_factory=clients(), analyst_bash_warn_after=.1)
+        changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'drift', client_factory=clients(), analyst_bash_warn_after=.1)
+        try:
+            assert changed.roles['growth'].executor.bash_warn_after == .05
+        finally:
+            dispose(changed)
         runtime.roles['growth'].executor.bash_timeout = 3
         with pytest.raises(ValueError, match='Bash policy drift'):
             runtime.checkpoint()
@@ -498,11 +508,14 @@ def test_legacy_checkpoint_preserves_custom_hard_limit_and_absent_soft(tmp_path,
         assert restored.server.role_executors['ops_finance'].bash_timeout == 29
         assert all(role.executor.bash_warn_after is None for role in restored.roles.values())
         assert '[Framework timing notice]' not in restored.roles['growth'].executor.execute('bash', dict(command='echo 42'))
-        with pytest.raises(ValueError, match='configuration drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'new-policy', client_factory=clients(),
-                analyst_bash_timeout=480, analyst_bash_warn_after=120)
-        with pytest.raises(ValueError, match='configuration drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'new-soft', client_factory=clients(), analyst_bash_warn_after=1)
+        for name, settings in [('new-policy', dict(analyst_bash_timeout=480, analyst_bash_warn_after=120)),
+                               ('new-soft', dict(analyst_bash_warn_after=1))]:
+            changed = MultiAgentRuntime.restore(snapshot, tmp_path / name, client_factory=clients(), **settings)
+            try:
+                assert changed.roles['growth'].executor.bash_timeout == 17
+                assert changed.roles['growth'].executor.bash_warn_after is None
+            finally:
+                dispose(changed)
     finally:
         if restored:
             dispose(restored)

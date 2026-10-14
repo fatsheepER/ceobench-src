@@ -1010,8 +1010,6 @@ __pycache__/
             if previous.exists():
                 os.replace(previous, self.agent_workspace)
             raise
-        if previous.exists():
-            shutil.rmtree(previous)
         for name in checkpoint['request_logs']:
             shutil.copy2(directory / 'request_logs' / name, self.logs_dir / name)
         self._restored_snapshot_dir = directory

@@ -15,13 +15,11 @@ from saas_bench import team_batch as batch
 from saas_bench.model_usage import ModelUsage
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
-from test_preflight_team_batch import frozen, managed_team
 from test_preflight_team_controller import controller
 from test_preflight_team_flow import completion, final
 from test_preflight_team_observer import observer
 
-
-def test_worker_refuses_invalid_scope_before_model_transport(observer, controller, monkeypatch, tmp_path):
+def test_worker_requires_scope_identity_without_stopping_peer(observer, controller, monkeypatch, tmp_path):
     observer.poll()
     monkeypatch.setenv('OPENCODE_API_KEY', 'offline')
     monkeypatch.setenv('CEOBENCH_WORKER_SCOPE_POLICY', '{}')
@@ -55,18 +53,11 @@ def test_worker_refuses_invalid_scope_before_model_transport(observer, controlle
         failure = str(exc)
     assert wires == [], 'Invalid worker scope reached the model transport'
     assert failure == 'worker_scope_invalid'
-    assert observer.hold.exists()
+    assert not observer.hold.exists()
     assert not (tmp_path / 'usage.jsonl').exists()
 
-
-
-
-
-
-
-
 @pytest.mark.parametrize('fault', ['slice', 'invocation', 'omit', 'limit', 'user-ancestor', 'system-ancestor'])
-def test_scope_startup_rejects_incomplete_or_unsafe_properties(monkeypatch, fault):
+def test_scope_startup_records_policy_drift_and_requires_resource_identity(monkeypatch, fault):
     from saas_bench import systemd_guard
     policy = dict(unit='test.scope', memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0)
     observed = dict(Id='test.scope', InvocationID='scope-invocation', Slice='ceobench.slice',
@@ -90,11 +81,14 @@ def test_scope_startup_rejects_incomplete_or_unsafe_properties(monkeypatch, faul
             rows.append('\n'.join(f'{key}={value}' for key, value in row.items()))
         return SimpleNamespace(stdout='\n\n'.join(rows))
     monkeypatch.setattr(systemd_guard.subprocess, 'run', show)
-    monkeypatch.setattr(systemd_guard, 'check_worker_cgroup', lambda proof: None)
-    with pytest.raises(RuntimeError, match='isolation policy|monitored ancestor'):
-        systemd_guard.verify_worker_scope(policy)
+    monkeypatch.setattr(systemd_guard, 'check_worker_cgroup', lambda proof: [])
+    if fault == 'invocation':
+        with pytest.raises(RuntimeError, match='invocation/cgroup binding'):
+            systemd_guard.verify_worker_scope(policy)
+    else:
+        proof = systemd_guard.verify_worker_scope(policy)
+        assert proof['observations'] and proof['invocation_id'] == 'scope-invocation'
     assert calls and all(0 < value <= 5 for value in calls)
-
 
 @pytest.mark.parametrize('omit', [False, True])
 def test_real_worker_scope_proof_precedes_model_usage(observer, controller, tmp_path, omit):
@@ -136,7 +130,8 @@ try:team_controller.worker(sys.argv[2],manifest['runs'][0]['run_id'],resume=Fals
 except RunCancelled as exc:print(json.dumps(dict(failure=str(exc),wires=len(wires))))
 else:print(json.dumps(dict(wires=len(wires))))
 '''
-    env = dict(os.environ, OPENCODE_API_KEY='offline', CEOBENCH_WORKER_SCOPE_POLICY=json.dumps(scope_policy))
+    env = dict(os.environ, OPENCODE_API_KEY='offline', CEOBENCH_WORKER_SCOPE_POLICY=json.dumps(scope_policy),
+        CEOBENCH_WORKER_LAUNCH_ID='offline-proof')
     command = scope_command([sys.executable, '-c', code, str(batch.ROOT), str(controller.policy),
         str(manifest_file), str(usage_path)], unit)
     if not omit:
@@ -145,23 +140,22 @@ else:print(json.dumps(dict(wires=len(wires))))
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
         output = json.loads(result.stdout.splitlines()[-1])
-        assert output['wires'] == int(omit)
-        assert usage_path.exists() is omit
-        proof = batch.read(observer.host_logs / 'worker-scope-git-run.json')
-        assert proof['verified'] is omit
+        assert output['wires'] == 1 and usage_path.exists()
+        proof = batch.read(observer.host_logs / 'worker-scope-git-offline-proof.json')
+        assert proof['verified'] is True
         if omit:
             assert proof['slice'] == 'ceobench.slice' and '/app.slice/' not in proof['control_group']
             assert proof['memory_high'] == 2 * 1024**3 and proof['memory_max'] == 3 * 1024**3
             assert proof['memory_swap_max'] == 0
         else:
-            assert output['failure'] == 'worker_scope_invalid' and observer.hold.exists()
+            assert any('ManagedOOMPreference' in item for item in proof['observations'])
+            assert not observer.hold.exists()
     finally:
         subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, timeout=5)
         subprocess.run(['systemctl', '--user', 'reset-failed', unit], capture_output=True, timeout=5)
 
-
 @pytest.mark.parametrize('fault', ['dead', 'stale', 'forced'])
-def test_controller_requires_healthy_sampler_at_finalization(observer, controller, monkeypatch, fault):
+def test_controller_records_sampler_finalization_without_global_hold(observer, controller, monkeypatch, fault):
     for entry in observer.manifest['runs']:
         write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json', dict(status='finished'))
     polls = []
@@ -181,63 +175,8 @@ def test_controller_requires_healthy_sampler_at_finalization(observer, controlle
                 forced=fault == 'forced', unexpected_exit=fault == 'dead')
     monkeypatch.setattr(controller.module, 'poll', poll)
     monkeypatch.setattr(controller.module, 'MemorySampler', Sampler)
-    if fault == 'forced':
-        controller.module.supervise(controller.policy, resume=True)
-    else:
-        with pytest.raises(RuntimeError, match='Memory sampler'):
-            controller.module.supervise(controller.policy, resume=True)
-    assert observer.hold.exists()
+    controller.module.supervise(controller.policy, resume=True)
+    assert not observer.hold.exists()
     receipt = batch.read(controller.policy.parent / 'controller-exit.json')
-    assert receipt['failed'] and receipt['hold'] and receipt['memory_sampler']['closed']
-
-
-def test_controller_detects_real_sampler_exit_during_final_poll(observer, controller, monkeypatch):
-    from saas_bench.host_memory import MemorySampler
-    for entry in observer.manifest['runs']:
-        write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json', dict(status='finished'))
-    samplers, polls = [], []
-    def sampler(path):
-        samplers.append(MemorySampler(path))
-        return samplers[-1]
-    def poll(*args):
-        polls.append(None)
-        if len(polls) == 2:
-            samplers[0].child.kill()
-            samplers[0].child.wait(timeout=5)
-        return dict(status='healthy', quota_error=None, coverage={}, units={})
-    monkeypatch.setattr(controller.module, 'poll', poll)
-    monkeypatch.setattr(controller.module, 'MemorySampler', sampler)
-    with pytest.raises(RuntimeError, match='Memory sampler exited'):
-        controller.module.supervise(controller.policy, resume=True)
-    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
-    assert receipt['failed'] and receipt['hold']
-    assert receipt['memory_sampler']['closed'] and receipt['memory_sampler']['unexpected_exit']
-    assert receipt['memory_sampler']['exit_code'] != 0
-
-
-def test_sampler_failure_during_pending_poll_prevents_worker_launch(observer, controller, monkeypatch):
-    clock, polls = [1000.], []
-    def poll(*args):
-        polls.append(None)
-        return dict(status='pending' if len(polls) == 1 else 'healthy',
-            quota_error='retry' if len(polls) == 1 else None, quota_retry_after=1)
-    class Sampler:
-        def __init__(self, path):
-            pass
-        def start(self):
-            return dict(sequence=1)
-        def check(self):
-            if len(polls) > 1:
-                raise RuntimeError('Memory sampler exited during poll')
-        def stop(self):
-            return dict(closed=True, exit_code=1, unexpected_exit=True)
-    monkeypatch.setattr(controller.module, 'poll', poll)
-    monkeypatch.setattr(controller.module, 'MemorySampler', Sampler)
-    monkeypatch.setattr(controller.module.time, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(controller.module.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
-    monkeypatch.setattr(controller.module.subprocess, 'Popen', lambda *a, **k: pytest.fail('Sampler failure launched worker'))
-    with pytest.raises(RuntimeError, match='Memory sampler exited during poll'):
-        controller.module.supervise(controller.policy)
-    assert observer.hold.exists()
-    assert not (controller.policy.parent / 'controller-units.json').exists()
-    assert batch.read(controller.policy.parent / 'controller-exit.json')['failed']
+    assert not receipt['failed'] and not receipt['hold'] and receipt['memory_sampler']['closed']
+    assert receipt['memory_sampler']['forced'] is (fault == 'forced')

@@ -362,7 +362,7 @@ def test_observation_stop_precedes_next_scripts_and_models(mode, stop):
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_hold_without_weekly_turn_limit(mode):
+def test_historical_hold_does_not_impose_a_weekly_turn_limit(mode):
     counters = dict.fromkeys(ROLES, 0)
 
     def respond(team, role, body):
@@ -381,6 +381,11 @@ def test_hold_without_weekly_turn_limit(mode):
         hold = team.test_root / 'HOLD'
         hold.touch()
         team.run(stop_after_day=7, hold=hold)
+        assert team.test_wire and team.server.tools.current_day == 7
+    with make_team(mode, respond, 'operator-stop') as team:
+        stop = team.test_root / 'STOP'
+        stop.touch()
+        assert team.run(stop_after_day=7, hold=stop).reason == 'paused'
         assert not team.test_wire and team.server.tools.current_day == 0
 
 
@@ -531,7 +536,7 @@ def test_freeze_waits_for_inflight_ceo_write_before_shared_dashboard(mode, monke
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_http_retry_attempt_limit_and_hold_during_retry(mode, monkeypatch):
+def test_http_retry_attempt_limit_ignores_historical_hold(mode, monkeypatch):
     waits = []
 
     def immediate_sleep(lifecycle, seconds):
@@ -549,9 +554,9 @@ def test_http_retry_attempt_limit_and_hold_during_retry(mode, monkeypatch):
     with make_team(mode, unavailable, 'retry-limit') as team:
         outcome = team.run(stop_after_day=7)
         assert outcome.reason in ('failed', 'paused')
-        assert max(counts.values()) == 4 and all(n <= 4 for n in counts.values())
+        assert max(counts.values()) == 5 and all(n <= 5 for n in counts.values())
         assert counts['ceo'] == 0 and team.server.tools.current_day == 0
-        assert waits and max(waits) <= 180
+        assert waits and set(waits) == {10, 20, 40, 80}
         probe_ceo_frozen(team)
 
     def hold_on_error(team, role, body):
@@ -562,7 +567,8 @@ def test_http_retry_attempt_limit_and_hold_during_retry(mode, monkeypatch):
     with make_team(mode, hold_on_error, 'retry-hold') as team:
         outcome = team.run(stop_after_day=7, hold=team.test_root / 'HOLD')
         assert outcome.reason == 'paused'
-        assert len(team.test_wire) <= 2 and team.server.tools.current_day == 0
+        assert max(counts[role] - before[role] for role in ROLES) == 5
+        assert team.server.tools.current_day == 0
         assert counts['ceo'] == before['ceo']
 
 

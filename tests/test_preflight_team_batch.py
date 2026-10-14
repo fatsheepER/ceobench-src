@@ -297,8 +297,6 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
     lambda m: m['runs'][0].update(seed=42),
     lambda m: m['runs'].append(copy.deepcopy(m['runs'][0])),
     lambda m: m['runs'][0].update(d0=m['d0']['102']['path'] if m['runs'][0]['seed'] != 102 else m['d0']['101']['path']),
-    lambda m: m['pricing']['rates'][batch.MODEL].update(input=99),
-    lambda m: m.update(build=dict(m['build'], source_sha256='changed')),
     lambda m: m['runs'][0].update(output_dir=m['runs'][1]['output_dir']),
     lambda m: m['runs'][0].update(stop_after_day=28),
 ])
@@ -321,6 +319,22 @@ def test_manifest_keeps_sealed_d0_while_source_revisions_can_resume(frozen, tmp_
     for source in sources.values():
         assert source.stat().st_mode & 0o222 == 0
         assert (source / 'world.nmdb').stat().st_mode & 0o222 == 0
+
+
+def test_saved_d0_survives_changed_code_defaults_prices_and_build(frozen, tmp_path, monkeypatch):
+    _, _, _, sources = frozen
+    hashes = {path: tree_hash(path) for path in sources.values()}
+    path = changed_manifest(frozen, tmp_path, lambda manifest: manifest.update(
+        build=dict(source_sha256='new'), source_sha256='new', price_source='new'))
+    manifest = batch.read(path)
+    manifest['pricing']['rates'][batch.MODEL]['input'] = 99
+    manifest['pricing']['source'] = 'new'
+    write_json(path, manifest)
+    def changed_defaults(*args, **kwargs):
+        raise AssertionError('Validation must use sealed D0 files, not current code defaults')
+    monkeypatch.setattr(batch, 'configuration', changed_defaults)
+    assert batch.validate_manifest(path)['pricing']['rates'][batch.MODEL]['input'] == 99
+    assert {source: tree_hash(source) for source in hashes} == hashes
 
 
 def test_same_seed_clones_share_d0_but_have_independent_sessions_worlds_and_histories(frozen, tmp_path):
@@ -430,8 +444,9 @@ def test_checked_client_uses_frozen_phase_timeouts(frozen, role):
         client.close()
 
 
-def test_returned_model_mismatch_keeps_known_raw_receipts(tmp_path):
+def test_returned_model_mismatch_keeps_five_known_raw_receipts(tmp_path, monkeypatch):
     from saas_bench.model_usage import ModelUsage
+    from saas_bench.run_lifecycle import RunCancelled
     def respond(request):
         response = completion(final('wrong model'))
         body = response.json()
@@ -440,17 +455,20 @@ def test_returned_model_mismatch_keeps_known_raw_receipts(tmp_path):
     client = batch.checked_client('simulator', 'offline', transport=httpx.MockTransport(respond))
     recorder = ModelUsage(tmp_path / 'mismatch.jsonl', 'simulator', PRICES['rates'])
     recorder.expected_model = batch.MODEL
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: None)
     recorder.attach(client)
     kwargs = dict(model=batch.MODEL, reasoning_effort='none', max_tokens=100, temperature=0.3,
                   messages=[dict(role='user', content='offline')],
                   extra_body={'thinking': {'type': 'disabled'}})
     try:
-        with pytest.raises(ValueError, match='model'):
+        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
             recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
         rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
         assert rows[-1]['event'] == 'response' and rows[-1]['usage']['input_tokens'] == 20
         assert rows[-1]['error'] is not None
         assert next(row for row in rows if row['event'] == 'http_response')['body']
+        assert len([row for row in rows if row['event'] == 'http_request']) == 5
+        assert rows[-1]['model_attempts'] == 5
     finally:
         client.close()
 
@@ -467,19 +485,16 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     write_json(tmp_path / 'freeze.json', dict(manifest_sha256=file_hash(path)))
     run_id = next(entry['run_id'] for entry in copied['runs'] if entry['group'] == group)
     wire = []
-    cleanup_checks = []
-    prune = batch.prune_checkpoints
-    def checked_prune(parent, ledger, directory):
-        latest = Path(ledger['snapshots'][-1]['snapshot'])
-        logs = list(parent.parent.glob('private/*/model-usage.jsonl'))
-        def analysis():
-            return (tree_hash(parent.parent / 'roles'), tree_hash(parent.parent / 'private'),
-                tree_hash(latest), aggregate(logs, PRICES, category='engineering'))
-        before = analysis()
-        prune(parent, ledger, directory)
-        assert analysis() == before
-        cleanup_checks.append(str(latest))
-    monkeypatch.setattr(batch, 'prune_checkpoints', checked_prune)
+    publication_checks = []
+    save = batch.save_checkpoint
+    def checked_save(team, directory, record, boundary):
+        before = {p: tree_hash(p) for p in (team.root / 'checkpoints').iterdir()
+                  if p.is_dir() and (p / 'checkpoint.json').exists()}
+        snapshot = save(team, directory, record, boundary)
+        assert {p: tree_hash(p) for p in before} == before
+        publication_checks.append(snapshot)
+        return snapshot
+    monkeypatch.setattr(batch, 'save_checkpoint', checked_save)
     pause_once = [True]
     def client(role):
         def respond(request):
@@ -518,7 +533,8 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     history = batch.attempts(entry)
     snapshot = Path(resumed['checkpoint'])
     snapshots = list(snapshot.parent.glob('*/checkpoint.json'))
-    assert len(snapshots) == 2 and len(cleanup_checks) == 10
+    published_here = [p for p in publication_checks if p.parent == snapshot.parent]
+    assert len(snapshots) == len(published_here) and len(snapshots) > 2
     states = [batch.read(p.parent / 'team.json') for p in snapshots]
     assert sum(s['day'] == 28 for s in states) == 1
     _, terminal = validate_snapshot(snapshot)
@@ -534,7 +550,7 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
         assert (snapshot / 'private/evidence.sqlite').stat().st_size > 0
         assert terminal['evidence']
     source = Path(first['checkpoint'])
-    assert batch.read(source.parent / '.retention-pins.json')[str(source)] == file_hash(source / 'checkpoint.json')
+    assert not (source.parent / '.retention-pins.json').exists()
     before = tree_hash(snapshot)
     calls_before = len(wire)
     resumed['status'] = 'paused'
@@ -701,9 +717,7 @@ def managed_team(frozen, tmp_path):
             batch.close_team(team)
 
 
-@pytest.mark.parametrize('pin_previous', [False, True])
-def test_retention_keeps_all_week_boundaries_across_ceo_checkpoints(managed_team, pin_previous):
-    from saas_bench.team_checkpoint import _pin_snapshot
+def test_checkpoint_history_keeps_every_boundary_and_ceo_snapshot(managed_team):
     team, directory, record, _, _ = managed_team
     def finish_week():
         team._stage = 'ceo'
@@ -719,16 +733,14 @@ def test_retention_keeps_all_week_boundaries_across_ceo_checkpoints(managed_team
     initial = Path(record['checkpoint'])
     previous = finish_week()
     assert validate_snapshot(previous)[1]['day'] == 7
-    if pin_previous:
-        _pin_snapshot(previous)
-    ceo_checkpoints()
+    middle = ceo_checkpoints()
     assert previous.is_dir(), 'The D7 boundary was deleted by newer CEO handoffs'
     current = finish_week()
     assert validate_snapshot(current)[1]['day'] == 14
     assert previous.is_dir()
     latest = ceo_checkpoints()
     assert current.is_dir(), 'The D14 boundary was deleted by newer CEO handoffs'
-    expected = {str(initial), str(previous), str(current), *(str(path) for path in latest[-2:])}
+    expected = {str(initial), str(previous), str(current), *(str(path) for path in middle + latest)}
     ledger = batch.read(current.parent / '.retention.json')
     assert {item['snapshot'] for item in ledger['snapshots']} == expected
     for snapshot in expected:
@@ -737,34 +749,6 @@ def test_retention_keeps_all_week_boundaries_across_ceo_checkpoints(managed_team
     assert not record.get('checkpoint_retention_errors')
 
 
-@pytest.mark.parametrize('state_change', [dict(day=0), dict(day=True), dict(day=6), dict(day=7.0),
-    dict(stage='ceo'), dict(phase='paused'), dict(failure='requested_pause'), dict(week={'ceo_started': False})])
-def test_retention_classifies_saved_week_boundaries_by_day_and_stage(managed_team, state_change):
-    team, directory, record, _, _ = managed_team
-    team._stage = 'ceo'
-    team._set_phase('ceo')
-    assert team.server.advance_week()['success']
-    team._close_week()
-    previous = batch.save_checkpoint(team, directory, record, 'week_boundary')
-    state = batch.read(previous / 'team.json')
-    state.update(state_change)
-    write_json(previous / 'team.json', state)
-    receipt = batch.read(previous / 'checkpoint.json')
-    receipt['files']['team.json'] = file_hash(previous / 'team.json')
-    write_json(previous / 'checkpoint.json', receipt)
-    ledger_path = previous.parent / '.retention.json'
-    ledger = batch.read(ledger_path)
-    ledger['snapshots'][-1]['sha256'] = file_hash(previous / 'checkpoint.json')
-    write_json(ledger_path, ledger)
-    team._stage = 'ceo'
-    team._week = dict(observation='Continue the current week.', ceo_started=False)
-    team._set_phase('ceo')
-    for _ in range(3):
-        batch.save_checkpoint(team, directory, record, 'answers_ready')
-    assert previous.exists() is (type(state['day']) is int and state['day'] >= 0 and
-        state['day'] % 7 == 0 and state['stage'] == 'boundary')
-    assert all(role.usage.summary['calls'] == 0 for role in team.roles.values())
-    assert not record.get('checkpoint_retention_errors')
 
 
 def test_external_restore_preserves_managed_source_without_pin_writes(managed_team, tmp_path, monkeypatch):
@@ -803,77 +787,6 @@ def test_external_restore_preserves_managed_source_without_pin_writes(managed_te
     assert not record.get('checkpoint_retention_errors')
 
 
-@pytest.mark.parametrize('fault', ['bad_json', 'missing', 'unknown', 'outside', 'receipt', 'team_checksum',
-    'team_symlink', 'team_missing',
-    'candidate_symlink', 'parent_symlink', 'ledger_symlink', 'bad_pins', 'bad_attempt', 'partial_delete'])
-def test_retention_errors_preserve_current_analysis_and_continue(managed_team, tmp_path, monkeypatch, fault):
-    team, directory, record, manifest, entry = managed_team
-    first = Path(record['checkpoint'])
-    second = batch.save_checkpoint(team, directory, record, 'week_boundary')
-    second_hash = tree_hash(second)
-    logs = {p: file_hash(p) for p in (team.root / 'private').rglob('*.jsonl')}
-    roles_hash = tree_hash(team.root / 'roles')
-    parent, path = first.parent, first.parent / '.retention.json'
-    ledger = batch.read(path)
-    if fault == 'bad_json':
-        path.write_text('{')
-    elif fault == 'missing':
-        path.unlink()
-    elif fault == 'unknown':
-        write_json(path, dict(ledger, version=99))
-    elif fault == 'outside':
-        ledger['snapshots'][0]['snapshot'] = str(tmp_path / 'outside')
-        write_json(path, ledger)
-    elif fault == 'receipt':
-        (first / 'checkpoint.json').write_text('{}')
-    elif fault == 'team_checksum':
-        (first / 'team.json').write_text('{}')
-    elif fault == 'team_symlink':
-        state = tmp_path / 'linked-team.json'
-        shutil.copyfile(first / 'team.json', state)
-        (first / 'team.json').unlink()
-        (first / 'team.json').symlink_to(state)
-    elif fault == 'team_missing':
-        (first / 'team.json').unlink()
-    elif fault == 'candidate_symlink':
-        first.rename(tmp_path / 'moved-source')
-        first.symlink_to(tmp_path / 'moved-source', target_is_directory=True)
-    elif fault == 'parent_symlink':
-        parent.rename(tmp_path / 'moved-parent')
-        parent.symlink_to(tmp_path / 'moved-parent', target_is_directory=True)
-    elif fault == 'ledger_symlink':
-        path.rename(tmp_path / 'moved-ledger.json')
-        path.symlink_to(tmp_path / 'moved-ledger.json')
-    elif fault == 'bad_pins':
-        write_json(parent / '.retention-pins.json', {str(first): 'wrong'})
-    elif fault == 'bad_attempt':
-        other = directory.parent / 'attempt-002'
-        other.mkdir()
-        (other / 'attempt.json').write_text('{')
-    else:
-        remove = shutil.rmtree
-        def failed_remove(path, *args, **kwargs):
-            if Path(path) == first:
-                (first / 'world.nmdb').unlink(missing_ok=True)
-                raise OSError('injected partial deletion failure')
-            return remove(path, *args, **kwargs)
-        monkeypatch.setattr(shutil, 'rmtree', failed_remove)
-    third = batch.save_checkpoint(team, directory, record, 'week_boundary')
-    assert second.is_dir() and tree_hash(second) == second_hash
-    assert {p: file_hash(p) for p in logs} == logs and tree_hash(team.root / 'roles') == roles_hash
-    assert first.exists(), 'Retention deleted a checkpoint after invalid retention state'
-    assert third.is_dir() and record['checkpoint_retention_errors']
-    assert not record.get('checkpoint_error')
-    if fault == 'bad_attempt':
-        write_json(other / 'attempt.json', dict(checkpoint=None, source_checkpoint=None, wall_seconds=0))
-    monkeypatch.setattr(team, 'run', lambda **options: type('Outcome', (), dict(day=0, reason='paused'))())
-    team.failure = 'requested_pause'
-    team._set_phase('paused')
-    completed = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
-    assert completed['status'] == 'paused' and completed['result']['status'] == 'paused'
-    assert completed['checkpoint_reused_at_stop'] is False
-    assert completed['checkpoint_retention_errors']
-    assert batch.read(Path(completed['checkpoint']) / 'team.json')['phase'] == 'paused'
 
 
 @pytest.mark.parametrize('publication', ['pointer', 'attempt'])

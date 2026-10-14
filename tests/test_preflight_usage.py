@@ -10,6 +10,7 @@ from saas_bench.config import BenchmarkConfig
 from saas_bench.customer_llm import CustomerSimulator
 from saas_bench.database import init_database
 from saas_bench.model_usage import FIELDS, ModelUsage, cost_usd, usage_values
+from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
 
@@ -121,7 +122,6 @@ def test_go_cache_fields_and_sourced_time_bounded_prices(tmp_path):
 def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch, capture):
     from saas_bench.run_lifecycle import RunCancelled
     clock = [100.0]
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 15)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
     monkeypatch.setattr('time.sleep', lambda _: None)
     attempts = []
@@ -147,10 +147,10 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     def invoke():
         with client.messages.stream(**request) as stream:
             return stream.get_final_message()
-    with pytest.raises(RunCancelled, match='model_request_deadline'):
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
         recorder.call('messages', request, invoke, outer_attempt=1)
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
-    assert len([r for r in entries if r['event'] == 'http_request']) == 2
+    assert len([r for r in entries if r['event'] == 'http_request']) == 5
     assert any(r['event'] == 'http_error' and r['error'] == 'ConnectError' for r in entries)
     partial = next(r for r in entries if r['event'] == 'http_response')
     assert 'message_start' in partial['body'] and partial['error'] == 'ReadError'
@@ -160,7 +160,7 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     if store:
         store.assert_healthy()
         events = [store.read_event(event) for event in event_ids(store)]
-        assert len(events) == 2
+        assert len(events) == 5
         assert events[0]['result']['send_state'] == 'unknown'
         assert events[1]['result']['response_error'] == 'ReadError'
     client.close()
@@ -186,12 +186,12 @@ def test_agent_retry_records_full_request_and_missing_usage(tmp_path, monkeypatc
     assert agent.act('dashboard', 0, False, {'day': 7}).tool == 'read_file'
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
     calls = [r for r in entries if r['event'] == 'request']
-    assert [r['outer_attempt'] for r in calls] == ([1] if status == 503 else [1, 2])
+    assert [r['outer_attempt'] for r in calls] == [1]
     assert all('original instructions' in json.dumps(r['request']['messages']) for r in calls)
     assert agent.last_input_tokens is None
-    assert recorder.summary['missing']['input_tokens'] == (1 if status == 503 else 2)
+    assert recorder.summary['missing']['input_tokens'] == 1
     assert recorder.summary['known']['input_tokens'] is None
-    assert recorder.summary['errors'] == (0 if status == 503 else 1)
+    assert recorder.summary['errors'] == 0
     assert recorder.summary['failed_http_attempts'] == 1
     client.close()
 
@@ -325,8 +325,8 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
     requests = []
     def handle(request):
         requests.append(json.loads(request.content))
-        if len(requests) > 4:
-            raise RunCancelled('unexpected_fifth_request')
+        if len(requests) > 5:
+            raise RunCancelled('unexpected_sixth_request')
         if fault == 'connection':
             raise httpx.ConnectError('offline', request=request)
         if fault == 'status':
@@ -345,17 +345,16 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
     if fault != 'no_tool':
         clock = [100.0]
-        monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 35)
         monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
         monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
                       system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
                       workspace_path=tmp_path, usage_recorder=recorder)
     try:
-        with pytest.raises(RunCancelled, match='model_attempt_limit' if fault == 'no_tool' else 'model_request_deadline'):
+        with pytest.raises(RunCancelled, match='model_attempt_limit' if fault == 'no_tool' else 'model_request_attempt_limit'):
             agent.act('dashboard', 0, False, {'day': 7})
-        assert len(requests) == (4 if fault == 'no_tool' else 3)
-        assert recorder.summary['calls'] == (4 if fault == 'no_tool' else 1)
+        assert len(requests) == 5
+        assert recorder.summary['calls'] == (5 if fault == 'no_tool' else 1)
         assert recorder.summary['errors'] == (0 if fault == 'no_tool' else 1)
         assert agent._observation_recorded and not agent._pending_tool_calls
     finally:
@@ -364,27 +363,28 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
 
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
 @pytest.mark.parametrize('status', [400, 401, 403])
-def test_permanent_model_rejection_pauses_without_feedback(tmp_path, monkeypatch, api, status):
+def test_all_model_rejections_retry_five_times_without_feedback(tmp_path, monkeypatch, api, status):
     from saas_bench.agents.bash_agent.agent import BashAgent
     from saas_bench.run_lifecycle import RunCancelled
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
     def handle(request):
         requests.append(json.loads(request.content))
-        if len(requests) > 1:
-            raise RunCancelled('unexpected_second_request')
+        if len(requests) > 5:
+            raise RunCancelled('unexpected_sixth_request')
         return httpx.Response(status, json={'error': {'type': 'invalid_request_error', 'message': 'rejected'}})
     http = httpx.Client(transport=httpx.MockTransport(handle))
     client = (Anthropic(api_key='offline', http_client=http, max_retries=0) if api == 'messages'
               else OpenAI(api_key='offline', http_client=http, max_retries=0))
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
                       system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
                       workspace_path=tmp_path, usage_recorder=recorder)
     try:
-        with pytest.raises(RunCancelled, match=f'model_request_rejected:{status}'):
+        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
             agent.act('dashboard', 0, False, {'day': 7})
-        assert len(requests) == recorder.summary['calls'] == recorder.summary['errors'] == 1
+        assert len(requests) == 5 and recorder.summary['calls'] == recorder.summary['errors'] == 1
         assert recorder.summary['missing_cost'] == 1
         assert [message.role for message in agent.conversation] == ['system', 'user']
     finally:
@@ -406,16 +406,17 @@ def test_http200_error_body_is_a_failed_model_call(tmp_path, monkeypatch, provid
     else:
         client = (Anthropic if api == 'messages' else OpenAI)(api_key='offline', http_client=http, max_retries=0)
     sim = CustomerSimulator(client if api != 'messages' else None, init_database(':memory:'), BenchmarkConfig())
+    monkeypatch.setattr(sim.usage_recorder.lifecycle, 'sleep', lambda _: None)
     if api == 'messages':
         setattr(sim, '_bedrock_client' if provider == 'bedrock' else '_anthropic_client', sim.usage_recorder.attach(client))
     store = SQLEvidenceStore(tmp_path / 'private.sqlite', identity(capture_scope='execution'))
     sim.usage_recorder.evidence_store = store
     try:
-        with pytest.raises(ValueError, match='900-second timeout'):
+        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
             sim.complete_text(provider=provider, model='test-model', user='offline replay', max_tokens=30)
         summary = sim.usage_recorder.summary
-        assert summary['calls'] == summary['errors'] == summary['http_attempts'] == summary['failed_http_attempts'] == 1
-        assert summary['failed_attempts_without_usage'] == summary['missing_cost'] == 1
+        assert summary['calls'] == summary['errors'] == summary['missing_cost'] == 1
+        assert summary['http_attempts'] == summary['failed_http_attempts'] == summary['failed_attempts_without_usage'] == 5
         assert summary['known'] == dict.fromkeys(FIELDS) and summary['known_cost_usd'] is None
         entries = [json.loads(line) for line in (tmp_path / 'simulator.jsonl').read_text().splitlines()]
         http_response = next(e for e in entries if e['event'] == 'http_response')
@@ -432,12 +433,14 @@ def test_http200_error_body_is_a_failed_model_call(tmp_path, monkeypatch, provid
 
 
 @pytest.mark.parametrize('api,field', [('chat', 'choices'), ('responses', 'output'), ('messages', 'content')])
-def test_malformed_response_is_recorded_before_returning(tmp_path, api, field):
+def test_malformed_response_is_recorded_before_returning(tmp_path, monkeypatch, api, field):
     recorder = ModelUsage(tmp_path / 'usage.jsonl', 'agent')
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     malformed = reply(api)
     malformed[field] = None
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
         recorder.call(api, {}, lambda: malformed)
+    assert field in str(error.value.__cause__)
     assert recorder.summary['errors'] == 1
     assert recorder.summary['known']['input_tokens'] == 10
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] == malformed

@@ -101,17 +101,19 @@ def test_unreadable_historical_time_metadata_remains_unknown(tmp_path):
 
 def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, monkeypatch):
     from saas_bench.multi_agent import RunOutcome
+    from saas_bench.run_lifecycle import RunCancelled
     team, directory, record, manifest, entry = managed_team
     original = record['checkpoint']
     before = set((team.root / 'checkpoints').iterdir())
     def fail_model(**kwargs):
         usage = team.roles['ceo'].usage
+        monkeypatch.setattr(usage.lifecycle, 'sleep', lambda seconds: None)
         try:
             usage.call('chat', dict(model=team.roles['ceo'].agent.model),
                        lambda: (_ for _ in ()).throw(ValueError('offline failed request')), day=0)
-        except ValueError:
+        except RunCancelled:
             pass
-        team.failure = 'model_request_deadline'
+        team.failure = 'model_request_attempt_limit'
         return RunOutcome(day=0, reason='failed')
     monkeypatch.setattr(team, 'run', fail_model)
     result = batch.execute(team, manifest, entry, directory, record, directory / 'STOP')

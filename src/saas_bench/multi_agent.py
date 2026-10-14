@@ -382,9 +382,7 @@ class MultiAgentRuntime:
     def _check(self):
         if self._natural_end():
             raise RunCancelled('natural_end')
-        if self._lifecycle.hold and self._lifecycle.hold.exists():
-            self._lifecycle.cancel('hold')
-        self._lifecycle.check()
+        self._lifecycle.check(retry=True)
 
     def _check_model_send(self):
         deadline = time.monotonic() + 3
@@ -583,7 +581,7 @@ class MultiAgentRuntime:
             raise ValueError('stop_after_day must be a positive whole-week boundary within the simulation')
         if self._pool is not None:
             raise RuntimeError('Team run is already active')
-        self._lifecycle.hold = Path(hold) if hold else None
+        self._lifecycle.hold = Path(hold) if hold and Path(hold).name == 'STOP' else None
         self._set_phase(self._stage)
         try:
             with self._lifecycle, ThreadPoolExecutor(max_workers=2) as pool:

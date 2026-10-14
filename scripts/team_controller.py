@@ -420,6 +420,8 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
             except (OSError, ValueError, RuntimeError) as exc:
                 event('memory_sampler_warning', error=str(exc))
             for group in queues:
+                if stop_requested or (directory / 'STOP').exists():
+                    break
                 active[group] = next_entry(group)
             while any(slot is not None for slot in active.values()):
                 telemetry()
@@ -442,6 +444,13 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
                     event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
                         status=saved.get('status'), day=saved.get('day'), unit=slot['unit'])
                     if stopping or own_stop or saved.get('runtime_failure') in ('requested_pause', 'supervisor_cancelled'):
+                        clean = (saved.get('status') in ('paused', 'finished') and child.returncode in (0, 2) and
+                            slot['unit'].get('result') != 'oom-kill' and not slot['unit'].get('cleanup_error'))
+                        terminal[entry['run_id']] = dict(disposition='paused' if clean else 'failed',
+                            status=saved.get('status'), operator_stop=True,
+                            reason=saved.get('runtime_failure') or 'requested_stop',
+                            unit=slot['unit'], attempt=saved.get('attempt'), children_reaped=True)
+                        event('group_operator_stopped', run_id=entry['run_id'], proof=terminal[entry['run_id']])
                         active[group] = None
                     elif saved.get('status') == 'finished' and child.returncode == 0 and slot['unit'].get('result') != 'oom-kill':
                         terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
@@ -472,11 +481,15 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
             write_json(directory / 'controller-terminal.json', terminal)
+            operator_stopped = (stop_requested or (directory / 'STOP').exists() or
+                any(record.get('operator_stop') for record in terminal.values()))
+            children_reaped = (all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
+                for slot in children) and all(unit.get('scope_empty') for unit in units.values()))
             write_json(directory / 'controller-exit.json', dict(hold=False,
-                failed=any(record.get('disposition') == 'alarm' for record in terminal.values()) or
+                failed=not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
+                    for record in terminal.values()) or not operator_stopped and
                     any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
-                children_reaped=all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
-                                    for slot in children) and all(unit.get('scope_empty') for unit in units.values()),
+                children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
                 auto_resume=True))

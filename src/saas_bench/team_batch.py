@@ -23,7 +23,8 @@ from openai import OpenAI
 from .config import BenchmarkConfig, RUNTIME_CONFIG_FIELDS, SCENARIO_PACKS, ScenarioPack, normalize_runtime_config
 from .database import init_database
 from .db_protection import load_session_db, save_session_db
-from .model_usage import load_pricing
+from .model_usage import (load_pricing, MODEL_REQUEST_ATTEMPTS, MODEL_ATTEMPT_SECONDS,
+                          MODEL_REQUEST_SECONDS, MODEL_RETRY_DELAYS, check_model_call)
 from .multi_agent import MultiAgentRuntime
 from .payload_tokens import load_counter
 from .role_policy import ROLES
@@ -31,7 +32,7 @@ from .run_state import file_hash, tree_hash, verify_build, write_json
 from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
-from .team_checkpoint import managed_snapshot, retention_lock
+from .team_checkpoint import retention_lock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,7 +42,9 @@ CONTROLLER_SCRIPTS = ('scripts/team_batch.py', 'scripts/team_controller.py',
                       'scripts/team_observer.py', 'scripts/team_model_monitor.py', 'scripts/round5.py')
 PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
-    total_days=500, effective_end=497, sdk_max_retries=2, model_request_seconds=900, retry_initial_seconds=5, retry_max_seconds=180,
+    total_days=500, effective_end=497, sdk_max_retries=2,
+    model_request_attempts=MODEL_REQUEST_ATTEMPTS, model_attempt_seconds=MODEL_ATTEMPT_SECONDS,
+    model_request_seconds=MODEL_REQUEST_SECONDS, model_retry_delays=list(MODEL_RETRY_DELAYS),
     timeout_seconds=dict(connect=60, read=180, write=60, pool=60),
     simulator_thinking='disabled', simulator_reasoning_effort='none',
     analyst_bash_timeout=480, analyst_bash_warn_after=120,
@@ -151,17 +154,15 @@ def seal_d0(seed, destination, prices, *, price_source, root=ROOT, public_dir=No
     return receipt
 
 
-def verify_d0(path, *, seed, prices, price_source, build, source_sha256):
+def verify_d0(path, *, seed):
     path = Path(path).resolve()
     receipt = read(path / 'seal.json')
     if receipt.get('version') != 1 or receipt.get('day') != 0 or receipt.get('seed') != seed:
         raise ValueError('D0 group source or seed mismatch')
     if receipt['files'] != {name: file_hash(path / name) for name in ('world.nmdb', 'configuration.json')}:
         raise ValueError('Sealed D0 checksum mismatch')
-    if receipt['build'] != build or receipt['source_sha256'] != source_sha256:
-        raise ValueError('D0 source or build mismatch')
-    if receipt['price_source'] != price_source or read(path / 'configuration.json') != canonical(asdict(configuration(seed, prices))):
-        raise ValueError('D0 configuration or pricing mismatch')
+    if read(path / 'configuration.json')['seed'] != seed:
+        raise ValueError('Sealed D0 configuration seed mismatch')
     return dict(path=str(path), seal_sha256=file_hash(path / 'seal.json'), **receipt)
 
 
@@ -262,8 +263,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         raise ValueError('D28 engineering verification uses seed 42')
     check_prices(prices, price_source)
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
-    d0 = {str(seed): verify_d0(path, seed=seed, prices=prices, price_source=price_source,
-                             build=build, source_sha256=source) for seed, path in d0_sources.items()}
+    d0 = {str(seed): verify_d0(path, seed=seed) for seed, path in d0_sources.items()}
     destination.mkdir(parents=True, exist_ok=False)
     pairs = [(seed, repeat) for seed in seeds for repeat in range(1, 3 if category == 'formal' else 2)]
     ordering = random.Random(order_seed)
@@ -336,8 +336,7 @@ def validate_manifest(path):
         if entry['category'] != category or entry['pair_id'] != f's{entry["seed"]}-r{entry["repeat"]}' or entry['stop_after_day'] != (112 if category == 'formal' else 28):
             raise ValueError('Run category, pair or observation stop mismatch')
         source = manifest['d0'][str(entry['seed'])]
-        checked = verify_d0(entry['d0'], seed=entry['seed'], prices=manifest['pricing'],
-            price_source=manifest['price_source'], build=manifest['build'], source_sha256=manifest['source_sha256'])
+        checked = verify_d0(entry['d0'], seed=entry['seed'])
         if source != checked:
             raise ValueError('Run D0 differs from the frozen same-seed source')
         actual.add(key)
@@ -539,69 +538,6 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     return directory, record, source
 
 
-def prune_checkpoints(parent, ledger, directory):
-    if (set(ledger) != {'version', 'snapshots'} or ledger['version'] != 1 or
-            not isinstance(ledger['snapshots'], list) or not ledger['snapshots']):
-        raise ValueError('Invalid checkpoint retention ledger')
-    snapshots = {}
-    boundaries = set()
-    for item in ledger['snapshots']:
-        if not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or item['snapshot'] in snapshots:
-            raise ValueError('Invalid checkpoint retention entry')
-        snapshot = snapshots[item['snapshot']] = managed_snapshot(parent, item['snapshot'], item['sha256'])
-        state_path = snapshot / 'team.json'
-        if state_path.is_symlink():
-            raise ValueError('Checkpoint retention state cannot be a symlink')
-        if file_hash(state_path) != read(snapshot / 'checkpoint.json')['files']['team.json']:
-            raise ValueError('Checkpoint retention state checksum mismatch')
-        state = read(state_path)
-        day = state['day']
-        if type(day) is int and day >= 0 and day % 7 == 0 and state['stage'] == 'boundary':
-            boundaries.add(item['snapshot'])
-    protected = {item['snapshot'] for item in ledger['snapshots'][-2:]}
-    protected.update(boundaries)
-    pins_path = parent / '.retention-pins.json'
-    if pins_path.is_symlink():
-        raise ValueError('Checkpoint retention pins cannot be a symlink')
-    pins = read(pins_path) if pins_path.exists() else {}
-    if not isinstance(pins, dict):
-        raise ValueError('Invalid checkpoint retention pins')
-    for value, checksum in pins.items():
-        managed_snapshot(parent, value, checksum)
-        protected.add(value)
-    history = sorted(directory.parent.glob('attempt-*'))
-    for attempt in history:
-        if attempt.is_symlink() or (attempt / 'attempt.json').is_symlink():
-            raise ValueError('Checkpoint retention attempt cannot be a symlink')
-        saved = read(attempt / 'attempt.json')
-        for key in ('checkpoint', 'source_checkpoint'):
-            value = saved[key]
-            if value is not None:
-                if (not isinstance(value, str) or not Path(value).is_absolute() or str(Path(value)) != value or
-                        Path(value).parent not in {p / 'runtime' / 'checkpoints' for p in history} or
-                        not Path(value).is_dir() or any(p.is_symlink() for p in (Path(value), *Path(value).parents))):
-                    raise ValueError('Invalid attempt checkpoint reference')
-                protected.add(value)
-        pointer = attempt / 'runtime' / 'checkpoint.json'
-        if pointer.is_symlink() or any(p.is_symlink() for p in pointer.parents):
-            raise ValueError('Checkpoint retention pointer cannot contain symlinks')
-        if pointer.exists():
-            saved = read(pointer)
-            if set(saved) != {'snapshot', 'sha256'}:
-                raise ValueError('Invalid runtime checkpoint pointer')
-            value = saved['snapshot']
-            if not isinstance(value, str) or not Path(value).is_absolute() or str(Path(value)) != value:
-                raise ValueError('Invalid runtime checkpoint reference')
-            managed_snapshot(attempt / 'runtime' / 'checkpoints', value, saved['sha256'])
-            protected.add(value)
-    discarded = [value for value in snapshots if value not in protected]
-    for value in discarded:
-        shutil.rmtree(snapshots[value])
-    if discarded:
-        ledger['snapshots'] = [item for item in ledger['snapshots'] if item['snapshot'] not in discarded]
-        write_json(parent / '.retention.json', ledger)
-
-
 def save_checkpoint(team, directory, record, boundary):
     parent = team.root / 'checkpoints'
     with ExitStack() as stack:
@@ -630,7 +566,6 @@ def save_checkpoint(team, directory, record, boundary):
                 raise ValueError('Checkpoint retention ledger is missing')
             ledger['snapshots'].append(dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json')))
             write_json(path, ledger)
-            prune_checkpoints(parent, ledger, directory)
         except Exception as exc:
             record.setdefault('checkpoint_retention_errors', []).append(dict(error_type=type(exc).__name__, error=str(exc)))
             try:
@@ -656,8 +591,12 @@ def prepare(path, run_id, *, resume=False, week=None, live=False, client_factory
             counter = load_counter('opencode', MODEL)
             record['tokenizer_changed'] = canonical(counter.metadata if counter else None) != manifest['tokenizer']
             session = record['attempt_id']
+            def check_request():
+                check_model_call()
+                if team:
+                    team._lifecycle.check()
             def guarded_request(request):
-                request_guard(request, check=team._lifecycle.check if team else lambda: None)
+                request_guard(request, check=check_request)
             guard_options = dict(request_guard=guarded_request if request_guard else None, response_guard=response_guard,
                 hold=None)
             factory = client_factory or (lambda role: checked_client(role, session, no_models=not live,

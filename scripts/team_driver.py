@@ -63,7 +63,8 @@ def main(argv=None):
             exit_record = batch.read(directory / 'controller-exit.json')
             terminal = batch.read(directory / 'controller-terminal.json') if (directory / 'controller-terminal.json').exists() else {}
             outcome = 0 if (exit_record['children_reaped'] and not exit_record['hold'] and
-                not exit_record['failed'] and set(terminal) == {entry['run_id'] for entry in manifest['runs']}) else 2
+                not exit_record['failed'] and (exit_record.get('operator_stopped') or
+                    set(terminal) == {entry['run_id'] for entry in manifest['runs']})) else 2
             return outcome
         finally:
             write_json(directory / 'driver-exit.json', dict(time=datetime.now(timezone.utc).isoformat(),

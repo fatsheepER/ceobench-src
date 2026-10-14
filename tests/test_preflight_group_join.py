@@ -14,7 +14,7 @@ from test_preflight_team_observer import observer
 from test_preflight_team_batch import frozen
 
 
-def group_batch(observer, controller, monkeypatch, *, first_status='finished', second_status='finished', hold=False, unknown=False, partial=False, peer_partial=False, paired=False, persistent_failure=False):
+def group_batch(observer, controller, monkeypatch, *, first_status='finished', second_status='finished', hold=False, unknown=False, partial=False, peer_partial=False, paired=False, persistent_failure=False, operator_pause=None):
     module = controller.module
     observer.manifest.update(category='formal', source_root=str(Path(__file__).resolve().parents[1]))
     observer.expected['source_root'] = observer.manifest['source_root']
@@ -60,7 +60,7 @@ def group_batch(observer, controller, monkeypatch, *, first_status='finished', s
         module.worker_arguments.append(list(command))
         code = '''import json,sys,time
 from pathlib import Path
-run,out,status,hold,unknown,partial,peer_partial,model,joined,attempt=sys.argv[1:]
+run,out,status,hold,unknown,partial,peer_partial,model,joined,attempt,operator=sys.argv[1:]
 p=Path(out)/('attempt-'+attempt)/'attempt.json';p.parent.mkdir(parents=True)
 p.write_text(json.dumps(dict(status='running',execution_started=True)))
 if partial=='yes' or peer_partial=='yes':
@@ -77,8 +77,9 @@ if unknown=='yes':
  q.write_text(json.dumps(dict(kind='api:set_prices',day=0,status='running')))
 if hold!='-':Path(hold).touch()
 if status=='oom-kill':sys.exit(137)
+if operator=='STOP':(p.parent/'STOP').touch()
 p.write_text(json.dumps(dict(status=status,reason='offline_terminal_failure' if status=='failed' else status,
-    execution_started=True,day=28)))
+    execution_started=True,day=28,runtime_failure='run_evidence_fault' if operator=='STOP' else operator if operator!='-' else None)))
 sys.exit(0 if status=='finished' else 2)
 '''
         status = first_status if run_id == 's101-pf' and (persistent_failure or launches.count(run_id) == 1) else second_status if run_id == 's102-pf' and launches.count(run_id) == 1 else 'finished'
@@ -88,7 +89,7 @@ sys.exit(0 if status=='finished' else 2)
             'yes' if partial and run_id == 's101-pf' and '--resume' not in command else 'no',
             'yes' if peer_partial and run_id == 's101-git' else 'no', observer.module.round5.MODEL,
             str(joined) if not paired else '-',
-            f'{len(module.batch.attempts(entry)) + 1:03}'], **kwargs)
+            f'{len(module.batch.attempts(entry)) + 1:03}', operator_pause if run_id == 's101-pf' and operator_pause else '-'], **kwargs)
         children.append((run_id, child))
         if run_id == 's102-pf':
             joined.touch()
@@ -129,6 +130,23 @@ def test_paused_lane_automatically_recovers_without_stopping_other_group(observe
     controller.module.supervise(controller.policy)
     assert launches.count('s101-pf') == 2 and launches[-2:] == ['s102-pf', 's102-git']
     assert not observer.hold.exists()
+
+
+@pytest.mark.parametrize('reason', ['requested_pause', 'supervisor_cancelled', 'STOP'])
+def test_deliberate_worker_stop_has_closed_receipt_and_successful_controller_exit(observer, controller, monkeypatch, reason):
+    launches, children = group_batch(observer, controller, monkeypatch, first_status='paused',
+        paired=True, operator_pause=reason)
+    controller.module.supervise(controller.policy)
+    assert launches == ['s101-git', 's101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    terminal = controller.module.batch.read(controller.policy.parent / 'controller-terminal.json')
+    stopped = terminal['s101-pf']
+    assert stopped['disposition'] == 'paused' and stopped['operator_stop']
+    assert stopped['children_reaped'] and stopped['unit']['scope_empty']
+    result = controller.module.batch.read(controller.policy.parent / 'controller-exit.json')
+    assert result['operator_stopped'] and result['children_reaped'] and not result['failed']
+    rows = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
+    assert not any(row['event'] == 'recovery_failure' for row in rows)
 
 
 def test_historical_hold_does_not_stop_either_group(observer, controller, monkeypatch):

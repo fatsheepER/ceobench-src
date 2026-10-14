@@ -129,8 +129,8 @@ class WorkerLifecycle:
         if self.parent_pid is not None and hasattr(self, '_parent'):
             if select.select([self._parent], [], [], 0)[0]:
                 self.reason = 'supervisor_exited'
-        if retry and self.hold and self.hold.exists():
-            self.reason = self.reason or 'hold_during_retry'
+        if retry and self.hold and self.hold.name == 'STOP' and self.hold.exists():
+            self.cancel('requested_pause')
         if self.reason:
             raise RunCancelled(self.reason)
 

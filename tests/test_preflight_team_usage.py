@@ -220,17 +220,23 @@ def test_real_sdk_retry_counts_known_failed_http_usage_once(tmp_path, monkeypatc
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
 
 
-def test_returned_model_mismatch_is_rejected_after_raw_receipt(tmp_path):
+def test_returned_model_mismatch_retries_five_times_after_raw_receipt(tmp_path, monkeypatch):
+    from saas_bench.run_lifecycle import RunCancelled
     recorder = ModelUsage(tmp_path / 'model.jsonl', 'ceo', PRICES['rates'], expected_model='frozen-model')
-    with pytest.raises(ValueError, match='frozen configuration'):
+    waits = []
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
         recorder.call('chat', {'model': 'frozen-model'}, lambda: body(), day=0)
+    assert isinstance(error.value.__cause__, ValueError)
+    assert waits == [10, 20, 40, 80]
     row = json.loads(recorder.path.read_text().splitlines()[-1])
     assert row['response']['model'] == 'test-model' and row['usage']['input_tokens'] == 10
-    assert row['error'] == 'ValueError' and recorder.summary['errors'] == 1
+    assert row['error'] == 'RunCancelled' and recorder.summary['errors'] == 1
+    assert row['model_attempts'] == 5 and row['last_model_error'] == 'ValueError'
     assert row['cost_usd'] == pytest.approx(.0113)
     recorder.expected_model = 'test-model'
     assert recorder.call('chat', {}, lambda: body(), day=7)['model'] == 'test-model'
-    with pytest.raises(ValueError, match='object'):
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
         recorder.call('chat', {}, lambda: None, day=14)
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] is None
 

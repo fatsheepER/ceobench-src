@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 
 import httpx
@@ -12,7 +13,7 @@ from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from saas_bench.customer_llm import CustomerSimulator
 from saas_bench.database import init_database
 from saas_bench.llm import AgentLLM, CostTracker
-from saas_bench.model_usage import ModelUsage
+from saas_bench.model_usage import ModelUsage, check_model_call
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
 
@@ -42,7 +43,7 @@ def test_customer_retries_one_unchanged_request_and_retains_attempts(tmp_path, m
     try:
         assert customer.complete_text(provider=provider, model='test-model', user='same user input',
             system='same system input', max_tokens=30) == ('hello', 10, 2)
-        assert waits == [5, 10]
+        assert waits == [10, 20]
         assert requests[0] == requests[1] == requests[2]
         rows = [json.loads(line) for line in (tmp_path / 'usage.jsonl').read_text().splitlines()]
         assert len({row['call_id'] for row in rows}) == 1
@@ -60,7 +61,6 @@ def test_customer_retries_one_unchanged_request_and_retains_attempts(tmp_path, m
 def test_shared_deadline_includes_all_backoff_and_does_not_reset(tmp_path, monkeypatch):
     clock, calls, waits = [100.0], [], []
     recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo')
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 45)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
     def wait(seconds):
         waits.append(seconds)
@@ -68,11 +68,15 @@ def test_shared_deadline_includes_all_backoff_and_does_not_reset(tmp_path, monke
     monkeypatch.setattr(recorder.lifecycle, 'sleep', wait)
     def invoke():
         calls.append(clock[0])
-        raise httpx.ConnectError('offline')
-    with pytest.raises(RunCancelled, match='model_request_deadline'):
+        clock[0] += 600
+        check_model_call()
+        pytest.fail('Timed out attempt must not continue')
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
         recorder.call('chat', {'model': 'test-model'}, invoke, day=21)
-    assert calls == [100, 105, 115, 135]
-    assert waits == [5, 10, 20, 10]
+    assert calls == [100, 710, 1330, 1970, 2650]
+    assert waits == [10, 20, 40, 80]
+    assert clock[0] == 3250
+    assert recorder.lifecycle.reason is None
     assert recorder.summary['calls'] == recorder.summary['errors'] == 1
     assert recorder.summary['known']['input_tokens'] is None
 
@@ -87,16 +91,17 @@ def test_deadline_includes_call_lock_wait(monkeypatch):
             clock[0] += timeout
             return False
     recorder.call_lock = Locked()
-    with pytest.raises(RunCancelled, match='model_request_deadline'):
+    with pytest.raises(TimeoutError, match='lock exceeded'):
         recorder.call('chat', {}, lambda: pytest.fail('request must not start'))
     assert clock[0] == pytest.approx(100.25)
     assert recorder.summary['calls'] == 0
 
 
 @pytest.mark.parametrize('role', ['ceo', 'growth', 'ops_finance', 'simulator'])
-def test_all_roles_share_900_second_exponential_outage_budget(monkeypatch, role):
-    from saas_bench.model_usage import MODEL_REQUEST_SECONDS
-    assert MODEL_REQUEST_SECONDS == 900
+@pytest.mark.parametrize('error_type', [ValueError, TimeoutError, httpx.ConnectError])
+def test_all_roles_retry_every_model_error_exactly_five_times(monkeypatch, role, error_type):
+    from saas_bench.model_usage import MODEL_REQUEST_SECONDS, MODEL_REQUEST_ATTEMPTS
+    assert MODEL_REQUEST_SECONDS == 3150 and MODEL_REQUEST_ATTEMPTS == 5
     clock, waits, calls = [100.0], [], []
     recorder = ModelUsage(None, role)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
@@ -106,12 +111,12 @@ def test_all_roles_share_900_second_exponential_outage_budget(monkeypatch, role)
     monkeypatch.setattr(recorder.lifecycle, 'sleep', wait)
     def invoke():
         calls.append(clock[0])
-        raise httpx.ConnectError('offline')
-    with pytest.raises(RunCancelled, match='model_request_deadline'):
+        raise error_type('offline')
+    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
         recorder.call('chat', {}, invoke)
-    assert waits == [5, 10, 20, 40, 80, 160, 180, 180, 180, 45]
-    assert calls == [100, 105, 115, 135, 175, 255, 415, 595, 775, 955]
-    assert clock[0] == 1000
+    assert waits == [10, 20, 40, 80]
+    assert calls == [100, 110, 130, 170, 250]
+    assert clock[0] == 250
     assert recorder.summary['calls'] == recorder.summary['errors'] == 1
 
 
@@ -127,23 +132,49 @@ def test_cancellation_during_backoff_prevents_another_attempt(monkeypatch):
     assert calls == [1]
 
 
-def test_remaining_deadline_caps_sdk_phase_timeouts_and_permanent_errors(tmp_path, monkeypatch):
+def test_each_attempt_timeout_wakes_its_socket_and_preserves_outer_lifecycle(monkeypatch):
+    from saas_bench.model_usage import _ATTEMPT
+    recorder = ModelUsage(None, 'ceo')
+    monkeypatch.setattr('saas_bench.model_usage.MODEL_ATTEMPT_SECONDS', .01)
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
+    calls = []
+    def invoke():
+        calls.append(1)
+        channel, peer = socket.socketpair()
+        with channel, peer:
+            _ATTEMPT.get()._sockets.add(channel)
+            assert channel.recv(1) == b''
+    channel, peer = socket.socketpair()
+    with channel, peer:
+        recorder.lifecycle._sockets.add(channel)
+        with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
+            recorder.call('chat', {}, invoke)
+        assert isinstance(error.value.__cause__, TimeoutError)
+        assert calls == [1] * 5
+        assert recorder.lifecycle.reason is None
+        channel.sendall(b'peer continues')
+        assert peer.recv(32) == b'peer continues'
+
+
+def test_attempt_deadline_caps_sdk_phase_timeouts_and_all_rejected_requests(tmp_path, monkeypatch):
     timeouts = []
     def handle(request):
         timeouts.append(request.extensions['timeout'])
         return httpx.Response(401, json={'error': {'message': 'unauthorized'}})
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 2)
+    monkeypatch.setattr('saas_bench.model_usage.MODEL_ATTEMPT_SECONDS', 2)
     recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo')
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     client = recorder.attach(OpenAI(api_key='offline', max_retries=2,
         http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[{'role': 'user', 'content': 'unchanged'}])
     try:
-        with pytest.raises(Exception) as error:
+        with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
             recorder.call('chat', request, lambda: client.chat.completions.create(**request))
-        assert error.value.status_code == 401
+        assert error.value.__cause__.status_code == 401
         assert client.max_retries == 2
-        assert len(timeouts) == 1
-        assert all(0 < value <= 2 for value in timeouts[0].values())
+        assert len(timeouts) == 5
+        assert all(0 < value <= 2 for phases in timeouts for value in phases.values())
+        assert len(client._client.event_hooks['request']) == 1
     finally:
         client.close()
 
@@ -172,7 +203,6 @@ def test_retryable_http_status_keeps_one_logical_call(monkeypatch, status):
 
 def test_threaded_agent_uses_shared_deadline(monkeypatch):
     clock, failures, requests = [100.0], [], []
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 15)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
     def handle(request):
         requests.append(request)
@@ -194,9 +224,9 @@ def test_threaded_agent_uses_shared_deadline(monkeypatch):
         worker.start()
         worker.join(timeout=2)
         assert not worker.is_alive()
-        assert len(requests) == 2
+        assert len(requests) == 5
         assert len(failures) == 1 and isinstance(failures[0], RunCancelled)
-        assert str(failures[0]) == 'model_request_deadline'
+        assert str(failures[0]) == 'model_request_attempt_limit'
         assert agent.usage_recorder.summary['calls'] == 1
     finally:
         client.close()

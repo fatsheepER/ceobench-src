@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -36,54 +37,6 @@ def retention_lock(parent, *, create=False):
     with os.fdopen(fd, 'r') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield created
-
-
-def managed_snapshot(parent, value, checksum):
-    snapshot = Path(value)
-    if (not isinstance(value, str) or str(snapshot) != value or snapshot.parent != parent or
-            len(snapshot.name) != 32 or any(c not in '0123456789abcdef' for c in snapshot.name) or
-            snapshot.is_symlink() or snapshot.resolve() != snapshot or not snapshot.is_dir() or
-            (snapshot / 'checkpoint.json').is_symlink() or
-            not isinstance(checksum, str) or len(checksum) != 64 or
-            any(c not in '0123456789abcdef' for c in checksum) or
-            file_hash(snapshot / 'checkpoint.json') != checksum):
-        raise ValueError('Invalid managed checkpoint path or receipt')
-    return snapshot
-
-
-def _pin_snapshot(snapshot):
-    snapshot = Path(snapshot).resolve()
-    parent = snapshot.parent
-    signal = parent / '.retention.lock'
-    if not signal.exists() and not signal.is_symlink():
-        return
-    with retention_lock(parent):
-        ledger_path = parent / '.retention.json'
-        if ledger_path.is_symlink():
-            raise ValueError('Checkpoint retention ledger cannot be a symlink')
-        ledger = json.loads(ledger_path.read_text())
-        if (not isinstance(ledger, dict) or set(ledger) != {'version', 'snapshots'} or
-                ledger['version'] != 1 or not isinstance(ledger['snapshots'], list)):
-            raise ValueError('Invalid checkpoint retention ledger')
-        entries = {}
-        for item in ledger['snapshots']:
-            if (not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or
-                    not isinstance(item['snapshot'], str) or not isinstance(item['sha256'], str) or
-                    item['snapshot'] in entries):
-                raise ValueError('Invalid checkpoint retention entry')
-            entries[item['snapshot']] = item['sha256']
-        if str(snapshot) not in entries:
-            return
-        checksum = entries[str(snapshot)]
-        managed_snapshot(parent, str(snapshot), checksum)
-        path = parent / '.retention-pins.json'
-        if path.is_symlink():
-            raise ValueError('Checkpoint retention pins cannot be a symlink')
-        pins = json.loads(path.read_text()) if path.exists() else {}
-        if not isinstance(pins, dict):
-            raise ValueError('Invalid checkpoint retention pins')
-        pins[str(snapshot)] = checksum
-        write_json(path, pins)
 
 
 def business_operations(root):
@@ -366,14 +319,14 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     for key in list(options):
         if key in configuration:
             if options.pop(key) != configuration[key]:
-                raise ValueError('Recovery configuration drift for ' + key)
+                logging.warning('Recovery restores checkpoint setting for %s; supplied value differs', key)
         elif key in ('analyst_bash_timeout', 'analyst_bash_warn_after'):
             field = 'bash_timeout' if key == 'analyst_bash_timeout' else 'bash_warn_after'
             requested = options.pop(key)
             if any(saved['executor'].get(field) != requested for name, saved in state['roles'].items() if name != 'ceo'):
-                raise ValueError('Recovery configuration drift for ' + key)
+                logging.warning('Recovery restores checkpoint analyst setting for %s; supplied value differs', key)
     if state['live_customer'] and simulator_factory is None:
-        raise ValueError('Live simulator recovery requires its frozen customer client factory')
+        raise ValueError('Live simulator recovery requires a customer client factory')
     root.mkdir(parents=True)
     try:
         copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
@@ -468,7 +421,7 @@ def restore_runtime_state(runtime, state):
     for name, role in runtime.roles.items():
         saved = state['roles'][name]
         if _client_configuration(role.agent.client) != saved['client']:
-            raise ValueError('Recovery client configuration drift for ' + name)
+            logging.warning('Recovery client configuration differs from checkpoint for %s', name)
         role.usage.summary = saved['usage']
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
@@ -486,7 +439,7 @@ def restore_runtime_state(runtime, state):
         usage = customer.usage_recorder
         saved = state['simulator_usage']
         if _client_configuration(customer.client) != saved['client']:
-            raise ValueError('Recovery simulator client configuration drift')
+            logging.warning('Recovery simulator client configuration differs from checkpoint')
         usage.path = runtime.root / 'private' / 'simulator-model-usage.jsonl'
         usage.summary, usage.context_id, usage.pricing = saved['summary'], saved['context_id'], saved['pricing']
         usage.expected_model = saved['expected_model']

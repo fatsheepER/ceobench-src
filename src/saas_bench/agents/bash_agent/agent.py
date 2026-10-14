@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
-from ...model_usage import ModelUsage, usage_values
+from ...model_usage import MODEL_REQUEST_ATTEMPTS, ModelUsage, usage_values
 from ...run_lifecycle import RunCancelled
 
 
@@ -451,7 +451,7 @@ class BashAgent(BaseAgent):
         return action
 
     def _retry_wait(self, seconds):
-        if getattr(self, '_llm_attempt', 0) >= 4:
+        if getattr(self, '_llm_attempt', 0) >= MODEL_REQUEST_ATTEMPTS:
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
@@ -460,7 +460,7 @@ class BashAgent(BaseAgent):
             time.sleep(seconds)
 
     def _request_model(self, api, request, invoke):
-        if getattr(self, '_llm_attempt', 0) >= 4:
+        if getattr(self, '_llm_attempt', 0) >= MODEL_REQUEST_ATTEMPTS:
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
@@ -471,11 +471,6 @@ class BashAgent(BaseAgent):
             self.usage_recorder.message_ids = [m.message_id for m in self.conversation]
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
                                                 turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
-        except Exception as exc:
-            status = getattr(exc, 'status_code', 0) or 0
-            if 400 <= status < 500 and status not in (408, 409, 429):
-                raise RunCancelled(f'model_request_rejected:{status}') from exc
-            raise
         finally:
             for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
                 setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)

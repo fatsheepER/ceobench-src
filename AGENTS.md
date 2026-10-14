@@ -28,11 +28,11 @@
 - 子调用使用同一截止时间的剩余预算，覆盖输入读取、锁等待与执行。取消须唤醒实际阻塞操作；清理与持久化有独立且有界的预算，外层强杀期限须容纳它们。监测和停止通路独立于被监测工作占用的资源。
 - 回归从真实公共客户端和运行包装层进入。涉及模型发送时覆盖 `ModelUsage`，涉及停止时覆盖 controller；用本地 HTTP、真实子进程和假模型响应验证客户端先退出、服务端晚完成、断连、重复收尾及伙伴失败。断言下一次调用实际继续或按预期暂停、资源终态、attempt 状态与检查点恢复资格。
 - SQL 收尾与 PF 期限从 `tests/test_sql_capture_residuals.py`、`tests/test_pf_deadline.py` 定位；停止与资源隔离从 `tests/test_team_stop_residuals.py`、`tests/test_preflight_memory_guards.py` 定位。新增故障测试须证明修复前会失败，再验证修复后的完整路径。
-- 故障恢复由 controller 自动执行，各组独立。旧 worker 与后代关闭后，默认从最近完整检查点恢复数据库、模拟器日期、RNG、角色工作区、PF 记录和会话，使用新 attempt 重启；同一 day 与 stage 连续失败三次才停止该组并报警。原 attempt、回执及控制文件保留。各组保留全部周界检查点，包括 D0；`--week N` 从 D(7×(N−1)) 周界重跑，指定周仅作用于首次启动，后续自动恢复使用最新完整检查点。
+- 故障恢复由 controller 自动执行，各组独立。旧 worker 与后代关闭后，默认从最近完整检查点恢复数据库、模拟器日期、RNG、角色工作区、PF 记录和会话，使用新 attempt 重启；同一内部日期与 stage 连续失败三次才停止该组并报警。原 attempt、回执及控制文件保留。全部检查点保留，不删除或覆盖，包括初始周界；`--week N` 从内部日期 7×(N−1) 的周界重跑，指定周仅作用于首次启动，后续自动恢复使用最新完整检查点。实验状态对外使用周与专家/CEO 阶段表述。
 - 历史 HOLD、冻结源码或控制文件哈希、恢复审批、fix_classification、未知业务回执与检查点后的已完成操作均作为历史信息，不阻止检查点回退。检查点本身的文件完整性、组身份与恢复目标独立性由 `team_checkpoint.py` 和 `team_recovery.py` 验证。
 - `scripts/team_driver.py` 支持旧配对批次和单组选择，自动判断恢复。每组默认 MemoryHigh 16G、MemoryMax 20G，launcher 转发内存参数；运行中属性变化只记录。主动 STOP 保留为操作者停止入口。
 - 回退作废轨迹的用量按组与角色记入 waste，配对比较只使用保留轨迹。组耗时按检查点继承链扣除作废执行段，角色耗时为模型逻辑请求耗时，缺失字段保持 null。定位见 `tests/test_recovery_waste.py`。
-- 模型调用共用单次请求截止时间，连接与暂时服务错误在剩余预算内退避重试。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_preflight_team_recovery_gap.py`、`tests/test_preflight_team_checkpoint_rollback.py`。
+- 所有角色与模拟器模型调用使用同一重试入口：首次请求加四次重试，间隔依次为 10、20、40、80 秒；任何模型错误均走满五次后交给自动回退。请求与清理有截止时间，操作者停止仍可中断。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_preflight_team_recovery_gap.py`、`tests/test_preflight_team_checkpoint_rollback.py`。
 
 # 测试执行与验收成本
 
