@@ -511,6 +511,7 @@ class PFQueries:
                           or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds'
                               and t['check'].get('change_kind') != 'append_only')]
                 entries.append(dict(text=self._describe(version), total=len(tops), changed=direct,
+                                    diff_pair=next((t['diff_pair'] for t in tops if t.get('diff_pair')), None),
                                     stored_conditions=[self._describe_edge(r) for r in rows if not r['historical_only']
                                         and r['check'].get('evaluation_scope') == 'stored_artifact' and self._conditional(r)]))
                 if not direct and any(t['check'].get('below_changed') or

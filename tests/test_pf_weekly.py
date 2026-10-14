@@ -138,6 +138,17 @@ def test_unchanged_dependency_keeps_depend_hint_without_a_change_hint(workspace,
     assert 'Before changing this source' not in executor.weekly_check(14)
 
 
+def test_append_only_source_change_also_recommends_diff(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    server.conn.execute("INSERT INTO ledger(day, category, amount) VALUES(1, 'operations', 43)")
+    server.conn.commit()
+    weekly = executor.weekly_check(14)
+    assert 'Only added rows' in weekly and 'pf depend r2' in weekly
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in weekly
+    diff = executor.execute('bash', {'command': 'pf diff query1@v1 query1@v2'})
+    assert '--- query1@v1\n+++ query1@v2' in diff and '"amount": 43.0' in diff
+
+
 def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server, select={'col': 'amount'},
         predicate={'type': 'threshold', 'op': '>=', 'value': 40})

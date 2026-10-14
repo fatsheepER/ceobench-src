@@ -479,6 +479,10 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
     if underlying:
         lines.append(f"Only added rows in checked sources for {plural(len(underlying), 'text')}; "
                      f"pf depend {underlying[0].split('.')[0]} shows one.")
+        pair = next((entry['diff_pair'] for entry in entries
+                     if entry['text']['version'] in underlying and entry.get('diff_pair')), None)
+        if pair:
+            lines.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
     if ended:
         lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
     if flagged:
