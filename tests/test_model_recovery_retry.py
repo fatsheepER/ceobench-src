@@ -42,7 +42,7 @@ def test_customer_retries_one_unchanged_request_and_retains_attempts(tmp_path, m
     try:
         assert customer.complete_text(provider=provider, model='test-model', user='same user input',
             system='same system input', max_tokens=30) == ('hello', 10, 2)
-        assert waits == [10, 20]
+        assert waits == [5, 10]
         assert requests[0] == requests[1] == requests[2]
         rows = [json.loads(line) for line in (tmp_path / 'usage.jsonl').read_text().splitlines()]
         assert len({row['call_id'] for row in rows}) == 1
@@ -71,8 +71,8 @@ def test_shared_deadline_includes_all_backoff_and_does_not_reset(tmp_path, monke
         raise httpx.ConnectError('offline')
     with pytest.raises(RunCancelled, match='model_request_deadline'):
         recorder.call('chat', {'model': 'test-model'}, invoke, day=21)
-    assert calls == [100, 110, 130]
-    assert waits == [10, 20, 15]
+    assert calls == [100, 105, 115, 135]
+    assert waits == [5, 10, 20, 10]
     assert recorder.summary['calls'] == recorder.summary['errors'] == 1
     assert recorder.summary['known']['input_tokens'] is None
 
@@ -91,6 +91,28 @@ def test_deadline_includes_call_lock_wait(monkeypatch):
         recorder.call('chat', {}, lambda: pytest.fail('request must not start'))
     assert clock[0] == pytest.approx(100.25)
     assert recorder.summary['calls'] == 0
+
+
+@pytest.mark.parametrize('role', ['ceo', 'growth', 'ops_finance', 'simulator'])
+def test_all_roles_share_900_second_exponential_outage_budget(monkeypatch, role):
+    from saas_bench.model_usage import MODEL_REQUEST_SECONDS
+    assert MODEL_REQUEST_SECONDS == 900
+    clock, waits, calls = [100.0], [], []
+    recorder = ModelUsage(None, role)
+    monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
+    def wait(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', wait)
+    def invoke():
+        calls.append(clock[0])
+        raise httpx.ConnectError('offline')
+    with pytest.raises(RunCancelled, match='model_request_deadline'):
+        recorder.call('chat', {}, invoke)
+    assert waits == [5, 10, 20, 40, 80, 160, 180, 180, 180, 45]
+    assert calls == [100, 105, 115, 135, 175, 255, 415, 595, 775, 955]
+    assert clock[0] == 1000
+    assert recorder.summary['calls'] == recorder.summary['errors'] == 1
 
 
 def test_cancellation_during_backoff_prevents_another_attempt(monkeypatch):
@@ -150,7 +172,7 @@ def test_retryable_http_status_keeps_one_logical_call(monkeypatch, status):
 
 def test_threaded_agent_uses_shared_deadline(monkeypatch):
     clock, failures, requests = [100.0], [], []
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 30)
+    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 15)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
     def handle(request):
         requests.append(request)

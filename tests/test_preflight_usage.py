@@ -121,7 +121,7 @@ def test_go_cache_fields_and_sourced_time_bounded_prices(tmp_path):
 def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch, capture):
     from saas_bench.run_lifecycle import RunCancelled
     clock = [100.0]
-    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 30)
+    monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 15)
     monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
     monkeypatch.setattr('time.sleep', lambda _: None)
     attempts = []
@@ -345,7 +345,7 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
     if fault != 'no_tool':
         clock = [100.0]
-        monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 70)
+        monkeypatch.setattr('saas_bench.model_usage.MODEL_REQUEST_SECONDS', 35)
         monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
         monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',

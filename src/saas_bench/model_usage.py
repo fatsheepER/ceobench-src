@@ -19,7 +19,7 @@ from .run_lifecycle import WorkerLifecycle
 
 _CALL = ContextVar('model_call', default=None)
 _DEADLINE = ContextVar('model_request_deadline', default=None)
-MODEL_REQUEST_SECONDS = 600
+MODEL_REQUEST_SECONDS = 900
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
@@ -490,7 +490,7 @@ class ModelUsage:
                         raise
                     self._check_deadline()
                     retries += 1
-                    self.lifecycle.sleep(min(40, 10 * 2 ** min(retries - 1, 2),
+                    self.lifecycle.sleep(min(180, 5 * 2 ** min(retries - 1, 6),
                                              _DEADLINE.get() - time.monotonic()))
         except BaseException as exc:
             error = type(exc).__name__

@@ -10,9 +10,6 @@ import json
 import os
 import re
 import time
-import signal
-import threading
-from contextlib import contextmanager
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -27,28 +24,6 @@ from ...run_lifecycle import RunCancelled
 @dataclass(frozen=True)
 class FinalText:
     text: str
-
-
-class LLMTimeoutError(Exception):
-    pass
-
-
-_MODEL_CLOCK = threading.local()
-
-
-@contextmanager
-def _pause_model_deadline():
-    started = time.monotonic()
-    timer = (signal.getitimer(signal.ITIMER_REAL) if getattr(_MODEL_CLOCK, 'active', False)
-             and threading.current_thread() is threading.main_thread() else None)
-    if timer:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-    try:
-        yield
-    finally:
-        _MODEL_CLOCK.paused = getattr(_MODEL_CLOCK, 'paused', 0) + time.monotonic() - started
-        if timer:
-            signal.setitimer(signal.ITIMER_REAL, *timer)
 
 
 @dataclass
@@ -79,16 +54,12 @@ def _stream_chat_completion(client, request, check=lambda: None):
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
     from pydantic import ValidationError
 
-    deadline = time.monotonic() + 600
-    paused = getattr(_MODEL_CLOCK, 'paused', 0)
     state = ChatCompletionStreamState()
     received = False
     with client.chat.completions.create(**request) as stream:
         try:
             for chunk in stream:
                 check()
-                if time.monotonic() - (getattr(_MODEL_CLOCK, 'paused', 0) - paused) >= deadline:
-                    raise LLMTimeoutError('Chat stream exceeded 600s wall-clock timeout')
                 chunk = ChatCompletionChunk.model_validate(
                     chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
                 received = True
@@ -877,7 +848,7 @@ class BashAgent(BaseAgent):
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
-                    is_retryable = isinstance(e, (openai.APIConnectionError, openai.APITimeoutError, LLMTimeoutError))
+                    is_retryable = isinstance(e, (openai.APIConnectionError, openai.APITimeoutError))
                 if not is_retryable:
                     is_retryable = any(code in str(e) for code in ('429', '500', '502', '503', '504', '529'))
                 print(f"OpenAI LLM call error (retryable={is_retryable}, status={status}): {e}")
@@ -1050,7 +1021,7 @@ class BashAgent(BaseAgent):
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
-                    is_retryable = isinstance(e, (openai.APIConnectionError, openai.APITimeoutError, LLMTimeoutError))
+                    is_retryable = isinstance(e, (openai.APIConnectionError, openai.APITimeoutError))
                 if not is_retryable:
                     is_retryable = any(code in str(e) for code in ('429', '500', '502', '503', '504', '529'))
                 print(f"OpenAI Responses API error (retryable={is_retryable}, status={status}): {e}")
@@ -1272,14 +1243,11 @@ class BashAgent(BaseAgent):
                 api_kwargs['timeout'] = 60 if use_streaming else 600
                 def invoke():
                     if use_streaming:
-                        deadline = time.monotonic() + 600
                         with anthropic_messages.stream(**api_kwargs) as stream:
                             if hasattr(stream, '__iter__'):
                                 for event in stream:
                                     if lifecycle := getattr(self, 'lifecycle', None):
                                         lifecycle.check()
-                                    if time.monotonic() >= deadline:
-                                        raise LLMTimeoutError('Anthropic stream exceeded 600s wall-clock timeout')
                             return stream.get_final_message()
                     return anthropic_messages.create(**api_kwargs)
                 response = self._request_model('messages', dict(api_kwargs, stream=use_streaming), invoke)
