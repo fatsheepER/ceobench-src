@@ -248,7 +248,9 @@ def analyze(pointer):
     # Cumulative over the lineage: a branch includes its prefix.
     out['usage'] = {role: dict(calls=usage[role]['calls'], input=usage[role]['known']['input_tokens'],
                                cached=usage[role]['known']['cached_tokens'], output=usage[role]['known']['output_tokens'],
-                               usd=round(usage[role]['known_cost_usd'], 6), missing_cost=usage[role]['missing_cost'])
+                               usd=(round(usage[role]['known_cost_usd'], 6)
+                                    if usage[role]['known_cost_usd'] is not None else None),
+                               missing_cost=usage[role]['missing_cost'], costs=usage[role].get('costs'))
                     for role in ('agent', 'simulator') if role in usage}
     out['agent_request_usage'] = summarize_usage_log(run / 'logs/agent_requests.jsonl', start_day=start)
     out['weekly_check_seconds'] = {t['day']: t['elapsed_s'] for t in timing if t.get('event') == 'weekly_check'}

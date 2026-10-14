@@ -60,6 +60,8 @@ def summarize_pairs(runs):
             run.get('day') is not None for run in (git, pf)) else None
         pairs.append(dict(seed=seed, repeat=repeat, run_ids={g: r['run_id'] for g, r in pair.items()},
             statuses={g: r['status'] for g, r in pair.items()}, complete_d112=complete,
+            cost_breakdown={group: (run.get('usage') or {}).get('team', {}).get('costs')
+                            for group, run in pair.items()},
             common_completed_week_end=common_day,
             comparison=comparison, missing_groups=[g for g in ('git', 'pf') if g not in pair]))
     return dict(runs=runs, pairs=pairs, allocated_runs=len(runs), complete_d112_pairs=sum(p['complete_d112'] for p in pairs),

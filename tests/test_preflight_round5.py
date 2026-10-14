@@ -30,12 +30,17 @@ def test_monitor_detects_both_roles_and_usage_failures():
         assert round5.model_issue(dict(role=role, event='http_response', status=429)) == 'http_or_provider_error'
         assert round5.model_issue(dict(role=role, event='http_error')) == 'transport_error'
         assert round5.model_issue(dict(role=role, event='response', error='ValueError')) == 'model_call_error'
-        assert round5.model_issue(dict(role=role, event='response', usage={'input_tokens': None})) == 'missing_usage'
+        assert round5.model_issue(dict(role=role, event='response', response={'model': round5.MODEL},
+                                      usage={'input_tokens': None})) == 'missing_usage'
         response = dict(role=role, event='response', response={'model': round5.MODEL},
                         usage=dict(input_tokens=10, output_tokens=2, cached_tokens=0), cost_usd=.01)
         assert round5.model_issue(response) is None
         response['cost_usd'] = None
-        assert round5.model_issue(response) == 'missing_cost'
+        assert round5.model_issue(response) is None
+        response['usage']['cached_tokens'] = None
+        assert round5.model_issue(response) is None
+        response['usage']['output_tokens'] = None
+        assert round5.model_issue(response) == 'missing_usage'
     assert round5.model_issue(dict(event='tool_result', result='Traceback (most recent call last): ordinary agent script')) is None
     request = dict(role='simulator', event='http_request', endpoint=round5.ENDPOINT + 'chat/completions',
                    body=dict(model=round5.MODEL, thinking={'type': 'disabled'}, reasoning_effort='none'))

@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import PurePosixPath
 import re
+import shlex
 import subprocess
 
 from . import evidence_handles
@@ -352,6 +353,40 @@ class EvidenceResolver:
                 meta.get('object_id') in event['result'].get('changed_paths',
                                                           event['result'].get('written_paths', [])))
 
+    def _delivery_error(self, candidates, scope, message):
+        for version in scope['sources']:
+            meta, _ = self.content(version)
+            if meta['layer'] != 'tool_return':
+                continue
+            event = self.store.read_event(meta['created_by_event'], evidence=True)
+            if (event['request']['kind'] != 'bash' or
+                    'pf_pipeline_source_ranges_unknown' not in event['result'].get('capture_gaps', []) or
+                    self.store.identity.get('role') and
+                    event['request'].get('role') != self.store.identity['role']):
+                continue
+            sink = event['result'].get('stdout_sink')
+            if sink is None:
+                continue
+            for call in event['result'].get('pf_calls', []):
+                if (call.get('operation') != 'pf_read' or call.get('outcome') != 'succeeded' or
+                        call.get('arguments', {}).get('mode') != 'content' or not call.get('event_id')):
+                    continue
+                child = self.store.read_event(call['event_id'])
+                child_sink = child['result'].get('stdout_sink')
+                read_version = call['event_id'] + ':read_full'
+                if child_sink is None or child_sink == sink or read_version not in child['outputs']:
+                    continue
+                read, _ = self.content(read_version)
+                if self.identity(read['target'])[0] in candidates:
+                    command = shlex.join(['pf', 'show', '--full', '--', self.handle(read['target'])])
+                    return ValueError('PF output was displayed, but pipeline processing did not bind its '
+                        'source ranges in this model request (pf_pipeline_source_ranges_unknown). '
+                        'Selected fields cannot be registered. Run this command alone in Bash, without '
+                        'pipes or redirection, then retry the same registration:\n```bash\n' + command +
+                        '\n```' + ('\nIf the response returns next_cursor, read it with pf more before retrying.'
+                                   if not read['complete'] else ''))
+        return ValueError(message)
+
     def resolve(self, evidence, reference, accept=None):
         if getattr(self, '_binding_context', None) is None:
             with self.binding_scope():
@@ -433,7 +468,8 @@ class EvidenceResolver:
                                                             'csv' if str(object_id).endswith('.csv') else 'json'))
             if not matches:
                 if written:
-                    raise ValueError('Selected evidence was not fully delivered in this request; read the computed file first')
+                    raise self._delivery_error([candidate], scope,
+                        'Selected evidence was not fully delivered in this request; read the computed file first')
                 continue
             for source_version in dict.fromkeys(item['version_id'] for item, _, _ in matches):
                 group = [(item, content) for item, content, _ in matches if item['version_id'] == source_version]
@@ -447,15 +483,18 @@ class EvidenceResolver:
                     meta, _ = self.content(candidate)
                     return dict(version_id=candidate, latest_version_id=latest,
                                 source_truncated=meta['source_truncated'], delivered_in=delivery, selected_ranges=ranges)
-            raise ValueError('Selected evidence was not fully delivered in this request; use unknown with a reason')
+            raise self._delivery_error([candidate], scope,
+                'Selected evidence was not fully delivered in this request; use unknown with a reason')
         if whole and (members is not None or accept is not None):
             return self._whole_binding(candidates[0], latest, [],
                                        'explicit_handle' if members is not None else 'committed_bytes')
         if kind == 'query':
-            raise ValueError('Evidence has not been delivered in this request: cite the command output by the '
-                             'first handle in its [pf: ...] line, or read the query version first')
-        raise ValueError('Evidence has not been delivered in this request or written in this context; '
-                         'read it first, cite an explicit whole version, or use unknown with a reason')
+            message = ('Evidence has not been delivered in this request: cite the command output by the '
+                       'first handle in its [pf: ...] line, or read the query version first')
+        else:
+            message = ('Evidence has not been delivered in this request or written in this context; '
+                       'read it first, cite an explicit whole version, or use unknown with a reason')
+        raise ValueError(message) if whole else self._delivery_error(candidates, scope, message)
 
     def _whole_binding(self, version, latest, delivered, basis, fully_known=False):
         meta, raw = self.content(version)

@@ -66,7 +66,7 @@ def test_copied_prefix_retry_partial_line_and_restart_alert_once(tmp_path, monke
     assert str(invalid) not in state['offsets']
 
 
-def test_freeze_and_missing_cost_still_hold_with_copied_receipts(tmp_path, monkeypatch):
+def test_freeze_still_holds_billing_only_warns_with_copied_receipts(tmp_path, monkeypatch):
     monitor = load_monitor(monkeypatch)
     route = dict(event='http_request', call_id='route-call', attempt_id='route-attempt',
                  endpoint=monitor.round5.ENDPOINT + 'chat/completions', body={'model': 'changed-model'})
@@ -82,7 +82,8 @@ def test_freeze_and_missing_cost_still_hold_with_copied_receipts(tmp_path, monke
     errors = monitor.poll(tmp_path, state)
     assert [row.get('issue', row['event']) for row in errors] == [
         'model_route_changed', 'simulator_thinking_changed', 'served_model_changed',
-        'missing_cost', 'missing_uniform_cost']
+        'billing_fields_missing']
+    assert errors[-1]['missing_fields'] == ['cache_creation_tokens', 'cost_usd']
     hold = tmp_path / 'engineering/HOLD'
     assert hold.exists()
     resumed = tmp_path / 'engineering/runs/pf/attempt-002/runtime/private/ceo/model-usage.jsonl'

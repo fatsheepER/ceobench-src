@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 CONTROLLER_SCRIPTS = ('scripts/team_batch.py', 'scripts/team_controller.py',
-                      'scripts/team_observer.py', 'scripts/round5.py')
+                      'scripts/team_observer.py', 'scripts/team_model_monitor.py', 'scripts/round5.py')
 PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
     total_days=500, effective_end=497, sdk_max_retries=2, logical_request_attempts=4,

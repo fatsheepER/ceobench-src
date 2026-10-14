@@ -1,0 +1,8 @@
+{
+  "source": {"run": "formal-s1045-r2-pf", "day": 63, "role": "growth", "query_event": "formal-s1045-r2-pf/growth/2902", "pipe_event": "formal-s1045-r2-pf/growth/2961", "rejection_event": "formal-s1045-r2-pf/growth/2966"},
+  "handle": "growth:query195@v1",
+  "command": "pf show growth:query195@v1 2>&1 | tail -20",
+  "sql": "SELECT COALESCE(c.acquisition_source,'(none)') src,\n        COUNT(*) leads, SUM(s.status IN ('subscribed','cancelled')) subs,\n        ROUND(1.0*SUM(s.status IN ('subscribed','cancelled'))/COUNT(*),3) conv\n      FROM subscriptions s JOIN customers c ON c.customer_id=s.customer_id\n      WHERE c.created_day>=57 GROUP BY 1 ORDER BY leads DESC",
+  "response": "{\"success\": true, \"columns\": [\"src\", \"leads\", \"subs\", \"conv\"], \"rows\": [{\"src\": \"content_marketing\", \"leads\": 1849, \"subs\": 1387, \"conv\": 0.75}, {\"src\": \"network\", \"leads\": 834, \"subs\": 571, \"conv\": 0.685}, {\"src\": \"referral_program\", \"leads\": 146, \"subs\": 110, \"conv\": 0.753}, {\"src\": \"social_media\", \"leads\": 76, \"subs\": 54, \"conv\": 0.711}], \"row_count\": 4}",
+  "reference": {"cite": "growth:query195@v1", "purpose": "current", "select": {"col": "conv", "row": {"src": "content_marketing"}}, "predicate": {"op": "<", "type": "threshold", "value": 0.8}}
+}

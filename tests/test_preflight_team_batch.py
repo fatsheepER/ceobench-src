@@ -358,6 +358,7 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
     lambda m: m['runs'][0].update(output_dir=m['runs'][1]['output_dir']),
     lambda m: m['runs'][0].update(stop_after_day=28),
     lambda m: m['controller_sha256'].update({'scripts/team_controller.py': 'changed'}),
+    lambda m: m['controller_sha256'].update({'scripts/team_model_monitor.py': 'changed'}),
     lambda m: m.pop('controller_sha256'),
 ])
 def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):

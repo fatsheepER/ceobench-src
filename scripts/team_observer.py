@@ -13,6 +13,7 @@ import brotli
 import httpx
 
 import round5
+from team_model_monitor import finish_billing, record_billing
 from saas_bench import team_batch as batch
 from saas_bench.model_usage import usage_values
 from saas_bench.run_state import file_hash, write_json
@@ -198,7 +199,7 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
             if prior and (prior.get('identity', target['identity']) != target['identity'] or
                           prior.get('inode', stat.st_ino) != stat.st_ino):
                 target['reason'] = 'log_identity_changed'
-            elif target['offset'] > stat.st_size:
+            elif max(target['offset'], prior.get('billing_previous_offset', 0)) > stat.st_size:
                 target['reason'] = 'log_truncated'
             elif prior.get('closed_tail'):
                 proof = prior['closed_tail']
@@ -269,6 +270,14 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     physical_requests = state.setdefault('physical_request_meta', {})
     cursors = state.setdefault('cursors', {})
     seen = state.setdefault('receipt_hashes', {})
+    if 'billing_groups' not in state and seen:
+        for key, cursor in cursors.items():
+            if key.endswith('model-usage.jsonl'):
+                cursor['billing_previous_offset'] = cursor['offset']
+                cursor['offset'] = 0
+        state['billing_rebuild'] = True
+    state.setdefault('billing_groups', {})
+    billing_changed = state.setdefault('billing_pending', [])
     known = set(state.get('known_faults', []))
     previous = state.get('active_checks', [])
     oldprogress = state.get('progress', {})
@@ -276,12 +285,13 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
     pending = quota_error is not None
 
     def event(*, new_checks=(), sql_errors=(), route_errors=(), new_faults=(),
-              transient_errors=(), completed=()):
+              transient_errors=(), completed=(), billing=()):
         with (output / 'events.jsonl').open('a') as stream:
             stream.write(json.dumps(dict(time=datetime.now(timezone.utc).isoformat(),
                 new_checks=list(new_checks), sql_service_errors=list(sql_errors),
                 route_errors=list(route_errors), new_faults=list(new_faults),
-                transient_receipt_failures=list(transient_errors), completed=list(completed))) + '\n')
+                transient_receipt_failures=list(transient_errors), completed=list(completed),
+                billing_warnings=list(billing))) + '\n')
 
     targets = _capture_logs(manifest, expected, cursors, checks, progress, faults) if manifest else {}
     while manifest:
@@ -324,9 +334,15 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                             raise ValueError('Immutable model receipt ID is required')
                         receipt_key = row['event'] + ':' + str(receipt_id)
                         fingerprint = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
+                        group = next((run['run_id'] for run in manifest['runs']
+                                      if path.is_relative_to(Path(run['output_dir']))), None)
+                        if group is None:
+                            raise ValueError('Model usage log outside frozen run outputs')
                         if receipt_key in seen:
                             if seen[receipt_key] != fingerprint:
                                 checks.append('conflicting_receipt:' + receipt_key)
+                            elif state.get('billing_rebuild'):
+                                record_billing(row, state, group, path)
                             continue
                         issue = round5.model_issue(row)
                         if row['event'] == 'http_request':
@@ -339,7 +355,7 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                             if body.get('model') != request_meta.get('model'):
                                 issue = 'served_model_changed'
                             elif any(wire_usage.get(field) is None for field in (
-                                    'input_tokens', 'output_tokens', 'cached_tokens')):
+                                    'input_tokens', 'output_tokens')):
                                 issue = 'missing_usage'
                         if row['event'] == 'http_request' and row.get('role') != 'simulator':
                             if (row['body'].get('reasoning_effort') != 'high' or
@@ -349,10 +365,12 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                                       attempt_id=row.get('attempt_id'))
                         if issue in ('model_route_changed', 'served_model_changed',
                                      'simulator_thinking_changed', 'business_thinking_changed',
-                                     'missing_usage', 'missing_cost'):
+                                     'missing_usage', 'model_call_error'):
                             routes.append(detail)
                         elif issue:
                             transient.append(detail)
+                        if recorded := record_billing(row, state, group, path):
+                            billing_changed.append(recorded)
                         seen[receipt_key] = fingerprint
                 except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                     target['reason'] = 'log_read:' + type(exc).__name__ + ':' + str(exc)
@@ -366,8 +384,10 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
                     break
                 target['offset'] = next_offset
                 target['backlog_bytes'] = target['target_size'] - next_offset
-                cursors[key] = dict(offset=next_offset, inode=target['identity'][1],
-                                    identity=target['identity'])
+                cursor = dict(offset=next_offset, inode=target['identity'][1], identity=target['identity'])
+                if 'billing_previous_offset' in cursors.get(key, {}):
+                    cursor['billing_previous_offset'] = cursors[key]['billing_previous_offset']
+                cursors[key] = cursor
                 write_json(output / 'state.json', state)
                 if next_offset == offset:
                     try:
@@ -398,6 +418,14 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
             break
         targets = latest
 
+    billing_complete = bool(manifest) and all(target['offset'] == target['target_size'] and not target['reason']
+        for prefix, target in targets.values() if not prefix)
+    bill_warnings = finish_billing(state, billing_complete)
+    if billing_complete:
+        for cursor in cursors.values():
+            cursor.pop('billing_previous_offset', None)
+    if bill_warnings:
+        event(billing=bill_warnings)
     checks = list(dict.fromkeys(checks))
     newfaults = sorted(set(faults) - known)
     if checks or sql or routes:
@@ -426,6 +454,8 @@ def poll(manifest_path, output, expected, state, *, quota_fn=round5.quota_health
         runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']] if manifest else [],
         batch_id=expected['batch_id'], status='hold' if hold.exists() else 'pending' if pending else 'healthy',
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
+        billing_warnings=bill_warnings,
+        billing_coverage=state['billing_coverage'],
         quota_retry_after=max(0, state.get('quota_retry_at', 0) - time.time()) if quota_error else 0,
         run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],
         progress=progress, units=units, coverage=coverage, state=state)

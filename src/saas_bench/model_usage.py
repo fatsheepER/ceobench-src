@@ -85,17 +85,17 @@ def summarize_usage_log(path, start_day=0, end_day=None):
     Missing usage remains separate from the known subtotals.
     """
     summary = dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
-                   known_cost_usd=None, missing_cost=0, unreturned_requests=0)
-    pending = set()
+                   known_cost_usd=None, missing_cost=0, unreturned_requests=0, costs=billing_totals())
+    pending = {}
     with Path(path).open() as stream:
         for line in stream:
             row = json.loads(line)
             call_id = row.get('call_id')
             if row['event'] == 'request':
                 if row['day'] >= start_day and (end_day is None or row['day'] < end_day):
-                    pending.add(call_id)
+                    pending[call_id] = row.get('timestamp')
             elif row['event'] == 'response' and call_id in pending:
-                pending.remove(call_id)
+                timestamp = pending.pop(call_id)
                 summary['calls'] += 1
                 summary['errors'] += row.get('error') is not None
                 usage = row.get('usage') or {}
@@ -110,6 +110,8 @@ def summarize_usage_log(path, start_day=0, end_day=None):
                     summary['missing_cost'] += 1
                 else:
                     summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+                add_billing(summary['costs'], billing_assessment(usage, row.get('api'), row.get('pricing'),
+                    at=datetime.fromisoformat(timestamp) if timestamp else None, recorded_cost=cost))
     summary['unreturned_requests'] = len(pending)
     return summary
 
@@ -160,6 +162,64 @@ def cost_usd(usage, api, rates, at=None):
         if utc.weekday() < 5 and (1 <= utc.hour < 4 or 6 <= utc.hour < 10):
             multiplier = rates.get('peak_multiplier', 1)
     return multiplier * sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
+
+
+def billing_assessment(usage, api, rates, *, at=None, recorded_cost=None):
+    """Frozen uniform fees; raw billing fields remain unchanged."""
+    usage = {field: usage.get(field) for field in FIELDS}
+    complete = all(usage[field] is not None for field in ('input_tokens', 'output_tokens'))
+    missing = ([field for field in ('cached_tokens', 'cache_creation_tokens') if usage[field] is None] +
+               (['cost_usd'] if recorded_cost is None else [])) if complete else []
+    result = dict(kind='unknown', usd=None, lower_usd=None, upper_usd=None, missing_fields=missing)
+    timed = rates and any(key in rates for key in ('valid_from', 'valid_until', 'peak_schedule'))
+    if not complete or not rates or api not in ('chat', 'responses', 'messages') or timed and at is None:
+        return result
+    at = at or datetime.min.replace(tzinfo=timezone.utc)
+    if at.tzinfo is None:
+        raise ValueError('Receipt timestamp requires a timezone')
+    uncertain_read = usage['cached_tokens'] is None
+    uncertain_write = api == 'messages' and usage['cache_creation_tokens'] is None
+    if not uncertain_read and not uncertain_write:
+        fee = cost_usd(usage, api, rates, at=at)
+        if fee is not None:
+            result.update(kind='exact' if recorded_cost is not None else 'recomputed', usd=fee)
+        return result
+    read = usage['cached_tokens']
+    write = usage['cache_creation_tokens'] if api == 'messages' else 0
+    if uncertain_read and uncertain_write:
+        endpoints = [(0, 0), (usage['input_tokens'], 0), (0, usage['input_tokens'])]
+    elif uncertain_read:
+        endpoints = [(0, write), (usage['input_tokens'] - write, write)]
+    else:
+        endpoints = [(read, 0), (read, usage['input_tokens'] - read)]
+    amounts = [cost_usd(dict(usage, cached_tokens=cached, cache_creation_tokens=created), api, rates, at=at)
+               for cached, created in endpoints]
+    if all(amount is not None for amount in amounts):
+        result.update(kind='interval', lower_usd=min(amounts), upper_usd=max(amounts))
+    return result
+
+
+def billing_totals():
+    return dict(exact=dict(calls=0, subtotal_usd=None), recomputed=dict(calls=0, subtotal_usd=None),
+                interval=dict(calls=0, lower_usd=None, upper_usd=None), unknown_calls=0,
+                missing_field_calls=0, unclassified_prior_calls=0,
+                missing_fields=dict.fromkeys(('cached_tokens', 'cache_creation_tokens', 'cost_usd'), 0))
+
+
+def add_billing(totals, cost):
+    totals['missing_field_calls'] += bool(cost['missing_fields'])
+    for field in cost['missing_fields']:
+        totals['missing_fields'][field] += 1
+    if cost['kind'] == 'unknown':
+        totals['unknown_calls'] += 1
+        return
+    category = totals[cost['kind']]
+    category['calls'] += 1
+    if cost['kind'] == 'interval':
+        for field in ('lower_usd', 'upper_usd'):
+            category[field] = (category[field] or 0) + cost[field]
+    else:
+        category['subtotal_usd'] = (category['subtotal_usd'] or 0) + cost['usd']
 
 
 class _Stream(httpx.SyncByteStream):
@@ -217,6 +277,7 @@ class ModelUsage:
         self.call_lock = threading.RLock()
         self.summary = {'calls': 0, 'errors': 0, 'known': {k: None for k in FIELDS},
                         'missing': {k: 0 for k in FIELDS}, 'known_cost_usd': None, 'missing_cost': 0,
+                        'costs': billing_totals(),
                         'http_attempts': 0, 'failed_http_attempts': 0, 'failed_attempts_without_usage': 0}
 
     def write(self, event, **values):
@@ -373,8 +434,12 @@ class ModelUsage:
                 usage = usage_values(raw, api)
                 served_model = raw.get('model') if isinstance(raw, dict) else None
                 cost = cost_usd(usage, api, self.pricing.get(served_model), at=started)
+                billing = billing_assessment(usage, api, self.pricing.get(served_model),
+                                             at=started, recorded_cost=cost)
                 with self.lock:
                     summary = self.summary
+                    totals = summary.setdefault('costs', dict(billing_totals(),
+                                                              unclassified_prior_calls=summary['calls']))
                     summary['calls'] += 1
                     summary['errors'] += error is not None
                     for field, value in usage.items():
@@ -386,8 +451,10 @@ class ModelUsage:
                         summary['missing_cost'] += 1
                     else:
                         summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+                    add_billing(totals, billing)
                     self.write('response', call_id=call_id, api=api, response=raw, usage=usage,
-                               error=error, cost_usd=cost, pricing=self.pricing.get(served_model))
+                               error=error, cost_usd=cost, pricing=self.pricing.get(served_model),
+                               cost=billing, request_timestamp=started.isoformat())
             finally:
                 _CALL.reset(token)
                 if replacements:
