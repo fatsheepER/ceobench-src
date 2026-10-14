@@ -155,7 +155,10 @@ def _capture_logs(manifest, expected, cursors, checks, progress, faults):
             if history:
                 saved = json.loads((history[-1] / 'attempt.json').read_text())
                 progress[run['run_id']] = dict(status=saved['status'], **{key: saved.get(key) for key in (
-                    'attempt', 'day', 'reason', 'checkpoint_reused_at_stop', 'runtime_phase')})
+                    'attempt', 'day', 'reason', 'runtime_failure', 'checkpoint_reused_at_stop', 'runtime_phase')})
+                if saved['status'] in ('paused', 'failed') and 'model_attempt_limit' in (
+                        saved.get('reason'), saved.get('runtime_failure')):
+                    checks.append('model_attempt_limit:' + run['run_id'])
             else:
                 progress[run['run_id']] = {'status': 'not_started'}
         except (OSError, ValueError, KeyError, TypeError) as exc:

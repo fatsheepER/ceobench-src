@@ -465,12 +465,12 @@ def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(o
     observer.log(role='pf').write_bytes(b'')
     attempt = failed.parents[3] / 'attempt.json'
     attempt.write_text(json.dumps(dict(status='failed', attempt='001', day=14,
-                                      reason='model_attempt_limit', runtime_phase='ceo')))
+                                      reason='ordinary_failure', runtime_phase='ceo')))
     health = observer.poll()
     assert health['status'] == 'healthy' and not observer.hold.exists()
     assert health['checks'] == []
     assert health['progress']['git']['status'] == 'failed'
-    assert health['progress']['git']['reason'] == 'model_attempt_limit'
+    assert health['progress']['git']['reason'] == 'ordinary_failure'
     assert health['progress']['pf']['status'] == 'running'
     assert events(observer)[-1]['completed'] == ['git']
     assert [row['issue'] for row in events(observer)[0]['transient_receipt_failures']] == ['transport_error']
@@ -481,6 +481,46 @@ def test_failed_run_does_not_hold_healthy_peer_but_retains_global_fault_checks(o
     health = observer.poll(state=restarted)
     assert health['status'] == 'hold' and observer.hold.exists()
     assert [row['issue'] for row in health['route_errors']] == ['model_route_changed']
+
+
+@pytest.mark.parametrize('status,reason,failure,hold', [
+    ('paused', 'model_attempt_limit', None, True),
+    ('failed', 'model_attempt_limit', None, True),
+    ('failed', 'failed', 'model_attempt_limit', True),
+    ('running', 'model_attempt_limit', 'model_attempt_limit', False),
+])
+def test_attempt_limit_holds_only_after_harness_exit(observer, status, reason, failure, hold):
+    path = observer.log()
+    (path.parents[3] / 'attempt.json').write_text(json.dumps(dict(status=status,
+        attempt='001', day=0, reason=reason, runtime_failure=failure)))
+    state = {}
+    for _ in range(2):
+        health = observer.poll(state=state)
+        assert health['status'] == ('hold' if hold else 'healthy')
+        assert observer.hold.exists() == hold
+        assert health['checks'] == (['model_attempt_limit:git'] if hold else [])
+        state = json.loads((observer.output / 'state.json').read_text())
+    if hold:
+        assert sum('model_attempt_limit:git' in event['new_checks'] for event in events(observer)) == 1
+
+
+@pytest.mark.parametrize('event', ['response', 'http_error'])
+@pytest.mark.parametrize('error,issue', [
+    ('APIConnectionError', 'transport_error'), ('APITimeoutError', 'transport_error'),
+    ('ConnectError', 'transport_error'), ('ReadTimeout', 'transport_error'),
+    ('LLMTimeoutError', 'transport_error'), ('ValueError', 'model_call_error'),
+    ('UnsupportedProtocol', 'model_call_error'), ('LocalProtocolError', 'model_call_error'),
+])
+def test_observer_network_and_configuration_receipts(observer, event, error, issue):
+    path = observer.log()
+    append(path, dict(event=event, call_id='call', attempt_id='attempt', error=error,
+                      response=None))
+    health = observer.poll()
+    assert health['status'] == ('healthy' if issue == 'transport_error' else 'hold')
+    details = (events(observer)[0]['transient_receipt_failures'] if issue == 'transport_error'
+               else health['route_errors'])
+    assert [row['issue'] for row in details] == [issue]
+    assert observer.hold.exists() == (issue == 'model_call_error')
 
 
 def formal_pair(observer):

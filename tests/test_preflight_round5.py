@@ -51,6 +51,23 @@ def test_monitor_detects_both_roles_and_usage_failures():
     assert round5.model_issue(request) == 'model_route_changed'
 
 
+@pytest.mark.parametrize('error', [
+    'APIConnectionError', 'APITimeoutError', 'LLMTimeoutError', 'NetworkError',
+    'ConnectError', 'ReadError', 'WriteError', 'CloseError', 'TimeoutException',
+    'ConnectTimeout', 'ReadTimeout', 'WriteTimeout', 'PoolTimeout', 'RemoteProtocolError', 'ProxyError',
+])
+@pytest.mark.parametrize('event', ['response', 'http_error'])
+def test_monitor_classifies_named_network_errors_as_transient(error, event):
+    assert round5.model_issue(dict(event=event, error=error)) == 'transport_error'
+
+
+@pytest.mark.parametrize('error', ['ValueError', 'HTTPError', 'TransportError',
+                                  'UnsupportedProtocol', 'LocalProtocolError', 'APIStatusError'])
+@pytest.mark.parametrize('event', ['response', 'http_error'])
+def test_monitor_does_not_mask_configuration_or_other_errors(error, event):
+    assert round5.model_issue(dict(event=event, error=error)) == 'model_call_error'
+
+
 def test_incremental_receipts_do_not_lose_partial_lines(tmp_path):
     path = tmp_path / 'requests.jsonl'
     path.write_bytes(b'{"event":"request"}\n{"event":')

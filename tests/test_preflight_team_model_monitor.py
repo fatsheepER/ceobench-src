@@ -92,3 +92,17 @@ def test_freeze_still_holds_billing_only_warns_with_copied_receipts(tmp_path, mo
     hold.unlink()
     assert monitor.poll(tmp_path, json.loads(json.dumps(state))) == []
     assert hold.exists()
+
+
+@pytest.mark.parametrize('error,issue,hold', [
+    ('APIConnectionError', 'transport_error', False), ('APITimeoutError', 'transport_error', False),
+    ('ConnectError', 'transport_error', False), ('ValueError', 'model_call_error', True),
+    ('UnsupportedProtocol', 'model_call_error', True),
+])
+def test_logical_network_failure_does_not_hold_independent_monitor(tmp_path, monkeypatch, error, issue, hold):
+    monitor = load_monitor(monkeypatch)
+    path = tmp_path / 'engineering/runs/pf/attempt-001/runtime/private/ceo/model-usage.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(dict(event='response', call_id='call', error=error, response=None)) + '\n')
+    assert monitor.poll(tmp_path, {})[0]['issue'] == issue
+    assert (tmp_path / 'engineering/HOLD').exists() == hold

@@ -20,6 +20,11 @@ OUT = ROOT / 'acceptance-materials' / 'round5-first'
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 SEEDS = {42: 'A', 43: 'B', 44: 'C'}
+TRANSPORT_ERRORS = (
+    'APIConnectionError', 'APITimeoutError', 'LLMTimeoutError', 'NetworkError',
+    'ConnectError', 'ReadError', 'WriteError', 'CloseError', 'TimeoutException',
+    'ConnectTimeout', 'ReadTimeout', 'WriteTimeout', 'PoolTimeout', 'RemoteProtocolError', 'ProxyError',
+)
 
 
 def read(path, default=None):
@@ -271,11 +276,15 @@ def model_issue(row):
         if row.get('role') == 'simulator' and (row['body'].get('reasoning_effort') != 'none' or row['body'].get('thinking') != {'type': 'disabled'}):
             return 'simulator_thinking_changed'
     if row['event'] == 'http_error':
+        if row.get('error') and row['error'] not in TRANSPORT_ERRORS + ('RunCancelled',):
+            return 'model_call_error'
         return 'transport_error'
     if row['event'] == 'http_response' and (row.get('error') or row.get('status', 0) >= 400):
         return 'http_or_provider_error'
     if row['event'] == 'response':
         if row.get('error'):
+            if row['error'] in TRANSPORT_ERRORS:
+                return 'transport_error'
             if row['error'] == 'RunCancelled' and row.get('response') is None:
                 return 'model_call_interrupted'
             return 'model_call_error'

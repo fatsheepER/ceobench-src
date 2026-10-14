@@ -2,13 +2,16 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 import pytest
 
+from saas_bench.agents.bash_agent.agent import BashAgent, FinalText
+from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from saas_bench.model_usage import ModelUsage, billing_assessment, summarize_usage_log
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.team_usage import aggregate
 from test_preflight_team_model_monitor import load_monitor
+from test_preflight_team_flow import completion, final
 from test_preflight_team_observer import append, events, observer, request
 
 
@@ -249,7 +252,7 @@ def test_old_cursor_truncation_guard_survives_partial_billing_rebuild(observer, 
     ({'missing': ('cached_tokens', 'cost_usd'), 'model': 'changed'}, 'served_model_changed'),
     ({'error': 'ValueError'}, 'model_call_error'),
 ])
-def test_observer_final_response_fault_still_holds(observer, change, issue):
+def test_observer_non_network_final_response_fault_still_holds(observer, change, issue):
     path = observer.log()
     append(path, response('fault', **change))
     health = observer.poll()
@@ -257,7 +260,7 @@ def test_observer_final_response_fault_still_holds(observer, change, issue):
     assert health['route_errors'][0]['issue'] == issue
 
 
-def test_model_usage_harness_pause_is_visible_and_provider_failure_still_holds(observer):
+def test_model_usage_harness_pause_is_visible_and_provider_value_error_still_holds(observer):
     path = observer.log(role='pf')
     mode = ['pause']
     reply = dict(id='offline', object='chat.completion', created=1, model=observer.module.round5.MODEL,
@@ -293,6 +296,86 @@ def test_model_usage_harness_pause_is_visible_and_provider_failure_still_holds(o
         health = observer.poll()
         assert health['status'] == 'hold' and observer.hold.exists()
         assert health['route_errors'][0]['issue'] == 'model_call_error'
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('recover', [True, False])
+def test_real_harness_transport_retry_only_holds_after_attempt_limit(observer, monkeypatch, recover):
+    path = observer.log(role='pf')
+    requests, waits = [], []
+
+    def respond(request):
+        requests.append(request)
+        if not recover or len(requests) <= 3:
+            raise httpx.ConnectError('temporary outage', request=request)
+        return completion(final('recovered advice'), stream=True)
+
+    def sleep(seconds):
+        waits.append(seconds)
+        health = observer.poll()
+        assert health['status'] == 'healthy' and not observer.hold.exists()
+        assert health['route_errors'] == []
+
+    monkeypatch.setattr('time.sleep', sleep)
+    client = OpenAI(api_key='offline', base_url=observer.module.round5.ENDPOINT, max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+    recorder = ModelUsage(path, 'ceo', PRICES['rates'])
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model=observer.module.round5.MODEL,
+        system_prompt='Give business advice.', workspace_path=path.parent, reasoning_effort='high',
+        usage_recorder=recorder, allow_final_text=True)
+    try:
+        if recover:
+            assert agent.act('dashboard', 0, False, {'day': 0}) == FinalText('recovered advice')
+        else:
+            with pytest.raises(RunCancelled, match='model_attempt_limit'):
+                agent.act('dashboard', 0, False, {'day': 0})
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        logical = [row for row in rows if row['event'] == 'request']
+        assert [row['outer_attempt'] for row in logical] == ([1, 2] if recover else [1, 2, 3, 4])
+        assert len(requests) == (4 if recover else 12)
+        assert [wait for wait in waits if wait >= 10] == ([10] if recover else [10, 20, 40])
+        assert {row['error'] for row in rows if row['event'] == 'response' and row.get('error')} == {'APIConnectionError'}
+        if recover:
+            health = observer.poll()
+            assert health['status'] == 'healthy' and not observer.hold.exists()
+            assert health['route_errors'] == []
+            assert observer.poll(state={})['status'] == 'healthy'
+        else:
+            assert observer.poll()['status'] == 'healthy' and not observer.hold.exists()
+            (path.parents[3] / 'attempt.json').write_text(json.dumps(dict(status='failed',
+                attempt='001', day=0, reason='failed', runtime_failure='model_attempt_limit',
+                runtime_phase='ceo')))
+            health = observer.poll()
+            assert health['status'] == 'hold' and observer.hold.exists()
+            assert health['checks'] == ['model_attempt_limit:pf']
+            assert health['progress']['pf']['runtime_failure'] == 'model_attempt_limit'
+        issues = [row['issue'] for event in events(observer) for row in event['transient_receipt_failures']]
+        assert issues and set(issues) == {'transport_error'}
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('error', [httpx.UnsupportedProtocol, httpx.LocalProtocolError, ValueError])
+def test_sdk_connection_wrapper_preserves_immediate_configuration_hold(observer, error):
+    path = observer.log()
+
+    def respond(request):
+        raise error('invalid local configuration')
+
+    client = OpenAI(api_key='offline', base_url=observer.module.round5.ENDPOINT, max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+    recorder = ModelUsage(path, 'ceo', PRICES['rates'])
+    recorder.attach(client)
+    kwargs = dict(model=observer.module.round5.MODEL, messages=[], reasoning_effort='high',
+                  extra_body=dict(thinking={'type': 'enabled'}))
+    try:
+        with pytest.raises(APIConnectionError):
+            recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
+        assert json.loads(path.read_text().splitlines()[-1])['error'] == 'APIConnectionError'
+        health = observer.poll()
+        assert health['status'] == 'hold' and observer.hold.exists()
+        assert [row['issue'] for row in health['route_errors']] == ['model_call_error']
     finally:
         client.close()
 
