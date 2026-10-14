@@ -583,6 +583,14 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     assert again._load_checkpoint()['sql_evidence']['cutoff'] == 2
     with closing(store.connect()) as conn:
         assert store.sequence(conn) == 5
+    restored._http_post('/query', {'sql': 'SELECT 44 AS x'})
+    restored._stop_server()
+    evidence_bytes = (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes()
+    with pytest.raises(ValueError, match='SQL evidence has uncheckpointed events'):
+        offline_runner(restored.workspace_dir)
+    assert (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes() == evidence_bytes
+    with closing(store.connect()) as conn:
+        assert store.sequence(conn) == 6
 
 
 def test_packed_execution_capture_scripts_cache_restore_and_fork(offline_runner, tmp_path):

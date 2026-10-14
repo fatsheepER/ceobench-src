@@ -223,7 +223,7 @@ def create_approval(manifest_path, destination, declaration, *, source_root=None
         changed_files=changed, affected_files=declaration.get('affected_files'),
         fix_classification=declaration.get('fix_classification'), fix_commit=declaration.get('fix_commit'),
         reason=declaration.get('reason'), evidence=evidence,
-        hold=str(destination / 'HOLD'), attempts={})
+        hold=str(destination / 'HOLD'), attempts={}, decisions=[])
     declared_fix(record, old, actual)
     controls = declaration.get('control_freeze_file')
     if controls:
@@ -236,8 +236,16 @@ def create_approval(manifest_path, destination, declaration, *, source_root=None
             raise ValueError('Approved recovery requires an existing attempt: ' + run_id)
         directory = history[-1]
         previous = read(directory / 'attempt.json')
-        snapshot = Path(previous['checkpoint']).resolve()
-        state = read(snapshot / 'team.json')
+        from .team_checkpoint import validate_snapshot
+        snapshot = Path(overrides.get('checkpoint', previous['checkpoint'])).resolve()
+        owner = next((attempt for attempt in history
+            if snapshot.is_relative_to(attempt / 'runtime/checkpoints')), None)
+        if owner is None or file_hash(owner / 'manifest.json') != file_hash(manifest_path):
+            raise ValueError('Approved checkpoint belongs to another run or manifest')
+        snapshot, state = validate_snapshot(snapshot)
+        if (state['stage'] not in ('boundary', 'ceo') or
+                any(role['identity']['run_id'] != run_id for role in state['roles'].values())):
+            raise ValueError('Approved checkpoint is outside this run recoverable boundary')
         record['attempts'][run_id] = dict(attempt=previous['attempt'],
             attempt_id=previous['attempt_id'],
             attempt_sha256=file_hash(directory / 'attempt.json'), checkpoint=str(snapshot),
@@ -245,6 +253,21 @@ def create_approval(manifest_path, destination, declaration, *, source_root=None
             roles={name: role['identity'] for name, role in state['roles'].items()},
             residual_operations=overrides.get('residual_operations', []),
             allow_unknown_business_write=overrides.get('allow_unknown_business_write', False))
+        record['decisions'].append(dict(kind='recovery_checkpoint', run_id=run_id,
+            seed=entry['seed'], repeat=entry['repeat'], group=entry['group'],
+            checkpoint=str(snapshot), day=state['day'], stage=state['stage'],
+            week_boundary=state['stage'] == state['phase'] == 'boundary' and
+                state['day'] % 7 == 0 and state['week'] == {} and state['failure'] is None))
+    points = list(record['decisions'])
+    pairs = {(point['seed'], point['repeat']) for point in points}
+    for seed, repeat in sorted(pairs):
+        pair = [point for point in points if (point['seed'], point['repeat']) == (seed, repeat)]
+        aligned = (len(pair) == 2 and {point['group'] for point in pair} == {'git', 'pf'} and
+            len({point['day'] for point in pair}) == 1 and all(point['week_boundary'] for point in pair))
+        record['decisions'].append(dict(kind='paired_recovery_alignment', seed=seed, repeat=repeat,
+            alignment='same_week_boundary' if aligned else 'independent_checkpoints',
+            checkpoints={point['group']: dict(checkpoint=point['checkpoint'], day=point['day'],
+                stage=point['stage']) for point in pair}))
     validate_residual_declarations(record)
     destination.mkdir(parents=True, exist_ok=False)
     path = destination / 'approval.json'

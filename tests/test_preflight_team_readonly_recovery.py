@@ -63,7 +63,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return receive(handler)
         monkeypatch.setattr(execution_capture, 'receive_client', delayed_capture)
     command = 'python -c "import novamind_api as nm; nm.query(\'SELECT 1 AS n\')"'
-    blocked = interruption in ('pending_write', 'registered_write', 'local_write', 'cancelled_write', 'symlink')
+    blocked = interruption in ('pending_write', 'registered_write')
     hashed_symlinks = []
     if interruption == 'symlink':
         from saas_bench import run_state
@@ -260,7 +260,7 @@ def test_legacy_residual_approval_is_exact_and_preserves_old_attempt(approved_at
     ('read_only_interrupted', False), ('read_only_interrupted', True), ('unknown_business_write', False),
 ])
 @pytest.mark.parametrize('managed_git', ['git'], indirect=True)
-def test_resume_refuses_old_bash_write_even_with_closed_worker_or_readonly_label(managed_git,
+def test_resume_requires_operation_proof_for_old_bash_write(managed_git,
         monkeypatch, tmp_path, classification, proof):
     team, directory, previous, manifest, entry = managed_git
     snapshot = batch.save_checkpoint(team, directory, previous, 'ready')
@@ -309,6 +309,14 @@ def test_resume_refuses_old_bash_write_even_with_closed_worker_or_readonly_label
     original = {path: path.read_bytes() for path in
         (approved.directory / 'attempt.json', operation, changed, approved.snapshot / 'checkpoint.json')}
     try:
+        if proof:
+            resumed = batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
+                simulator_factory=fast_simulator)
+            assert resumed['status'] == 'ready' and resumed['attempt'] == 2
+            restored = batch.attempts(approved.entry)[-1] / 'runtime/roles/ceo/legacy-write.txt'
+            assert not restored.exists()
+            assert {path: path.read_bytes() for path in original} == original
+            return
         with pytest.raises((RuntimeError, ValueError), match='Read-only residual approval|workspace changed|Unknown business write'):
             batch.prepare(approved.manifest_path, approved.entry['run_id'], resume=True,
                 simulator_factory=fast_simulator)
@@ -326,7 +334,7 @@ def test_resume_refuses_old_bash_write_even_with_closed_worker_or_readonly_label
 
 
 @pytest.mark.parametrize('managed_git', ['git', 'pf'], indirect=True)
-def test_direct_bash_write_requires_new_checkpoint_before_real_resume(managed_git, tmp_path):
+def test_direct_bash_write_rolls_back_on_real_resume(managed_git, tmp_path):
     team, directory, previous, manifest, entry = managed_git
     batch.save_checkpoint(team, directory, previous, 'ready')
     original = Path(previous['checkpoint'])
@@ -335,24 +343,19 @@ def test_direct_bash_write_requires_new_checkpoint_before_real_resume(managed_gi
     assert changed.read_text() == 'preserved'
     previous['status'] = 'paused'
     write_json(directory / 'attempt.json', previous)
-    with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-        batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
-            simulator_factory=fast_simulator)
-    assert batch.attempts(entry) == [directory]
-    assert previous['checkpoint'] == str(original)
-    fresh = batch.save_checkpoint(team, directory, previous, 'confirmed_workspace_write')
-    assert (fresh / 'roles/ceo/direct-bash-write.txt').read_text() == 'preserved'
+    before = (directory / 'attempt.json').read_bytes()
     resumed = batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
         simulator_factory=fast_simulator)
     assert resumed['status'] == 'ready' and resumed['attempt'] == 2
-    assert resumed['source_checkpoint'] == str(fresh)
+    assert resumed['source_checkpoint'] == str(original)
     restored = batch.attempts(entry)[-1] / 'runtime/roles/ceo/direct-bash-write.txt'
-    assert restored.read_text() == changed.read_text() == 'preserved'
+    assert not restored.exists() and changed.read_text() == 'preserved'
+    assert (directory / 'attempt.json').read_bytes() == before
 
 
 @pytest.mark.parametrize('managed_git', ['git'], indirect=True)
 @pytest.mark.parametrize('change', ['missing', 'dangling_link'])
-def test_real_resume_refuses_missing_role_tree_and_preserves_original_records(managed_git, tmp_path, change):
+def test_real_resume_restores_missing_role_tree_and_preserves_original_records(managed_git, tmp_path, change):
     team, directory, previous, manifest, entry = managed_git
     snapshot = batch.save_checkpoint(team, directory, previous, 'ready')
     previous['status'] = 'paused'
@@ -365,17 +368,18 @@ def test_real_resume_refuses_missing_role_tree_and_preserves_original_records(ma
         roles.symlink_to('missing-role-tree', target_is_directory=True)
     original = {path: path.read_bytes() for path in
         (directory / 'attempt.json', snapshot / 'checkpoint.json')}
-    with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-        batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
-            simulator_factory=fast_simulator)
-    assert batch.attempts(entry) == [directory]
+    resumed = batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
+        simulator_factory=fast_simulator)
+    assert resumed['status'] == 'ready'
+    restored = batch.attempts(entry)[-1] / 'runtime/roles'
+    assert tree_hash(restored, exact=True) == tree_hash(snapshot / 'roles', exact=True)
     assert tree_hash(preserved) == original_roles
     assert {path: path.read_bytes() for path in original} == original
 
 
 @pytest.mark.parametrize('managed_git', ['git'], indirect=True)
 @pytest.mark.parametrize('change', ['chmod', 'empty_directory'])
-def test_real_resume_preserves_bash_metadata_writes_by_refusing_old_checkpoint(managed_git, tmp_path, change):
+def test_real_resume_rolls_back_bash_metadata_writes(managed_git, tmp_path, change):
     team, directory, previous, manifest, entry = managed_git
     snapshot = batch.save_checkpoint(team, directory, previous, 'ready')
     workspace = team.roles['ceo'].workspace
@@ -389,10 +393,12 @@ def test_real_resume_preserves_bash_metadata_writes_by_refusing_old_checkpoint(m
     write_json(directory / 'attempt.json', previous)
     original = {path: path.read_bytes() for path in
         (directory / 'attempt.json', snapshot / 'checkpoint.json', memory)}
-    with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-        batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
-            simulator_factory=fast_simulator)
-    assert batch.attempts(entry) == [directory]
+    resumed = batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True,
+        simulator_factory=fast_simulator)
+    assert resumed['status'] == 'ready'
+    restored = batch.attempts(entry)[-1] / 'runtime/roles/ceo'
+    assert (restored / 'MEMORY.md').stat().st_mode == (snapshot / 'roles/ceo/MEMORY.md').stat().st_mode
+    assert not (restored / 'confirmed-empty-directory').exists()
     assert memory.stat().st_mode == mode
     assert change == 'chmod' or (workspace / 'confirmed-empty-directory').is_dir()
     assert {path: path.read_bytes() for path in original} == original

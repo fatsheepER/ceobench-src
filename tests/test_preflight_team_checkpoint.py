@@ -235,17 +235,22 @@ def test_checkpoint_restores_bash_files_with_host_runtime_names(tmp_path, mode):
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('filename', ['weekly_rules.pyc', '__pycache__/artifact.bin'])
-def test_checkpoint_refuses_later_bytecode_or_cache_writes(tmp_path, mode, filename):
+def test_checkpoint_rolls_back_later_bytecode_or_cache_writes(tmp_path, mode, filename):
     runtime = make_team(tmp_path / 'bytecode-write', mode)
+    restored = None
     try:
         snapshot = runtime.checkpoint()
         _, state = validate_snapshot(snapshot)
         runtime.roles['growth'].executor.execute('bash', dict(
             command='mkdir -p __pycache__; printf changed > ' + shlex.quote(filename)))
-        with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-            validate_recovery_source(snapshot, state, current_root=runtime.root)
+        validate_recovery_source(snapshot, state, current_root=runtime.root)
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert not (restored.roles['growth'].workspace / filename).exists()
         assert (runtime.roles['growth'].workspace / filename).read_bytes() == b'changed'
     finally:
+        if restored:
+            dispose(restored)
         dispose(runtime)
 
 
@@ -262,9 +267,10 @@ def test_legacy_role_checksum_refuses_unchecked_bytecode(tmp_path):
             client_factory=clients(), simulator_factory=fast_simulator)
         path = runtime.roles['growth'].workspace / 'weekly_rules.pyc'
         path.write_bytes(b'uncheckpointed')
-        with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-            rejected = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-rejected', client_factory=clients())
-        assert not (tmp_path / 'legacy-rejected').exists()
+        rejected = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-rollback',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert not (rejected.roles['growth'].workspace / 'weekly_rules.pyc').exists()
+        assert path.read_bytes() == b'uncheckpointed'
         (snapshot / 'roles/growth/weekly_rules.pyc').write_bytes(b'unchecked')
         assert tree_hash(snapshot / 'roles') == receipt['roles_sha256']
         with pytest.raises(ValueError, match='checksum mismatch for roles'):

@@ -112,7 +112,7 @@ def test_unavailable_source_refuses_automatic_recovery(tmp_path):
         validate_recovery_source(tmp_path/"checkpoint", state)
 
 
-def test_real_restore_preserves_frozen_portable_links_and_refuses_changed_targets(tmp_path):
+def test_real_restore_rolls_back_portable_link_targets(tmp_path):
     source = make_team(tmp_path / 'source', 'git')
     restored = None
     try:
@@ -129,10 +129,9 @@ def test_real_restore_preserves_frozen_portable_links_and_refuses_changed_target
         restored = None
         link.unlink()
         link.symlink_to('after.txt')
-        with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'refused',
-                client_factory=clients(), simulator_factory=fast_simulator)
-        assert not (tmp_path / 'refused').exists()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'rolled-back',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert (restored.roles['ceo'].workspace / 'portable-link').readlink() == Path('before.txt')
         assert link.readlink() == Path('after.txt')
     finally:
         if restored:

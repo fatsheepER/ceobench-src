@@ -3,7 +3,7 @@
 import argparse
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -479,7 +479,7 @@ def evidence_fault(directory, record):
 
 
 def register_attempt(path, manifest, entry, *, resume=False):
-    from .team_recovery import hold_path, recovery_source
+    from .team_recovery import approval, hold_path, recovery_source
     if hold_path(path).exists():
         raise ValueError('Batch HOLD marker is active')
     history = attempts(entry)
@@ -526,6 +526,37 @@ def register_attempt(path, manifest, entry, *, resume=False):
         attempt_id=uuid.uuid4().hex, status='preparing', execution_started=False, manifest_sha256=file_hash(path),
         source_checkpoint=str(source) if source else None, checkpoint=str(source) if source else None,
         started_at=datetime.now(timezone.utc).isoformat())
+    if source:
+        checkpoint_at = state.get('saved_at') or datetime.fromtimestamp(
+            (source / 'team.json').stat().st_mtime, timezone.utc).isoformat()
+        discarded_until = previous.get('finished_at')
+        if not discarded_until and previous.get('started_at') and type(previous.get('wall_seconds')) in (int, float):
+            discarded_until = (datetime.fromisoformat(previous['started_at']) +
+                timedelta(seconds=previous['wall_seconds'])).isoformat()
+        discarded_wall_seconds = None
+        if discarded_until:
+            try:
+                seconds = (datetime.fromisoformat(discarded_until) - datetime.fromisoformat(checkpoint_at)).total_seconds()
+                if seconds >= 0:
+                    discarded_wall_seconds = seconds
+            except (TypeError, ValueError):
+                pass
+        rollback = dict(checkpoint=str(source), checkpoint_sha256=file_hash(source / 'checkpoint.json'),
+            source_attempt=str(Path(state['source_root']).parent), source_root=state['source_root'],
+            day=state['day'], stage=state['stage'], checkpoint_at=checkpoint_at,
+            checkpoint_at_estimated=not bool(state.get('saved_at')),
+            discarded_until=discarded_until,
+            discarded_until_estimated=not bool(previous.get('finished_at')),
+            discarded_wall_seconds=discarded_wall_seconds)
+        if type(previous.get('day')) is int and previous['day'] >= state['day']:
+            rollback['discarded_simulation_days'] = previous['day'] - state['day']
+        record['checkpoint_rollback'] = rollback
+        revision = approval(path)
+        record['decisions'] = [decision for decision in (revision or {}).get('decisions', [])
+            if decision.get('run_id') == entry['run_id'] or
+                (decision.get('kind') == 'paired_recovery_alignment' and
+                    (decision.get('seed'), decision.get('repeat')) == (entry['seed'], entry['repeat']))]
+        record['decisions'].append(dict(kind='checkpoint_rollback', run_id=entry['run_id'], **rollback))
     write_json(temporary / 'attempt.json', record)
     temporary.rename(directory)
     return directory, record, source

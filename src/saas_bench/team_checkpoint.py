@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -95,19 +96,23 @@ def _wrapper(receipt):
     return kind == 'ceo_scripts' or kind.startswith('ceo_tool:')
 
 
-def recovery_operation_safe(root, receipt):
+def recovery_operation_safe(root, receipt, *, allow_workspace_rollback=False):
     proof = receipt.get('recovery', {})
+    classifications = ('read_only', 'read_only_interrupted', 'pending_read_only')
+    if allow_workspace_rollback:
+        classifications += ('unproven',)
     if (not _wrapper(receipt) or receipt.get('wrapper_version') != 1 or
             receipt.get('status') not in ('completed', 'interrupted') or
-            proof.get('classification') not in ('read_only', 'read_only_interrupted', 'pending_read_only') or
+            proof.get('classification') not in classifications or
             proof.get('client_closed') is not True or proof.get('operation_failed') is not False or
             proof.get('step_day_timed_out') is not False or proof.get('queued_requests') is not False or
             not isinstance(proof.get('business_operations_after'), dict) or
             receipt.get('business_operations_before') != proof['business_operations_after'] or
             not isinstance(receipt.get('mutation_epoch_before'), int) or
             receipt['mutation_epoch_before'] != proof.get('mutation_epoch_after') or
-            not isinstance(receipt.get('workspace_sha256_before'), str) or
-            receipt['workspace_sha256_before'] != proof.get('workspace_sha256_after') or
+            (not allow_workspace_rollback and
+                (not isinstance(receipt.get('workspace_sha256_before'), str) or
+                    receipt['workspace_sha256_before'] != proof.get('workspace_sha256_after'))) or
             any(request.get('read_only') is not True for request in proof.get('pending_requests', []))):
         return False
     if proof.get('subprocess') is False:
@@ -172,38 +177,18 @@ def validate_recovery_source(snapshot, state, *, current_root=None):
     snapshot = Path(snapshot)
     approved = _approved_residuals(snapshot)
     frozen = {p.name: file_hash(p) for p in (snapshot / 'private' / 'operations').glob('*.json')
-        if not recovery_operation_safe(snapshot, json.loads(p.read_text()))}
+        if not recovery_operation_safe(snapshot, json.loads(p.read_text()), allow_workspace_rollback=True)}
     roots = {Path(state['source_root'])}
     if current_root is not None:
         roots.add(Path(current_root))
     for root in roots:
         if not root.is_dir():
             raise RuntimeError('Recovery source is unavailable; operation coverage cannot be verified')
-        roles = root / 'roles'
-        frozen_roles = snapshot / 'roles'
-        if frozen_roles.exists():
-            if not roles.is_dir() or roles.is_symlink():
-                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
-            links = {str(path.relative_to(roles)): os.readlink(path)
-                for path in roles.rglob('*') if path.is_symlink()}
-            frozen_links = {str(path.relative_to(frozen_roles)): os.readlink(path)
-                for path in frozen_roles.rglob('*') if path.is_symlink()}
-            try:
-                unsafe_links = any(Path(target).is_absolute() or not (roles / name).resolve().is_relative_to(roles)
-                    for name, target in links.items())
-            except (OSError, RuntimeError):
-                unsafe_links = True
-            if links != frozen_links or unsafe_links:
-                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
-            modes = [{str(path.relative_to(workspace)): path.lstat().st_mode
-                for path in (workspace, *workspace.rglob('*'))}
-                for workspace in (roles, frozen_roles)]
-            if modes[0] != modes[1] or tree_hash(roles, exact=True) != tree_hash(frozen_roles, exact=True):
-                raise RuntimeError('Role workspace changed after checkpoint; recovery refused')
         current = {}
         for path in (root / 'private' / 'operations').glob('*.json'):
             receipt = json.loads(path.read_text())
-            if recovery_operation_safe(root, receipt) or (str(root.resolve()), path.name) in approved:
+            if (recovery_operation_safe(root, receipt, allow_workspace_rollback=True) or
+                    (str(root.resolve()), path.name) in approved):
                 continue
             if receipt.get('status') != 'completed':
                 raise RuntimeError('Business operation outcome unknown; automatic recovery refused')
@@ -213,6 +198,25 @@ def validate_recovery_source(snapshot, state, *, current_root=None):
         # A completed receipt identifies a known outcome, not a snapshotted outcome.
         if current != frozen_root:
             raise RuntimeError('Business operations changed after checkpoint; recovery refused')
+
+
+def _validate_restored_roles(snapshot, root):
+    roles, frozen_roles = Path(root) / 'roles', Path(snapshot) / 'roles'
+    if not roles.is_dir() or roles.is_symlink() or not frozen_roles.is_dir() or frozen_roles.is_symlink():
+        raise RuntimeError('Restored role workspace differs from checkpoint')
+    links = [{str(path.relative_to(workspace)): os.readlink(path)
+        for path in workspace.rglob('*') if path.is_symlink()}
+        for workspace in (roles, frozen_roles)]
+    try:
+        unsafe_links = any(Path(target).is_absolute() or not (roles / name).resolve().is_relative_to(roles)
+            for name, target in links[0].items())
+    except (OSError, RuntimeError):
+        unsafe_links = True
+    modes = [{str(path.relative_to(workspace)): path.lstat().st_mode
+        for path in (workspace, *workspace.rglob('*'))}
+        for workspace in (roles, frozen_roles)]
+    if links[0] != links[1] or unsafe_links or modes[0] != modes[1] or tree_hash(roles, exact=True) != tree_hash(frozen_roles, exact=True):
+        raise RuntimeError('Restored role workspace differs from checkpoint')
 
 
 def _client_configuration(client):
@@ -345,7 +349,8 @@ def _freeze(runtime, directory):
     result = server._last_day_result
     if result is not None and not is_dataclass(result):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
-    state = dict(version=1, source_root=str(runtime.root), configuration=runtime.configuration,
+    state = dict(version=1, saved_at=datetime.now(timezone.utc).isoformat(),
+        source_root=str(runtime.root), configuration=runtime.configuration,
         benchmark_config=asdict(server.tools.config), day=server.tools.current_day,
         seed=server.tools.seed, tools_rng=server.tools.rng.bit_generator.state,
         shared_rng=server.tools.rng is server.simulator.rng,
@@ -445,8 +450,14 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     if state['live_customer'] and simulator_factory is None:
         raise ValueError('Live simulator recovery requires its frozen customer client factory')
     root.mkdir(parents=True)
-    copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
-    copy_workspace(snapshot / 'private', root / 'private')
+    try:
+        copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
+        _validate_restored_roles(snapshot, root)
+        validate_recovery_source(snapshot, state)
+        copy_workspace(snapshot / 'private', root / 'private', exact=True)
+    except BaseException:
+        shutil.rmtree(root)
+        raise
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
         checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),

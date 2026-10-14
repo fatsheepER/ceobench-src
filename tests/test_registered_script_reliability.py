@@ -134,11 +134,7 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
         from saas_bench.run_state import tree_hash
         _, state = validate_snapshot(source)
-        if tree_hash(source / 'roles', exact=True) != tree_hash(team.root / 'roles', exact=True):
-            with pytest.raises(RuntimeError, match='workspace changed after checkpoint'):
-                validate_recovery_source(source, state, current_root=team.root)
-        else:
-            validate_recovery_source(source, state, current_root=team.root)
+        validate_recovery_source(source, state, current_root=team.root)
         paused = team.checkpoint()
         assert tree_hash(paused / 'roles', exact=True) == tree_hash(team.root / 'roles', exact=True)
         _, state = validate_snapshot(paused)
@@ -322,7 +318,7 @@ def test_partner_script_cancel_retains_streams_and_closed_resources(mode):
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('second_script', [False, True])
-def test_script_workspace_write_preserves_wrapper_and_old_checkpoint_refuses(mode, second_script):
+def test_script_workspace_write_preserves_wrapper_and_allows_rollback(mode, second_script):
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-workspace') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         executor = team.roles['ceo'].executor
@@ -339,8 +335,7 @@ def test_script_workspace_write_preserves_wrapper_and_old_checkpoint_refuses(mod
         assert any(row['kind'] == 'ceo_scripts' and row['recovery']['classification'] == 'unproven' for row in wrappers)
         from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
         _, state = validate_snapshot(source)
-        with pytest.raises(RuntimeError, match='after checkpoint'):
-            validate_recovery_source(source, state, current_root=team.root)
+        validate_recovery_source(source, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
