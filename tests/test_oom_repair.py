@@ -132,7 +132,7 @@ blocks=[bytearray(1024**2) for _ in range(128)]
 
 
 @pytest.mark.parametrize('fault', ['workspace', 'unknown-write', 'completed-write', 'evidence', 'missing', 'corrupt'])
-def test_oom_validation_refuses_unsafe_sources(managed_team, controller, fault):
+def test_oom_validation_checks_recovery_sources(managed_team, controller, fault):
     team, directory, record, _, entry = managed_team
     record['status'] = 'running'
     if fault == 'workspace':
@@ -152,8 +152,13 @@ def test_oom_validation_refuses_unsafe_sources(managed_team, controller, fault):
     result = controller.module.finalize_oom(entry, unit)
     assert result['status'] == 'failed' and result['reason'] == 'oom-kill'
     assert result['checkpoint'] == record['checkpoint']
-    assert result['recovery_validation']['eligible'] is False
-    assert result['recovery_validation']['error']
+    assert result['recovery_validation']['eligible'] is (fault == 'workspace')
+    if fault == 'workspace':
+        assert result['recovery_validation']['current_operation_coverage'] is True
+        assert result['recovery_validation'].get('error') is None
+        assert (team.root / 'roles/ceo/late.txt').read_text() == 'after checkpoint'
+    else:
+        assert result['recovery_validation']['error']
 
 
 def test_oom_finalization_requires_closure_and_repeated_binding(managed_team, controller):
