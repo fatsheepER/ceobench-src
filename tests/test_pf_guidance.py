@@ -106,6 +106,19 @@ def test_standalone_prompt_example_is_safe_before_any_registration(workspace, tm
     assert 'Replace the synthetic names below with handles from actual receipts' in registration_prompt.PF_HISTORY
 
 
+def test_search_examples_share_placeholders_and_run_without_registration(workspace, tmp_path):
+    _, registry, executor = captured(workspace, tmp_path)
+    literal, object_search = commands(5)
+    assert literal == 'pf search --text "KEYWORD"'
+    assert object_search == 'pf search ACTUAL_ID'
+    for history in (registration_prompt.PF_HISTORY, team_prompts.PF_CEO_HISTORY, team_prompts.PF_ANALYST_HISTORY):
+        assert literal in history and object_search in history
+    assert literal in pf_cli.USAGE
+    assert '0 matching' in executor.execute('bash', {'command': literal})
+    assert 'No object matches' in executor.execute('bash', {'command': object_search})
+    assert not registry.path.exists()
+
+
 def test_help_peer_example_reads_exact_version_and_compares_one_object():
     with make_team('pf', lambda *args: calls(('text_list', {})), 'guidance-peer') as team:
         first = write(team, 'growth', 'earlier evidence\n', path='notes.md')

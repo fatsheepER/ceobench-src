@@ -89,8 +89,8 @@ pf diff MEMORY.md          what the latest version changed; or pf diff MEMORY.md
 pf blame MEMORY.md         the version and day each line was written
 pf depend r4               what r4 cites; reruns the queries behind it and reports changes
 pf rdepend scripts/an_w7d.py.out@v1   registered texts that cite it
-pf search EXAMPLE_GROUP    your texts, business writes and latest outputs about that object
-pf search --text "market cap"   literal text search across captured history
+pf search ACTUAL_ID        your texts, business writes and latest outputs about that object
+pf search --text "KEYWORD" literal text search across captured history
 ```
 
 Example: MEMORY.md is rewritten almost every week. Before relying on something

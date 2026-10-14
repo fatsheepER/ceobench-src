@@ -14,7 +14,7 @@ USAGE = '''usage: pf <command> ...
   pf depend <object> [--detail] [--history]   what it cites; reruns and checks current references
   pf rdepend <object> [--detail] [--all]      registered texts that cite it
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about an object
-  pf search --text "term"              literal text in public captured history, newest first
+  pf search --text "KEYWORD"           literal text in public captured history, newest first
   pf more <cursor>                     the next page of an earlier result
 Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
 version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.
@@ -80,12 +80,25 @@ Use the complete JSON request in the text_create tool description. Replace its
 synthetic handle, group, metric, threshold and days with the observed evidence and
 the intended claim. Selected fields must be covered in your current model input
 or your own current-context file write; a truncated or partial view may omit them.
+Before registering selected fields, run pf show alone, without a pipe.
 purpose defaults to current. historical_only records past evidence without checking
 it against the current world. With no select/predicate, checks compare whole content;
 select alone checks equality of the selected value. A threshold check reports holds,
 fails or cannot_check. Holds applies only to that declared condition and checked
 scope; it does not verify the whole conclusion. Stop after registration accepts the
 intended condition. A missing selected field needs an adequate read, not a guessed value.
+
+5. Locate evidence
+Replace KEYWORD with the words you need to find; this works before any registration:
+```bash
+pf search --text "KEYWORD"
+```
+For a known business object, replace ACTUAL_ID with its real ID:
+```bash
+pf search ACTUAL_ID
+```
+Literal search scans captured content; object search uses recorded object IDs.
+Read the relevant returned version with show.
 
 Other boundaries: blame locates the version and day each saved file line was written.
 rdepend follows declared references, not every consumer or inferred business impact.
