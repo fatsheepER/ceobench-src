@@ -264,6 +264,12 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
                                      bash_timeout=1200, bash_warn_after=None) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
+    if team:
+        definitions = [dict(t, description=(
+            'Execute a Bash command in your workspace: ./novamind-operation for business APIs, Python scripts '
+            "importing novamind_api, or shell commands. Use the mode's history commands for evidence questions "
+            'described in your system instructions.'))
+                       if t['name'] == 'bash' else t for t in definitions]
     if bash_warn_after is not None:
         definitions = [dict(t, description=t['description'] +
             f' The outer Bash task limit is {bash_timeout:g} seconds. Subtools may time out earlier; '
@@ -276,6 +282,10 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
     if pf_queries:
         definitions = [dict(t, description=t['description'] +
             ' Run PF directly as `pf`; never `novamind-operation pf`. `pf help` has complete examples.')
+            if t['name'] == 'bash' else t for t in definitions]
+    elif team and text_registration:
+        definitions = [dict(t, description=t['description'] +
+            ' Run Git directly as `git`. `git help -a` lists commands; `git log -h` gives log options.')
             if t['name'] == 'bash' else t for t in definitions]
     if text_registration or pf_queries:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.

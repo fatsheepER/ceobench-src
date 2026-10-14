@@ -53,6 +53,9 @@ changes. In `text_create`, cite such a handle, a file path (the version you last
 saw or wrote), a committed file (`MEMORY.md@week-6`), another text (`r4.2`) or
 `unknown: <reason>`. The weekly check reports cited files and texts that changed
 and predicates that no longer hold.
+Register selected conditions for reusable judgments; weekly checks keep testing them
+within their applies window and flag failures or unavailable evidence.
+Run `pf show HANDLE --full` alone, without a pipe, before registering selected fields.
 
 After an ordinary reference needs review, the weekly check retains its first
 finding and last verification day instead of rerunning it each week. Revise the

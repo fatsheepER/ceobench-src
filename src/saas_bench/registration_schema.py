@@ -337,13 +337,58 @@ def tool_definitions(pf=False, team=False):
                                    '}\n```\n')
         descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
     if team:
-        descriptions['create'] += (' Team receipts include a Shareable reference such as growth:r4.2. '
-            'Copy the exact role and version for cross-role citations. Git handoff files use '
-            'growth:notes.md@<handoff commit>; a bare path binds the weekly closing commit. '
-            'In PF, copy the returned file or output handle exactly. pf show reads saved evidence; '
-            'pf depend checks dependencies by replaying permitted SQL or public read-only API calls, not analyst scripts.')
-        for operation in ('revise', 'retire'):
-            descriptions[operation] += ' Use your local record ID rN; the receipt includes the new role-qualified version.'
-        descriptions['list'] += ' shareable_references maps local versions to exact role-qualified citations.'
+        descriptions = {
+            'create': (
+                'Register a reusable hypothesis, forecast, plan, conclusion, or counterevidence. Set text, objects '
+                '[{kind,id}], references, applies, and reason. Each reference has cite, optional purpose current '
+                '(default) or historical_only, and optional note (max 200 characters retained). applies uses '
+                'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Choose dates to cover the intended '
+                'review. Omitted revision references retain the list; supplied references replace it. Share the '
+                'returned exact ROLE:rN.M, not a guessed peer version. Cite actual [pf: ...] handles, file paths '
+                'read in this request or written in this context, committed path@week-N or path@COMMIT, registered '
+                'texts, or "unknown: <reason>". Whole-version citations bind saved evidence; coverage is recorded '
+                'separately. Selected fields require a read in this request or your current-context write. Without '
+                'select/predicate, checks compare whole content; select alone checks equality. Use table row/col '
+                'selectors or JSON Pointer path. Numeric predicates require select; compare uses left/right table '
+                'selectors within one query. Script stdout and plain text support whole-content equality only. '
+                'Format-only example: replace its handle, object, field, value, and days with observed evidence.\n'
+                'Example request:\n```json\n{"text":"The selected metric is at least '
+                '0.5.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"query1@v1","select":{"row":{"group_id":"EXAMPLE_GROUP"},"col":"metric"},"predicate":{"type":"threshold","op":">=","value":0.5}}],"applies":"7-13","reason":"Track'
+                ' this condition."}\n```'
+            ) if pf else (
+                'Register a reusable hypothesis, forecast, plan, conclusion, or counterevidence. Set text, objects '
+                '[{kind,id}], references, applies, and reason. Each reference has cite, optional purpose current '
+                '(default) or historical_only, and optional note (max 200 characters retained). applies uses '
+                'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Choose dates to cover the intended '
+                'review. Omitted revision references retain the list; supplied references replace it. Share the '
+                'returned exact ROLE:rN.M, not a guessed peer version. Cite a workspace path, committed path@week-N'
+                ' or path@COMMIT, registered text rN.M, or "unknown: <reason>". A bare path binds this week\'s '
+                'closing commit, including later edits. Cite readable peer handoff files as ROLE:PATH@COMMIT with '
+                'the actual host snapshot. Save command output to a file before citing it. Weekly checks compare '
+                'whole cited files and registered texts. select/predicate are stored without condition evaluation; '
+                'check selected values and conditions yourself using current read-only evidence. Example below is '
+                'format-only: the saved path and object must exist, and dates must fit the judgment.\nExample '
+                'request:\n```json\n{"text":"Review this group before changing its '
+                'price.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"notes.md","purpose":"current","note":"Observed'
+                ' pricing evidence."}],"applies":"7-13","reason":"Keep the rationale for review."}\n```'
+            ),
+            'revise': (
+                'Append a revision with a reason. Omitted fields retain their values; supplied references replace '
+                'the complete list, and [] clears it. Preserve the complete intended evidence set. Use local rN; '
+                'share the returned role-qualified revision. Earlier revisions remain in registrations.json.'
+            ),
+            'retire': (
+                'Retire your judgment with a reason while preserving history. Use local rN; the receipt includes '
+                'its role-qualified retired revision.'
+            ),
+            'list': (
+                'List your active texts, references, and notes without checking them. Continue with next_after as '
+                'after. shareable_references gives exact role-qualified citations.'
+            ) + (
+                ' Use review="pending" to filter pending source checks; their original verification days are '
+                'retained.'
+                if pf else ''
+            ),
+        }
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
             for name, model in models.items()]

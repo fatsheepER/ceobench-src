@@ -46,23 +46,37 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
             for published in tool_definitions(pf=mode == 'pf', team=True):
                 assert tools[published['name']] == published
             description = tools['text_create']['description']
+            history = ((team_prompts.PF_CEO_HISTORY if role == 'ceo' else team_prompts.PF_ANALYST_HISTORY)
+                       if mode == 'pf' else
+                       (team_prompts.GIT_CEO_HISTORY if role == 'ceo' else team_prompts.GIT_ANALYST_HISTORY))
+            assert system.count(history) == 1
+            assert registration_prompt.PF_HISTORY not in system
+            assert registration_prompt.GIT_HISTORY not in system
             if mode == 'pf':
-                assert system.count(team_prompts.PF_HISTORY) == 1
-                assert team_prompts.GIT_HISTORY not in system
+                assert '## Git evidence' not in system
+                assert 'alone, without a pipe' in system
+                assert 'within their applies window' in system if role == 'ceo' else 'Within its applies window' in system
                 assert description.count('Example request:') == 1
                 PF_CREATE.model_validate(example(description))
             else:
-                assert system.count(team_prompts.GIT_HISTORY) == 1
-                assert team_prompts.PF_HISTORY not in system
-                assert 'Example request:' not in description
-                assert 'EXAMPLE_GROUP' not in description
+                assert '## PF evidence' not in system
+                assert 'pf show' not in description and 'pf depend' not in description
+                assert 'stored without condition evaluation' in description
+                from saas_bench.registration_schema import GIT_CREATE
+                GIT_CREATE.model_validate(example(description))
+            assert tools['text_create']['parameters'] == tool_definitions(pf=mode == 'pf')[0]['parameters']
+            for verb in ('show', 'log', 'diff', 'search', 'blame', 'help'):
+                assert f'- {verb}:' in history
+            if mode == 'pf':
+                for verb in ('rdepend', 'depend', 'more'):
+                    assert f'- {verb}:' in history
 
 
 def test_d0_prompt_example_runs_and_full_help_reaches_all_role_wires():
     def respond(team, role, body):
         system = '\n'.join(m['content'] for m in body['messages'] if m['role'] == 'system')
-        command = re.search(r'for example `(pf[^`]*)`', system)[1]
-        return calls(('bash', {'command': command}))
+        assert 'run `pf help`' in system
+        return calls(('bash', {'command': 'pf help'}))
 
     with make_team('pf', respond, 'guidance-d0-help') as team:
         for role in ROLES:
@@ -78,7 +92,7 @@ def test_d0_prompt_example_runs_and_full_help_reaches_all_role_wires():
             event = runtime.usage.last_request_event
             assert json.loads(runtime.store.get_content(event + ':wire')[1]) == wire['body']
             system = wire['body']['messages'][0]['content']
-            assert '`pf help` has complete examples' in system
+            assert 'run `pf help`' in system
             bash = next(t['function'] for t in wire['body']['tools'] if t['function']['name'] == 'bash')
             assert '`pf help` has complete examples' in bash['description']
 
