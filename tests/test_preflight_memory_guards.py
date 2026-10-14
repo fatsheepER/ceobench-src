@@ -123,6 +123,8 @@ def test_scope_command_has_separate_units_and_memory_properties():
     assert commands[0] != commands[1]
     for command in commands:
         assert command[:3] == ['systemd-run', '--user', '--scope']
+        assert '--slice=ceobench.slice' in command
+        assert '--property=ManagedOOMPreference=omit' in command
         assert '--property=MemoryHigh=134217728' in command
         assert '--property=MemoryMax=268435456' in command
         assert '--property=MemorySwapMax=0' in command

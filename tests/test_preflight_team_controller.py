@@ -40,6 +40,16 @@ def controller(observer, monkeypatch):
                       control_group='/test/' + saved['unit'], scope_empty=exit_code is not None)
         return record
     monkeypatch.setattr(module, 'scope_state', scope)
+    class Sampler:
+        def __init__(self, path):
+            self.path = str(path)
+        def start(self):
+            return dict(sequence=1)
+        def check(self):
+            return self.start()
+        def stop(self):
+            return dict(closed=True, samples_path=self.path)
+    monkeypatch.setattr(module, 'MemorySampler', Sampler)
     policy = observer.output.parent / 'policy.json'
     write_json(policy, dict(identity=observer.expected))
     return SimpleNamespace(module=module, policy=policy, gate=module.RequestGate(policy))
@@ -428,6 +438,8 @@ def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monke
         raise AssertionError('Offline worker must not read credentials')
 
     monkeypatch.setattr(batch, 'prepare', prepare)
+    monkeypatch.setenv('CEOBENCH_WORKER_SCOPE_POLICY', '{}')
+    monkeypatch.setattr(controller.module, 'verify_worker_scope', lambda policy: dict(unit='offline.scope'))
     monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', forbidden_env_read)
     assert controller.module.worker(controller.policy, entry['run_id'], resume=False,
                                     parent_pid=None) == 0

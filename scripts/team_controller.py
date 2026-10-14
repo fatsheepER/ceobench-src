@@ -16,8 +16,9 @@ import uuid
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import file_hash, write_json
+from saas_bench.host_memory import MemorySampler
 from saas_bench.team_recovery import execution_root, hold_path, recovery_source
-from saas_bench.systemd_guard import memory_bytes, scope_command, unit_status
+from saas_bench.systemd_guard import check_worker_cgroup, memory_bytes, scope_command, unit_status, verify_worker_scope
 from team_observer import identity, poll
 
 
@@ -84,6 +85,7 @@ class RequestGate:
         self.expected = batch.read(policy)['identity']
         self.hold = hold_path(self.expected['manifest'])
         self.parent_pid = parent_pid
+        self.scope = None
         self.entry = None
         if run_id:
             self.entry = batch.selected(self.manifest(), run_id)
@@ -93,6 +95,11 @@ class RequestGate:
         raise RunCancelled(reason)
 
     def check_stop(self):
+        if self.scope is not None:
+            try:
+                check_worker_cgroup(self.scope)
+            except (OSError, ValueError, RuntimeError):
+                self.stop('worker_scope_changed')
         if any(path.exists() for path in (self.hold, self.directory / 'STOP',
                                          self.directory / 'QUOTA_EXHAUSTED')):
             self.stop('supervisor_cancelled')
@@ -157,6 +164,51 @@ def run_stopped(entry):
     return bool(history and (history[-1] / 'STOP').exists())
 
 
+def finalize_oom(entry, unit):
+    history = batch.attempts(entry)
+    record = latest(entry)
+    binding = ('unit', 'invocation_id', 'control_group')
+    previous = (record or {}).get('controller_finalization')
+    if previous and any(previous['unit'].get(key) != unit.get(key) for key in binding):
+        raise RuntimeError('Conflicting OOM worker finalization')
+    if (not record or unit.get('result') != 'oom-kill' or
+            unit.get('scope_empty') is not True or unit.get('cleanup_error')):
+        return record
+    if any(not unit.get(key) for key in binding):
+        raise RuntimeError('OOM finalization requires a bound closed worker scope')
+    if previous and record.get('recovery_validation') is not None:
+        return record
+    if record['status'] not in ('preparing', 'ready', 'running') and not (
+            record['status'] == 'failed' and record.get('reason') == 'oom-kill'):
+        return record
+    directory = history[-1]
+    try:
+        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+        if batch.evidence_fault(directory, record):
+            raise RuntimeError('Permanent evidence fault prevents OOM recovery')
+        if not record.get('checkpoint'):
+            raise ValueError('OOM attempt has no safe checkpoint')
+        snapshot, state = validate_snapshot(record['checkpoint'])
+        if not any(snapshot.is_relative_to(path / 'runtime/checkpoints') for path in history):
+            raise ValueError('OOM checkpoint belongs to another run')
+        if (type(state['day']) is not int or state['day'] < 0 or state['stage'] not in ('boundary', 'ceo') or
+                set(state['roles']) != {'ceo', 'growth', 'ops_finance'} or
+                any(role['identity']['run_id'] != entry['run_id'] for role in state['roles'].values())):
+            raise ValueError('OOM checkpoint has invalid run or recovery state')
+        validate_recovery_source(snapshot, state, current_root=directory / 'runtime')
+        validation = dict(eligible=True, checkpoint=str(snapshot),
+            checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'), day=state['day'], stage=state['stage'],
+            current_operation_coverage=True)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        validation = dict(eligible=False, error_type=type(exc).__name__, error=str(exc))
+    finalization = previous or dict(previous_status=record['status'], previous_reason=record.get('reason'),
+        previous_runtime_failure=record.get('runtime_failure'), unit=unit)
+    record = dict(record, status='failed', reason='oom-kill', controller_finalization=finalization,
+        recovery_validation=validation, finished_at=datetime.now(timezone.utc).isoformat())
+    write_json(directory / 'attempt.json', record)
+    return record
+
+
 def run_disposition(entry, record, unit):
     """Only a proved final outcome releases a group slot; pauses retain it."""
     if not record or record.get('status') in ('preparing', 'ready', 'running'):
@@ -196,6 +248,13 @@ def run_disposition(entry, record, unit):
 
 def worker(policy, run_id, *, resume, parent_pid):
     gate = RequestGate(policy, run_id=run_id, parent_pid=parent_pid)
+    scope_receipt = Path(gate.expected['host_logs']) / f'worker-scope-{run_id}-{"resume" if resume else "run"}.json'
+    try:
+        gate.scope = verify_worker_scope(json.loads(os.environ.pop('CEOBENCH_WORKER_SCOPE_POLICY', 'null')))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        write_json(scope_receipt, dict(verified=False, error_type=type(exc).__name__, error=str(exc)))
+        gate.stop('worker_scope_invalid')
+    write_json(scope_receipt, dict(verified=True, **gate.scope))
     manifest = gate.manifest()
     entry = batch.selected(manifest, run_id)
     from saas_bench.runtime_temp import prepare_tmpdir
@@ -266,6 +325,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                     gate.hold.touch()
                     raise ValueError('Previous group worker resources are not proved closed')
     stopped_at, signaled, exited = {}, set(), set()
+    sampler = MemorySampler(host_logs / 'host-memory.jsonl')
     settled = set()
     queues = {group: [entry for entry in entries if entry['group'] == group]
               for group in ('git', 'pf')} if independent else {}
@@ -283,6 +343,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
 
     def launch(entry, predecessor=None):
         nonlocal launch_ordinal
+        sampler.check()
         saved = latest(entry)
         mode = 'resume' if resume and saved else 'run'
         ready = host_logs / f'ready-{entry["run_id"]}-{mode}.json'
@@ -299,6 +360,8 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         if mode == 'resume':
             command.append('--resume')
         unit = 'ceobench-worker-' + uuid.uuid4().hex + '.scope'
+        env['CEOBENCH_WORKER_SCOPE_POLICY'] = json.dumps(dict(unit=unit,
+            memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max))
         command = scope_command(command, unit, memory_high=memory_high,
             memory_max=memory_max, memory_swap_max=memory_swap_max)
         units[entry['run_id']] = dict(unit=unit)
@@ -330,13 +393,10 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max,
             scope=units[entry['run_id']], **fields)
 
-    def finalize_oom(entry, unit):
-        record = latest(entry)
-        if (unit.get('scope_empty') and record and record.get('status') in ('preparing', 'ready', 'running') and
-                unit.get('result') == 'oom-kill'):
-            record = dict(record, status='failed', reason='oom-kill',
-                controller_finalization=dict(previous_status=record['status'], unit=unit))
-            write_json(batch.attempts(entry)[-1] / 'attempt.json', record)
+    def finish_oom(entry, unit):
+        before = latest(entry)
+        record = finalize_oom(entry, unit)
+        if record != before:
             event('attempt_finalized_after_oom', run_id=entry['run_id'], unit=unit)
         return record
 
@@ -353,6 +413,10 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         if record and capture_faults and not record.get('controller_capture_faults'):
             record = dict(record, status='failed', reason=record.get('reason') if record['status'] == 'failed'
                 else 'run_evidence_fault', controller_capture_faults=capture_faults)
+            if record.get('recovery_validation') is not None:
+                record['recovery_validation'] = dict(record['recovery_validation'], eligible=False,
+                    error=record['recovery_validation'].get('error') or 'Terminal model log capture fault',
+                    capture_faults=sorted(capture_faults))
             write_json(roots[-1] / 'attempt.json', record)
             event('attempt_finalized_after_capture_fault', run_id=entry['run_id'], coverage=capture_faults)
         return record
@@ -364,7 +428,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         if not unit.get('scope_empty'):
             return
         child.wait()
-        record = finalize_oom(entry, unit)
+        record = finish_oom(entry, unit)
         disposition = run_disposition(entry, record, unit)
         if disposition == 'hold':
             gate.hold.touch()
@@ -442,9 +506,12 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
         handlers = {sig: signal.signal(sig, lambda *_: gate.hold.touch())
                     for sig in (signal.SIGTERM, signal.SIGINT)}
         try:
+            event('memory_sampler_started', sample=sampler.start())
             health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+            sampler.check()
             last_poll = time.monotonic()
             while health['status'] == 'pending' and not stopped():
+                sampler.check()
                 time.sleep(1)
                 if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
                     health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
@@ -464,6 +531,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                         predecessor = queue[ordinal - 1]
                 launch(entry, predecessor=predecessor)
             while workers_running() or independent and any(child.pid not in settled for _, child, _ in children):
+                sampler.check()
                 if time.monotonic() - last_poll >= (min(300, max(1, health['quota_retry_after'])) if health.get('quota_error') else 300):
                     health = poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
                     last_poll = time.monotonic()
@@ -484,7 +552,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
             for entry, child, _ in children:
                 child.wait()
                 unit = observe_unit(entry, child)
-                record = finalize_oom(entry, unit) or {}
+                record = finish_oom(entry, unit) or {}
                 event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
                     status=record.get('status'), day=record.get('day'), unit=unit)
             if stopped():
@@ -501,6 +569,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                     gate.hold.touch()
             if finalized_capture:
                 poll(gate.expected['manifest'], directory / 'observer', gate.expected, state)
+            sampler.check()
             return [dict(latest(entry) or {}, status='failed', reason='oom-kill')
                     if units[entry['run_id']]['result'] == 'oom-kill' else latest(entry)
                     for entry, _, _ in children]
@@ -515,6 +584,10 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                 child.wait()
             for stream in streams:
                 stream.close()
+            sampler_receipt = sampler.stop()
+            if (not sampler_receipt['closed'] or sampler_receipt.get('exit_code', 0) != 0 or
+                    sampler_receipt.get('forced') or sampler_receipt.get('unexpected_exit')):
+                gate.hold.touch()
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
             write_json(directory / 'controller-exit.json', dict(hold=gate.hold.exists(),
@@ -524,6 +597,7 @@ def supervise(policy, *, resume=False, memory_high=2 * 1024**3, memory_max=3 * 1
                     (latest(entry) or {}).get('status') != 'finished' for entry, child, _ in children),
                 children_reaped=all(child.returncode is not None and units[entry['run_id']].get('scope_empty')
                     for entry, child, _ in children),
+                memory_sampler=sampler_receipt,
                 units=units, attempts={entry['run_id']: dict(
                     attempt=(latest(entry) or {}).get('attempt'), attempt_id=(latest(entry) or {}).get('attempt_id'),
                     attempt_sha256=file_hash(batch.attempts(entry)[-1] / 'attempt.json'))

@@ -1,12 +1,15 @@
 """Memory-isolated worker scopes and invocation-bound unit observations."""
 import argparse
 import json
+import os
+from pathlib import Path
 import re
 import subprocess
 import time
 
 # Stable systemd OOM event IDs from sd-messages.h.
 OOM_MESSAGE_IDS = {'d989611b15e44c9dbf31e3c81256e4ed', 'fe6faa94e7774663a0da52717891d8ef'}
+WORKER_SLICE = 'ceobench.slice'
 
 
 def memory_bytes(value):
@@ -23,8 +26,62 @@ def scope_command(command, unit, *, memory_high=2 * 1024**3, memory_max=3 * 1024
             0 < memory_high <= memory_max and memory_swap_max >= 0):
         raise ValueError('Require 0 < MemoryHigh <= MemoryMax and MemorySwapMax >= 0')
     return ['systemd-run', '--user', '--scope', '--quiet', '--unit=' + unit,
+        '--slice=' + WORKER_SLICE, '--property=ManagedOOMPreference=omit',
         '--property=MemoryHigh=' + str(memory_high), '--property=MemoryMax=' + str(memory_max),
         '--property=MemorySwapMax=' + str(memory_swap_max), '--property=OOMPolicy=kill', *command]
+
+
+def check_worker_cgroup(proof):
+    group = Path('/sys/fs/cgroup') / proof['control_group'].lstrip('/')
+    own = Path('/proc/self/cgroup').read_text().strip().split('0::')[-1]
+    if own != proof['control_group']:
+        raise RuntimeError('Worker moved outside its verified cgroup')
+    for name, expected in (('memory.high', proof['memory_high']), ('memory.max', proof['memory_max']),
+                           ('memory.swap.max', proof['memory_swap_max']), ('memory.oom.group', 1)):
+        if (group / name).read_text().strip() != str(expected):
+            raise RuntimeError('Worker cgroup limit changed: ' + name)
+    if os.getxattr(group, 'user.oomd_omit') != b'1':
+        raise RuntimeError('Worker cgroup lacks effective oomd omit')
+
+
+def verify_worker_scope(policy):
+    if (not isinstance(policy, dict) or set(policy) != {'unit', 'memory_high', 'memory_max', 'memory_swap_max'} or
+            not isinstance(policy.get('unit'), str)):
+        raise ValueError('Missing worker scope policy')
+    scope_command([], policy['unit'], **{key: policy[key] for key in ('memory_high', 'memory_max', 'memory_swap_max')})
+    deadline = time.monotonic() + 5
+    def show(units, *, user):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('Worker scope verification deadline expired')
+        command = ['systemctl', *(['--user'] if user else []), 'show',
+            '--property=Id,InvocationID,Slice,ControlGroup,MemoryHigh,MemoryMax,MemorySwapMax,OOMPolicy,ManagedOOMPreference,ManagedOOMMemoryPressure,ManagedOOMSwap',
+            '--', *units]
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=remaining)
+        values = [dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+                  for block in result.stdout.strip().split('\n\n')]
+        records = {record.get('Id'): record for record in values}
+        if set(records) != set(units):
+            raise RuntimeError('Worker scope properties are incomplete')
+        return records
+    observed = show([policy['unit']], user=True)[policy['unit']]
+    group = f'/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/{WORKER_SLICE}/{policy["unit"]}'
+    expected = dict(Slice=WORKER_SLICE, ControlGroup=group, OOMPolicy='kill', ManagedOOMPreference='omit',
+        ManagedOOMMemoryPressure='auto', ManagedOOMSwap='auto',
+        **{name: str(policy[key]) for name, key in (
+            ('MemoryHigh', 'memory_high'), ('MemoryMax', 'memory_max'), ('MemorySwapMax', 'memory_swap_max'))})
+    if not observed.get('InvocationID') or any(observed.get(key) != value for key, value in expected.items()):
+        raise RuntimeError('Worker scope does not match its isolation policy')
+    ancestors = {'user:' + name: record for name, record in show([WORKER_SLICE, '-.slice'], user=True).items()}
+    ancestors.update({'system:' + name: record for name, record in show(
+        ['-.slice', 'user.slice', f'user-{os.getuid()}.slice', f'user@{os.getuid()}.service'], user=False).items()})
+    if any(record.get(key) != 'auto' for record in ancestors.values()
+           for key in ('ManagedOOMMemoryPressure', 'ManagedOOMSwap')):
+        raise RuntimeError('Worker has an oomd-monitored ancestor')
+    proof = dict(policy, pid=os.getpid(), invocation_id=observed['InvocationID'], control_group=group,
+        slice=WORKER_SLICE, ancestors=ancestors, checked_at=time.time())
+    check_worker_cgroup(proof)
+    return proof
 
 
 def unit_status(unit, *, invocation_id=None, exit_code=None):

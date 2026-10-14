@@ -1,5 +1,6 @@
 import copy
 import json
+import tracemalloc
 
 import httpx
 from openai import OpenAI
@@ -310,6 +311,115 @@ def test_conflicting_copied_receipts_and_invalid_counts_are_rejected(tmp_path):
     changed[0].pop('call_id')
     with pytest.raises(ValueError, match='Immutable'):
         aggregate([log(tmp_path / 'identity.jsonl', changed)], PRICES)
+
+
+@pytest.mark.parametrize('numeric_equivalent', [False, True])
+def test_aggregate_encoding_different_duplicates_keep_full_equality(tmp_path, numeric_equivalent):
+    rows = receipts('same', 'ceo', body(), attempts=[('same-http', body(), None, 200)], cost=.1)
+    rows[0]['request']['messages'] = [dict(role='user', content='离线')]
+    first = log(tmp_path / 'first.jsonl', rows)
+    copied = copy.deepcopy(rows)
+    if numeric_equivalent:
+        copied[0]['day'] = 0.0
+        copied[2]['status'] = 200.0
+        copied[-1]['response']['created'] = 1.0
+        copied[-1]['usage']['input_tokens'] = 10.0
+    second = tmp_path / 'encoded.jsonl'
+    second.write_text(''.join(json.dumps(dict(reversed(list(row.items()))),
+        ensure_ascii=False, separators=(',', ':')) + '\n' for row in copied))
+    expected = aggregate([first], PRICES)
+    result = aggregate([first, second], PRICES)
+    assert result == dict(expected, duplicates=len(rows))
+    assert result['records'][0]['response_receipt'] == dict(path=str(first.resolve()), line=3)
+
+
+@pytest.mark.parametrize('event', ['request', 'http_request', 'http_response', 'response'])
+def test_aggregate_changed_discarded_body_still_conflicts(tmp_path, event):
+    rows = receipts('same', 'ceo', body(), attempts=[('same-http', body(), None, 200)], cost=.1)
+    first = log(tmp_path / 'first.jsonl', rows)
+    changed = copy.deepcopy(rows)
+    row = next(row for row in changed if row['event'] == event)
+    if event == 'http_response':
+        raw = json.loads(row['body'])
+        raw['choices'][0]['message']['content'] = 'changed without changing usage'
+        row['body'] = json.dumps(raw)
+    elif event == 'response':
+        row['response']['choices'][0]['message']['content'] = 'changed without changing usage'
+    else:
+        row['request' if event == 'request' else 'body']['messages'] = [dict(content='changed')]
+    second = log(tmp_path / 'changed.jsonl', changed)
+    with pytest.raises(ValueError, match='Conflicting immutable'):
+        aggregate([first, second], PRICES)
+
+
+def test_aggregate_memory_does_not_retain_payload_history(tmp_path):
+    path = tmp_path / 'large.jsonl'
+    payload = 'x' * (256 * 1024)
+    with path.open('w') as stream:
+        for ordinal in range(48):
+            response = body()
+            response['choices'][0]['message']['content'] = payload
+            rows = receipts(f'call-{ordinal}', 'ceo', response,
+                attempts=[(f'http-{ordinal}', response, None, 200)], cost=.1)
+            rows[0]['request']['messages'] = [dict(role='user', content=payload)]
+            rows[1]['body']['messages'] = [dict(role='user', content=payload)]
+            for row in rows:
+                stream.write(json.dumps(row) + '\n')
+    assert path.stat().st_size > 48 * 1024**2
+    tracemalloc.start()
+    try:
+        result = aggregate([path], PRICES)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result['calls'] == result['attempts'] == 48
+    assert result['team']['complete']['input_tokens'] == 480
+    assert result['team']['complete']['output_tokens'] == 96
+    assert result['duplicates'] == 0 and result['missing_receipts'] == []
+    assert result['records'][-1]['request_receipt'] == dict(path=str(path.resolve()), line=189)
+    assert result['records'][-1]['response_receipt'] == dict(path=str(path.resolve()), line=191)
+    print(f'48 MiB payload history: traced aggregation peak={peak} bytes')
+    assert peak < 12 * 1024**2, f'Aggregation retained payload history: traced peak={peak} bytes'
+
+
+@pytest.mark.parametrize('physical', [False, True])
+@pytest.mark.parametrize('source,key', [('row', 'raw_cost_usd'), ('row', 'billed_cost_usd'),
+    ('body', 'cost_usd'), ('body', 'cost'), ('usage', 'cost_usd'), ('usage', 'cost')])
+def test_aggregate_retains_raw_billing_sources(tmp_path, physical, source, key):
+    response = body()
+    rows = receipts('bill', 'ceo', response,
+        attempts=[('bill-http', response, None, 200)] if physical else (), cost=.4)
+    row = next(row for row in rows if row['event'] == ('http_response' if physical else 'response'))
+    raw = json.loads(row['body']) if physical else row['response']
+    target = row if source == 'row' else raw if source == 'body' else raw['usage']
+    target[key] = 1.25
+    if physical:
+        row['body'] = json.dumps(raw)
+    result = aggregate([log(tmp_path / 'bill.jsonl', rows)], PRICES)
+    assert result['team']['complete']['raw_billed_cost_usd'] == 1.25
+    assert result['team']['complete']['recorded_cost_usd'] == .4
+    assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0113)
+
+
+@pytest.mark.parametrize('response', [None, {}])
+def test_aggregate_empty_response_retains_receive_state(tmp_path, response):
+    result = aggregate([log(tmp_path / 'empty.jsonl', receipts('empty', 'ceo', response))], PRICES)
+    assert result['records'][0]['unreturned'] is False
+    assert result['records'][0]['no_response'] is (response is None)
+    assert result['team']['complete']['input_tokens'] is None
+
+
+def test_aggregate_encoding_difference_detects_changed_original_receipt(tmp_path):
+    rows = receipts('same', 'ceo', body(), attempts=[('same-http', body(), None, 200)])
+    first = log(tmp_path / 'first.jsonl', rows)
+    copied = tmp_path / 'encoded.jsonl'
+    copied.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows))
+    def files():
+        yield first
+        first.write_text(first.read_text().replace('offline', 'changed', 1))
+        yield copied
+    with pytest.raises(ValueError, match='Original immutable model receipt changed'):
+        aggregate(files(), PRICES)
 
 
 def test_frozen_model_time_prices_and_zero_values(tmp_path):

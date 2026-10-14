@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -61,6 +62,28 @@ def _raw_cost(row, body):
             if source.get(key) is not None:
                 return _number(source[key])
     return None
+
+
+def _accounting_body(value):
+    body = _body(value)
+    return {key: body[key] for key in ('model', 'usage', 'cost_usd', 'cost') if key in body}
+
+
+def _accounting_row(row):
+    result = {key: row[key] for key in ('api', 'day', 'timestamp', 'attempt_id', 'sdk_retry',
+        'status', 'raw_cost_usd', 'billed_cost_usd', 'cost_usd') if key in row}
+    if 'error' in row:
+        result['error'] = bool(row['error'])
+    if 'usage' in row:
+        usage = row['usage']
+        result['usage'] = ({field: usage[field] for field in FIELDS if field in usage}
+                          if isinstance(usage, dict) else usage)
+    if row['event'] == 'http_response':
+        result['body'] = _accounting_body(row.get('body'))
+    if 'response' in row:
+        response = row['response']
+        result['response'] = _accounting_body(response) if isinstance(response, dict) else response
+    return result
 
 
 def _summary(records):
@@ -125,7 +148,8 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
             raise ValueError('Unknown resource category: ' + resource)
         files = [files] if isinstance(files, (str, Path)) else files
         for path in files:
-            with Path(path).open('rb') as stream:
+            path = Path(path).resolve()
+            with path.open('rb') as stream:
                 for line_number, line in enumerate(stream, 1):
                     try:
                         row = json.loads(line)
@@ -154,17 +178,26 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal'):
                         raise ValueError('Immutable call and HTTP attempt IDs are required')
                     assigned = 'simulator' if resource in ('formal', 'engineering') and row.get('role') == 'simulator' else resource
                     key = (event, attempt_id if event.startswith('http_') else call_id)
-                    value = (assigned, row)
+                    digest = sha256(line).digest()
                     if key in seen:
-                        if seen[key] != value:
+                        original_category, original_digest, original_path, offset, size = seen[key]
+                        if original_category != assigned:
                             raise ValueError('Conflicting immutable model receipt: ' + str(key))
+                        if original_digest != digest:
+                            with original_path.open('rb') as original:
+                                original.seek(offset)
+                                previous = original.read(size)
+                            if sha256(previous).digest() != original_digest:
+                                raise ValueError('Original immutable model receipt changed: ' + str(key))
+                            if json.loads(previous) != row:
+                                raise ValueError('Conflicting immutable model receipt: ' + str(key))
                         duplicates += 1
                         continue
-                    seen[key] = value
+                    seen[key] = (assigned, digest, path, stream.tell() - len(line), len(line))
                     call = calls.setdefault(call_id, dict(attempts=[], category=assigned, role=row.get('role')))
                     if call['category'] != assigned or call['role'] != row.get('role'):
                         raise ValueError('Call identity or category changed: ' + call_id)
-                    row = dict(row, receipt_path=str(Path(path).resolve()), receipt_line=line_number)
+                    row = dict(_accounting_row(row), receipt_path=str(path), receipt_line=line_number)
                     if event.startswith('http_'):
                         attempt = attempts.setdefault(attempt_id, dict(call_id=call_id))
                         if attempt['call_id'] != call_id:

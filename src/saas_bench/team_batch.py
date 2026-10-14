@@ -536,11 +536,24 @@ def prune_checkpoints(parent, ledger, directory):
             not isinstance(ledger['snapshots'], list) or not ledger['snapshots']):
         raise ValueError('Invalid checkpoint retention ledger')
     snapshots = {}
+    latest_boundary = None
     for item in ledger['snapshots']:
         if not isinstance(item, dict) or set(item) != {'snapshot', 'sha256'} or item['snapshot'] in snapshots:
             raise ValueError('Invalid checkpoint retention entry')
-        snapshots[item['snapshot']] = managed_snapshot(parent, item['snapshot'], item['sha256'])
+        snapshot = snapshots[item['snapshot']] = managed_snapshot(parent, item['snapshot'], item['sha256'])
+        state_path = snapshot / 'team.json'
+        if state_path.is_symlink():
+            raise ValueError('Checkpoint retention state cannot be a symlink')
+        if file_hash(state_path) != read(snapshot / 'checkpoint.json')['files']['team.json']:
+            raise ValueError('Checkpoint retention state checksum mismatch')
+        state = read(state_path)
+        day = state['day']
+        if (type(day) is int and day > 0 and day % 7 == 0 and state['stage'] == 'boundary' and
+                state['phase'] == 'boundary' and state['failure'] is None and state['week'] == {}):
+            latest_boundary = item['snapshot']
     protected = {item['snapshot'] for item in ledger['snapshots'][-2:]}
+    if latest_boundary is not None:
+        protected.add(latest_boundary)
     pins_path = parent / '.retention-pins.json'
     if pins_path.is_symlink():
         raise ValueError('Checkpoint retention pins cannot be a symlink')

@@ -773,6 +773,72 @@ def managed_team(frozen, tmp_path):
             batch.close_team(team)
 
 
+@pytest.mark.parametrize('pin_previous', [False, True])
+def test_retention_keeps_latest_week_boundary_across_ceo_checkpoints(managed_team, pin_previous):
+    from saas_bench.team_checkpoint import _pin_snapshot
+    team, directory, record, _, _ = managed_team
+    def finish_week():
+        team._stage = 'ceo'
+        team._set_phase('ceo')
+        assert team.server.advance_week()['success']
+        team._close_week()
+        return batch.save_checkpoint(team, directory, record, 'week_boundary')
+    def ceo_checkpoints():
+        team._stage = 'ceo'
+        team._week = dict(observation='Continue the current week.', ceo_started=False)
+        team._set_phase('ceo')
+        return [batch.save_checkpoint(team, directory, record, 'answers_ready') for _ in range(3)]
+    previous = finish_week()
+    assert validate_snapshot(previous)[1]['day'] == 7
+    if pin_previous:
+        _pin_snapshot(previous)
+    ceo_checkpoints()
+    assert previous.is_dir(), 'The D7 boundary was deleted by newer CEO handoffs'
+    current = finish_week()
+    assert validate_snapshot(current)[1]['day'] == 14
+    assert previous.exists() is pin_previous
+    latest = ceo_checkpoints()
+    assert current.is_dir(), 'The D14 boundary was deleted by newer CEO handoffs'
+    expected = {str(current), *(str(path) for path in latest[-2:])}
+    if pin_previous:
+        expected.add(str(previous))
+    ledger = batch.read(current.parent / '.retention.json')
+    assert {item['snapshot'] for item in ledger['snapshots']} == expected
+    for snapshot in expected:
+        validate_snapshot(snapshot)
+    assert all(role.usage.summary['calls'] == 0 for role in team.roles.values())
+    assert not record.get('checkpoint_retention_errors')
+
+
+@pytest.mark.parametrize('state_change', [dict(day=0), dict(day=True), dict(day=6), dict(day=7.0),
+    dict(stage='ceo'), dict(phase='paused'), dict(failure='requested_pause'), dict(week={'ceo_started': False})])
+def test_retention_releases_unclean_or_nonweekly_state(managed_team, state_change):
+    team, directory, record, _, _ = managed_team
+    team._stage = 'ceo'
+    team._set_phase('ceo')
+    assert team.server.advance_week()['success']
+    team._close_week()
+    previous = batch.save_checkpoint(team, directory, record, 'week_boundary')
+    state = batch.read(previous / 'team.json')
+    state.update(state_change)
+    write_json(previous / 'team.json', state)
+    receipt = batch.read(previous / 'checkpoint.json')
+    receipt['files']['team.json'] = file_hash(previous / 'team.json')
+    write_json(previous / 'checkpoint.json', receipt)
+    ledger_path = previous.parent / '.retention.json'
+    ledger = batch.read(ledger_path)
+    ledger['snapshots'][-1]['sha256'] = file_hash(previous / 'checkpoint.json')
+    write_json(ledger_path, ledger)
+    team._stage = 'ceo'
+    team._week = dict(observation='Continue the current week.', ceo_started=False)
+    team._set_phase('ceo')
+    for _ in range(3):
+        batch.save_checkpoint(team, directory, record, 'answers_ready')
+    assert not previous.exists()
+    assert all(role.usage.summary['calls'] == 0 for role in team.roles.values())
+    assert not record.get('checkpoint_retention_errors')
+
+
 def test_external_restore_permanently_pins_managed_source_before_reading(managed_team, tmp_path, monkeypatch):
     from saas_bench import team_checkpoint
     team, directory, record, manifest, _ = managed_team
@@ -809,7 +875,8 @@ def test_external_restore_permanently_pins_managed_source_before_reading(managed
     assert not record.get('checkpoint_retention_errors')
 
 
-@pytest.mark.parametrize('fault', ['bad_json', 'missing', 'unknown', 'outside', 'receipt',
+@pytest.mark.parametrize('fault', ['bad_json', 'missing', 'unknown', 'outside', 'receipt', 'team_checksum',
+    'team_symlink', 'team_missing',
     'candidate_symlink', 'parent_symlink', 'ledger_symlink', 'bad_pins', 'bad_attempt', 'partial_delete'])
 def test_retention_errors_preserve_current_analysis_and_continue(managed_team, tmp_path, monkeypatch, fault):
     team, directory, record, manifest, entry = managed_team
@@ -831,6 +898,15 @@ def test_retention_errors_preserve_current_analysis_and_continue(managed_team, t
         write_json(path, ledger)
     elif fault == 'receipt':
         (first / 'checkpoint.json').write_text('{}')
+    elif fault == 'team_checksum':
+        (first / 'team.json').write_text('{}')
+    elif fault == 'team_symlink':
+        state = tmp_path / 'linked-team.json'
+        shutil.copyfile(first / 'team.json', state)
+        (first / 'team.json').unlink()
+        (first / 'team.json').symlink_to(state)
+    elif fault == 'team_missing':
+        (first / 'team.json').unlink()
     elif fault == 'candidate_symlink':
         first.rename(tmp_path / 'moved-source')
         first.symlink_to(tmp_path / 'moved-source', target_is_directory=True)
@@ -857,8 +933,8 @@ def test_retention_errors_preserve_current_analysis_and_continue(managed_team, t
     third = batch.save_checkpoint(team, directory, record, 'week_boundary')
     assert second.is_dir() and tree_hash(second) == second_hash
     assert {p: file_hash(p) for p in logs} == logs and tree_hash(team.root / 'roles') == roles_hash
+    assert first.exists(), 'Retention deleted a checkpoint after invalid retention state'
     assert third.is_dir() and record['checkpoint_retention_errors']
-    assert first.exists()
     assert not record.get('checkpoint_error')
     if fault == 'bad_attempt':
         write_json(other / 'attempt.json', dict(checkpoint=None, source_checkpoint=None, wall_seconds=0))

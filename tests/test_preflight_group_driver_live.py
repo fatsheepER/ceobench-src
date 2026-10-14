@@ -49,6 +49,10 @@ def unit_status(unit, **kwargs):
 systemd_guard.scope_command = team_controller.scope_command = scope_command
 systemd_guard.unit_status = team_controller.unit_status = unit_status
 team_controller.scope_state = lambda saved, **kwargs: unit_status(saved['unit'], **kwargs)
+def verify_worker_scope(policy):
+    return dict(policy, invocation_id=policy['unit'], control_group='/offline/' + policy['unit'])
+team_controller.verify_worker_scope = systemd_guard.verify_worker_scope = verify_worker_scope
+team_controller.check_worker_cgroup = systemd_guard.check_worker_cgroup = lambda proof: None
 popen = subprocess.Popen
 def launch(command, **kwargs):
     if len(command) > 1 and command[1].endswith('/scripts/team_controller.py'):
