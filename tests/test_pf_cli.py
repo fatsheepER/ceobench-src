@@ -68,7 +68,8 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     assert lines[0] == 'file MEMORY.md: 2 versions, newest first'
     assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
     assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
-    assert lines[3] == 'pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md'
+    assert lines[3] == ('pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md '
+                        'Before changing this source: pf rdepend MEMORY.md@v2 --detail.')
     assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
     diff = executor.execute('bash', {'command': 'pf diff MEMORY.md'})
     assert '--- MEMORY.md@v1\n+++ MEMORY.md@v2' in diff and '-b\n+B\n+c' in diff
@@ -243,7 +244,7 @@ def test_single_diff_continues_the_same_pair_after_new_writes(workspace, tmp_pat
     assert tail['baseline']['version'] == header['baseline']['version'] == 'long.txt@v1'
     assert tail['target']['version'] == header['target']['version'] == 'long.txt@v2'
     assert tail['range'] == [24000, header['total_chars']] and tail['next_cursor'] is None
-    complete = body.rsplit('\n[', 1)[0] + rest
+    complete = body.rsplit('\n[', 1)[0] + rest.split('\n[Before changing this source:', 1)[0]
     assert len(complete) == header['total_chars'] and 'newer' not in complete
 
 

@@ -8,6 +8,7 @@ import re
 import pytest
 
 from saas_bench.pf_queries import MODELS, PFQueries
+from saas_bench.execution_capture import finish_http
 from saas_bench.registration_evidence import HANDLES
 from saas_bench.sql_evidence import SQLEvidenceStore, encoded
 from test_sql_evidence import identity, request, settled
@@ -30,6 +31,19 @@ def read(executor, **args):
     assert not text.startswith('Error:'), text
     head, body = text.split('\n', 1)
     return json.loads(head), body, text
+
+
+def test_public_read_versions_support_the_recommended_diff(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    handles = []
+    for value in (1, 2):
+        event = store.begin_event('public_http', dict(method='POST', path='/call',
+            parsed=dict(tool='list_research_projects', args={})))
+        finish_http(store, event, 200, '', encoded(dict(success=True, data={'count': value})), {})
+        handles.append(registry.resolver.handle(event + ':public_response'))
+    diff = executor.execute('bash', {'command': f'pf diff {handles[0]} {handles[1]}'})
+    assert '"count":1' in diff and '"count":2' in diff
+    assert f'Before changing this source: pf rdepend {handles[0]} --detail.' in diff
 
 
 def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_path):

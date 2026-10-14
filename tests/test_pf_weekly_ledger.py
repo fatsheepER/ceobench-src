@@ -214,7 +214,7 @@ def test_actual_team_pf_prompts_receipts_and_weekly_delivery(tmp_path, monkeypat
         day = team.server.tools.current_day
         key = (role, day)
         n = counters[key] = counters.get(key, 0) + 1
-        assert 'PF is a separate command' in body['messages'][0]['content']
+        assert 'Run `pf` directly in Bash, never `novamind-operation pf`' in body['messages'][0]['content']
         bash = next(t for t in body['tools'] if t['function']['name'] == 'bash')
         assert 'never `novamind-operation pf`' in bash['function']['description']
         rendered = json.dumps(body['messages'])

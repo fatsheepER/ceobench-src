@@ -4,6 +4,7 @@ from contextlib import closing
 import difflib
 import json
 import re
+import shlex
 import time
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -748,6 +749,12 @@ class PFQueries:
             result['check']['sources'] = '; '.join(parts)
         result['check'].update(below_failed=len(failed) + len(unknown), below_changed=len(changed),
                               below_content_changed=sum(r['check'].get('change_kind') != 'append_only' for r in changed))
+        if not result.get('diff_pair'):
+            pair = next((self._describe_edge(r).get('diff_pair') for r in below.values()
+                         if r['edge']['target'] and r['check']['version_changed'] and r['check']['current_version']
+                         and not self._clock(r['edge']['target'])), None)
+            if pair:
+                result['diff_pair'] = pair
         return result
 
     def _clock(self, version):
@@ -1173,6 +1180,8 @@ class PFQueries:
             check['current_version'] = self.resolver.handle(current) if current else None
             check['affected_paths'] = [[self.resolver.handle(v) for v in path] for path in check['affected_paths']]
             result['check'] = check
+            if edge['target'] and check['version_changed'] and check['current_version']:
+                result['diff_pair'] = [result['target']['version'], check['current_version']]
         return result
 
     # --- pf log / diff / blame / search ---------------------------------------------
@@ -1379,7 +1388,7 @@ class PFQueries:
         if self.values['mode'] == 'diff':
             baseline = baseline or self._target(self.values['baseline'])
             key = self._key(target)
-            if key != self._key(baseline) or not (key[0] in ('query', 'file_bytes', 'registered_text', 'registered_script',
+            if key != self._key(baseline) or not (key[0] in ('query', 'public_read', 'file_bytes', 'registered_text', 'registered_script',
                                                               'dashboard') or key[0].startswith(('script_', 'command_'))):
                 raise ValueError('Diff requires two versions of the same captured object')
             old_meta, old = self.resolver.content(baseline, public=True)
@@ -1413,6 +1422,8 @@ class PFQueries:
         prefix = encoded(header).decode() + '\n'
         # The continuation command follows the body; the header keeps the delivery fields.
         more = f"\n[{len(content) - end:,} more characters: pf more {header['next_cursor']}]" if header['next_cursor'] else ''
+        if self.values['mode'] == 'diff' and content and end == len(content):
+            more += f"\n[Before changing this source: pf rdepend {shlex.quote(header['baseline']['version'])} --detail.]"
         from .pf_read import capture_read
         return capture_read(self, target, prefix + content[offset:end] + more,
                             offset, end, len(content))

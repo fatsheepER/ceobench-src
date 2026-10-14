@@ -280,6 +280,7 @@ def render_log(page):
         newest = items[0]['version']
         tail.append(f'pf show {newest}' + (f" · pf diff {items[1]['version']} {newest}" if len(items) > 1 else '')
                     + (f" · pf blame {newest.rsplit('@', 1)[0]}" if root.get('layer') == 'file_bytes' else ''))
+        tail.append(f"Before changing this source: pf rdepend {shlex.quote(root['version'])} --detail.")
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -378,11 +379,9 @@ def render_dependencies(page):
     if not detail:
         tail.append(f"pf depend {root['version']} --detail lists the expanded queries, reads and files.")
     # Name a pair that was just compared, so the example is directly usable.
-    pair = next(((row['target']['version'], row['check']['current_version']) for row in page['items']
-                 if row.get('target') and (row.get('check') or {}).get('current_version') not in
-                 (None, row['target']['version'])), None)
+    pair = next((row['diff_pair'] for row in page['items'] if row.get('diff_pair')), None)
     if pair:
-        tail.append('See what changed: pf diff %s %s.' % pair)
+        tail.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -484,6 +483,12 @@ def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, p
         lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
     if flagged:
         example = flagged[0]['text']['record'].split('.')[0]
+        if pf:
+            pair = next((row['diff_pair'] for entry in flagged for row in entry['changed']
+                         if isinstance(row, dict) and row.get('diff_pair')), None)
+            if pair:
+                lines.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
+                lines.append(f'Before changing this source: pf rdepend {shlex.quote(pair[0])} --detail.')
         lines.append(f'Details: pf depend {example}.' if pf else 'Details: run the git diff shown on each line.')
     if rendered is not None:
         offsets, offset = [], 0
@@ -505,6 +510,8 @@ def render_pending(items, day):
     for p in changed[:3]:
         lines.append(f"{p['record']} (last verified day {p['last_day'] if p['last_day'] is not None else 'unknown'}): "
                      + short(dependency_line(p['reason'], relation=False), 240))
+        if pair := p['reason'].get('diff_pair'):
+            lines.append('See the last verified change: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
     if len(changed) > 3:
         lines.append(f'{len(changed) - 3} more texts have earlier content-change findings.')
     return '\n' + '\n'.join(lines)

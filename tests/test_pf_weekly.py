@@ -112,6 +112,32 @@ def test_query_changes_name_the_rows_that_differ(workspace, tmp_path, server):
     assert history.startswith('Versions of SQL: ') and ': 1 saved' in history and 'rerun' not in history
 
 
+def test_contextual_next_steps_follow_changed_underlying_sources(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    server.conn.execute('UPDATE ledger SET amount=amount+1')
+    server.conn.commit()
+    weekly = executor.weekly_check(14)
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in weekly
+    assert 'Details: pf depend r2.' in weekly
+    compact = executor.execute('bash', {'command': 'pf depend r2'})
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in compact
+    assert 'pf depend r2.1 --detail' in compact
+    diff = executor.execute('bash', {'command': 'pf diff query1@v1 query1@v2'})
+    assert 'Before changing this source: pf rdepend query1@v1 --detail.' in diff
+    referrers = executor.execute('bash', {'command': 'pf rdepend query1@v1 --detail'})
+    assert 'r1.1' in referrers and 'r2.1' in referrers
+    log = executor.execute('bash', {'command': 'pf log query1@v1'})
+    assert 'Before changing this source: pf rdepend query1@v1 --detail.' in log
+
+
+def test_unchanged_dependency_keeps_depend_hint_without_a_change_hint(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    result = executor.execute('bash', {'command': 'pf depend r2'})
+    assert 'pf depend r2.1 --detail' in result
+    assert 'See what changed' not in result
+    assert 'Before changing this source' not in executor.weekly_check(14)
+
+
 def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server, select={'col': 'amount'},
         predicate={'type': 'threshold', 'op': '>=', 'value': 40})
