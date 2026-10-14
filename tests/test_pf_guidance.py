@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from saas_bench import pf_cli, team_prompts
+from saas_bench import pf_cli, registration_prompt, team_prompts
 from saas_bench.pf_refresh import refresh
 from saas_bench.public_sql import execute_query
 from saas_bench.registration_schema import PF_CREATE, PF_REVISE, tool_definitions
@@ -56,6 +56,40 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
                 assert team_prompts.PF_HISTORY not in system
                 assert 'Example request:' not in description
                 assert 'EXAMPLE_GROUP' not in description
+
+
+def test_d0_prompt_example_runs_and_full_help_reaches_all_role_wires():
+    def respond(team, role, body):
+        system = '\n'.join(m['content'] for m in body['messages'] if m['role'] == 'system')
+        command = re.search(r'for example `(pf[^`]*)`', system)[1]
+        return calls(('bash', {'command': command}))
+
+    with make_team('pf', respond, 'guidance-d0-help') as team:
+        for role in ROLES:
+            runtime = team.roles[role]
+            action = runtime.agent.act('Synthetic dashboard', 0, False, {'day': 0})
+            result = runtime.executor.execute(action.tool, action.arguments)
+            assert result == pf_cli.HELP
+            assert runtime.executor.last_status == 'succeeded'
+            runtime.agent.act(result, 0, False, {'day': 0})
+            wire = team.test_wire[-1]
+            assert wire['role'] == role
+            assert wire['body']['messages'][-1]['content'] == pf_cli.HELP
+            event = runtime.usage.last_request_event
+            assert json.loads(runtime.store.get_content(event + ':wire')[1]) == wire['body']
+            system = wire['body']['messages'][0]['content']
+            assert '`pf help` has complete examples' in system
+            bash = next(t['function'] for t in wire['body']['tools'] if t['function']['name'] == 'bash')
+            assert '`pf help` has complete examples' in bash['description']
+
+
+def test_standalone_prompt_example_is_safe_before_any_registration(workspace, tmp_path):
+    _, registry, executor = captured(workspace, tmp_path)
+    command = re.search(r'for example `(pf[^`]*)`', registration_prompt.PF_HISTORY)[1]
+    assert executor.execute('bash', {'command': command}) == pf_cli.HELP
+    assert not registry.path.exists()
+    assert '`pf help` has complete examples' in registration_prompt.PF_HISTORY
+    assert 'Replace the synthetic names below with handles from actual receipts' in registration_prompt.PF_HISTORY
 
 
 def test_help_peer_example_reads_exact_version_and_compares_one_object():
@@ -133,14 +167,43 @@ def test_published_condition_and_review_examples(workspace, tmp_path, server):
     assert registry._load()['records']['r1'][-1]['references'] == []
 
 
-def test_help_is_on_demand_and_usage_errors_stay_short(workspace, tmp_path):
-    store, registry, executor = captured(workspace, tmp_path)
-    assert executor.execute('bash', {'command': 'pf help'}) == pf_cli.HELP
-    error = executor.execute('bash', {'command': 'pf depend'})
-    assert error == '[stderr]\npf depend: wrong number of arguments\n\n[exit code: 2]'
-    for flag in ('--help', '-h'):
-        error = executor.execute('bash', {'command': 'pf ' + flag})
-        assert error == f'[stderr]\npf: unknown command {flag}\n\n[exit code: 2]'
-        with pytest.raises(pf_cli.Usage, match='unknown command'):
-            pf_cli.parse('pf ' + flag, {'/workspace'})
+def test_help_aliases_in_bash_and_historical_parser(workspace, tmp_path):
+    _, registry, executor = captured(workspace, tmp_path)
+    commands = ['pf', 'pf help', 'pf --help', 'pf -h']
+    for verb in ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more'):
+        for flag in ('--help', '-h'):
+            commands.extend((f'pf {verb} {flag}', f'pf {verb} {flag} missing', f'pf {verb} missing {flag}'))
+    for command in commands:
+        assert executor.execute('bash', {'command': command}) == pf_cli.HELP, command
+        assert executor.last_status == 'succeeded'
+        with pytest.raises(pf_cli.Usage) as error:
+            pf_cli.parse(command, {'/workspace'})
+        assert str(error.value) == pf_cli.USAGE
     assert not registry.path.exists()
+
+
+@pytest.mark.parametrize('command', ['pf typo', 'pf depend', 'pf depend r1 --bogus',
+    'pf search --kind', 'pf search --text term --all', 'pf more 3'])
+def test_usage_errors_point_to_complete_help(workspace, tmp_path, command):
+    _, registry, executor = captured(workspace, tmp_path)
+    error = executor.execute('bash', {'command': command})
+    assert error.startswith('[stderr]\npf')
+    assert 'Run pf help for usage and complete examples.' in error
+    assert error.endswith('[exit code: 2]')
+    assert pf_cli.HELP not in error
+    assert not registry.path.exists()
+
+
+@pytest.mark.parametrize('literal', ['--help', '-h'])
+def test_help_like_literal_search_values_and_paths(workspace, tmp_path, literal):
+    _, _, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', {'path': literal, 'content': 'saved literal ' + literal})
+    result = executor.execute('bash', {'command': f"pf search --text '{literal}'"})
+    assert literal + '@v1' in result and 'saved literal ' + literal in result, result
+    assert executor.last_status == 'succeeded'
+    shown = executor.execute('bash', {'command': f"pf show -- '{literal}'"})
+    assert 'saved literal ' + literal in shown and shown != pf_cli.HELP, shown
+    assert pf_cli.parse_argv(['search', 'S1', '--kind', literal]) == (
+        'pf_search', {'object': {'id': 'S1', 'kind': literal}, 'all': False})
+    for command in (f"pf search --text '{literal}' --help", f"pf search -h --text '{literal}'"):
+        assert executor.execute('bash', {'command': command}) == pf_cli.HELP

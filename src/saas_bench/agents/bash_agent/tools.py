@@ -275,7 +275,7 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
             if t['name'] == 'bash' else t for t in definitions]
     if pf_queries:
         definitions = [dict(t, description=t['description'] +
-            ' Run PF directly as `pf`, for example `pf depend r1`; never `novamind-operation pf`.')
+            ' Run PF directly as `pf`; never `novamind-operation pf`. `pf help` has complete examples.')
             if t['name'] == 'bash' else t for t in definitions]
     if text_registration or pf_queries:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.

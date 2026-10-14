@@ -29,7 +29,7 @@ def test_pf_command_parsing_views_and_refusals():
     assert pf_cli.parse('pf search S1 --kind customer_group', ROOTS)[1] == dict(
         object={'id': 'S1', 'kind': 'customer_group'}, all=False)
     assert pf_cli.parse('pf more c3 | tail -n 5', ROOTS) == ('pf_more', {'cursor': 'c3'}, ('tail', 5))
-    for command in ('pf', 'pf help'):
+    for command in ('pf', 'pf help', 'pf --help', 'pf -h'):
         with pytest.raises(pf_cli.Usage) as error:
             pf_cli.parse(command, ROOTS)
         assert str(error.value) == pf_cli.USAGE
@@ -47,7 +47,7 @@ def test_pf_command_parsing_views_and_refusals():
     for command, message in refusals.items():
         with pytest.raises(pf_cli.Usage) as error:
             pf_cli.parse(command, ROOTS)
-        assert str(error.value) == message
+        assert str(error.value) == message + '\nRun pf help for usage and complete examples.'
 
 
 def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_path):

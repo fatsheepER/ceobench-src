@@ -6,7 +6,7 @@ from .evidence_handles import RAW_VERSION, RECORD, SINGLE, VERSIONED
 from .pf_render import _HEREDOC
 
 USAGE = '''usage: pf <command> ...
-  pf help                              command help and examples
+  pf help | pf --help | pf -h          complete command help and examples
   pf log <object>                      versions of a file, an output or a text, newest first
   pf show <handle> [--full]            one saved version
   pf diff <object> | <old> [<new>]     what changed; one object compares its last two versions
@@ -17,7 +17,9 @@ USAGE = '''usage: pf <command> ...
   pf search --text "term"              literal text in public captured history, newest first
   pf more <cursor>                     the next page of an earlier result
 Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
-version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.'''
+version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.
+Bare pf also shows help. Every subcommand accepts --help or -h.
+Use -- before an object name beginning with a dash, e.g. pf show -- -h.'''
 
 HELP = USAGE + '''
 
@@ -93,11 +95,14 @@ pipes and redirection can leave only a partial view.
 '''
 
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more', 'help')
-_INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS) + r')\b|\s*$)', re.M)
+_INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS + ('--help', '-h')) + r')\b|\s*$)', re.M)
 
 
 class Usage(ValueError):
     """A pf invocation that cannot run; its message is the whole agent-facing reply."""
+
+    def __init__(self, message):
+        super().__init__(message if message == USAGE else message + '\nRun pf help for usage and complete examples.')
 
 
 def mentions_pf(command):
@@ -119,8 +124,11 @@ def _flags(words, allowed):
     flags, rest, i = {}, [], 0
     while i < len(words):
         word = words[i]
-        if word.startswith('--'):
-            name = word[2:]
+        if word == '--':
+            rest.extend(words[i + 1:])
+            break
+        if word.startswith('--') or word == '-h':
+            name = 'help' if word == '-h' else word[2:]
             if name not in allowed:
                 raise Usage(f'pf: unknown option {word}')
             if allowed[name]:
@@ -176,31 +184,34 @@ def parse(command, roots):
         raise Usage('pf: only | head -N and | tail -N can follow pf')
     view = _view(segments[1]) if len(segments) == 2 else None
     words = segments[0][1:]
-    if not words or words[0] == 'help':
+    operation, arguments = parse_argv(words)
+    if operation == 'pf_help':
         raise Usage(USAGE)
-    return (*parse_argv(words), view)
+    return operation, arguments, view
 
 
 def parse_argv(words):
     """Parse argv already expanded by Bash; never interpret shell syntax here."""
-    if not words or words[0] == 'help':
+    if not words or words[0] in ('help', '--help', '-h'):
         return 'pf_help', {}
     verb, words = words[0], words[1:]
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}')
     options = dict(show={'full': False}, depend={'detail': False, 'history': False},
-                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': False}).get(verb, {})
-    flags, rest = _flags(words, options)
-    expected = dict(diff=(1, 2)).get(verb, (1, 1))
+                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': True}).get(verb, {})
+    flags, rest = _flags(words, dict(options, help=False))
+    if flags.get('help'):
+        return 'pf_help', {}
+    expected = (0, 0) if 'text' in flags else dict(diff=(1, 2)).get(verb, (1, 1))
     if not expected[0] <= len(rest) <= expected[1]:
         raise Usage(f'pf {verb}: wrong number of arguments')
-    first = rest[0]
+    first = flags['text'] if 'text' in flags else rest[0]
     if verb == 'more':
         if not re.fullmatch(r'c[1-9][0-9]*', first):
             raise Usage('pf more: give the cursor from a previous result, e.g. pf more c2')
         return 'pf_more', {'cursor': first}
     if verb == 'search':
-        if flags.get('text'):
+        if 'text' in flags:
             if 'kind' in flags or 'all' in flags:
                 raise Usage('pf search --text cannot be combined with --kind or --all')
             return 'pf_search', {'text': first}

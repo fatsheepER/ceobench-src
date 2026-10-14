@@ -52,8 +52,8 @@ each handoff and every workspace at week close. Use git log or git diff to revie
 past changes.
 '''
 
-PF_HISTORY = '''Run PF directly in Bash, for example `pf depend r1`. PF is a separate command;
-never use `novamind-operation pf`.
+PF_HISTORY = '''Run PF directly in Bash, for example `pf`. PF is a separate command;
+never use `novamind-operation pf`. `pf help` has complete examples.
 Choose PF operations for the evidence question:
 - For exact peer evidence, copy the returned role and version into pf show.
 - Before reusing an old conclusion, read its saved version; use pf depend <handle> --detail

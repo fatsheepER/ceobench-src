@@ -149,8 +149,8 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
                 item['parameters']['properties'].pop('note', None)
         expected_tools = [dict(item) for item in ORIGINAL['tools']]
         if mode == 'pf':
-            expected_tools[0]['description'] += (' Run PF directly as `pf`, for example `pf depend r1`; '
-                                                 'never `novamind-operation pf`.')
+            expected_tools[0]['description'] += (' Run PF directly as `pf`; never `novamind-operation pf`. '
+                                                 '`pf help` has complete examples.')
         assert definitions[:6] == expected_tools
         assert [t['name'] for t in definitions[6:]] == ([] if mode == 'off' else
             ['text_create', 'text_revise', 'text_retire', 'text_list'])

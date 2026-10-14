@@ -68,13 +68,15 @@ retrieve them. Only a completed `research_group` survey updates that date.
 command or what the change is for. PF keeps it with the outputs and files of
 that call and shows it when you see them again, e.g. above MEMORY.md next week.
 
-Run `pf` directly in Bash, for example `pf depend r1`. It is a separate command;
-never use `novamind-operation pf`. Loops, pipes and redirects follow normal Bash rules.
+Run `pf` directly in Bash, for example `pf`. It is a separate command;
+never use `novamind-operation pf`. `pf help` has complete examples.
+Loops, pipes and redirects follow normal Bash rules.
 Citing a whole captured object does not require reading all of it. PF records
 what you actually read separately; selected fields must have reached you.
 Compact DELTA/UNCHANGED returns name the exact baseline and a `pf show ... --full`
 command. Use that command if you need the saved full output.
 
+Replace the synthetic names below with handles from actual receipts.
 Commands:
 
 ```
