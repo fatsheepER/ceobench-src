@@ -412,7 +412,9 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     assert call(registry, 'create', **declaration(references=[ref]))['id'] == 'r2'
 
 
-def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, server, packed_public):
+def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, server, packed_public, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_ROW_LIMIT', '5000')
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     import shlex
     from test_sql_evidence import settled
     from saas_bench.pf_stale import compare
