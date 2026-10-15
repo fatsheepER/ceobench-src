@@ -305,6 +305,18 @@ class BashAgentRunner:
             ) from exc
 
         self.use_anthropic = self.provider in ("anthropic", "bedrock")
+        from saas_bench.runtime_options import runtime_value
+        prior_provider = (self._source_manifest or {}).get('configuration', {}).get('provider', self.provider)
+        defaults = dict(memory_max_chars=40000 if self.continue_from else 100000,
+            max_output_tokens=128000 if prior_provider in ('anthropic', 'bedrock') else 16384 if self.continue_from else 32768,
+            invalid_generation_attempts=4)
+        saved_policy = (self._source_manifest or {}).get('generation_policy', {})
+        self.generation_policy = {key: runtime_value('model_max_output_tokens' if key == 'max_output_tokens' else key,
+            saved_policy.get(key, value)) for key, value in defaults.items()}
+        if self.continue_from:
+            self.configuration_overrides.extend(dict(field=key, old=saved_policy.get(key, value),
+                new=self.generation_policy[key], effective_at='new_recovery_attempt')
+                for key, value in defaults.items() if self.generation_policy[key] != saved_policy.get(key, value))
         if api_key:
             self.api_key = api_key
         elif self.provider == "xai":
@@ -758,6 +770,7 @@ __pycache__/
                     if row not in self.configuration_overrides:
                         self.configuration_overrides.append(row)
         manifest = dict(version=1, build=build, configuration=configuration,
+                        generation_policy=self.generation_policy,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
         from .tools import GUEST_WORKSPACE, agent_runtime
@@ -1195,6 +1208,7 @@ __pycache__/
                                       self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
             pf=self.text_registration == 'pf',
+            **self.generation_policy,
         )
 
         self.agent.lifecycle = getattr(self, 'lifecycle', None)

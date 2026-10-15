@@ -244,6 +244,9 @@ def _freeze(runtime, directory):
         context_id=role.usage.context_id, last_request_event=role.usage.last_request_event,
         expected_model=getattr(role.usage, 'expected_model', None),
         total_turns=role.agent.total_turns, system_prompt=role.agent.system_prompt,
+        generation_policy=dict(memory_max_chars=role.agent.memory_max_chars,
+            max_output_tokens=role.agent.max_output_tokens,
+            invalid_generation_attempts=role.agent.invalid_generation_attempts),
         executor=dict(bash_timeout=role.executor.bash_timeout, bash_warn_after=role.executor.bash_warn_after,
             stop_on_timeout=role.executor.stop_on_timeout),
         script_executor=dict(bash_timeout=server.role_executors[name].bash_timeout,
@@ -341,6 +344,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     policy_keys = ('analyst_bash_timeout', 'analyst_bash_warn_after', 'ceo_bash_timeout', 'ceo_bash_warn_after')
     from .runtime_options import OPTIONS, runtime_value
     environment_before = {env: os.environ.get(env) for env, _, _ in OPTIONS.values()}
+    state['_explicit_runtime_environment'] = [env for env, value in environment_before.items() if value is not None]
     for key in policy_keys:
         env = OPTIONS[key][0]
         if environment_before[env] is not None and key not in options:
@@ -360,6 +364,14 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
                     if (name == 'ceo') == key.startswith('ceo_'):
                         saved['executor'][field] = requested
     state['_configuration_changes'] = changes
+    for role, saved in state['roles'].items():
+        for key, option in dict(memory_max_chars='memory_max_chars', max_output_tokens='model_max_output_tokens',
+                                invalid_generation_attempts='invalid_generation_attempts').items():
+            if environment_before[OPTIONS[option][0]] is not None:
+                old = saved.get('generation_policy', {}).get(key)
+                new = runtime_value(option, None)
+                if old != new:
+                    changes[f'{role}.{key}'] = dict(old=old, new=new, effective_at='new_attempt')
     if state['live_customer'] and simulator_factory is None:
         logging.warning('Live simulator recovery has no customer client factory')
     root.mkdir(parents=True, exist_ok=True)

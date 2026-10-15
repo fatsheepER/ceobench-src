@@ -608,3 +608,36 @@ def test_recovery_retains_numeric_settings_unless_explicitly_overridden(tmp_path
         for team in (changed, restored, runtime):
             if team:
                 dispose(team)
+
+
+def test_legacy_generation_limits_restore_and_explicit_values_override(tmp_path, monkeypatch):
+    from saas_bench import team_checkpoint
+    runtime = make_team(tmp_path / 'legacy-generation-source', 'git')
+    restored = changed = None
+    try:
+        snapshot = runtime.checkpoint()
+        validate = team_checkpoint.validate_snapshot
+        def legacy(source):
+            directory, state = validate(source)
+            state.pop('runtime_environment', None)
+            for saved in state['roles'].values():
+                saved.pop('generation_policy', None)
+            return directory, state
+        monkeypatch.setattr(team_checkpoint, 'validate_snapshot', legacy)
+        for name in ('CEOBENCH_MEMORY_MAX_CHARS', 'CEOBENCH_MODEL_MAX_OUTPUT_TOKENS'):
+            monkeypatch.delenv(name, raising=False)
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-generation-restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert all(role.agent.memory_max_chars == 40000 and role.agent.max_output_tokens == 16384
+                   for role in restored.roles.values())
+        monkeypatch.setenv('CEOBENCH_MEMORY_MAX_CHARS', '60000')
+        monkeypatch.setenv('CEOBENCH_MODEL_MAX_OUTPUT_TOKENS', '64000')
+        changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'legacy-generation-changed',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert all(role.agent.memory_max_chars == 60000 and role.agent.max_output_tokens == 64000
+                   for role in changed.roles.values())
+        assert all(role.agent.memory_max_chars == 40000 for role in restored.roles.values())
+    finally:
+        for team in (changed, restored, runtime):
+            if team:
+                dispose(team)

@@ -154,12 +154,24 @@ class MultiAgentRuntime:
             executor.temp_root = script_executors[role].temp_root = self._temp_root
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
+            client = client_factory(role)
+            generation_policy = {}
+            if _restored_state:
+                generation_policy = dict(_restored_state['roles'][role].get('generation_policy', {}))
+                if not generation_policy and 'runtime_environment' not in _restored_state:
+                    generation_policy = dict(memory_max_chars=40000, invalid_generation_attempts=4,
+                        max_output_tokens=128000 if type(client).__module__.startswith('anthropic') else 16384)
+                from .runtime_options import OPTIONS
+                for key, option in dict(memory_max_chars='memory_max_chars', max_output_tokens='model_max_output_tokens',
+                                        invalid_generation_attempts='invalid_generation_attempts').items():
+                    if OPTIONS[option][0] in _restored_state.get('_explicit_runtime_environment', []):
+                        generation_policy.pop(key, None)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf',
                 ask_analyst=role == 'ceo', team=True, bash_timeout=executor.bash_timeout, bash_warn_after=executor.bash_warn_after),
-                client_factory(role), workspace_path=workspace, usage_recorder=usage,
+                client, workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
                 text_registration=True, pf=mode == 'pf', identity=identity,
-                allow_final_text=role != 'ceo')
+                allow_final_text=role != 'ceo', **generation_policy)
             agent.system_prompt = system_prompt(agent.system_prompt, role, mode, total_days,
                 self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]])
             agent.lifecycle = self._lifecycle
