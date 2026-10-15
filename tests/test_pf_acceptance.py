@@ -26,7 +26,8 @@ from test_public_sql import server
 from test_text_registry import captured, declaration, workspace
 
 
-def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, server):
+def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_ROW_LIMIT', '5000')
     destination = os.environ.get('CEOBENCH_STAGE4_ARTIFACTS')
     counter = load_counter('deepseek', 'deepseek-flash') if destination else Counter()
     assert counter is not None

@@ -303,7 +303,8 @@ def test_all_sdk_reads_preserve_world_and_all_random_streams(workspace, tmp_path
         conn.close()
 
 
-def test_refresh_permission_rejection_timeout_and_lossy_results(workspace, tmp_path, server):
+def test_refresh_permission_rejection_timeout_and_lossy_results(workspace, tmp_path, server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_ROW_LIMIT', '5000')
     store, registry, executor = chain(workspace, tmp_path, server)
     for index, (sql, reason) in enumerate([
         ('SELECT * FROM group_insight_snapshots', 'refresh_failed:rejected'),
