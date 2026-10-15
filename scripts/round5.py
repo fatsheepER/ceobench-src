@@ -16,7 +16,7 @@ from saas_bench.run_state import (checkpoint_directory, checkpoint_manifest, clo
     file_hash, tree_hash, write_json)
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'acceptance-materials' / 'round5-first'
+OUT = Path.home() / 'Documents' / 'Codex' / 'round5-first'
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 SEEDS = {42: 'A', 43: 'B', 44: 'C'}
