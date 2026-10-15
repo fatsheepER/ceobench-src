@@ -104,3 +104,20 @@ def test_unknown_outcome_discovered_at_final_checkpoint_holds(managed_team, tmp_
     assert result['checkpoint'] == checkpoint
     notice = batch.read(directory / 'HOLD')
     assert notice['manual_resume_required'] and 'unknown' in notice['detail'].lower()
+
+
+@pytest.mark.parametrize('reason,detail', [
+    ('model_attempt_limit', 'No valid reply after 7 model requests. Last invalid generation arguments; feedback re-emit JSON.'),
+    ('model_request_failed', 'Model request stopped after 9 attempts. Last error HTTP 503. Continue with --resume --week 4.')])
+def test_hold_preserves_actual_configured_attempts_and_last_failure(tmp_path, reason, detail):
+    from types import SimpleNamespace
+    from saas_bench import team_batch as batch
+    team = SimpleNamespace(failure=reason, failure_detail=detail)
+    entry = dict(run_id='git', output_dir=str(tmp_path / 'run'))
+    directory = tmp_path / 'run/attempt-001'
+    record = {}
+    assert batch.hold_attempt(team, entry, directory, record, reason) == 'paused'
+    notice = batch.read(directory / 'HOLD')
+    assert detail in notice['detail'] and detail in record['hold_detail']
+    assert notice['manual_resume_required']
+    assert 'after 4' not in notice['detail'] and 'receive 5' not in notice['detail']

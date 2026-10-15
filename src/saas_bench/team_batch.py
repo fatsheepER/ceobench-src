@@ -769,9 +769,9 @@ def execute(team, manifest, entry, directory, record, hold):
 def hold_attempt(team, entry, directory, record, reason):
     detail = getattr(team, 'failure_detail', None) or team.failure or reason
     if team.failure == 'model_attempt_limit':
-        detail = 'No valid reply after 4 model requests in this turn; manual checkpoint resume required'
+        detail = 'Invalid generation limit reached; manual checkpoint resume required. ' + detail
     elif team.failure == 'model_request_failed':
-        detail = 'Model request failed; network errors receive 5 attempts (10/20/40/80 seconds). ' + detail
+        detail = 'Model request failed; manual checkpoint resume required. ' + detail
     elif team.failure == 'world_operation_failed':
         detail = 'World advancement failed or timed out; progress is recorded in the operation receipts. ' + detail
     elif team.failure == 'business_operation_pending':
