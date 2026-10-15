@@ -728,6 +728,7 @@ class Simulator:
         # regardless of how many customers other groups generate (agent actions don't
         # affect the attribute sequence within a group).
         self._group_rngs: Dict[str, Generator] = {}
+        self._group_seed_hash = 'crc32'
         for gid in CUSTOMER_GROUPS:
             group_seed = int(self.rng.integers(0, 2**63))
             # XOR with hash of group_id for extra differentiation
@@ -825,7 +826,7 @@ class Simulator:
 
         states = {
             'version': 3,
-            'group_seed_hash': 'crc32',
+            'group_seed_hash': self._group_seed_hash,
             'runtime_config': normalize_runtime_config(
                 {name: getattr(self.config, name) for name in RUNTIME_CONFIG_FIELDS}),
             'rng': _serialize_state(self.rng),
@@ -895,6 +896,7 @@ class Simulator:
             return False
 
         states = _json.loads(row['state_json'])
+        self._group_seed_hash = states.get('group_seed_hash', 'python-hash')
         if states.get('group_seed_hash') != 'crc32':
             logging.warning('Checkpoint group RNG hash scheme is %s; restoring saved RNG states, new D0 uses crc32',
                             states.get('group_seed_hash', 'python-hash'))

@@ -53,3 +53,5 @@ def test_legacy_rng_hash_scheme_warns_and_restores_saved_states(make_initialized
     assert sim.restore_rng_states()
     assert sim.rng.bit_generator.state == saved['rng']
     assert 'Checkpoint group RNG hash scheme is python-hash' in caplog.text
+    sim.save_rng_states()
+    assert json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])['group_seed_hash'] == 'python-hash'
