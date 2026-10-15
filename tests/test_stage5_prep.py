@@ -206,8 +206,9 @@ def test_repeated_tool_calls_are_delivered_compactly_and_reconstruct(workspace, 
     assert summary['read_kinds']['tool_call'] >= 4 and summary['net_saved_tokens'] > 0
 
 
-def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
+def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path, monkeypatch):
     store, registry, executor = pf_executor(workspace, tmp_path)
+    monkeypatch.setitem(executor.runtime_environment, 'CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     (workspace / 'facts.txt').write_text(sample())
     a = executor.execute('read_file', {'path': 'facts.txt'})
     b = executor.execute('read_file', {'path': 'facts.txt'})
@@ -225,6 +226,7 @@ def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
     (workspace / 'big.txt').write_text('x' * 40000)
     big1 = executor.execute('bash', {'command': 'cat big.txt'})
     big2 = executor.execute('bash', {'command': 'cat big.txt'})
+    assert 'output truncated' in big1 and 'output truncated' in big2
     _, ledger = deliver(store, [big1, big2])
     assert ledger[1]['mode'] == 'FULL' and ledger[1]['reason'] == 'partial_or_truncated'
     # Git and prefix groups never produce compact tool reads.
