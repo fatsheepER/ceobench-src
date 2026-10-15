@@ -34,7 +34,7 @@ def test_latest_checkpoint_ignores_failed_operation_tail_and_preserves_old_files
     assert {path: path.read_bytes() for path in original} == original
 
 
-def test_initial_checkpoint_selection_expires_after_first_recovery(tmp_path, monkeypatch):
+def test_explicit_checkpoint_selection_survives_repeated_recovery(tmp_path, monkeypatch):
     entry = dict(run_id='pf-1', output_dir=str(tmp_path / 'pf'))
     first = Path(entry['output_dir']) / 'attempt-001'
     boundary = snapshot(first / 'runtime/checkpoints/boundary', entry['run_id'], '2026-10-15T01:00:00+00:00')
@@ -46,7 +46,11 @@ def test_initial_checkpoint_selection_expires_after_first_recovery(tmp_path, mon
     assert recovery.latest_checkpoint(entry) == boundary
     resumed = snapshot(Path(entry['output_dir']) / 'attempt-002/runtime/checkpoints/resumed',
         entry['run_id'], '2026-10-15T03:00:00+00:00')
-    assert recovery.latest_checkpoint(entry) == resumed
+    assert recovery.latest_checkpoint(entry) == boundary
+    monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(newest)}))
+    assert recovery.latest_checkpoint(entry) == newest
+    monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(boundary)}))
+    assert recovery.latest_checkpoint(entry) == boundary
 
 
 def test_replay_retry_stays_on_selected_past_until_new_checkpoint_is_saved(tmp_path):
@@ -62,14 +66,14 @@ def test_replay_retry_stays_on_selected_past_until_new_checkpoint_is_saved(tmp_p
     assert recovery.latest_checkpoint(entry, week=11).name == 'future'
 
 
-def test_invalid_latest_checkpoint_is_reported_before_previous_valid_is_selected(tmp_path, caplog):
+def test_invalid_latest_checkpoint_is_reported_and_selected(tmp_path, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     first = Path(entry['output_dir']) / 'attempt-001'
     valid = snapshot(first / 'runtime/checkpoints/valid', entry['run_id'], '2026-10-15T01:00:00+00:00')
     broken = snapshot(first / 'runtime/checkpoints/broken', entry['run_id'], '2026-10-15T02:00:00+00:00')
     (broken / 'world.nmdb').write_bytes(b'incomplete')
-    assert recovery.latest_checkpoint(entry) == valid
-    assert str(broken) in caplog.text and 'checksum mismatch' in caplog.text
+    assert recovery.latest_checkpoint(entry) == broken
+    assert 'checksum mismatch' in caplog.text
 
 
 def test_checkpoint_discovery_survives_incomplete_attempt_metadata(tmp_path, caplog):
@@ -81,12 +85,12 @@ def test_checkpoint_discovery_survives_incomplete_attempt_metadata(tmp_path, cap
     assert str(first / 'attempt.json') in caplog.text
 
 
-def test_checkpoint_selection_checks_run_identity(tmp_path, monkeypatch):
+def test_checkpoint_selection_warns_about_run_identity(tmp_path, monkeypatch, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     wrong = snapshot(Path(entry['output_dir']) / 'attempt-001/runtime/checkpoints/wrong', 'pf-1', '2026-10-15T01:00:00+00:00')
     monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(wrong)}))
-    with pytest.raises(ValueError, match='run identity'):
-        recovery.latest_checkpoint(entry)
+    assert recovery.latest_checkpoint(entry) == wrong
+    assert 'run identity' in caplog.text
 
 
 def test_any_saved_week_can_be_selected_after_later_attempts(tmp_path, monkeypatch):
@@ -106,12 +110,12 @@ def test_any_saved_week_can_be_selected_after_later_attempts(tmp_path, monkeypat
     assert {path: path.read_bytes() for path in original} == original
 
 
-def test_missing_week_does_not_fall_back_to_a_different_saved_week(tmp_path):
+def test_missing_week_warns_and_does_not_choose_a_different_saved_week(tmp_path, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     first = Path(entry['output_dir']) / 'attempt-001'
     snapshot(first / 'runtime/checkpoints/latest', entry['run_id'], '2026-10-15T01:00:00+00:00')
-    with pytest.raises(ValueError, match='No complete saved checkpoint for week 1, day 0'):
-        recovery.latest_checkpoint(entry, week=1)
+    assert recovery.latest_checkpoint(entry, week=1) is None
+    assert 'No saved checkpoint for week 1' in caplog.text
 
 
 @pytest.mark.parametrize('week', [None, 4])

@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import fcntl
+import errno
 import hashlib
 import json
 import logging
@@ -549,9 +550,18 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
         record['checkpoint_rollback'] = rollback
         record['decisions'] = []
         record['decisions'].append(dict(kind='checkpoint_rollback', run_id=entry['run_id'], **rollback))
-    write_json(temporary / 'attempt.json', record)
-    temporary.rename(directory)
-    return directory, record, source
+    while True:
+        record['attempt'] = number
+        write_json(temporary / 'attempt.json', record)
+        try:
+            temporary.rename(directory)
+            return directory, record, source
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+            logging.warning('Attempt directory was allocated concurrently; allocating the next attempt')
+            number += 1
+            directory = Path(entry['output_dir']) / f'attempt-{number:03}'
 
 
 def save_checkpoint(team, directory, record, boundary):

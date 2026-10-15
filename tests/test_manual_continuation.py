@@ -77,3 +77,24 @@ def test_attempt_numbering_remains_monotonic_beyond_three_digits(tmp_path):
 def test_historical_attempt_policy_does_not_block_recovery(frozen, tmp_path, policy):
     path = changed_manifest(frozen, tmp_path, lambda manifest: manifest.update(policy))
     assert batch.validate_manifest(path)['attempt_policy'] == policy.get('attempt_policy', 'automatic_checkpoint_recovery')
+
+
+def test_concurrent_manual_registrations_preserve_both_attempts(frozen, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from test_preflight_team_batch import changed_manifest
+    path = changed_manifest(frozen, tmp_path, lambda manifest: None)
+    manifest = batch.read(path)
+    entry = manifest['runs'][0]
+    Path(entry['output_dir']).mkdir(parents=True)
+    barrier = threading.Barrier(2)
+    create = batch.tempfile.mkdtemp
+    def together(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return create(*args, **kwargs)
+    monkeypatch.setattr(batch.tempfile, 'mkdtemp', together)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: batch.register_attempt(path, manifest, entry), range(2)))
+    assert {row[1]['attempt'] for row in results} == {1, 2}
+    assert len(batch.attempts(entry)) == 2
+    assert len({batch.read(row[0] / 'attempt.json')['attempt_id'] for row in results}) == 2
