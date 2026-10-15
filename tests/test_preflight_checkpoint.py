@@ -59,14 +59,16 @@ def test_checkpoint_rejects_inflight_unknown_and_wrong_day(tmp_path):
         server.checkpoint(7)
 
 
-def test_legacy_and_nonportable_workspace_are_rejected(tmp_path):
+def test_legacy_is_rejected_and_external_symlink_is_warned(tmp_path, caplog):
     with pytest.raises(ValueError, match='legacy'):
         checkpoint_directory(tmp_path, {'day': 7})
     workspace = tmp_path / 'source'
     workspace.mkdir()
     (workspace / 'escape').symlink_to(tmp_path)
-    with pytest.raises(ValueError, match='symlink'):
-        copy_workspace(workspace, tmp_path / 'copy')
+    copy_workspace(workspace, tmp_path / 'copy')
+    assert 'Workspace symlink escapes the checkpoint' in caplog.text
+    assert (tmp_path / 'copy/escape').is_symlink()
+    assert (tmp_path / 'copy/escape').resolve() == tmp_path
 
 
 def test_checkpoint_copy_omits_only_current_session_world(tmp_path):
