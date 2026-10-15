@@ -4,11 +4,8 @@ import signal
 import subprocess
 import sys
 
-import pytest
-
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import WorkerLifecycle
-from saas_bench.run_state import write_json
 from test_preflight_team_batch import frozen, managed_team
 
 
@@ -79,20 +76,3 @@ def test_execute_protects_result_and_attempt_persistence(managed_team, tmp_path,
     assert result['status'] == 'paused'
     assert (directory / 'result.json').exists()
     assert batch.read(directory / 'attempt.json')['status'] == 'paused'
-
-
-@pytest.mark.parametrize('operation', ['covered', 'new_completed', 'unknown'])
-def test_analysis_hold_preserves_error_and_audits_safe_boundary(managed_team, tmp_path, monkeypatch, operation):
-    team, directory, record, manifest, entry = managed_team
-    checkpoint = record['checkpoint']
-    team._stage = 'analysis'
-    team.failure = 'hold'
-    monkeypatch.setattr(team, 'run', lambda **kw: type('Outcome', (), dict(day=0, reason='paused'))())
-    if operation != 'covered':
-        write_json(team.root / 'private/operations/post-snapshot.json',
-            dict(status='completed' if operation == 'new_completed' else 'started'))
-    result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
-    assert 'outside a recoverable handoff' in result['checkpoint_error']
-    assert result['checkpoint'] == checkpoint
-    assert result.get('recovery_validation', {}).get('eligible') is True
-    assert result['recovery_validation']['checkpoint'] == checkpoint

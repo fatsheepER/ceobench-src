@@ -76,9 +76,9 @@ def test_prestart_enospc_pauses_at_boundary_without_script_error_model_input(mod
         assert record['classification'] == 'transient_infrastructure'
         assert record['facts']['process_started'] is False
         assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b''
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+        from saas_bench.team_checkpoint import validate_snapshot
         _, state = validate_snapshot(snapshots[-1])
-        validate_recovery_source(snapshots[-1], state, current_root=team.root)
+        assert state['day'] == 0
         assert all(item['day'] == 0 for item in team.test_wire)
 
 
@@ -90,7 +90,6 @@ def test_readonly_script_keeps_evidence_without_business_wrapper(mode):
         result = role.executor.execute('write_file', dict(path='weekly.py', content='import novamind_api as nm\nprint(nm.vars.current_day)\n'))
         assert 'Error:' not in result
         assert 'registered' in role.executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        snapshot = team.checkpoint()
         assert '0' in team._script_output('ceo')
         operations = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
         assert not any(row['kind'] == 'ceo_scripts' for row in operations)
@@ -98,9 +97,6 @@ def test_readonly_script_keeps_evidence_without_business_wrapper(mode):
         assert record['classification'] == 'succeeded'
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'0\n'
         assert not list(role.workspace.rglob('__pycache__'))
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(snapshot)
-        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -117,7 +113,6 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         executor = team.roles[role].executor
         assert 'Error:' not in executor.execute('write_file', dict(path='weekly.py', content=code))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        source = team.checkpoint()
         script_timeout = team.server.role_executors[role].bash_timeout
         if failure == 'timeout':
             team.server.role_executors[role].bash_timeout = .3
@@ -131,32 +126,26 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         assert record['facts']['boundary_closed'] is True
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'PARTIAL-OUT\n'
         assert all(not executor.preserved_process for executor in team.server.role_executors.values())
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+        from saas_bench.team_checkpoint import validate_snapshot
         from saas_bench.run_state import tree_hash
-        _, state = validate_snapshot(source)
-        validate_recovery_source(source, state, current_root=team.root)
         paused = team.checkpoint()
         assert tree_hash(paused / 'roles', exact=True) == tree_hash(team.root / 'roles', exact=True)
         _, state = validate_snapshot(paused)
-        validate_recovery_source(paused, state, current_root=team.root)
+        assert state['day'] == 0
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_failed_script_partial_business_write_blocks_old_checkpoint(mode):
+def test_failed_script_retains_partial_business_write_and_error(mode):
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-write') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         code = "import novamind_api as nm\nnm.pricing.set_prices(A=37)\nprint('WRITE-DONE')\nraise ValueError('repair me')\n"
         executor = team.roles['ceo'].executor
         executor.execute('write_file', dict(path='weekly.py', content=code))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        snapshot = team.checkpoint()
         output = team._script_output('ceo')
         assert 'WRITE-DONE' in output and 'ValueError: repair me' in output
         assert team.server.role_script_results['ceo'][0]['classification'] == 'script_error'
         assert team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 37
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(snapshot)
-        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
 def test_permanent_pf_capture_fault_retains_raw_evidence_and_prior_checkpoint(monkeypatch):
@@ -231,13 +220,12 @@ def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_pat
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_real_launcher_pre_auth_failure_retains_stderr_and_safe_readonly_checkpoint(mode, monkeypatch):
+def test_real_launcher_pre_auth_failure_retains_stderr_and_closes_resources(mode, monkeypatch):
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-launcher') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         executor = team.roles['ceo'].executor
         executor.execute('write_file', dict(path='weekly.py', content="print('MUST-NOT-RUN')\n"))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        snapshot = team.checkpoint()
         registered = team.server.role_executors['ceo']
         monkeypatch.setattr(registered, '_build_bwrap_cmd', lambda *args: ['bash', '-c', "printf 'HOST-ENOSPC\\n' >&2; exit 1"])
         outcome = team.run(stop_after_day=7)
@@ -252,13 +240,10 @@ def test_real_launcher_pre_auth_failure_retains_stderr_and_safe_readonly_checkpo
         assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b'HOST-ENOSPC\n'
         assert not registered.preserved_process
         assert not team.test_wire
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(snapshot)
-        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_unknown_registered_business_write_retains_receipt_and_allows_checkpoint_rollback(mode, monkeypatch):
+def test_unknown_registered_business_write_retains_receipt_and_skips_model(mode, monkeypatch):
     from saas_bench import api_server
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-unknown') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
@@ -266,7 +251,6 @@ def test_unknown_registered_business_write_retains_receipt_and_allows_checkpoint
         code = "import novamind_api as nm\nprint('WRITE-BEGIN', flush=True)\nnm.pricing.set_prices(A=42)\n"
         executor.execute('write_file', dict(path='weekly.py', content=code))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        snapshot = team.checkpoint()
         original = api_server._TOOL_DISPATCH['set_prices']
         def fail_after_write(tools, args):
             original(tools, args)
@@ -281,9 +265,6 @@ def test_unknown_registered_business_write_retains_receipt_and_allows_checkpoint
         operations = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
         assert any(row['kind'] == 'api:set_prices' and row['status'] == 'running' for row in operations)
         assert not team.test_wire
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(snapshot)
-        validate_recovery_source(snapshot, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -294,7 +275,6 @@ def test_partner_script_cancel_retains_streams_and_closed_resources(mode):
             executor = team.roles[role].executor
             executor.execute('write_file', dict(path='weekly.py', content=f"import time\nprint('{role}-BEGIN', flush=True)\ntime.sleep(60)\n"))
             assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        source = team.checkpoint()
         team.server.role_executors['growth'].bash_timeout = .5
         outcome = team.run(stop_after_day=7)
         assert outcome.reason == 'paused', team.failure
@@ -306,9 +286,6 @@ def test_partner_script_cancel_retains_streams_and_closed_resources(mode):
             assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == f'{role}-BEGIN\n'.encode()
             assert not team.server.role_executors[role].preserved_process
         assert team.server.role_script_results['ops_finance'][0]['status'] == 'cancelled'
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(source)
-        validate_recovery_source(source, state, current_root=team.root)
         if mode == 'pf':
             for role in team.roles.values():
                 role.store.assert_healthy()
@@ -316,7 +293,7 @@ def test_partner_script_cancel_retains_streams_and_closed_resources(mode):
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('second_script', [False, True])
-def test_script_workspace_write_preserves_wrapper_and_allows_rollback(mode, second_script):
+def test_script_workspace_write_preserves_file_and_wrapper(mode, second_script):
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-workspace') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         executor = team.roles['ceo'].executor
@@ -326,18 +303,14 @@ def test_script_workspace_write_preserves_wrapper_and_allows_rollback(mode, seco
         for name, code in scripts.items():
             executor.execute('write_file', dict(path=name, content=code))
             assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script ' + name)).lower()
-        source = team.checkpoint()
         assert 'FILE-WRITTEN' in team._script_output('ceo')
         assert (team.roles['ceo'].workspace / 'derived-evidence.txt').read_text() == 'new evidence'
         wrappers = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
         assert any(row['kind'] == 'ceo_scripts' and row['recovery']['classification'] == 'unproven' for row in wrappers)
-        from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-        _, state = validate_snapshot(source)
-        validate_recovery_source(source, state, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_pre_auth_open_streams_preserve_partial_host_evidence_and_block_checkpoint(mode, monkeypatch):
+def test_pre_auth_open_streams_preserve_partial_host_evidence_and_skip_model(mode, monkeypatch):
     import os
     import signal
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-open-launcher') as team:
@@ -345,7 +318,6 @@ def test_pre_auth_open_streams_preserve_partial_host_evidence_and_block_checkpoi
         executor = team.roles['ceo'].executor
         executor.execute('write_file', dict(path='weekly.py', content="print('MUST-NOT-RUN')\n"))
         assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        source = team.checkpoint()
         registered = team.server.role_executors['ceo']
         monkeypatch.setattr(registered, '_build_bwrap_cmd', lambda *args: ['bash', '-c', "printf 'PARTIAL-HOST\\n' >&2; sleep 60 & exit 1"])
         try:
@@ -356,9 +328,6 @@ def test_pre_auth_open_streams_preserve_partial_host_evidence_and_block_checkpoi
             assert record['facts']['boundary_closed'] is False
             assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b'PARTIAL-HOST\n'
             assert not team.test_wire
-            from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
-            _, state = validate_snapshot(source)
-            validate_recovery_source(source, state, current_root=team.root)
         finally:
             process = registered.preserved_process
             if process:

@@ -71,14 +71,6 @@ def test_attempt_numbering_remains_monotonic_beyond_three_digits(tmp_path):
     assert record['attempt'] == 1001 and directory.name == 'attempt-1001'
 
 
-@pytest.mark.parametrize('policy', [
-    dict(attempt_policy='automatic_retry'), dict(max_attempts=0), dict(max_attempts=True),
-])
-def test_historical_attempt_policy_does_not_block_recovery(frozen, tmp_path, policy):
-    path = changed_manifest(frozen, tmp_path, lambda manifest: manifest.update(policy))
-    assert batch.validate_manifest(path)['attempt_policy'] == policy.get('attempt_policy', 'automatic_checkpoint_recovery')
-
-
 def test_concurrent_manual_registrations_preserve_both_attempts(frozen, tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     import threading

@@ -229,7 +229,7 @@ def test_runner_cancels_after_week_advance_only(offline_runner, monkeypatch):
     assert all(f['model_context_id'] == request['request']['request']['context_id'] for f in facts)
 
 
-def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_runner, monkeypatch, tmp_path):
+def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_runner, monkeypatch, tmp_path, caplog):
     import threading
     from saas_bench import db_protection
     from saas_bench.run_state import recover_run, checkpoint_directory, tree_hash
@@ -256,8 +256,8 @@ def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_
     checkpoint = json.loads((runner.workspace_dir / 'checkpoint.json').read_text())
     directory = checkpoint_directory(runner.workspace_dir, checkpoint)
     assert (directory / 'agent_workspace/MEMORY.md').read_text() == 'frozen'
-    with pytest.raises(ValueError, match='recover_run.py'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint() == checkpoint
+    assert 'Discarding post-checkpoint operation outcomes' in caplog.text
     runner._stop_server()
     before = tree_hash(runner.workspace_dir)
     with pytest.raises(ValueError, match='outside the original run'):

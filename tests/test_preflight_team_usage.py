@@ -224,7 +224,7 @@ def test_real_sdk_http_error_counts_known_failed_usage_once_without_retry(tmp_pa
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
 
 
-def test_returned_model_mismatch_warns_without_network_retry(tmp_path, monkeypatch, caplog):
+def test_model_mismatch_preserves_raw_usage_and_continues(tmp_path, monkeypatch, caplog):
     from saas_bench.run_lifecycle import RunCancelled
     recorder = ModelUsage(tmp_path / 'model.jsonl', 'ceo', PRICES['rates'], expected_model='frozen-model')
     waits = []

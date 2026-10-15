@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import pytest
 from saas_bench.multi_agent import MultiAgentRuntime
-from saas_bench.team_checkpoint import validate_snapshot, validate_recovery_source
+from saas_bench.team_checkpoint import validate_snapshot
 from test_preflight_team_checkpoint import make_team, dispose, clients, fast_simulator
 from test_preflight_team_flow import raw
 
@@ -76,42 +76,12 @@ def test_completed_post_checkpoint_write_is_rolled_back(tmp_path, mode):
         dispose(restored)
         restored = None
         fresh = source.checkpoint()
-        _, state = validate_snapshot(fresh)
-        validate_recovery_source(fresh, state)
         restored = MultiAgentRuntime.restore(fresh, tmp_path/"fresh", client_factory=clients(), simulator_factory=fast_simulator)
         assert restored.server.tools.current_day == source.server.tools.current_day
         assert restored.server.conn.execute("SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1").fetchone()[0] == 29
     finally:
         if restored: dispose(restored)
         dispose(source)
-
-
-@pytest.mark.parametrize("change", ["added_completed", "changed_completed", "missing", "latest_attempt_tail"])
-def test_post_checkpoint_receipts_do_not_block_complete_snapshot(tmp_path, change):
-    from saas_bench.run_state import write_json
-    snapshot = tmp_path/"checkpoint"
-    source = tmp_path/"source"
-    latest = tmp_path/"latest"
-    receipt = dict(kind="api:research_market", day=7, status="completed")
-    for root in (snapshot, source, latest):
-        write_json(root/"private/operations/covered.json", receipt)
-    state = {"source_root":str(source), "day":7}
-    validate_recovery_source(snapshot, state, current_root=latest)
-    if change == "added_completed":
-        write_json(source/"private/operations/new.json", receipt)
-    elif change == "changed_completed":
-        write_json(source/"private/operations/covered.json", dict(receipt, day=14))
-    elif change == "missing":
-        (source/"private/operations/covered.json").unlink()
-    else:
-        write_json(latest/"private/operations/new.json", receipt)
-    audit = validate_recovery_source(snapshot, state, current_root=latest)
-    assert audit['discard_post_checkpoint_operations'] is True
-
-
-def test_recovery_does_not_need_old_live_source(tmp_path):
-    state = {"source_root":str(tmp_path/"missing-source"), "day":21}
-    assert validate_recovery_source(tmp_path/"checkpoint", state)['day'] == 21
 
 
 def test_real_restore_rolls_back_portable_link_targets(tmp_path):

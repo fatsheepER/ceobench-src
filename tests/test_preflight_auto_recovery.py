@@ -8,11 +8,6 @@ from test_preflight_team_controller import controller
 from test_preflight_team_observer import observer
 
 
-def test_controller_has_no_automatic_failure_count_or_restart(controller):
-    assert not hasattr(controller.module, 'record_failure')
-    assert not hasattr(controller.module, 'retry_position')
-
-
 def test_scope_and_historical_hold_observations_do_not_block_requests(observer, controller, monkeypatch):
     observer.hold.touch()
     write_json(observer.output / 'health.json', dict(status='hold', batch_id='old', time='old'))

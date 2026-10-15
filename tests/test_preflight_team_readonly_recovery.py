@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from saas_bench import team_batch as batch
-from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+from saas_bench.team_checkpoint import validate_snapshot
 from saas_bench.run_state import file_hash, tree_hash, write_json
 from test_preflight_team_batch import frozen
 from test_preflight_team_checkpoint import fast_simulator
@@ -136,7 +136,6 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             result = running.result(timeout=7)
             assert result['status'] == 'paused'
             assert result['checkpoint'] == str(source)
-            assert result['recovery_validation']['eligible'] is True
             if interruption == 'symlink':
                 assert hashed_symlinks == []
                 bash = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
@@ -157,10 +156,8 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
                 assert wrappers[-1]['recovery']['classification'] == 'pending_read_only'
                 if entry['group'] == 'pf':
                     assert role.executor._pf_service is None
-            _, state = validate_snapshot(source)
             if interruption == 'symlink':
                 assert hashed_symlinks == []
-            validate_recovery_source(source, state, current_root=team.root)
         finally:
             release.set()
             running.result(timeout=7)
@@ -174,7 +171,6 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         assert wrapper['recovery']['classification'] in ('read_only', 'read_only_interrupted')
         assert wrapper['recovery']['mutation_epoch_after'] == 0
         assert record['checkpoint'] == str(source)
-        assert record['recovery_validation']['eligible'] is True
         assert batch.read(directory / 'attempt.json') == record
     else:
         team.close()

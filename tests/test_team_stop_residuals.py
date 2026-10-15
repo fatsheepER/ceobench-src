@@ -269,7 +269,7 @@ def test_scope_identity_mismatch_warns_and_keeps_stop_available(tmp_path, monkey
     assert len(signals) == 1 and '--signal=SIGKILL' in signals[0]
 
 
-def test_controller_reaps_real_residual_scope_and_preserves_peer(observer, tmp_path, monkeypatch):
+def test_failed_worker_scope_is_reaped_once_and_peer_finishes(observer, tmp_path, monkeypatch):
     controller = controller_module()
     source = str(Path(__file__).resolve().parents[1])
     observer.expected['source_root'] = observer.manifest['source_root'] = source

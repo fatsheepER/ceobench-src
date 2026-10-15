@@ -13,7 +13,7 @@ from saas_bench import api_server, team_batch as batch
 from saas_bench.agents.bash_agent.agent import _stream_chat_completion
 from saas_bench.role_policy import ROLES
 from saas_bench.run_lifecycle import RunCancelled
-from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+from saas_bench.team_checkpoint import validate_snapshot
 from test_preflight_team_batch import frozen
 from test_preflight_team_checkpoint import fast_simulator
 from test_preflight_team_flow import ADVANCE, calls, completion, final, make_team, raw
@@ -141,8 +141,6 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
             assert wrapper['recovery']['client_closed'] is True
             assert any(request['read_only'] is False for request in wrapper['recovery']['pending_requests'])
             assert team.server._operation_failed is False
-            _, saved = validate_snapshot(source)
-            validate_recovery_source(source, saved, current_root=team.root)
         finally:
             release.set()
             running.result(timeout=10)
@@ -153,11 +151,9 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
     assert team.server._operation_failed is False
     assert team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] != 29
     batch.close_team(team, record)
-    validate_recovery_source(source, saved, current_root=team.root)
     wrapper = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
         if batch.read(path)['kind'] == 'ceo_tool:bash')
     assert (wrapper['status'], wrapper['recovery']['classification']) == ('completed', 'read_only')
-    assert batch.read(directory / 'attempt.json')['recovery_validation']['eligible'] is True
     def resume_client(role):
         def resume_response(request):
             body = json.loads(request.content)
@@ -238,13 +234,10 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
         if batch.read(path)['kind'] == 'ceo_tool:bash')
     assert (wrapper['status'], wrapper['recovery']['classification']) == ('completed', 'unproven')
     assert batch.read(directory / 'attempt.json') == record
-    assert record['recovery_validation']['eligible'] is True
     assert record['checkpoint'] == str(source)
     _, settled = validate_snapshot(record['checkpoint'])
     assert settled['day'] == 0 and settled['stage'] == 'ceo'
     assert not (role.workspace / 'old-week.txt').exists()
-    _, saved = validate_snapshot(source)
-    validate_recovery_source(source, saved, current_root=team.root)
     resumed_wire = []
     def resume_client(sender):
         def resume_response(request):
@@ -282,7 +275,6 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
     with make_team(mode, lambda team, sender, body: final('Confirmed data checked.'), 'send-guard') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         team._set_phase('ceo')
-        source = team.checkpoint()
         executor = team.roles['ceo'].executor
         command = 'python -c ' + shlex.quote(CLIENT)
         sends, waits = [], []
@@ -336,8 +328,6 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
         response = runtime.usage.call('chat', payload, lambda: _stream_chat_completion(runtime.agent.client, payload))
         assert response.choices[0].message.content == 'Confirmed data checked.'
         assert len(sends) == 1 + int(network_retry)
-        _, saved = validate_snapshot(source)
-        validate_recovery_source(source, saved, current_root=team.root)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])

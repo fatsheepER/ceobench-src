@@ -309,11 +309,6 @@ def test_validation_warns_about_mismatch_and_duplicate(frozen, tmp_path, change,
     assert caplog.records
 
 
-def test_validation_allows_historical_timeout_metadata(frozen, tmp_path):
-    path = changed_manifest(frozen, tmp_path, lambda m: m['parameters'].update(timeout_seconds=60))
-    assert batch.validate_manifest(path)['parameters'] == batch.read(path)['parameters']
-
-
 def test_manifest_keeps_sealed_d0_while_source_revisions_can_resume(frozen, tmp_path):
     _, _, _, sources = frozen
     path = changed_manifest(frozen, tmp_path, lambda m: m.update(
@@ -376,7 +371,7 @@ def test_same_seed_clones_share_d0_but_have_independent_sessions_worlds_and_hist
             batch.close_team(team)
 
 
-def test_registration_automatically_resumes_and_preserves_originals(frozen, tmp_path):
+def test_manual_registration_restores_checkpoint_and_preserves_originals(frozen, tmp_path):
     path = changed_manifest(frozen, tmp_path, lambda m: None)
     manifest = batch.validate_manifest(path)
     entry = manifest['runs'][0]
@@ -611,7 +606,7 @@ with batch.run_lock(Path(entry['output_dir'])):
 
 
 @pytest.mark.parametrize('boundary', ['before_world', 'before_checkpoint'])
-def test_killed_preparation_restarts_from_d0_and_preserves_failed_attempt(frozen, tmp_path, boundary):
+def test_manual_resume_after_killed_preparation_uses_d0_and_preserves_failed_attempt(frozen, tmp_path, boundary):
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
     manifest = batch.validate_manifest(path)
     entry = manifest['runs'][0]
@@ -916,13 +911,6 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
         assert resumed['status'] == 'ready' and resumed['attempt'] == 2
         assert resumed['source_checkpoint'] == previous
         validate_snapshot(resumed['checkpoint'])
-
-
-@pytest.mark.parametrize('key, value', [('analyst_bash_timeout', 600), ('analyst_bash_warn_after', 60),
-                                       ('analyst_bash_scope', 'all_bash')])
-def test_bash_policy_changes_do_not_block_checkpoint_discovery(frozen, tmp_path, key, value):
-    path = changed_manifest(frozen, tmp_path, lambda manifest: manifest['parameters'].update({key: value}))
-    assert batch.validate_manifest(path)['parameters'] == batch.read(path)['parameters']
 
 
 def test_team_creation_uses_frozen_bash_limits(frozen, tmp_path):

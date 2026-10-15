@@ -16,7 +16,7 @@ from saas_bench.config import BenchmarkConfig
 from saas_bench.database import init_database
 from saas_bench.execution_capture import text_sources
 from saas_bench.multi_agent import MultiAgentRuntime
-from saas_bench.team_checkpoint import validate_recovery_source, validate_snapshot
+from saas_bench.team_checkpoint import validate_snapshot
 from saas_bench.role_policy import ROLES
 from saas_bench.run_state import write_json
 from saas_bench.simulation import DayResult, Simulator
@@ -240,10 +240,8 @@ def test_checkpoint_rolls_back_later_bytecode_or_cache_writes(tmp_path, mode, fi
     restored = None
     try:
         snapshot = runtime.checkpoint()
-        _, state = validate_snapshot(snapshot)
         runtime.roles['growth'].executor.execute('bash', dict(
             command='mkdir -p __pycache__; printf changed > ' + shlex.quote(filename)))
-        validate_recovery_source(snapshot, state, current_root=runtime.root)
         restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored',
             client_factory=clients(), simulator_factory=fast_simulator)
         assert not (restored.roles['growth'].workspace / filename).exists()

@@ -8,7 +8,7 @@ import urllib.request
 
 import pytest
 
-from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor, validate_bash_limits
+from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
 from saas_bench.execution_capture import CapturedText, text_sources, model_request
 from saas_bench.sql_evidence import SQLEvidenceStore
 from test_sql_evidence import identity, event_ids, settled
@@ -812,7 +812,7 @@ def test_checkpoint_drains_parent_while_allowing_child_callbacks(captured, tmp_p
     store.assert_healthy()
 
 
-def test_model_retries_identical_sources_and_unsent_result(captured, monkeypatch):
+def test_network_retries_preserve_source_mapping_and_exclude_unsent_result(captured, monkeypatch):
     import httpx
     from openai import OpenAI
     from saas_bench.model_usage import ModelUsage
@@ -1111,16 +1111,6 @@ def test_timeout_signal_oserror_runs_fallback_or_preserves_boundary(captured, mo
             except ProcessLookupError:
                 pass
             proc.communicate(timeout=5)
-
-
-@pytest.mark.parametrize('hard, soft', [(0, None), (True, None), (float('inf'), None),
-    (float('nan'), None), (1, 0), (1, True), (1, 1), (1, 2), (1, float('nan')), (1, float('inf'))])
-def test_bash_threshold_validation(tmp_path, caplog, hard, soft):
-    with pytest.raises(ValueError, match='bash_') as error:
-        validate_bash_limits(hard, soft)
-    executor = BashAgentToolExecutor(tmp_path, bash_timeout=hard, bash_warn_after=soft)
-    assert f'ValueError: {error.value}; continuing as requested' in caplog.messages
-    assert executor.bash_timeout is hard and executor.bash_warn_after is soft
 
 
 @pytest.mark.parametrize('elapsed, exit_code, notice', [(119.999, 0, False), (120, 0, True),

@@ -232,7 +232,7 @@ def process_group_members(group):
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-def test_real_cli_midweek_sigkill_automatic_resume_restores_week_boundary(tmp_path, group):
+def test_real_cli_manual_resume_after_midweek_sigkill_restores_selected_week_boundary(tmp_path, group):
     source = tmp_path / 'source'
     for name in ('src', 'scripts', 'public', 'public_sources'):
         shutil.copytree(batch.ROOT / name, source / name,
