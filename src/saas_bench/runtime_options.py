@@ -31,6 +31,13 @@ def retry_delays(value):
     return ','.join(f'{part:g}' for part in values)
 
 
+def positive_integer(value):
+    result = nonnegative_integer(value)
+    if not result:
+        raise argparse.ArgumentTypeError('The model provider requires a positive output token limit')
+    return result
+
+
 def bash_memory_bytes(value):
     from .systemd_guard import memory_bytes
     if str(value).lower() in ('0', 'none', 'max', 'infinity', 'unlimited'):
@@ -65,7 +72,7 @@ OPTIONS = {
     'search_match_limit': ('CEOBENCH_SEARCH_MATCH_LIMIT', nonnegative_integer, 'Search matches, default 2000; 0 is unlimited'),
     'glob_limit': ('CEOBENCH_GLOB_LIMIT', nonnegative_integer, 'Glob returned paths, default 2000; 0 is unlimited'),
     'memory_max_chars': ('CEOBENCH_MEMORY_MAX_CHARS', nonnegative_integer, 'MEMORY prompt characters, default 100000; 0 is unlimited'),
-    'model_max_output_tokens': ('CEOBENCH_MODEL_MAX_OUTPUT_TOKENS', nonnegative_integer, 'Model output tokens, default 32768 (Anthropic 128000)'),
+    'model_max_output_tokens': ('CEOBENCH_MODEL_MAX_OUTPUT_TOKENS', positive_integer, 'Model output tokens, default 32768 (Anthropic 128000)'),
 }
 
 

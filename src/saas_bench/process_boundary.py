@@ -203,11 +203,11 @@ class Boundary:
         if self.socket_dir:
             self.socket_dir.cleanup()
 
-    def communicate(self, process, timeout, *, started_at=None, check=None):
+    def communicate(self, process, timeout, *, started_at=None, check=None, deadline=None):
         try:
             if self.verified:
-                return self._communicate_verified(process, timeout, started_at, check)
-            return self._communicate(process, timeout, started_at)
+                return self._communicate_verified(process, timeout, started_at, check, deadline)
+            return self._communicate(process, timeout, started_at, deadline)
         except subprocess.TimeoutExpired:
             raise
         except BoundaryOpen:
@@ -215,9 +215,9 @@ class Boundary:
         except Exception as exc:
             raise BoundaryOpen(process, dict(exit_code=process.poll(), children=[], unknown=str(exc)), b'', b'') from exc
 
-    def _communicate_verified(self, process, timeout, started_at, check=None):
+    def _communicate_verified(self, process, timeout, started_at, check=None, deadline_callback=None):
         started_at = time.monotonic() if started_at is None else started_at
-        deadline = started_at + timeout
+        deadline = started_at + timeout if timeout is not None else float('inf')
         cleanup_started = None
         stdout, stderr, data = b'', b'', b''
         authenticated = False
@@ -227,6 +227,8 @@ class Boundary:
         try:
             while True:
                 now = time.monotonic()
+                if deadline_callback and cleanup_started is None:
+                    deadline = deadline_callback()
                 if check and cancellation is None:
                     from .run_lifecycle import RunCancelled
                     try:
@@ -307,13 +309,16 @@ class Boundary:
                 cleanup_seconds=finished - cleanup_started if cleanup_started is not None else 0)
             raise BoundaryOpen(process, self.record, stdout, stderr) from exc
 
-    def _communicate(self, process, timeout, started_at=None):
-        deadline = (time.monotonic() if started_at is None else started_at) + timeout
-        self.listener.settimeout(min(0.05, max(0.001, timeout)))
+    def _communicate(self, process, timeout, started_at=None, deadline_callback=None):
+        started_at = time.monotonic() if started_at is None else started_at
+        deadline = started_at + timeout if timeout is not None else float('inf')
+        self.listener.settimeout(min(0.05, max(0.001, timeout)) if timeout is not None else .05)
         while self.channel is None:
             try:
                 self.channel, _ = self.listener.accept()
             except TimeoutError:
+                if deadline_callback:
+                    deadline = deadline_callback()
                 if process.poll() is not None:
                     self.record = dict(exit_code=process.returncode, children=[], unknown=None,
                                        coverage='supervisor_start_failed')
@@ -338,6 +343,8 @@ class Boundary:
                     if self.record['unknown']:
                         raise BoundaryOpen(process, self.record, stdout, stderr)
         while True:
+            if deadline_callback:
+                deadline = deadline_callback()
             try:
                 chunk = self.channel.recv(65536)
                 receive(chunk)
@@ -352,7 +359,7 @@ class Boundary:
                 stdout, stderr = process.communicate(timeout=min(0.05, remaining))
                 if self.record is None or self.record.get('phase') != 'closed':
                     # The supervisor sends the boundary before exiting. Drain its socket.
-                    self.channel.settimeout(max(.001, deadline - time.monotonic()))
+                    self.channel.settimeout(min(5, max(.001, deadline - time.monotonic())))
                     while self.record is None or self.record.get('phase') != 'closed':
                         chunk = self.channel.recv(65536)
                         if not chunk:

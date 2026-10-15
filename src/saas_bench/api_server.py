@@ -1076,6 +1076,9 @@ class NovaMindAPIServer:
                     raise ValueError('Registered script checksum mismatch: ' + name)
                 self._role_scripts[role][name] = content
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
+        from .runtime_options import runtime_value, timeout_value
+        self.STEP_WEEK_TIMEOUT = timeout_value('advance_timeout', 0)
+        self.advance_warn_after = runtime_value('advance_warn_after', 600)
 
     def start(self):
         """Start the HTTP server in a background thread."""
@@ -1176,8 +1179,7 @@ class NovaMindAPIServer:
                         self.team_phase = 'boundary'
             return result
 
-    # Maximum allowed time for step_week before auto-quit (seconds)
-    STEP_WEEK_TIMEOUT = 4200  # 7× longer than old per-day timeout
+    STEP_WEEK_TIMEOUT = None
 
     # Lock wait, reader setup and SQL share this deadline. The world lock stays
     # held until the separate query connection closes.
@@ -1298,7 +1300,7 @@ class NovaMindAPIServer:
                      rationale: Optional[str] = None, *, on_settled=None) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
-        Enforces a hard timeout (STEP_WEEK_TIMEOUT seconds) on step_week().
+        Waits for step_week with slow-operation warnings and an optional deadline.
         If exceeded, returns an error so the runner can save checkpoint and exit.
 
         If a shock_manager is configured, shocks are checked before step_week
@@ -1395,9 +1397,29 @@ class NovaMindAPIServer:
 
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_do_step)
+        wait_expired = False
         try:
-            week_result = future.result(timeout=self.STEP_WEEK_TIMEOUT)
+            warning_at = _step_start
+            while True:
+                now = _time.monotonic()
+                remaining = self.STEP_WEEK_TIMEOUT - (now - _step_start) if self.STEP_WEEK_TIMEOUT is not None else None
+                if remaining is not None and remaining <= 0:
+                    wait_expired = True
+                    raise FuturesTimeoutError()
+                try:
+                    week_result = future.result(timeout=min(.5, remaining) if remaining is not None else .5)
+                    break
+                except FuturesTimeoutError:
+                    if future.done():
+                        raise
+                    if self.advance_warn_after and _time.monotonic() - warning_at >= self.advance_warn_after:
+                        warning_at = _time.monotonic()
+                        logging.warning('Slow week advancement still running after %.1fs at day %s; waiting for its result',
+                            warning_at - _step_start, getattr(self.simulator, 'current_day', old_day))
         except FuturesTimeoutError:
+            if not wait_expired:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
             elapsed = _time.monotonic() - _step_start
             self._last_step_elapsed = elapsed
             self._step_day_timed_out = True

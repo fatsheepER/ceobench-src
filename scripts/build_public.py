@@ -55,6 +55,7 @@ _ENGINE_MODULES = [
     "run_warnings",
     "process_boundary",
     "runtime_temp",
+    "runtime_options",
     "config",
     "customer_llm",
     "database",

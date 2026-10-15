@@ -33,6 +33,36 @@ def completed_day(team, day):
     team.server.conn.commit()
 
 
+@pytest.mark.parametrize('nested', [False, True])
+def test_slow_advance_warns_past_ordinary_bash_deadline_and_next_command_keeps_limit(nested, caplog):
+    with make_team('git', lambda *args: final('unused'), 'advance-warning-only') as team:
+        team._set_phase('ceo')
+        executor = team.roles['ceo'].executor
+        executor.bash_timeout = .5
+        executor.advance_warn_after = .05
+        team.server.advance_warn_after = .05
+
+        def step():
+            time.sleep(.8)
+            return SimpleNamespace(day=7)
+
+        team.server.simulator.step_week = step
+        command = ADVANCE
+        if nested:
+            (executor.workspace_path / 'advance.sh').write_text(ADVANCE)
+            command = 'bash advance.sh'
+        result = executor.execute('bash', dict(command=command))
+        assert 'Day 7' in result
+        assert executor._bash_facts['timed_out'] is False
+        assert executor._bash_facts['process_boundary']['descendants_closed'] is True
+        assert 'Slow week advancement still running' in caplog.text
+        assert team.server.STEP_WEEK_TIMEOUT is None
+        team._set_phase('ceo')
+        result = executor.execute('bash', dict(command='sleep 1'))
+        assert 'timed out after 0.5 seconds' in result
+        assert executor._bash_facts['process_boundary']['descendants_closed'] is True
+
+
 @pytest.mark.parametrize('reached,last_completed,progression', [(0, 0, 'not_advanced'), (3, 2, 'partial')])
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 def test_public_advance_failure_has_durable_terminal_progress(mode, reached, last_completed, progression):
@@ -209,6 +239,7 @@ def test_cli_disconnect_then_runtime_close_settles_after_http_finishes(late_fail
         sim.step_week = step
         executor = team.roles['ceo'].executor
         executor.bash_timeout = .2
+        executor.advance_timeout = .2
         hook_errors, hook_threads = [], []
         hook_finished = threading.Event()
         finish_request = team.server.request_finished_callback
@@ -303,6 +334,7 @@ def test_advance_settlement_during_listener_close_keeps_terminal_consistent(monk
         sim.step_week = step
         executor = team.roles['ceo'].executor
         executor.bash_timeout = .2
+        executor.advance_timeout = .2
         wrapper_path = team._begin_operation('ceo_tool:bash')
         try:
             with pytest.raises(NextDayTimeoutError):

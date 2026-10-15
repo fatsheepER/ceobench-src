@@ -183,6 +183,7 @@ class MultiAgentRuntime:
                 store.world_state = lambda: self.server.world_state_id
         for executor in [*(r.executor for r in runtimes.values()), *script_executors.values()]:
             executor.world_status = lambda: self.server._operation_failed or self.server._step_day_timed_out
+            executor.advance_active = self.server._advance_lock.locked
             executor.authorize = self.server.authorize_team
         try:
             self.server.start()

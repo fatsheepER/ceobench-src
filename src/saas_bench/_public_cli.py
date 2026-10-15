@@ -184,7 +184,9 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
         method=method,
     )
     try:
-        with urlopen(req, timeout=1800) as resp:
+        advance_timeout = float(os.environ.get('CEOBENCH_ADVANCE_TIMEOUT_SECONDS', '0'))
+        timeout = (advance_timeout + 20 if advance_timeout else None) if path == '/next-week' else 1800
+        with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_bytes = e.read()

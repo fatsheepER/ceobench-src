@@ -373,6 +373,10 @@ class BashAgentToolExecutor:
             validate_bash_limits(bash_timeout, bash_warn_after)
         self.bash_timeout = bash_timeout
         self.bash_warn_after = bash_warn_after
+        from saas_bench.runtime_options import runtime_value, timeout_value
+        advance_timeout = timeout_value('advance_timeout', 0)
+        self.advance_timeout = advance_timeout + 30 if advance_timeout else None
+        self.advance_warn_after = runtime_value('advance_warn_after', 600)
         from saas_bench.process_boundary import command_memory_limit
         self.bash_memory_limit_bytes = command_memory_limit(bash_memory_limit_bytes)
         self.require_sandbox = require_sandbox
@@ -904,6 +908,9 @@ class BashAgentToolExecutor:
             'OMP_NUM_THREADS': '1',
         }
         env.update(self.extra_env)
+        for name in ('CEOBENCH_ADVANCE_TIMEOUT_SECONDS', 'CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS'):
+            if name in os.environ:
+                env[name] = os.environ[name]
         if getattr(self, '_pf_service', None):
             env['PATH'] = self._pf_service.guest + os.pathsep + env['PATH']
             env['PF_SOCKET'] = self._pf_service.guest + '/socket'
@@ -924,6 +931,30 @@ class BashAgentToolExecutor:
                                 warning_emitted=False)
         started_at = time.monotonic()
         lifecycle = getattr(self, 'lifecycle', None)
+        advance_started = advance_finished = None
+        advance_warning_at = started_at
+        advance_active = getattr(self, 'advance_active', None)
+
+        def command_deadline():
+            nonlocal advance_started, advance_finished, advance_warning_at
+            now = time.monotonic()
+            active = advance_active() if advance_active else bool(re.search(r'novamind-operation\s+next-week\b', command))
+            if active:
+                if advance_started is None:
+                    advance_started = now
+                    advance_warning_at = now
+                if self.advance_warn_after and now - advance_warning_at >= self.advance_warn_after:
+                    logging.warning('Slow week advancement still running after %.1fs; waiting for its result', now - advance_started)
+                    advance_warning_at = now
+                    self._bash_facts['advance_warning_emitted'] = True
+                return advance_started + self.advance_timeout if self.advance_timeout is not None else float('inf')
+            if advance_started is not None:
+                if advance_finished is None:
+                    advance_finished = now
+                return max(started_at + self.bash_timeout, advance_finished + 30)
+            return started_at + self.bash_timeout
+
+        self._bash_facts['advance_timeout'] = self.advance_timeout
         if getattr(self, '_pf_service', None):
             self._pf_service.set_deadline(started_at + self.bash_timeout,
                                           check=lifecycle.check if lifecycle else None)
@@ -960,7 +991,8 @@ class BashAgentToolExecutor:
             self.capture.facts['stdout_sink'] = [sink.st_dev, sink.st_ino]
         try:
             raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout, started_at=started_at,
-                                                        check=lifecycle.check if lifecycle else None)
+                                                        check=lifecycle.check if lifecycle else None,
+                                                        deadline=command_deadline)
             self._bash_facts.update(elapsed_seconds=time.monotonic() - started_at,
                 boundary_closed=boundary.record.get('phase') == 'closed', cleanup_seconds=0,
                 timeout_trigger_seconds=None)
