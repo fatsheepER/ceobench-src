@@ -224,19 +224,18 @@ def test_real_sdk_http_error_counts_known_failed_usage_once_without_retry(tmp_pa
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
 
 
-def test_returned_model_mismatch_fails_without_network_retry(tmp_path, monkeypatch):
+def test_returned_model_mismatch_warns_without_network_retry(tmp_path, monkeypatch, caplog):
     from saas_bench.run_lifecycle import RunCancelled
     recorder = ModelUsage(tmp_path / 'model.jsonl', 'ceo', PRICES['rates'], expected_model='frozen-model')
     waits = []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
-    with pytest.raises(RunCancelled, match='model_request_failed') as error:
-        recorder.call('chat', {'model': 'frozen-model'}, lambda: body(), day=0)
-    assert isinstance(error.value.__cause__, ValueError)
+    assert recorder.call('chat', {'model': 'frozen-model'}, lambda: body(), day=0)['model'] == 'test-model'
+    assert 'Returned model differs from frozen configuration' in caplog.text
     assert waits == []
     row = json.loads(recorder.path.read_text().splitlines()[-1])
     assert row['response']['model'] == 'test-model' and row['usage']['input_tokens'] == 10
-    assert row['error'] == 'RunCancelled' and recorder.summary['errors'] == 1
-    assert row['model_attempts'] == 1 and row['last_model_error'] == 'ValueError'
+    assert row['error'] is None and recorder.summary['errors'] == 0
+    assert row['model_attempts'] == 1 and row['last_model_error'] is None
     assert row['cost_usd'] == pytest.approx(.0113)
     recorder.expected_model = 'test-model'
     assert recorder.call('chat', {}, lambda: body(), day=7)['model'] == 'test-model'
