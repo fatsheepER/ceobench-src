@@ -50,7 +50,7 @@ def latest_checkpoint(entry, previous=None, week=None):
     candidates = [Path(requested)] if requested else [
         snapshot for attempt in history for snapshot in (attempt / 'runtime/checkpoints').glob('*')
         if snapshot.is_dir() and not snapshot.name.startswith('.')]
-    if not requested and week is None and history and latest.get('source_checkpoint'):
+    if not requested and week is None and history and (latest.get('source_checkpoint') or latest.get('replay_week') == 1):
         candidates = [snapshot for snapshot in (lineage_attempt / 'runtime/checkpoints').glob('*')
             if snapshot.is_dir() and not snapshot.name.startswith('.')] + [Path(latest[key])
             for key in ('checkpoint', 'source_checkpoint') if latest.get(key)]

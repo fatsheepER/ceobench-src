@@ -92,6 +92,21 @@ def test_missing_selection_preserves_previous_recovery_lineage(tmp_path):
     assert recovery.latest_checkpoint(entry, week=11) == future
 
 
+def test_d0_branch_without_checkpoint_does_not_reselect_old_future(tmp_path):
+    entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
+    first = Path(entry['output_dir']) / 'attempt-001'
+    future = snapshot(first / 'runtime/checkpoints/future', entry['run_id'], '2026-10-15T01:00:00+00:00', day=70)
+    restarted = Path(entry['output_dir']) / 'attempt-002'
+    write_json(restarted / 'attempt.json', dict(status='paused', replay_week=1, source_checkpoint=None, checkpoint=None))
+    assert recovery.latest_checkpoint(entry) is None
+    write_json(Path(entry['output_dir']) / 'attempt-003/attempt.json',
+        dict(status='paused', reason='missing_checkpoint', execution_started=False))
+    assert recovery.latest_checkpoint(entry) is None
+    assert recovery.latest_checkpoint(entry, week=11) == future
+    beginning = snapshot(restarted / 'runtime/checkpoints/ready', entry['run_id'], '2026-10-15T02:00:00+00:00', day=0)
+    assert recovery.latest_checkpoint(entry) == beginning
+
+
 def test_checkpoint_discovery_survives_incomplete_attempt_metadata(tmp_path, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     first = Path(entry['output_dir']) / 'attempt-001'
