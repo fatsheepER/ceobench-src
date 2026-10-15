@@ -262,6 +262,7 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
 @pytest.mark.parametrize('role', ROLES)
 @pytest.mark.parametrize('network_retry', [False, True])
 def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(mode, role, network_retry, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_COMPLETION_WAIT_SECONDS', '.2')
     entered, release = threading.Event(), threading.Event()
     read_body = api_server._APIHandler._read_body
 
