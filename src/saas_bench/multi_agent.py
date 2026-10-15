@@ -19,7 +19,7 @@ from .execution_capture import join_text
 from .model_usage import ModelUsage
 from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit
 from .run_state import tree_hash, write_json
-from .run_lifecycle import RunCancelled, WorkerLifecycle
+from .run_lifecycle import BusinessOutcomeUnknown, RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
 from .text_registry import TextRegistry
 from .team_prompts import WEEKLY_TASKS, system_prompt
@@ -339,7 +339,7 @@ class MultiAgentRuntime:
                 executor and (executor.preserved_process or getattr(executor, 'last_status', None) == 'result_unknown')):
             state['status'] = 'running'
             write_json(path, state)
-            raise RuntimeError('Business operation outcome unknown; continuation refused')
+            raise BusinessOutcomeUnknown('Business operation outcome unknown; HOLD for manual checkpoint resume')
         write_json(path, dict(state, status='completed'))
 
     def _guard_business_operations(self):
@@ -624,11 +624,23 @@ class MultiAgentRuntime:
                     self._boundary('week_boundary')
         except RunCancelled as exc:
             self.failure = str(exc)
+            cause = exc.__cause__
+            details = []
+            while cause is not None:
+                details.append(type(cause).__name__ + ': ' + str(cause))
+                cause = cause.__cause__
+            self.failure_detail = '; '.join(details) or None
             if self.failure == 'registered_script_transient_infrastructure':
                 self._stage = 'boundary'
                 self._week = {}
             self._set_phase('stopped' if str(exc) == 'natural_end' else 'paused')
             return RunOutcome(self.server.tools.current_day, 'natural_end' if str(exc) == 'natural_end' else 'paused')
+        except BusinessOutcomeUnknown as exc:
+            self.failure = 'business_operation_unknown'
+            self.failure_detail = str(exc)
+            self._lifecycle.cancel(self.failure)
+            self._set_phase('paused')
+            return RunOutcome(self.server.tools.current_day, 'paused')
         except Exception as exc:
             self.failure = f'{type(exc).__name__}: {exc}'
             self._lifecycle.cancel('runtime_failure')
@@ -667,9 +679,8 @@ class MultiAgentRuntime:
                     continue
                 try:
                     self._finish_operation(path, executor)
-                except RuntimeError as exc:
-                    if str(exc) != 'Business operation outcome unknown; continuation refused':
-                        raise
+                except BusinessOutcomeUnknown:
+                    pass
                 else:
                     if self._stage == 'ceo' and state['day'] < self.server.tools.current_day:
                         self._close_week()

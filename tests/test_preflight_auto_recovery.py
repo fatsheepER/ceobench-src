@@ -8,16 +8,9 @@ from test_preflight_team_controller import controller
 from test_preflight_team_observer import observer
 
 
-def test_failure_count_uses_checkpoint_position_and_resets_after_progress(controller):
-    failures = {}
-    count = controller.module.record_failure
-    assert [count(failures, 'pf', [70, 'boundary']) for _ in range(3)] == [1, 2, 3]
-    assert count(failures, 'git', [21, 'boundary']) == 1
-    assert count(failures, 'pf', [77, 'boundary']) == 1
-    assert failures == {
-        'pf': {'position': [77, 'boundary'], 'count': 1},
-        'git': {'position': [21, 'boundary'], 'count': 1},
-    }
+def test_controller_has_no_automatic_failure_count_or_restart(controller):
+    assert not hasattr(controller.module, 'record_failure')
+    assert not hasattr(controller.module, 'retry_position')
 
 
 def test_scope_and_historical_hold_observations_do_not_block_requests(observer, controller, monkeypatch):
@@ -69,7 +62,7 @@ def test_worker_memory_defaults_and_driver_forwarding(observer, monkeypatch):
     assert module.main(['--policy', str(policy), '--live']) == 0
     assert calls == [dict(resume=False, memory_high=17179869184,
                           memory_max=21474836480, memory_swap_max=0)]
-    assert json.loads((policy.parent / 'driver-exit.json').read_text())['auto_resume'] is True
+    assert json.loads((policy.parent / 'driver-exit.json').read_text())['auto_resume'] is False
     assert module.main(['--policy', str(policy), '--live', '--run-id', 'pf', '--week', '1']) == 0
     assert calls[-1] == dict(resume=False, memory_high=17179869184,
                             memory_max=21474836480, memory_swap_max=0, run_id='pf', week=1)

@@ -24,15 +24,15 @@
 # 运行可靠性修改
 
 - 修改超时、取消、重试、并行执行、证据捕获或检查点时，先追踪实际公共入口、宿主工作、回执、模型发送与 attempt 收尾。明确工作归属、结束证明，以及允许继续或必须暂停的条件。
-- 分别处理服务端结果、响应发送、客户端接收和后台资源关闭。故障现场保留在原 attempt；新 attempt 从最近完整检查点恢复，检查点后的操作全部作废。重复收尾接受一致结果，冲突结果明确失败。
+- 分别处理服务端结果、响应发送、客户端接收和后台资源关闭。故障现场保留在原 attempt；新 attempt 从操作者选定的检查点恢复，检查点后的操作全部作废。重复收尾接受一致结果，冲突结果明确失败。
 - 工具和业务子调用保留现有的期限与资源关闭契约；模型网络重试不设置总等待预算或全局截止时间。取消须唤醒实际阻塞操作；清理与持久化有独立且有界的预算，外层强杀期限须容纳它们。监测和停止通路独立于被监测工作占用的资源。
 - 回归从真实公共客户端和运行包装层进入。涉及模型发送时覆盖 `ModelUsage`，涉及停止时覆盖 controller；用本地 HTTP、真实子进程和假模型响应验证客户端先退出、服务端晚完成、断连、重复收尾及伙伴失败。断言下一次调用实际继续或按预期暂停、资源终态、attempt 状态与检查点恢复资格。
 - SQL 收尾与 PF 期限从 `tests/test_sql_capture_residuals.py`、`tests/test_pf_deadline.py` 定位；停止与资源隔离从 `tests/test_team_stop_residuals.py`、`tests/test_preflight_memory_guards.py` 定位。新增故障测试须证明修复前会失败，再验证修复后的完整路径。
-- 故障恢复由 controller 自动执行，各组独立。旧 worker 与后代关闭后，默认从最近完整检查点恢复数据库、模拟器日期、RNG、角色工作区、PF 记录和会话，使用新 attempt 重启；同一内部日期与 stage 连续失败三次才停止该组并报警。原 attempt、回执及控制文件保留。全部检查点保留，不删除或覆盖，包括初始周界；`--week N` 从内部日期 7×(N−1) 的周界重跑，指定周仅作用于首次启动，后续自动恢复使用最新完整检查点。实验状态对外使用周与专家/CEO 阶段表述。
-- 历史 HOLD、冻结源码或控制文件哈希、恢复审批、fix_classification、未知业务回执与检查点后的已完成操作均作为历史信息，不阻止检查点回退。检查点本身的文件完整性、组身份与恢复目标独立性由 `team_checkpoint.py` 和 `team_recovery.py` 验证。
-- `scripts/team_driver.py` 支持旧配对批次和单组选择，自动判断恢复。每组默认 MemoryHigh 16G、MemoryMax 20G，launcher 转发内存参数；运行中属性变化只记录。主动 STOP 保留为操作者停止入口。
+- 故障后该组进入 HOLD，记录原因并等待人工从 checkpoint 续跑。controller 每次启动对每个运行只启动一次 worker；正常完成后继续该组队列中的下一项，不自动回滚或重启，也不累计同位置失败次数。
+- 人工续跑可以反复指定任意历史 checkpoint 或 `--week N`，含第 1 周的初始周界。历史 HOLD、STOP、审批与哈希信息只作提醒。snapshot、manifest、D0、环境、工作区、RNG、Bash 策略与 scope 校验只记日志及 attempt 提示；`--force-resume` 记录操作者明确选择继续。
+- 全部 checkpoint 保留。故障现场保留在原 attempt，人工恢复使用新 attempt，并将选点后的执行记为作废。`scripts/team_driver.py` 支持旧配对批次和单组选择。每组默认 MemoryHigh 16G、MemoryMax 20G；主动 STOP 仍可停止当前执行。
 - 回退作废轨迹的用量按组与角色记入 waste，配对比较只使用保留轨迹。组耗时按检查点继承链扣除作废执行段，角色耗时为模型逻辑请求耗时，缺失字段保持 null。定位见 `tests/test_recovery_waste.py`。
-- 所有角色与模拟器的网络错误统一最多五次尝试，失败后间隔依次为 10、20、40、80 秒。首次回复最多等 600 秒，无回复超时记为一次网络失败；流式回复开始后不按累计时长截断。不设总等待预算或全局截止时间。非网络错误直接交给故障恢复，显式 STOP 和操作者取消保留。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_preflight_team_recovery_gap.py`、`tests/test_preflight_team_checkpoint_rollback.py`。
+- 所有角色与模拟器的网络错误统一最多五次尝试，失败后间隔依次为 10、20、40、80 秒。首次回复最多等 600 秒，无回复超时记为一次网络失败；流式回复开始后不按累计时长截断。不设总等待预算或全局截止时间。网络五次失败、每轮第四次模型请求后仍无有效回复、业务操作结果未知时进入 HOLD，等人工续跑。非网络错误直接结束本次执行并记录 HOLD，显式 STOP 和操作者取消保留。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_manual_hold.py`、`tests/test_resume_advisories.py`、`tests/test_preflight_team_recovery.py`。
 
 # 测试执行与验收成本
 

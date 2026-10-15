@@ -108,28 +108,25 @@ sys.exit(0 if status=='finished' else 2)
     return launches, children
 
 
-@pytest.mark.parametrize('first_status', ['finished', 'failed', 'oom-kill'])
-def test_group_join_reaps_worker_and_launches_while_peer_runs(observer, controller, monkeypatch, first_status):
-    launches, children = group_batch(observer, controller, monkeypatch, first_status=first_status)
+def test_group_join_reaps_worker_and_launches_while_peer_runs(observer, controller, monkeypatch):
+    launches, children = group_batch(observer, controller, monkeypatch)
     controller.module.supervise(controller.policy)
     assert launches[-2:] == ['s102-pf', 's102-git']
     assert all(child.poll() is not None for _, child in children)
-    records = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
-    joined = next(row for row in records if row['event'] == 'worker_launched' and row['run_id'] == 's102-pf')
-    intent = next(row for row in records if row['event'] == 'worker_launch_intent' and row['run_id'] == 's102-pf')
-    assert intent['launch_reason'] == 'previous_group_run_terminal'
-    assert intent['predecessor_run_id'] == 's101-pf'
-    assert joined['launch_ordinal'] == (3 if first_status == 'finished' else 4)
+    rows = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
+    intent = next(row for row in rows if row['event'] == 'worker_launch_intent' and row['run_id'] == 's102-pf')
+    assert intent['launch_reason'] == 'previous_group_run_terminal' and intent['predecessor_run_id'] == 's101-pf'
+    assert intent['launch_ordinal'] == 3
     before = list(launches)
-    controller.module.supervise(controller.policy, resume=True)
+    controller.module.supervise(controller.policy)
     assert launches == before
 
 
-def test_paused_lane_automatically_recovers_without_stopping_other_group(observer, controller, monkeypatch):
+def test_paused_lane_holds_without_stopping_other_group(observer, controller, monkeypatch):
     launches, _ = group_batch(observer, controller, monkeypatch, first_status='paused')
     controller.module.supervise(controller.policy)
-    assert launches.count('s101-pf') == 2 and launches[-2:] == ['s102-pf', 's102-git']
-    assert not observer.hold.exists()
+    assert launches.count('s101-pf') == 1 and 's102-pf' not in launches
+    assert 's102-git' in launches
 
 
 @pytest.mark.parametrize('reason', ['requested_pause', 'supervisor_cancelled', 'STOP'])
@@ -156,33 +153,20 @@ def test_historical_hold_does_not_stop_either_group(observer, controller, monkey
 
 
 @pytest.mark.parametrize('first_status', ['failed', 'oom-kill'])
-def test_unknown_business_write_is_discarded_during_recovery(observer, controller, monkeypatch, first_status):
+def test_unknown_business_write_holds_without_automatic_recovery(observer, controller, monkeypatch, first_status):
     launches, _ = group_batch(observer, controller, monkeypatch, first_status=first_status, unknown=True)
     controller.module.supervise(controller.policy)
-    assert 's102-pf' in launches and 's102-git' in launches
+    assert launches.count('s101-pf') == 1 and 's102-pf' not in launches
+    terminal = controller.module.batch.read(controller.policy.parent / 'controller-terminal.json')
+    assert terminal['s101-pf']['disposition'] == 'hold'
 
 
-def test_third_failure_alarms_only_its_group_and_preserves_peer_progress(observer, controller, monkeypatch):
-    launches, children = group_batch(observer, controller, monkeypatch,
-                                    first_status='failed', persistent_failure=True)
-    controller.module.supervise(controller.policy)
-    assert launches.count('s101-pf') == 3
-    assert 's102-pf' not in launches and 's102-git' in launches
-    assert all(child.poll() is not None for _, child in children)
-    alarm = json.loads((controller.policy.parent / 'alarm-s101-pf.json').read_text())
-    assert alarm['reason'] == 'repeated_failure' and alarm['failures'] == 3
-    assert not (controller.policy.parent / 'alarm-s101-git.json').exists()
-    assert not observer.hold.exists()
-
-
-def test_explicit_week_applies_only_to_first_launch_of_selected_run(observer, controller, monkeypatch):
+def test_explicit_week_never_causes_an_automatic_retry(observer, controller, monkeypatch):
     launches, children = group_batch(observer, controller, monkeypatch, first_status='failed')
     controller.module.supervise(controller.policy, run_id='s101-pf', week=4)
-    assert launches == ['s101-pf', 's101-pf']
-    assert all(child.poll() is not None for _, child in children)
-    first, retry = controller.module.worker_arguments
+    assert launches == ['s101-pf'] and all(child.poll() is not None for _, child in children)
+    first, = controller.module.worker_arguments
     assert first[first.index('--week') + 1] == '4'
-    assert '--week' not in retry and '--resume' in retry
     assert not (controller.policy.parent / 'alarm-s101-pf.json').exists()
 
 
@@ -192,7 +176,7 @@ def test_live_peer_partial_log_does_not_block_other_group_join(observer, control
     assert launches[-2:] == ['s102-pf', 's102-git']
 
 
-def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, tmp_path):
+def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, tmp_path, caplog):
     from saas_bench import team_batch as batch
     from saas_bench.run_state import file_hash
     base, original, _, sources = frozen
@@ -216,8 +200,8 @@ def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, t
     manifest['scheduling']['queues']['pf'].reverse()
     write_json(path, manifest)
     write_json(path.parent / 'freeze.json', dict(manifest_sha256=file_hash(path)))
-    with pytest.raises(ValueError, match='scheduling queues'):
-        batch.validate_manifest(path)
+    batch.validate_manifest(path)
+    assert 'scheduling queues' in caplog.text
 
 
 def test_two_seed_group_freeze_cli_and_driver_check(tmp_path):

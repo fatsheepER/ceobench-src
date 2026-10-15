@@ -16,6 +16,7 @@ import httpx
 
 from .run_state import artifact_hashes, copy_workspace, file_hash, tree_hash, write_json
 from .run_warnings import advisory, optional_hash
+from .run_lifecycle import BusinessOutcomeUnknown
 
 
 @contextmanager
@@ -81,7 +82,7 @@ def _known_operation(root):
     for path in (Path(root) / 'private' / 'operations').glob('*.json'):
         receipt = json.loads(path.read_text())
         if receipt.get('status') != 'completed' and not recovery_operation_safe(root, receipt):
-            raise RuntimeError('Business operation outcome unknown; new checkpoint publication deferred')
+            raise BusinessOutcomeUnknown('Business operation outcome unknown; HOLD for manual checkpoint resume')
 
 
 def validate_recovery_source(snapshot, state, *, current_root=None):
@@ -166,7 +167,7 @@ def checkpoint(runtime, destination=None):
             raise RuntimeError('Public HTTP operation is still in flight')
         _known_operation(runtime.root)
         if server._operation_failed or server._step_day_timed_out:
-            raise RuntimeError('World operation outcome unknown; checkpoint refused')
+            raise BusinessOutcomeUnknown('World operation outcome unknown; HOLD for manual checkpoint resume')
         for role in runtime.roles.values():
             if role.store:
                 role.store.assert_healthy(settle=3)

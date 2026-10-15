@@ -55,7 +55,7 @@ def controller(observer, monkeypatch):
     return SimpleNamespace(module=module, policy=policy, gate=module.RequestGate(policy))
 
 
-def test_run_evidence_stop_cancels_only_own_model_request(observer, controller):
+def test_historical_stop_warns_and_current_stop_cancels_only_own_request(observer, controller):
     observer.poll()
     entry = observer.manifest['runs'][0]
     attempt = Path(entry['output_dir']) / 'attempt-001'
@@ -63,6 +63,11 @@ def test_run_evidence_stop_cancels_only_own_model_request(observer, controller):
     (attempt / 'STOP').touch()
     stopped = controller.module.RequestGate(controller.policy, run_id=entry['run_id'])
     peer = controller.module.RequestGate(controller.policy, run_id=observer.manifest['runs'][1]['run_id'])
+    stopped(None)
+    peer(None)
+    current = attempt.parent / 'attempt-002'
+    write_json(current / 'attempt.json', dict(attempt=2))
+    (current / 'STOP').touch()
     with pytest.raises(RunCancelled, match='run_evidence_fault'):
         stopped(None)
     peer(None)
@@ -115,23 +120,15 @@ def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monke
 
 
 @pytest.mark.parametrize('bytes_available,inodes', [(1, 999999), (999999999, 1)])
-def test_controller_prechecks_storage_before_worker_launch(observer, controller, monkeypatch,
-                                                         bytes_available, inodes):
-    source = str(Path(__file__).resolve().parents[1])
-    observer.expected['source_root'] = observer.manifest['source_root'] = source
-    write_json(controller.policy, dict(identity=observer.expected))
-    monkeypatch.setattr(controller.module, 'identity', observer.module.identity)
-    monkeypatch.setattr(controller.module, 'poll',
-        lambda *args: observer.module.poll(*args, quota_fn=observer.quota))
+def test_controller_storage_precheck_only_warns(observer, controller, monkeypatch, caplog,
+                                              bytes_available, inodes):
+    from test_preflight_group_join import group_batch
     monkeypatch.setattr(os, 'statvfs', lambda path: SimpleNamespace(f_bavail=bytes_available,
         f_frsize=1, f_favail=inodes, f_files=1000000))
-    launches = []
-    monkeypatch.setattr(controller.module.subprocess, 'check_output', lambda *args, **kwargs: 'offline')
-    monkeypatch.setattr(controller.module.subprocess, 'Popen',
-        lambda *args, **kwargs: launches.append(args))
+    launches, children = group_batch(observer, controller, monkeypatch)
     controller.module.supervise(controller.policy)
-    assert launches == [] and not observer.hold.exists()
-    for group in ('git', 'pf'):
-        alarm = batch.read(controller.policy.parent / ('alarm-' + group + '.json'))
-        assert alarm['reason'] == 'repeated_failure' and alarm['failures'] == 3
-    assert all(batch.attempts(entry) == [] for entry in observer.manifest['runs'])
+    assert len(launches) == 4 and all(child.poll() is not None for _, child in children)
+    assert 'Insufficient temporary storage' in caplog.text
+    for entry in observer.manifest['runs']:
+        record = batch.read(batch.attempts(entry)[0] / 'attempt.json')
+        assert any('Insufficient temporary storage' in row['message'] for row in record['validation_warnings'])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise independent group workers and automatically restore failed attempts."""
+"""Supervise independent groups once; failures HOLD for manual checkpoint resume."""
 
 import argparse
 from datetime import datetime, timezone
@@ -35,7 +35,7 @@ def scope_state(saved, *, exit_code=None):
         '--property=LoadState,ActiveState,InvocationID,ControlGroup'],
         capture_output=True, text=True, timeout=10)
     if response.returncode:
-        raise RuntimeError('Cannot observe worker scope: ' + response.stderr.strip())
+        logging.warning('Cannot observe worker scope: %s', response.stderr.strip())
     properties = dict(line.split('=', 1) for line in response.stdout.splitlines() if '=' in line)
     invocation, group = properties.get('InvocationID'), properties.get('ControlGroup')
     if ((invocation and saved.get('invocation_id') and invocation != saved['invocation_id']) or
@@ -52,16 +52,19 @@ def scope_state(saved, *, exit_code=None):
         root = Path('/sys/fs/cgroup')
         path = root / record['control_group'].lstrip('/')
         if not path.is_relative_to(root) or '..' in path.parts:
-            raise RuntimeError('Invalid worker cgroup path')
+            logging.warning('Invalid worker cgroup path: %s', path)
+            record.update(scope_empty=exit_code is not None, scope_observation_unknown=True)
+            return record
         try:
             events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
             record['scope_empty'] = events['populated'] == '0'
         except FileNotFoundError:
             if active:
-                raise RuntimeError('Active worker cgroup is unavailable') from None
-            record['scope_empty'] = True
+                logging.warning('Active worker cgroup is unavailable')
+                record['scope_observation_unknown'] = True
+            record['scope_empty'] = not active or exit_code is not None
     else:
-        record['scope_empty'] = not active and bool(record['invocation_id'])
+        record['scope_empty'] = not active and (bool(record['invocation_id']) or exit_code is not None)
     return record
 
 
@@ -70,14 +73,15 @@ def signal_scope(saved, signum):
     if current['scope_empty']:
         return current
     if not saved.get('invocation_id') or not saved.get('control_group'):
-        raise RuntimeError('Cannot signal an unbound worker scope')
+        logging.warning('Cannot signal an unbound worker scope')
+        return current
     response = subprocess.run(['systemctl', '--user', 'kill', '--kill-whom=all',
         '--signal=' + signal.Signals(signum).name, saved['unit']],
         capture_output=True, text=True, timeout=10)
     if response.returncode:
         current = scope_state(saved)
         if not current['scope_empty']:
-            raise RuntimeError('Worker scope signal failed: ' + response.stderr.strip())
+            logging.warning('Worker scope signal failed: %s', response.stderr.strip())
     return current
 
 
@@ -90,6 +94,8 @@ class RequestGate:
         self.scope = None
         self.entry = None
         self.prior_stop = self.stop_stamp()
+        if self.prior_stop is not None:
+            logging.warning('Existing controller STOP is historical; continuing as requested')
         self.prior_attempt = None
         if run_id:
             self.entry = batch.selected(self.manifest(), run_id)
@@ -113,6 +119,7 @@ class RequestGate:
                 changes = [type(exc).__name__ + ': ' + str(exc)]
             if changes and changes != getattr(self, '_scope_changes', None):
                 self._scope_changes = changes
+                logging.warning('Worker scope observations: %s', '; '.join(changes))
                 path = Path(self.expected['host_logs']) / 'worker-scope-observations.jsonl'
                 try:
                     with path.open('a') as stream:
@@ -156,23 +163,6 @@ def run_stopped(entry, *, after_attempt=None):
     history = batch.attempts(entry)
     return bool(history and (history[-1] / 'STOP').exists() and
         (after_attempt is None or history[-1].name != after_attempt))
-
-
-def retry_position(entry):
-    from saas_bench.team_recovery import latest_checkpoint
-    from saas_bench.team_checkpoint import validate_snapshot
-    checkpoint = latest_checkpoint(entry, latest(entry))
-    if checkpoint is None:
-        return [None, None], None
-    _, state = validate_snapshot(checkpoint)
-    return [state['day'], state['stage']], str(checkpoint)
-
-
-def record_failure(failures, run_id, position):
-    previous = failures.get(run_id, {})
-    count = previous.get('count', 0) + 1 if previous.get('position') == position else 1
-    failures[run_id] = dict(position=position, count=count)
-    return count
 
 
 def worker(policy, run_id, *, resume, parent_pid, week=None, force_resume=False):
@@ -247,17 +237,14 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
     queues = {group: [entry for entry in manifest['runs'] if entry['group'] == group]
               for group in ('git', 'pf')}
     events_path = directory / 'controller-events.jsonl'
-    failures, terminal, children, streams = {}, {}, [], []
+    terminal, children, streams = {}, [], []
     units_path = directory / 'controller-units.json'
     units = batch.read(units_path) if units_path.exists() else {}
     launch_ordinal = 0
-    launched_runs = set()
     if events_path.exists():
         for line in events_path.read_text().splitlines():
             row = json.loads(line)
             launch_ordinal = max(launch_ordinal, row.get('launch_ordinal', 0))
-            if row.get('event') == 'recovery_failure':
-                failures[row['run_id']] = dict(position=row['position'], count=row['count'])
     state = {}
     stop_requested = False
     sampler = MemorySampler(host_logs / 'host-memory.jsonl')
@@ -282,7 +269,9 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         try:
             observed = scope_state(slot['unit'], exit_code=slot['child'].returncode)
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-            observed = dict(slot['unit'], scope_empty=False, cleanup_error=str(exc))
+            logging.warning('Worker scope observation unavailable for %s: %s', slot['entry']['run_id'], exc)
+            observed = dict(slot['unit'], scope_empty=slot['child'].returncode is not None,
+                scope_observation_unknown=True, cleanup_error=str(exc))
         slot['unit'] = observed
         run_id = slot['entry']['run_id']
         if units.get(run_id) != observed:
@@ -339,7 +328,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             command.append('--resume')
         if force_resume:
             command.append('--force-resume')
-        if week is not None and entry['run_id'] not in launched_runs:
+        if week is not None:
             command.extend(['--week', str(week)])
         unit = 'ceobench-worker-' + uuid.uuid4().hex + '.scope'
         env['CEOBENCH_WORKER_SCOPE_POLICY'] = json.dumps(dict(unit=unit,
@@ -354,7 +343,6 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             frozen_source_commit=manifest.get('source_commit'))
         child = subprocess.Popen(command, cwd=root, env=env, stdout=stream,
                                  stderr=subprocess.STDOUT, start_new_session=True)
-        launched_runs.add(entry['run_id'])
         slot = dict(entry=entry, child=child, ready=ready, unit=dict(unit=unit),
                     closed=False, stopping_at=None, signaled=False,
                     prior_attempt=history[-1].name if history else '')
@@ -364,36 +352,35 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             memory_max=memory_max, memory_swap_max=memory_swap_max, scope=observe(slot))
         return slot
 
-    def failed(entry, *, reason, unit=None):
-        try:
-            position, checkpoint = retry_position(entry)
-        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-            position, checkpoint = [None, None], None
-            reason += '; checkpoint: ' + str(exc)
-        count = record_failure(failures, entry['run_id'], position)
-        event('recovery_failure', run_id=entry['run_id'], group=entry['group'], position=position,
-              checkpoint=checkpoint, count=count, reason=reason, unit=unit)
-        if count >= 3:
-            alarm(entry, 'repeated_failure', position=position, failures=count, failure_reason=reason)
-            return None
-        try:
-            return launch(entry)
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-            return failed(entry, reason=type(exc).__name__ + ': ' + str(exc))
+    def hold_group(entry, *, reason, unit=None):
+        history = batch.attempts(entry)
+        notice = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
+            time=datetime.now(timezone.utc).isoformat(), manual_resume_required=True, unit=unit)
+        if history:
+            record = batch.read(history[-1] / 'attempt.json')
+            notice['checkpoint'] = record.get('checkpoint') or record.get('source_checkpoint')
+            notice['detail'] = record.get('hold_detail') or reason
+            record.update(status='paused', hold=True, hold_detail=record.get('hold_detail') or reason)
+            write_json(history[-1] / 'attempt.json', record)
+            write_json(history[-1] / 'HOLD', notice)
+        write_json(Path(entry['output_dir']) / 'HOLD', notice)
+        terminal[entry['run_id']] = dict(disposition='hold', **notice)
+        logging.warning('HOLD %s: %s; manual checkpoint resume required', entry['run_id'], reason)
+        event('group_hold', **notice)
+        return None
 
     def next_entry(group, predecessor=None):
         while queues[group]:
             entry = queues[group].pop(0)
             saved = latest(entry)
             try:
-                close_previous(entry)
-                if week is None and saved and saved.get('status') == 'finished' and units.get(entry['run_id'], {}).get('result') != 'oom-kill':
+                if not resume and week is None and saved and saved.get('status') == 'finished' and units.get(entry['run_id'], {}).get('result') != 'oom-kill':
                     terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
                                                     attempt=saved.get('attempt'))
                     continue
                 return launch(entry, predecessor)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                return failed(entry, reason=type(exc).__name__ + ': ' + str(exc))
+                return hold_group(entry, reason=type(exc).__name__ + ': ' + str(exc))
         return None
 
     def cleanup(slot, *, requested=False):
@@ -500,7 +487,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                         event('group_run_terminal', run_id=entry['run_id'], proof=terminal[entry['run_id']])
                         active[group] = next_entry(group, predecessor=entry['run_id'])
                     else:
-                        active[group] = failed(entry, reason=str(saved.get('runtime_failure') or
+                        active[group] = hold_group(entry, reason=str(saved.get('runtime_failure') or
                             saved.get('reason') or 'worker_exit:' + str(child.returncode)), unit=slot['unit'])
                     write_json(directory / 'controller-terminal.json', terminal)
                 time.sleep(1)
@@ -535,14 +522,14 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 any(record.get('operator_stop') for record in terminal.values()))
             children_reaped = (all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
                 for slot in children) and all(unit.get('scope_empty') for unit in units.values()))
-            write_json(directory / 'controller-exit.json', dict(hold=False,
+            write_json(directory / 'controller-exit.json', dict(hold=any(row.get('disposition') == 'hold' for row in terminal.values()),
                 failed=not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
                     for record in terminal.values()) or not operator_stopped and
                     any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
-                auto_resume=True))
+                auto_resume=False))
 
 
 def main(argv=None):
@@ -550,7 +537,7 @@ def main(argv=None):
     parser.add_argument('--policy', type=Path, required=True,
         help='Policy identity anchors the manifest and selected git/PF run IDs and output paths.')
     parser.add_argument('--live', action='store_true', help='Explicitly enable model requests.')
-    parser.add_argument('--resume', action='store_true', help='Compatibility flag; existing attempts resume automatically.')
+    parser.add_argument('--resume', action='store_true', help='Explicitly continue selected groups from saved checkpoints.')
     parser.add_argument('--force-resume', action='store_true', help='Record explicit continuation despite validation warnings.')
     parser.add_argument('--run-id', help='Run only this group run from the policy selection.')
     parser.add_argument('--week', type=int, help='Replay a saved week boundary; week 1 starts at day 0.')

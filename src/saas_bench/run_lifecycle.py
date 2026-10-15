@@ -13,6 +13,10 @@ class RunCancelled(BaseException):
     pass
 
 
+class BusinessOutcomeUnknown(RuntimeError):
+    pass
+
+
 class WorkerLifecycle:
     def __init__(self, hold=None, parent_pid=None):
         self.hold = Path(hold) if hold else None

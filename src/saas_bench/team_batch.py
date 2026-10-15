@@ -35,6 +35,7 @@ from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
 from .team_checkpoint import retention_lock
+from .run_lifecycle import BusinessOutcomeUnknown
 from .run_warnings import AttemptWarnings, advisory, optional_hash
 
 
@@ -292,7 +293,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
         controller_sha256={name: file_hash(root / name) for name in controllers},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
-        price_source=price_source, attempt_policy='automatic_checkpoint_recovery', d0=d0, runs=runs)
+        price_source=price_source, attempt_policy='manual_checkpoint_resume', d0=d0, runs=runs)
     if scheduling == 'group_independent':
         manifest['scheduling'] = dict(mode=scheduling, queues={group:
             [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
@@ -565,6 +566,17 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
 
 
 def save_checkpoint(team, directory, record, boundary):
+    try:
+        return _save_checkpoint(team, directory, record, boundary)
+    except BusinessOutcomeUnknown:
+        raise
+    except Exception as exc:
+        record['checkpoint_error'] = str(exc)
+        logging.warning('Checkpoint publication deferred; execution continues: %s', exc)
+        return None
+
+
+def _save_checkpoint(team, directory, record, boundary):
     parent = team.root / 'checkpoints'
     with ExitStack() as stack:
         lock_error = None
@@ -696,13 +708,29 @@ def _execute(team, manifest, entry, directory, record, hold):
     def checkpoint(runtime, boundary):
         nonlocal last_boundary
         snapshot = save_checkpoint(runtime, directory, record, boundary)
+        if snapshot is None:
+            return
         last_boundary = dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json'),
             boundary=boundary, day=runtime.server.tools.current_day, stage=runtime._stage, failure=runtime.failure)
     team.checkpoint_callback = checkpoint
     outcome = team.run(stop_after_day=entry['stop_after_day'], hold=hold)
     reason = outcome.reason
-    if reason == 'paused' and team.failure not in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled', 'sql_evidence_pending', 'business_operation_pending', 'registered_script_transient_infrastructure'):
-        reason = 'failed'
+    operator_pause = team.failure in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled')
+    if reason in ('failed', 'paused') and not operator_pause:
+        detail = getattr(team, 'failure_detail', None) or team.failure or reason
+        if team.failure == 'model_attempt_limit':
+            detail = 'No valid reply after 4 model requests in this turn; manual checkpoint resume required'
+        elif team.failure == 'model_request_failed':
+            detail = 'Model request failed; network errors receive 5 attempts (10/20/40/80 seconds). ' + detail
+        elif team.failure in ('business_operation_unknown', 'world_operation_failed', 'business_operation_pending'):
+            detail = 'Business operation outcome cannot be confirmed. ' + detail
+        reason = 'paused'
+        record.update(hold=True, hold_detail=detail)
+        notice = dict(reason=team.failure or outcome.reason, detail=detail, manual_resume_required=True,
+                      checkpoint=record.get('checkpoint'), time=datetime.now(timezone.utc).isoformat())
+        write_json(directory / 'HOLD', notice)
+        write_json(Path(entry['output_dir']) / 'HOLD', notice)
+        logging.warning('HOLD %s: %s', entry['run_id'], detail)
     reuse = (last_boundary is not None and reason == 'observation_end' and
         outcome.day == entry['stop_after_day'] == team.server.tools.current_day and
         last_boundary['boundary'] == 'week_boundary' and last_boundary['day'] == outcome.day and

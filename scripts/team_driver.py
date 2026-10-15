@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Run selected Git/PF groups independently with automatic checkpoint recovery."""
+"""Run selected Git/PF groups; resume held groups only on an explicit invocation."""
 
 import argparse
 from datetime import datetime, timezone
 import fcntl
 import json
-import logging
 from pathlib import Path
 
 from saas_bench import team_batch as batch
@@ -35,7 +34,7 @@ def _main(argv, warnings):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--check', action='store_true')
     mode.add_argument('--live', action='store_true')
-    parser.add_argument('--resume', action='store_true', help='Compatibility flag; recovery is automatic.')
+    parser.add_argument('--resume', action='store_true', help='Explicitly continue selected groups from saved checkpoints.')
     parser.add_argument('--force-resume', action='store_true', help='Record explicit continuation despite validation warnings.')
     parser.add_argument('--run-id', help='Run only this group run from the policy selection.')
     parser.add_argument('--week', type=int, help='Replay a saved week boundary; week 1 starts at day 0.')
@@ -63,8 +62,12 @@ def _main(argv, warnings):
         with advisory():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            options = dict(resume=args.resume, force_resume=args.force_resume, startup_warnings=warnings.rows, memory_high=args.memory_high,
+            options = dict(resume=args.resume, memory_high=args.memory_high,
                 memory_max=args.memory_max, memory_swap_max=args.memory_swap_max)
+            if args.force_resume:
+                options['force_resume'] = True
+            if warnings.rows:
+                options['startup_warnings'] = warnings.rows
             if args.week is not None:
                 options['week'] = args.week
             if args.run_id is not None:
@@ -78,7 +81,7 @@ def _main(argv, warnings):
             return outcome
         finally:
             write_json(directory / 'driver-exit.json', dict(time=datetime.now(timezone.utc).isoformat(),
-                returncode=outcome, batch_id=manifest['batch_id'], auto_resume=True))
+                returncode=outcome, batch_id=manifest['batch_id'], auto_resume=False))
 
 
 if __name__ == '__main__':
