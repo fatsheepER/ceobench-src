@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -165,6 +166,55 @@ def test_corrupt_management_history_warns_preserves_original_and_runs_peer(
     assert set(batch.read(receipt['units_path'])) == set(launches)
     events = [json.loads(line) for line in Path(receipt['events_path']).read_text().splitlines()]
     assert {row['run_id'] for row in events if row['event'] == 'worker_launched'} == set(launches)
+
+
+@pytest.mark.parametrize('observation', ['error', 'unknown'])
+def test_unknown_previous_scope_has_bounded_cleanup_and_keeps_new_attempt_isolated(
+        observer, controller, monkeypatch, caplog, observation):
+    from test_preflight_group_join import group_batch
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    module = controller.module
+    entry = observer.manifest['runs'][0]
+    original = Path(entry['output_dir']) / 'attempt-001/attempt.json'
+    write_json(original, dict(status='paused', attempt=1, day=0))
+    original_bytes = original.read_bytes()
+    old = dict(unit='unobservable.scope', invocation_id='old-invocation',
+        control_group='/offline/old', scope_empty=False)
+    write_json(controller.policy.parent / 'controller-units.json', {entry['run_id']: old})
+    monkeypatch.setenv('CEOBENCH_PREVIOUS_SCOPE_WAIT_SECONDS', '15')
+    clock, sleep, scope = time.monotonic, time.sleep, module.scope_state
+    elapsed, signals = [0], []
+
+    def observe(saved, **kwargs):
+        if saved['unit'] != old['unit']:
+            return scope(saved, **kwargs)
+        if observation == 'error':
+            raise OSError('old scope remains unavailable')
+        return dict(old, scope_empty=True, scope_observation_unknown=True)
+
+    def pause(_):
+        elapsed[0] += 5
+        if elapsed[0] > 200:
+            (controller.policy.parent / 'STOP').touch()
+        sleep(.01)
+
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock() + elapsed[0])
+    monkeypatch.setattr(module.time, 'sleep', pause)
+    monkeypatch.setattr(module, 'scope_state', observe)
+    monkeypatch.setattr(module, 'signal_scope', lambda saved, signum: signals.append((saved, signum)))
+    module.supervise(controller.policy, resume=True)
+    assert launches == ['s101-git', 's101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    assert original.read_bytes() == original_bytes
+    assert (original.parent.parent / 'attempt-002/attempt.json').exists()
+    assert [signum for _, signum in signals] == [signal.SIGTERM, signal.SIGKILL]
+    assert 'Previous worker scope remains unconfirmed' in caplog.text
+    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
+    assert receipt['children_reaped'] and not receipt['failed'] and not receipt['hold']
+    assert not receipt['previous_scopes_closed']
+    previous = receipt['previous_units'][entry['run_id']]
+    assert previous['unit'] == old['unit'] and previous['scope_observation_unknown']
+    assert receipt['units'][entry['run_id']]['unit'] != old['unit']
 
 
 def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):

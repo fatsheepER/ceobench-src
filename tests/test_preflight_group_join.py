@@ -127,6 +127,7 @@ def test_group_join_reaps_worker_and_launches_while_peer_runs(observer, controll
     'none', 'error', 'unknown', 'persistent_error', 'persistent_unknown', 'stop'])
 def test_resume_kills_previous_worker_after_45_seconds_and_confirms_exit(
         observer, controller, monkeypatch, tmp_path, observation_failure):
+    monkeypatch.setenv('CEOBENCH_PREVIOUS_SCOPE_WAIT_SECONDS', '75')
     signal_previous = controller.module.signal_scope
     launches, children = group_batch(observer, controller, monkeypatch, paired=True)
     module = controller.module
@@ -212,7 +213,7 @@ def test_resume_kills_previous_worker_after_45_seconds_and_confirms_exit(
             assert old.poll() is None
             assert not (Path(entry['output_dir']) / 'attempt-002').exists()
             receipt = module.batch.read(controller.policy.parent / 'controller-exit.json')
-            assert receipt['operator_stopped'] and not receipt['children_reaped']
+            assert receipt['operator_stopped'] and not receipt['previous_scopes_closed']
             return
         assert launches == ['s101-pf']
         assert signals[0][0] == signal.SIGTERM

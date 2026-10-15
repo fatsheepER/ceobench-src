@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import fcntl
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import signal
@@ -277,6 +278,14 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             logging.warning('Historical controller metadata unavailable at %s: %s; preserving it and continuing', events_path, exc)
             history_errors.append(dict(path=str(events_path), error=type(exc).__name__ + ': ' + str(exc)))
             events_path = directory / ('controller-events-' + uuid.uuid4().hex + '.jsonl')
+    previous_units = dict(units)
+    try:
+        previous_scope_wait = float(os.environ.get('CEOBENCH_PREVIOUS_SCOPE_WAIT_SECONDS', '30'))
+        if not math.isfinite(previous_scope_wait) or previous_scope_wait < 0:
+            raise ValueError('Previous scope wait must be finite and nonnegative')
+    except ValueError as exc:
+        logging.warning('Previous scope cleanup setting unavailable: %s; using 30 seconds', exc)
+        previous_scope_wait = 30
     state = {}
     stop_requested = False
     sampler = MemorySampler(host_logs / 'host-memory.jsonl')
@@ -318,7 +327,9 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         saved = units.get(entry['run_id'])
         if not saved:
             return True
-        deadline = time.monotonic() + 45
+        started = time.monotonic()
+        deadline = started + previous_scope_wait
+        force_at = started + min(45, previous_scope_wait * 2 / 3)
         signaled = False
         forced = False
         while True:
@@ -327,8 +338,9 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             try:
                 observed = scope_state(saved, exit_code=saved.get('exit_code'))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                logging.warning('Previous worker scope cannot be verified: %s; waiting before launch', exc)
-                observed = dict(saved, scope_empty=False, scope_observation_unknown=True)
+                logging.warning('Previous worker scope cannot be verified: %s; bounded cleanup continues', exc)
+                observed = dict(saved, scope_empty=False, scope_observation_unknown=True, cleanup_error=str(exc))
+            previous_units[entry['run_id']] = observed
             units[entry['run_id']] = observed
             write_json(units_path, units)
             if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
@@ -337,13 +349,20 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 event('previous_scope_closed', run_id=entry['run_id'], unit=observed)
                 return True
             remaining = deadline - time.monotonic()
-            if remaining <= 0 and not forced:
-                logging.warning('Previous worker scope did not close within 45 seconds; forcing SIGKILL and waiting')
+            if remaining <= 0:
+                logging.warning('Previous worker scope remains unconfirmed after %s seconds for %s; continuing in a new isolated attempt',
+                    previous_scope_wait, entry['run_id'])
+                event('previous_scope_unconfirmed', run_id=entry['run_id'], unit=observed,
+                    wait_seconds=previous_scope_wait)
+                return True
+            if time.monotonic() >= force_at and not forced:
+                logging.warning('Previous worker scope has not closed; requesting SIGKILL within the cleanup budget')
                 event('previous_scope_kill_requested', run_id=entry['run_id'], unit=observed)
                 forced = True
-            if not signaled or remaining <= 0:
+                signaled = False
+            if not signaled:
                 with advisory():
-                    signal_scope(observed, signal.SIGKILL if remaining <= 0 else signal.SIGTERM)
+                    signal_scope(observed, signal.SIGKILL if forced else signal.SIGTERM)
                 signaled = True
             time.sleep(.25)
 
@@ -571,14 +590,16 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             write_json(directory / 'controller-terminal.json', terminal)
             operator_stopped = (stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop) or
                 any(record.get('operator_stop') for record in terminal.values()))
-            children_reaped = (all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
-                for slot in children) and all(unit.get('scope_empty') for unit in units.values()))
+            children_reaped = all(slot['child'].poll() is not None and slot['unit'].get('scope_empty') and
+                not slot['unit'].get('scope_observation_unknown') for slot in children)
             write_json(directory / 'controller-exit.json', dict(hold=any(row.get('disposition') == 'hold' for row in terminal.values()),
                 failed=not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
                     for record in terminal.values()) or not operator_stopped and
                     any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
+                previous_units=previous_units, previous_scopes_closed=all(unit.get('scope_empty') and
+                    not unit.get('scope_observation_unknown') for unit in previous_units.values()),
                 units_path=str(units_path), events_path=str(events_path), history_read_errors=history_errors,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
                 auto_resume=False))
