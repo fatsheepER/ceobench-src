@@ -1273,6 +1273,8 @@ class NovaMindAPIServer:
                 raise RuntimeError('Previous operation outcome unknown; continuation refused')
             self._advance_outcome = None
             result = self._advance_week(predictions, rationale, on_settled=settle)
+            if result.get('error') == 'prediction_save_failed':
+                return result
             if self._advance_outcome is None and result.get('error') != 'step_week_timeout':
                 self._operation_failed = True
                 settle(error=RuntimeError(result.get('error', 'Advance did not complete')))
