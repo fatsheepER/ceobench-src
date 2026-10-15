@@ -457,10 +457,33 @@ class MultiAgentRuntime:
 
     def _observation(self, role, dashboard, scripts):
         runtime = self.roles[role]
-        check = runtime.executor.weekly_check(self.server.tools.current_day)
+        day = self.server.tools.current_day
+        started = None
+        if runtime.registry.mode == 'git':
+            runtime.usage.weekly_check = None
+            started = runtime.audit.record('git_weekly_check', day=day, status='started')
+        try:
+            check = runtime.executor.weekly_check(day)
+        except BaseException as exc:
+            if started:
+                runtime.audit.record('git_weekly_check', day=day, status='failed',
+                    check_id=started['event_id'], error=type(exc).__name__, detail=str(exc),
+                    delivery_state='not_assembled')
+            raise
+        if started:
+            result = runtime.audit.record('git_weekly_check', day=day, status='succeeded',
+                check_id=started['event_id'], outcome='summary_ready' if check else 'not_applicable',
+                summary=check, delivery_state='not_assembled')
         observation = (join_text(dashboard, '\n\nYour private registered-script output\n', scripts)
                        if scripts else dashboard)
-        return join_text(observation, '\n\n', check) if check else observation
+        observation = join_text(observation, '\n\n', check) if check else observation
+        if started:
+            receipt = dict(check_id=started['event_id'], result_event_id=result['event_id'], day=day,
+                outcome=result['outcome'], summary_chars=len(check or ''),
+                delivery_state='assembled' if check else 'not_applicable')
+            runtime.usage.weekly_check = dict(receipt=receipt, summary=check)
+            runtime.audit.record('git_weekly_check_delivery', status='assembled', **receipt)
+        return observation
 
     def _run_analyst(self, role, requests, dashboard=None):
         runtime = self.roles[role]

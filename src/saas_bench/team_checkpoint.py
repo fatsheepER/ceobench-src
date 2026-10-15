@@ -228,6 +228,7 @@ def _freeze(runtime, directory):
         for suffix in ('-wal', '-shm'):
             (directory / 'private' / ('evidence.sqlite' + suffix)).unlink(missing_ok=True)
     roles = {name: dict(identity=role.identity.fields(), usage=role.usage.summary,
+        weekly_check=role.usage.weekly_check,
         client=_client_configuration(role.agent.client),
         context_id=role.usage.context_id, last_request_event=role.usage.last_request_event,
         expected_model=getattr(role.usage, 'expected_model', None),
@@ -437,6 +438,7 @@ def restore_runtime_state(runtime, state):
         if _client_configuration(role.agent.client) != saved['client']:
             logging.warning('Recovery client configuration differs from checkpoint for %s', name)
         role.usage.summary = saved['usage']
+        role.usage.weekly_check = saved.get('weekly_check')
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
         role.usage.expected_model = saved['expected_model']
