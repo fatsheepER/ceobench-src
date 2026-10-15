@@ -77,11 +77,11 @@ def configuration(seed, prices):
 def check_prices(prices, source):
     if not all(isinstance(prices.get(key), str) and prices[key].strip() for key in ('source', 'basis')):
         raise ValueError('Pricing requires a source and applicable basis')
-    rates = prices.get('rates', {}).get(MODEL, {})
-    for field in ('input', 'output', 'cache_read', 'cache_write'):
-        value = rates.get(field)
-        if type(value) not in (int, float) or not 0 <= value < float('inf'):
-            raise ValueError('Freeze finite nonnegative USD/1k prices for ' + field)
+    for rates in prices.get('rates', {}).values():
+        for field in ('input', 'output', 'cache_read', 'cache_write'):
+            value = rates.get(field)
+            if type(value) not in (int, float) or not 0 <= value < float('inf'):
+                raise ValueError('Freeze finite nonnegative USD/1k prices for ' + field)
     if not isinstance(source, str) or source != prices['source']:
         raise ValueError('Freeze the pricing source and applicable basis')
     canonical(prices)

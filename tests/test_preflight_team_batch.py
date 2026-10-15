@@ -334,6 +334,8 @@ def test_saved_d0_survives_changed_code_defaults_prices_and_build(frozen, tmp_pa
         raise AssertionError('Validation must use sealed D0 files, not current code defaults')
     monkeypatch.setattr(batch, 'configuration', changed_defaults)
     assert batch.validate_manifest(path)['pricing']['rates'][batch.MODEL]['input'] == 99
+    monkeypatch.setattr(batch, 'MODEL', 'changed-code-default-model')
+    assert batch.validate_manifest(path) == manifest
     assert {source: tree_hash(source) for source in hashes} == hashes
 
 

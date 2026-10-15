@@ -151,6 +151,76 @@ def test_first_response_at_599_seconds_allows_stream_beyond_600(monkeypatch):
     assert clock[0] == 1899 and received == [(b'first replycontinuing reply', None)]
 
 
+@pytest.mark.parametrize('phase', ['first_body', 'reused_body', 'reused_headers'])
+def test_sdk_watchdog_owns_response_and_reused_connection(monkeypatch, phase):
+    clock, requests, waits, expired = [100.0], [], [], []
+    monkeypatch.setattr('saas_bench.model_usage.time.monotonic', lambda: clock[0])
+    class ManualTimer:
+        ident = None
+        def __init__(self, seconds, callback):
+            assert seconds == 600
+            self.callback, self.cancelled = callback, False
+        def start(self):
+            pass
+        def cancel(self):
+            self.cancelled = True
+        def fire(self):
+            assert not self.cancelled
+            self.callback()
+    monkeypatch.setattr('saas_bench.model_usage.threading.Timer', ManualTimer)
+    recorder, peer_recorder = ModelUsage(None, 'ceo'), ModelUsage(None, 'growth')
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
+    warm = phase != 'first_body'
+    channel, remote = socket.socketpair()
+    peer_channel, peer_remote = socket.socketpair()
+    class NetworkStream:
+        def get_extra_info(self, name):
+            assert name == 'socket'
+            return channel
+    def silent_read():
+        attempt = _ATTEMPT.get()
+        assert channel in attempt._sockets
+        assert peer_channel not in attempt._sockets
+        clock[0] = attempt.deadline
+        attempt.timer.fire()
+        assert channel.recv(1) == b''
+        expired.append(attempt.reason)
+    class SilentBody(httpx.SyncByteStream):
+        def __iter__(self):
+            silent_read()
+            yield b''
+    def handle(request):
+        requests.append(request)
+        if warm and len(requests) == 1:
+            return httpx.Response(200, stream=httpx.ByteStream(json.dumps(reply('chat')).encode()),
+                extensions={'network_stream': NetworkStream()})
+        if len(requests) > int(warm) + 1:
+            raise httpx.ConnectError('closed pooled connection', request=request)
+        clock[0] += 599
+        if phase == 'reused_headers':
+            silent_read()
+            raise httpx.ReadError('headers never arrived', request=request)
+        return httpx.Response(200, stream=SilentBody(), extensions={'network_stream': NetworkStream()})
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle))))
+    request = dict(model='test-model', messages=[{'role': 'user', 'content': 'same'}])
+    with channel, remote, peer_channel, peer_remote:
+        peer_recorder.lifecycle._sockets.add(peer_channel)
+        try:
+            if warm:
+                assert recorder.call('chat', request, lambda: client.chat.completions.create(**request)).model == 'test-model'
+                assert channel in client._client._ceobench_model_sockets
+            with pytest.raises(RunCancelled, match='model_request_failed'):
+                recorder.call('chat', request, lambda: client.chat.completions.create(**request))
+            assert len(requests) == int(warm) + 5 and waits == [10, 20, 40, 80]
+            assert expired == ['model_attempt_timeout']
+            assert recorder.lifecycle.reason is None and peer_recorder.lifecycle.reason is None
+            peer_channel.sendall(b'peer continues')
+            assert peer_remote.recv(32) == b'peer continues'
+        finally:
+            client.close()
+
+
 def test_operator_cancellation_during_backoff_prevents_another_request(monkeypatch):
     recorder, calls = ModelUsage(None, 'ceo'), []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: recorder.lifecycle.cancel('supervisor_cancelled'))

@@ -14,6 +14,7 @@ from pathlib import Path
 import threading
 import time
 import uuid
+import weakref
 
 import httpx
 
@@ -305,6 +306,17 @@ class _ModelAttempt(WorkerLifecycle):
         self.received_reply = False
         self.timer = None
 
+    def watch_socket(self, channel):
+        for owner in (self.lifecycle, self):
+            with owner._socket_lock:
+                owner._sockets.add(channel)
+                if owner.reason:
+                    try:
+                        channel.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        self.check()
+
     def reply_started(self):
         with self._socket_lock:
             self.check()
@@ -372,6 +384,7 @@ class ModelUsage:
         if getattr(http_client, '_ceobench_recorded', False):
             return client
         send = http_client.send
+        http_client._ceobench_model_sockets = weakref.WeakSet()
 
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
@@ -415,6 +428,12 @@ class ModelUsage:
                 # Read through our stream wrapper, so interrupted SSE bodies are retained too.
                 streaming = kwargs.get('stream', False)
                 response = send(request, *args, **dict(kwargs, stream=True))
+                network_stream = response.extensions.get('network_stream')
+                channel = network_stream.get_extra_info('socket') if network_stream else None
+                if channel is not None:
+                    http_client._ceobench_model_sockets.add(channel)
+                    if attempt := _ATTEMPT.get():
+                        attempt.watch_socket(channel)
                 def finish(content, error):
                     nonlocal failure_recorded, capture_done
                     try:
@@ -511,6 +530,8 @@ class ModelUsage:
         try:
             for client in self._clients:
                 http = client._client
+                for channel in list(http._ceobench_model_sockets):
+                    attempt.watch_socket(channel)
                 previous = getattr(http, '_ceobench_lifecycle', None)
                 attempt.watch_client(client)
                 hooks.append((http, http.event_hooks['request'][-1], previous))
