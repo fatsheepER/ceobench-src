@@ -7637,7 +7637,8 @@ Guidelines:
         _timings['process_billing'] = _time.monotonic() - _t0
 
         # Process costs
-        costs = self._process_costs(config, total_usage, usage_per_plan)
+        costs = (self._process_costs(config, total_usage, usage_per_plan)
+                 + new_leads * self.config.lead_acquisition_cost)
 
 
         # Social media — PHASE 2: collect LLM results and write to DB
