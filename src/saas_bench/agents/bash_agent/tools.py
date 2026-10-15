@@ -355,8 +355,8 @@ class BashAgentToolExecutor:
             env: Extra environment variables for bash commands.
             bash_timeout: Timeout in seconds for bash commands (default 20 min).
             bash_warn_after: Optional completed-command timing notice threshold.
-            bash_memory_limit_bytes: Per-process address-space limit, default 1 GiB or
-                CEOBENCH_BASH_MEMORY_MAX_BYTES. Descendants inherit the hard limit.
+            bash_memory_limit_bytes: Per-process address-space limit, default 8 GiB or
+                CEOBENCH_BASH_MEMORY_MAX_BYTES. Zero leaves the inherited limit unchanged.
         """
         self.audit = audit
         self.identity = identity

@@ -9,18 +9,21 @@ import time
 import tempfile
 import uuid
 
-DEFAULT_MEMORY_LIMIT_BYTES = 1024**3
+DEFAULT_MEMORY_LIMIT_BYTES = 8 * 1024**3
 
 
 def command_memory_limit(value=None):
     if value is None:
         value = os.environ.get('CEOBENCH_BASH_MEMORY_MAX_BYTES', str(DEFAULT_MEMORY_LIMIT_BYTES))
-        try:
-            value = int(value)
-        except ValueError:
-            raise ValueError('Bash memory limit must be a positive integer in bytes') from None
-    if type(value) is not int or value < 32 * 1024**2:
-        raise ValueError('Bash memory limit must be an integer of at least 32 MiB')
+        if str(value).lower() in ('none', 'max', 'infinity', 'unlimited'):
+            value = 0
+        else:
+            try:
+                value = int(value)
+            except ValueError:
+                raise ValueError('Bash memory limit must be bytes, or unlimited') from None
+    if type(value) is not int or value != 0 and value < 32 * 1024**2:
+        raise ValueError('Bash memory limit must be at least 32 MiB, or 0 for unlimited')
     return value
 
 # This code runs inside the same sandbox as Bash, with no engine imports.
@@ -56,10 +59,11 @@ try:
         if libc.prctl(36, 1, 0, 0, 0):
             raise OSError(ctypes.get_errno(), 'Cannot supervise descendants')
     # Set limits here, never in preexec_fn in the threaded host worker.
-    hard_limit = resource.getrlimit(resource.RLIMIT_AS)[1]
-    if hard_limit != resource.RLIM_INFINITY:
-        memory_limit = min(memory_limit, hard_limit)
-    resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    if memory_limit:
+        hard_limit = resource.getrlimit(resource.RLIMIT_AS)[1]
+        if hard_limit != resource.RLIM_INFINITY:
+            memory_limit = min(memory_limit, hard_limit)
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     proc = subprocess.Popen(['bash', '-c', command])
     if verified:

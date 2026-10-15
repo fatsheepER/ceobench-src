@@ -109,7 +109,7 @@ dict.fromkeys(range(10**9))
     store.assert_healthy()
 
 
-@pytest.mark.parametrize('value', [0, -1, True, 1.5, 'bad'])
+@pytest.mark.parametrize('value', [-1, True, 1.5, 'bad'])
 def test_invalid_bash_memory_limit_is_rejected(tmp_path, value):
     with pytest.raises(ValueError, match='memory'):
         BashAgentToolExecutor(tmp_path, bash_memory_limit_bytes=value)
