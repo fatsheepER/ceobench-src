@@ -368,6 +368,13 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     ref = dict(evidence={'sql': sql}, purpose='current', predicate=dict(type='compare',
                left={'row': {'channel': 'search'}, 'col': 'cost'}, op='<',
                right={'row': {'channel': 'social'}, 'col': 'cost'}))
+    footer = re.search(r'\[pf: (cmd\d+@v1) \| (query\d+@v1)\]', result)
+    assert footer, result
+    refused = executor.execute('text_create', declaration(references=[dict(ref, evidence={'version': footer[1]})]))
+    assert 'For a condition, cite ' + footer[2] + ' with row/col' in refused, refused
+    recovery = re.search(r'```bash\n(.*?)\n```', refused, re.S)[1]
+    assert recovery == f'pf show {footer[2]} --full'
+    send(store, executor.execute('bash', dict(command=recovery)))
     registered = call(registry, 'create', **declaration(references=[ref]))
     assert re.fullmatch(r'query\d+@v1', registered['evidence'][0]['version'])
     binding = store.load_state('declaration:r1.1')['references'][0]
@@ -388,6 +395,21 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     send(store, output)
     with pytest.raises(ValueError, match='not been delivered'):
         call(registry, 'create', **declaration({'sql': hidden_sql}))
+    multi = executor.execute('bash', {'command': 'python -c ' + shlex.quote(
+        "import novamind_api as n; n.query('SELECT 11 AS n'); n.query('SELECT 22 AS n'); print('summary')")})
+    assert not re.search(r'\[pf: .*\| query\d+', multi), multi
+    command_handle = re.search(r'\[pf: (cmd\d+@v1)', multi)[1]
+    ref = dict(evidence={'version': command_handle}, select={'col': 'n'},
+               predicate=dict(type='threshold', op='>', value=0))
+    rejected = executor.execute('text_create', declaration(references=[ref]))
+    recovery = re.search(r'```bash\n(.*?)\n```', rejected, re.S)[1].splitlines()
+    assert len(recovery) == 2, rejected
+    assert all(re.fullmatch(r'pf show query\d+@v1 --full', command) for command in recovery)
+    shown = executor.execute('bash', dict(command=recovery[-1]))
+    assert json.loads(shown.split('\n', 1)[1])['rows'] == [{'n': 22}]
+    send(store, shown)
+    ref['evidence'] = {'version': recovery[-1].split()[2]}
+    assert call(registry, 'create', **declaration(references=[ref]))['id'] == 'r2'
 
 
 def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, server, packed_public):

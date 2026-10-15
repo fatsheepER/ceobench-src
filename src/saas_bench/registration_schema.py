@@ -54,6 +54,14 @@ class Compare(Input):
     op: Literal['>', '>=', '<', '<=']
     right: Selector
 
+    @model_validator(mode='before')
+    @classmethod
+    def table_cells(cls, data):
+        if isinstance(data, dict) and any(isinstance(data.get(side), dict) and
+                                         'path' in data[side] for side in ('left', 'right')):
+            raise ValueError('compare requires row/col on both left and right; JSON paths are not supported')
+        return data
+
 
 CITE_FORMS = dict(
     git='a workspace file path (the version this week\'s closing commit week-N will store), path@week-N or '
@@ -173,8 +181,6 @@ def _declaration_models(pf):
             if self.predicate is not None and self.predicate.type == 'compare':
                 if self.select is not None:
                     raise ValueError('compare uses left/right selectors, not select')
-                if self.predicate.left.path is not None or self.predicate.right.path is not None:
-                    raise ValueError('compare requires two cells of one query result')
                 if 'path' in evidence or 'record' in evidence:
                     raise ValueError('compare requires a query view')
             elif self.predicate is not None and self.select is None:
@@ -348,7 +354,10 @@ def tool_definitions(pf=False, team=False):
                 'separately. Selected fields require a read in this request or your current-context write. Without '
                 'select/predicate, checks compare whole content; select alone checks equality. Use table row/col '
                 'selectors or JSON Pointer path. Threshold/tolerance require select; compare uses left/right table '
-                'selectors within one query. Script stdout and plain text support whole-content equality only. '
+                'selectors within one query. To find query handles behind a receipt, run '
+                '`pf depend <receipt-handle> --detail`, then cite a listed query handle with row/col. '
+                'Read that query with `pf show <query-handle> --full` alone before registering selected fields. '
+                'Script stdout and plain text support whole-content equality only. '
                 'Format-only example; use observed evidence and intended days.\n'
                 'Example request:\n```json\n{"text":"The selected metric is at least '
                 '0.5.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"query1@v1","select":{"row":{"group_id":"EXAMPLE_GROUP"},"col":"metric"},"predicate":{"type":"threshold","op":">=","value":0.5}}],"applies":"7-13","reason":"Track'

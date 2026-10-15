@@ -192,9 +192,9 @@ class PFQueries:
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
                 ON json_extract(r.request, '$.parent_event_id')=c.event_id
                 WHERE json_extract(r.request, '$.kind') NOT GLOB 'pf_*')
-                SELECT count(*) FROM versions v JOIN requests r USING(event_id)
+                SELECT v.version_id,r.query_id FROM versions v JOIN requests r USING(event_id)
                 WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
-                ''', (capture.event,)).fetchone()[0]
+                ORDER BY r.rowid''', (capture.event,)).fetchall()
             scripts = conn.execute('''SELECT r.event_id || ':stdout' FROM requests r
                 WHERE json_extract(r.request, '$.parent_event_id')=? AND json_extract(r.request, '$.kind')='cli_python'
                 AND json_extract(r.request, '$.request.script') IS NOT NULL ORDER BY r.rowid''',
@@ -230,7 +230,9 @@ class PFQueries:
             if printed:
                 output += ', with ' + ' and '.join(('' if full else 'part of ') + self.resolver.handle(v)
                                                    for v, full, _ in printed)
-        line = '[pf: ' + ' | '.join([output] + wrote + noted) + ']'
+        queries = [row['version_id'] for row in observed if row['query_id']]
+        query = [self.resolver.handle(queries[0])] if len(queries) == 1 else []
+        line = '[pf: ' + ' | '.join([output] + query + wrote + noted) + ']'
         return body + '\n' + line + ''.join('\n' + line for line in shown_files)
 
     def _noted(self, version):

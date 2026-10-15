@@ -387,6 +387,25 @@ class EvidenceResolver:
                                    if not read['complete'] else ''))
         return ValueError(message)
 
+    def _query_condition_error(self, version):
+        meta, _ = self.content(version)
+        with closing(self.store.connect()) as conn:
+            queries = conn.execute('''WITH RECURSIVE children(event_id) AS (
+                SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
+                ON json_extract(r.request, '$.parent_event_id')=c.event_id
+                WHERE json_extract(r.request, '$.kind') NOT GLOB 'pf_*')
+                SELECT v.version_id FROM versions v JOIN requests r USING(event_id)
+                WHERE r.event_id IN children AND r.query_id IS NOT NULL
+                AND json_extract(v.metadata, '$.layer')='server_public_response' ORDER BY r.rowid''',
+                (meta['created_by_event'],)).fetchall()
+        handles = evidence_handles.index(self.store)
+        names = list(dict.fromkeys(self.handle(row[0]) for row in queries if row[0] in handles.info))
+        if names:
+            return ValueError('Command receipts and script stdout support whole-content equality only. '
+                'For a condition, cite ' + ', '.join(names) + ' with row/col. Read the query first, '
+                'then retry with its handle:\n```bash\n' +
+                '\n'.join(shlex.join(['pf', 'show', name, '--full']) for name in names) + '\n```')
+
     def resolve(self, evidence, reference, accept=None):
         if getattr(self, '_binding_context', None) is None:
             with self.binding_scope():
@@ -450,6 +469,10 @@ class EvidenceResolver:
         scope = self._request_sources()
         selectors = ([predicate['left'], predicate['right']] if predicate.get('type') == 'compare'
                      else [reference.get('select')])
+        if kind == 'other' and any(selectors):
+            query_error = self._query_condition_error(candidates[0])
+            if query_error:
+                raise query_error
         if predicate.get('type') == 'compare' and kind != 'query':
             raise ValueError('compare requires one query view')
         if kind in ('file', 'other') and not str(object_id).endswith(('.csv', '.json')) and any(selectors):

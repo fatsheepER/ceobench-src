@@ -57,6 +57,8 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
                 assert 'alone, without a pipe' in system
                 assert 'within their applies window' in system if role == 'ceo' else 'Within its applies window' in system
                 assert description.count('Example request:') == 1
+                assert '`pf depend <receipt-handle> --detail`' in description
+                assert 'then cite a listed query handle with row/col' in description
                 PF_CREATE.model_validate(example(description))
             else:
                 assert '## PF evidence' not in system
@@ -70,6 +72,18 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
             if mode == 'pf':
                 for verb in ('rdepend', 'depend', 'more'):
                     assert f'- {verb}:' in history
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('path', ['/rows/0/n', '$.rows[0].n'])
+def test_compare_json_path_error_gives_table_selector_fix(side, path):
+    from pydantic import ValidationError
+    predicate = dict(type='compare', left={'col': 'n'}, op='<', right={'col': 'm'})
+    predicate[side] = dict(path=path)
+    args = dict(text='Compare cells', objects=[dict(kind='plan', id='B')],
+                references=[dict(cite='query1@v1', predicate=predicate)], applies='7-', reason='Review')
+    with pytest.raises(ValidationError, match='row/col on both left and right; JSON paths are not supported'):
+        PF_CREATE.model_validate(args)
 
 
 def test_d0_prompt_example_runs_and_full_help_reaches_all_role_wires():

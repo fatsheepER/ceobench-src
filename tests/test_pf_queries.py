@@ -365,11 +365,10 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert not any(t['name'].startswith('pf_') for t in child.agent.tool_descriptions)
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        # The return and the written file are named; the queries behind them are traced, not listed.
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| wrote query\.json@v1\]$', output), output
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote query\.json@v1\]$', output), output
         # A non-zero exit still delivered the SQL result and wrote the file.
         failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| wrote failed\.json@v1\]$', failed), failed
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote failed\.json@v1\]$', failed), failed
         assert 'SELECT' not in output.rsplit('\n', 1)[1]
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
@@ -464,7 +463,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
               "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
     runner._execute_tool('bash', {'command': script})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
-    footer = re.search(r'\n\[pf: (calc\.py\.out@v1)\]$', output)
+    footer = re.search(r'\n\[pf: (calc\.py\.out@v1) \| query\d+@v1\]$', output)
     assert footer and 'ledger rows:' in output, output
     store = runner.evidence_store
     settled_request = send(store, output)
@@ -472,6 +471,11 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     # The raw query result never reached the model, so SQL alone is still refused, with a pointer.
     refused = runner._execute_tool('text_create', declaration({'sql': 'SELECT COUNT(*) AS n FROM ledger'}))
     assert refused.startswith('Error:') and 'first handle in its [pf: ...] line' in refused, refused
+    refused_condition = runner._execute_tool('text_create', declaration(references=[dict(
+        evidence={'version': footer.group(1)}, select={'col': 'n'},
+        predicate=dict(type='threshold', op='>=', value=0))]))
+    assert 'For a condition, cite query' in refused_condition, refused_condition
+    assert re.search(r'pf show query\d+@v1 --full', refused_condition), refused_condition
     created = runner._execute_tool('text_create', declaration({'version': footer.group(1)}))
     assert created.startswith('Registered r1.1 (active).\nCited: calc.py.out@v1 (day 0)'), created
     assert runner.tool_executor.text_registry.last_result['evidence'][0]['version'] == footer.group(1)
@@ -488,7 +492,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     # Running the same script again with the same printed output keeps the handle; a
     # different output is its next version, whatever the surrounding command looks like.
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py 2>&1 | head -5'})
-    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\)\]$', output), output
+    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\) \| query\d+@v1\]$', output), output
     runner._execute_tool('bash', {'command': "printf 'print(2)\\nprint(3)\\n' > calc.py"})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py | head -1'})
     assert re.search(r'\[pf: cmd\d+@v1, with part of calc\.py\.out@v2\]$', output), output
