@@ -719,7 +719,11 @@ def hold_attempt(team, entry, directory, record, reason):
         detail = 'No valid reply after 4 model requests in this turn; manual checkpoint resume required'
     elif team.failure == 'model_request_failed':
         detail = 'Model request failed; network errors receive 5 attempts (10/20/40/80 seconds). ' + detail
-    elif team.failure in ('business_operation_unknown', 'world_operation_failed', 'business_operation_pending'):
+    elif team.failure == 'world_operation_failed':
+        detail = 'World advancement failed or timed out; progress is recorded in the operation receipts. ' + detail
+    elif team.failure == 'business_operation_pending':
+        detail = 'Business operation is still running; waiting for its terminal receipt. ' + detail
+    elif team.failure == 'business_operation_unknown':
         detail = 'Business operation outcome cannot be confirmed. ' + detail
     record.update(hold=True, hold_detail=detail)
     notice = dict(reason=team.failure or reason, detail=detail, manual_resume_required=True,

@@ -81,6 +81,11 @@ def recovery_operation_safe(root, receipt, *, allow_workspace_rollback=False):
 def _known_operation(root):
     for path in (Path(root) / 'private' / 'operations').glob('*.json'):
         receipt = json.loads(path.read_text())
+        if receipt.get('status') == 'failed' and (
+                receipt.get('kind') == 'api:advance' and receipt.get('advance', {}).get('status') == 'failed' or
+                receipt.get('recovery', {}).get('classification') == 'known_advance_failure' and
+                receipt.get('recovery', {}).get('client_closed') is True and receipt.get('advance_operations')):
+            continue
         if receipt.get('status') != 'completed' and not recovery_operation_safe(root, receipt):
             raise BusinessOutcomeUnknown('Business operation outcome unknown; HOLD for manual checkpoint resume')
 
@@ -167,6 +172,8 @@ def checkpoint(runtime, destination=None):
             raise RuntimeError('Public HTTP operation is still in flight')
         _known_operation(runtime.root)
         if server._operation_failed or server._step_day_timed_out:
+            if server._advance_outcome is not None:
+                raise RuntimeError('World advancement failed or timed out; restore a previous checkpoint')
             raise BusinessOutcomeUnknown('World operation outcome unknown; HOLD for manual checkpoint resume')
         for role in runtime.roles.values():
             if role.store:

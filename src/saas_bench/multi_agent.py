@@ -86,6 +86,8 @@ class MultiAgentRuntime:
         self.effective_end = total_days // 7 * 7
         self._lifecycle = WorkerLifecycle()
         self._message_lock = threading.Lock()
+        self._operation_lock = threading.RLock()
+        self._pending_operations = None
         self.messages = []
         self.failure = None
         self._pool = None
@@ -171,6 +173,7 @@ class MultiAgentRuntime:
         for runtime in self.roles.values():
             runtime.usage.request_check = self._check_model_send
         self._guard_business_operations()
+        self.server.request_finished_callback = self._settle_pending_operations
         for runtime in self.roles.values():
             if runtime.executor.pf_queries:
                 from .pf_refresh import refresh
@@ -278,12 +281,23 @@ class MultiAgentRuntime:
             preserved_process=bool(executor.preserved_process),
             pf_service_open=bool(getattr(executor, '_pf_service', None))) if executor else None)
 
-    def _finish_operation(self, path, executor=None):
+    def _finish_operation(self, path, executor=None, *, advance_outcome=None):
+        with self._operation_lock:
+            return self._settle_operation(path, executor, advance_outcome=advance_outcome)
+
+    def _settle_operation(self, path, executor=None, *, advance_outcome=None):
         state = json.loads(path.read_text())
         finalization = self._operation_finalization(executor)
-        if state['status'] in ('completed', 'interrupted'):
+        if state['status'] in ('completed', 'interrupted', 'failed'):
             if 'finalization' in state and state['finalization'] != finalization:
                 raise RuntimeError('Conflicting operation finalization')
+            if advance_outcome is not None and state.get('advance') != advance_outcome:
+                raise RuntimeError('Conflicting operation finalization')
+            return
+        if advance_outcome is not None:
+            write_json(path, dict(state, status=advance_outcome['status'], advance=advance_outcome))
+            return
+        if state['kind'] == 'api:advance':
             return
         if state.get('wrapper_version') == 1 and executor:
             state['finalization'] = finalization
@@ -314,12 +328,29 @@ class MultiAgentRuntime:
                     operation_failed=self.server._operation_failed, step_day_timed_out=self.server._step_day_timed_out)
                 state['status'] = 'interrupted' if status == 'result_unknown' else 'completed'
                 state['execution_status'] = status
+                changed = {name: json.loads((path.parent / name).read_text())
+                    for name, sha in state['recovery']['business_operations_after'].items()
+                    if state['business_operations_before'].get(name) != sha}
+                advances = {name: child for name, child in changed.items() if child['kind'] == 'api:advance'}
                 if requests['queued'] or any(request.get('read_only') is not True and
-                        request.get('outcome_known') is not True for request in requests['active']):
+                        request.get('outcome_known') is not True for request in requests['active']) or any(
+                        child['status'] == 'running' for child in advances.values()) or (advances and requests['active']):
                     state['status'] = 'running'
                     state['recovery']['classification'] = 'pending_business_write'
                     write_json(path, state)
+                    if self._pending_operations is not None:
+                        self._pending_operations.add(path)
                     raise RunCancelled('business_operation_pending')
+                known_advance = (advances and all(child['status'] in ('completed', 'failed') and
+                    child.get('advance', {}).get('status') == child['status'] for child in advances.values()) and
+                    all(child['status'] == 'completed' or child in advances.values() for child in changed.values()))
+                if (known_advance and client_closed and not requests['active'] and
+                        (self.server._operation_failed or self.server._step_day_timed_out or status == 'result_unknown')):
+                    state['recovery']['classification'] = 'known_advance_failure'
+                    state['advance_operations'] = {name: child['advance'] for name, child in advances.items()}
+                    write_json(path, dict(state, status='failed'))
+                    self._lifecycle.cancel('world_operation_failed')
+                    raise RunCancelled(self._lifecycle.reason)
                 if (state['kind'] == 'ceo_scripts' and client_closed and not requests['active'] and
                         not requests['queued'] and not self.server._operation_failed and
                         not self.server._step_day_timed_out and
@@ -355,6 +386,7 @@ class MultiAgentRuntime:
                     result = execute(tool, args, role=role)
                 except BaseException:
                     server._operation_failed = True
+                    server._advance_outcome = None
                     raise
                 self._finish_operation(operation)
                 return result
@@ -363,11 +395,66 @@ class MultiAgentRuntime:
                 return advance(*args, role=role, **kwargs)
             with server._lock:
                 server.authorize_team(role, 'advance')
+                if server._operation_failed or server._step_day_timed_out:
+                    return advance(*args, role=role, **kwargs)
                 operation = self._begin_operation('api:advance')
-            result = advance(*args, role=role, **kwargs)
-            self._finish_operation(operation)
-            return result
+            settlement = None
+
+            def settled(outcome):
+                nonlocal settlement
+                settlement = outcome
+                self._finish_operation(operation, advance_outcome=outcome)
+                self._settle_pending_operations()
+
+            try:
+                return advance(*args, role=role, on_settled=settled, **kwargs)
+            except Exception as exc:
+                if settlement is not None:
+                    self._finish_operation(operation, advance_outcome=settlement)
+                    raise
+                old_day = json.loads(operation.read_text())['day']
+                outcome = dict(status='failed', old_day=old_day, target_day=old_day + 7,
+                    reached_day=old_day, last_completed_day=old_day, progression='not_advanced',
+                    error=type(exc).__name__ + ': ' + str(exc))
+                self._finish_operation(operation, advance_outcome=outcome)
+                server._operation_failed, server._advance_outcome = True, outcome
+                if isinstance(exc, PermissionError):
+                    raise
+                return dict(success=False, error='advance_week_failed', message=outcome['error'],
+                    day=server.tools.current_day, advance=outcome)
+            finally:
+                self._finish_operation(operation)
         server.execute_tool, server.advance_week = guarded_execute, guarded_advance
+
+    def _settle_pending_operations(self):
+        finished = []
+        with self._operation_lock:
+            if self._pending_operations is None:
+                self._pending_operations = {path for path in (self.root / 'private/operations').glob('*.json')
+                    if json.loads(path.read_text()).get('recovery', {}).get('classification') == 'pending_business_write'}
+            for path in tuple(self._pending_operations):
+                state = json.loads(path.read_text())
+                if (state.get('status') != 'running' or
+                        state.get('recovery', {}).get('classification') != 'pending_business_write'):
+                    self._pending_operations.discard(path)
+                    continue
+                executor = (self.server.role_executors['ceo'] if state['kind'] == 'ceo_scripts' else
+                            self.roles['ceo'].executor)
+                if state.get('finalization') != self._operation_finalization(executor):
+                    continue
+                try:
+                    self._finish_operation(path, executor)
+                except BusinessOutcomeUnknown:
+                    pass
+                except RunCancelled as exc:
+                    if (str(exc) != 'business_operation_pending' and
+                            json.loads(path.read_text()).get('status') not in ('completed', 'interrupted', 'failed')):
+                        raise
+                else:
+                    finished.append(state)
+                if not path.exists() or json.loads(path.read_text()).get('status') != 'running':
+                    self._pending_operations.discard(path)
+        return finished
 
     def request_pause(self):
         self._lifecycle.cancel()
@@ -691,20 +778,7 @@ class MultiAgentRuntime:
                 runtime.executor.api_socket = None
             for executor in self.server.role_executors.values():
                 executor.api_socket = None
-            for path in (self.root / 'private/operations').glob('*.json'):
-                state = json.loads(path.read_text())
-                if (state.get('status') != 'running' or
-                        state.get('recovery', {}).get('classification') != 'pending_business_write'):
-                    continue
-                executor = (self.server.role_executors['ceo'] if state['kind'] == 'ceo_scripts' else
-                            self.roles['ceo'].executor)
-                if state.get('finalization') != self._operation_finalization(executor):
-                    continue
-                try:
-                    self._finish_operation(path, executor)
-                except BusinessOutcomeUnknown:
-                    pass
-                else:
-                    if self._stage == 'ceo' and state['day'] < self.server.tools.current_day:
-                        self._close_week()
+            for state in self._settle_pending_operations():
+                if self._stage == 'ceo' and state['day'] < self.server.tools.current_day:
+                    self._close_week()
         self._sockets.cleanup()

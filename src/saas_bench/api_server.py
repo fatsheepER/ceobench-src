@@ -945,6 +945,8 @@ class _TrackedHTTPServer(ThreadingHTTPServer):
             with api._request_lock:
                 api._active_requests.pop(id(request), None)
                 api._request_lock.notify_all()
+            if api.request_finished_callback:
+                api.request_finished_callback()
 
 
 def registered_script_classification(facts, error=None):
@@ -1039,11 +1041,13 @@ class NovaMindAPIServer:
         self._sql_lock = threading.Condition()
         self._request_lock = threading.Condition()
         self._active_requests = {}
+        self.request_finished_callback = None
         self._request_mutations = 0
         self._sql_active = 0
         self._sql_paused = False
         self._advance_lock = threading.Lock()
         self._operation_failed = False
+        self._advance_outcome = None
         self.checkpoint_callback = None
         self.checkpoint_token = checkpoint_token
         self._last_dashboard: str = ""
@@ -1104,15 +1108,18 @@ class NovaMindAPIServer:
 
     def stop(self):
         """Stop the HTTP server."""
-        for httpd in self._role_httpds:
+        for httpd in list(self._role_httpds):
             httpd.shutdown()
-            httpd.server_close()
+            with self._request_lock:
+                self._role_httpds.remove(httpd)
+                httpd.server_close()
             os.unlink(httpd.server_address)
-        self._role_httpds.clear()
         if self._httpd:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
+            httpd = self._httpd
+            httpd.shutdown()
+            with self._request_lock:
+                self._httpd = None
+                httpd.server_close()
 
     def public_request_state(self):
         with self._request_lock:
@@ -1208,6 +1215,8 @@ class NovaMindAPIServer:
                         if self.sql_evidence is not None:
                             self.sql_evidence.assert_healthy()
                         if self._operation_failed or self._step_day_timed_out:
+                            if self._advance_outcome is not None:
+                                raise RuntimeError('World advancement failed or timed out; restore a previous checkpoint')
                             raise RuntimeError('Operation outcome unknown; checkpoint refused')
                         if expected_day != self.tools.current_day:
                             raise ValueError('Checkpoint day mismatch')
@@ -1224,28 +1233,65 @@ class NovaMindAPIServer:
         finally:
             self._advance_lock.release()
 
-    def advance_week(self, predictions=None, rationale=None, *, role="ceo"):
+    def advance_week(self, predictions=None, rationale=None, *, role="ceo", on_settled=None):
         require_advance(role)
         with self._lock:
             self.authorize_team(role, 'advance')
             with self._request_lock:
                 self._request_mutations += 1
+            old_day = self.tools.current_day
         if not self._advance_lock.acquire(blocking=False):
             raise RuntimeError('Week advancement already in progress')
+
+        def settle(*, result=None, error=None):
+            reached = getattr(self.simulator, 'current_day', self.tools.current_day)
+            completed = result.day if result is not None else old_day
+            evidence_error = None
+            if result is None and self.conn is not None:
+                try:
+                    row = self.conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()
+                    if row:
+                        completed = json.loads(row[0])['_sim_state']['current_day']
+                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                    completed, evidence_error = None, type(exc).__name__ + ': ' + str(exc)
+            outcome = dict(status='failed' if error is not None else 'completed',
+                old_day=old_day, target_day=old_day + 7, reached_day=reached,
+                last_completed_day=completed,
+                progression='not_advanced' if reached <= old_day else
+                    'complete' if completed is not None and completed >= old_day + 7 else 'partial',
+                error=type(error).__name__ + ': ' + str(error) if error is not None else None)
+            if evidence_error:
+                outcome['progress_evidence_error'] = evidence_error
+            if on_settled:
+                on_settled(outcome)
+            self._advance_outcome = outcome
+
         try:
             if self._operation_failed or self._step_day_timed_out:
+                if self._advance_outcome is not None:
+                    raise RuntimeError('Previous week advancement failed or timed out; restore a previous checkpoint')
                 raise RuntimeError('Previous operation outcome unknown; continuation refused')
-            return self._advance_week(predictions, rationale)
+            self._advance_outcome = None
+            result = self._advance_week(predictions, rationale, on_settled=settle)
+            if self._advance_outcome is None and result.get('error') != 'step_week_timeout':
+                self._operation_failed = True
+                settle(error=RuntimeError(result.get('error', 'Advance did not complete')))
+            return dict(result, advance=self._advance_outcome)
         except PermissionError:
             raise
-        except Exception:
+        except Exception as exc:
             self._operation_failed = True
-            raise
+            step_failed = self._advance_outcome is not None and self._advance_outcome['status'] == 'failed'
+            if self._advance_outcome is None:
+                settle(error=exc)
+            return dict(success=False, error='step_week_failed' if step_failed else 'advance_week_failed',
+                message=type(exc).__name__ + ': ' + str(exc), day=self.tools.current_day,
+                advance=self._advance_outcome)
         finally:
             self._advance_lock.release()
 
     def _advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
-                     rationale: Optional[str] = None) -> Dict[str, Any]:
+                     rationale: Optional[str] = None, *, on_settled=None) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
         Enforces a hard timeout (STEP_WEEK_TIMEOUT seconds) on step_week().
@@ -1318,6 +1364,7 @@ class NovaMindAPIServer:
 
         def _do_step():
             with self._lock:
+                result, error = None, None
                 try:
                     # Publish the new world and day together, including shocks.
                     if self.shock_manager:
@@ -1333,10 +1380,14 @@ class NovaMindAPIServer:
                     if self.team_mode and self.team_phase is not None:
                         self.team_phase = 'boundary'
                     return result
-                except Exception:
+                except BaseException as exc:
                     # Readers must see the failure before this lock is released.
                     self._operation_failed = True
+                    error = exc
                     raise
+                finally:
+                    if on_settled:
+                        on_settled(result=result, error=error)
 
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_do_step)
