@@ -22,14 +22,18 @@ def latest_checkpoint(entry, previous=None, week=None):
     root = Path(entry['output_dir']).resolve()
     history = sorted(root.glob('attempt-*'), key=lambda path: int(path.name.removeprefix('attempt-')))
     latest = previous or {}
+    lineage_attempt = history[-1] if history else root
     for attempt in history:
         record = attempt / 'attempt.json'
         if not record.exists():
             continue
         try:
             state = json.loads(record.read_text())
-            if attempt == history[-1]:
-                latest = state
+            if not isinstance(state, dict):
+                raise ValueError('Attempt metadata is not a mapping')
+            if state.get('reason') == 'missing_checkpoint' and state.get('execution_started') is False:
+                continue
+            latest, lineage_attempt = state, attempt
         except (OSError, ValueError, AttributeError) as exc:
             logging.warning('Recovery could not read attempt metadata %s: %s', record, exc)
     requested = {}
@@ -47,7 +51,7 @@ def latest_checkpoint(entry, previous=None, week=None):
         snapshot for attempt in history for snapshot in (attempt / 'runtime/checkpoints').glob('*')
         if snapshot.is_dir() and not snapshot.name.startswith('.')]
     if not requested and week is None and history and latest.get('source_checkpoint'):
-        candidates = [snapshot for snapshot in (history[-1] / 'runtime/checkpoints').glob('*')
+        candidates = [snapshot for snapshot in (lineage_attempt / 'runtime/checkpoints').glob('*')
             if snapshot.is_dir() and not snapshot.name.startswith('.')] + [Path(latest[key])
             for key in ('checkpoint', 'source_checkpoint') if latest.get(key)]
         candidates = list(dict.fromkeys(candidates))

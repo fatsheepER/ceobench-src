@@ -76,6 +76,22 @@ def test_invalid_latest_checkpoint_is_reported_and_selected(tmp_path, caplog):
     assert 'checksum mismatch' in caplog.text
 
 
+def test_missing_selection_preserves_previous_recovery_lineage(tmp_path):
+    entry = dict(run_id='pf-1', output_dir=str(tmp_path / 'pf'))
+    first = Path(entry['output_dir']) / 'attempt-001'
+    selected = snapshot(first / 'runtime/checkpoints/past', entry['run_id'], '2026-10-15T01:00:00+00:00')
+    future = snapshot(first / 'runtime/checkpoints/future', entry['run_id'], '2026-10-15T02:00:00+00:00', day=70)
+    resumed = Path(entry['output_dir']) / 'attempt-002'
+    write_json(resumed / 'attempt.json', dict(status='paused', source_checkpoint=str(selected), checkpoint=str(selected)))
+    assert recovery.latest_checkpoint(entry) == selected
+    write_json(Path(entry['output_dir']) / 'attempt-003/attempt.json',
+        dict(status='paused', reason='missing_checkpoint', execution_started=False))
+    assert recovery.latest_checkpoint(entry) == selected
+    progressed = snapshot(resumed / 'runtime/checkpoints/new', entry['run_id'], '2026-10-15T03:00:00+00:00', day=28)
+    assert recovery.latest_checkpoint(entry) == progressed
+    assert recovery.latest_checkpoint(entry, week=11) == future
+
+
 def test_checkpoint_discovery_survives_incomplete_attempt_metadata(tmp_path, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     first = Path(entry['output_dir']) / 'attempt-001'
