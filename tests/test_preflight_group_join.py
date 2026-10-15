@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -120,6 +121,115 @@ def test_group_join_reaps_worker_and_launches_while_peer_runs(observer, controll
     before = list(launches)
     controller.module.supervise(controller.policy)
     assert launches == before
+
+
+@pytest.mark.parametrize('observation_failure', [
+    'none', 'error', 'unknown', 'persistent_error', 'persistent_unknown', 'stop'])
+def test_resume_kills_previous_worker_after_45_seconds_and_confirms_exit(
+        observer, controller, monkeypatch, tmp_path, observation_failure):
+    signal_previous = controller.module.signal_scope
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    module = controller.module
+    ready = tmp_path / 'old-worker-ready'
+    old = subprocess.Popen([sys.executable, '-c',
+        'import pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).touch(); time.sleep(60)', str(ready)], start_new_session=True)
+    sleep, monotonic = time.sleep, time.monotonic
+    try:
+        deadline = monotonic() + 5
+        while not ready.exists() and monotonic() < deadline:
+            sleep(.01)
+        assert ready.exists()
+        entry = module.batch.selected(observer.manifest, 's101-pf')
+        write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json',
+            dict(status='paused', attempt=1, day=0))
+        previous = dict(unit='previous.scope', invocation_id='previous',
+            control_group='/offline/previous', scope_empty=False)
+        write_json(controller.policy.parent / 'controller-units.json', {'s101-pf': previous})
+        scope, send, launch, run = (module.scope_state, module.signal_scope,
+            module.subprocess.Popen, module.subprocess.run)
+        started, elapsed, signals, observations = monotonic(), [0], [], []
+
+        def clock():
+            return monotonic() + elapsed[0]
+
+        def pause(_):
+            elapsed[0] += 5
+            sleep(.01)
+
+        def observe(saved, **kwargs):
+            if saved['unit'] != previous['unit']:
+                return scope(saved, **kwargs)
+            observations.append(clock() - started)
+            if observation_failure == 'error' and len(observations) == 1:
+                raise OSError('temporary scope observation failure')
+            if observation_failure == 'stop' and len(observations) == 1:
+                (controller.policy.parent / 'STOP').touch()
+                raise OSError('scope observation failed while operator stopped')
+            if observation_failure == 'unknown' and len(observations) == 1:
+                return dict(previous, scope_empty=True, scope_observation_unknown=True)
+            if clock() - started < 60:
+                if observation_failure == 'persistent_error':
+                    raise OSError('persistent scope observation failure')
+                if observation_failure == 'persistent_unknown':
+                    return dict(previous, scope_empty=True, scope_observation_unknown=True)
+            empty = old.poll() is not None and clock() - started >= 50
+            return dict(previous, scope_empty=empty)
+
+        def stop(saved, signum):
+            if saved['unit'] != previous['unit']:
+                return send(saved, signum)
+            return signal_previous(saved, signum)
+
+        def command(argv, **kwargs):
+            if argv[:3] == ['systemctl', '--user', 'kill'] and argv[-1] == previous['unit']:
+                signum = signal.Signals[next(arg.split('=', 1)[1] for arg in argv if arg.startswith('--signal='))]
+                signals.append((signum, clock() - started))
+                try:
+                    os.killpg(old.pid, signum)
+                except ProcessLookupError:
+                    return subprocess.CompletedProcess(argv, 1, stdout='', stderr='already exited')
+                return subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
+            return run(argv, **kwargs)
+
+        def start(command, **kwargs):
+            if '--worker' in command:
+                assert old.poll() == -signal.SIGKILL
+                events = [json.loads(line) for line in (
+                    controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
+                assert any(row['event'] == 'previous_scope_closed' for row in events)
+            return launch(command, **kwargs)
+
+        monkeypatch.setattr(module.time, 'monotonic', clock)
+        monkeypatch.setattr(module.time, 'sleep', pause)
+        monkeypatch.setattr(module, 'scope_state', observe)
+        monkeypatch.setattr(module, 'signal_scope', stop)
+        monkeypatch.setattr(module.subprocess, 'run', command)
+        monkeypatch.setattr(module.subprocess, 'Popen', start)
+        module.supervise(controller.policy, resume=True, run_id='s101-pf', week=1, force_resume=True)
+        if observation_failure == 'stop':
+            assert launches == [] and signals == []
+            assert old.poll() is None
+            assert not (Path(entry['output_dir']) / 'attempt-002').exists()
+            receipt = module.batch.read(controller.policy.parent / 'controller-exit.json')
+            assert receipt['operator_stopped'] and not receipt['children_reaped']
+            return
+        assert launches == ['s101-pf']
+        assert signals[0][0] == signal.SIGTERM
+        assert all(signum == signal.SIGKILL for signum, _ in signals[1:])
+        assert 45 <= signals[1][1] < 50
+        assert observations[-1] >= 50
+        assert all(child.poll() is not None for _, child in children)
+        assert (Path(entry['output_dir']) / 'attempt-002/attempt.json').exists()
+        assert module.batch.read(controller.policy.parent / 'controller-exit.json')['children_reaped']
+    finally:
+        if old.poll() is None:
+            old.kill()
+        old.wait(timeout=3)
+        for _, child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=3)
 
 
 def test_paused_lane_holds_without_stopping_other_group(observer, controller, monkeypatch):

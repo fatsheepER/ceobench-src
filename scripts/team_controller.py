@@ -69,8 +69,12 @@ def scope_state(saved, *, exit_code=None):
 
 
 def signal_scope(saved, signum):
-    current = scope_state(saved)
-    if current['scope_empty']:
+    try:
+        current = scope_state(saved)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        logging.warning('Worker scope cannot be observed before signal: %s', exc)
+        current = dict(saved, scope_empty=False, scope_observation_unknown=True)
+    if current['scope_empty'] and not current.get('scope_observation_unknown'):
         return current
     if not saved.get('invocation_id') or not saved.get('control_group'):
         logging.warning('Cannot signal an unbound worker scope')
@@ -281,34 +285,42 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
 
     def close_previous(entry):
         saved = units.get(entry['run_id'])
-        if not saved or saved.get('scope_empty'):
-            return
+        if not saved:
+            return True
         deadline = time.monotonic() + 45
         signaled = False
+        forced = False
         while True:
+            if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
+                return False
             try:
                 observed = scope_state(saved, exit_code=saved.get('exit_code'))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                logging.warning('Previous worker scope cannot be verified: %s; continuing', exc)
-                return
+                logging.warning('Previous worker scope cannot be verified: %s; waiting before launch', exc)
+                observed = dict(saved, scope_empty=False, scope_observation_unknown=True)
             units[entry['run_id']] = observed
             write_json(directory / 'controller-units.json', units)
-            if observed.get('scope_empty'):
+            if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
+                return False
+            if observed.get('scope_empty') and not observed.get('scope_observation_unknown'):
                 event('previous_scope_closed', run_id=entry['run_id'], unit=observed)
-                return
+                return True
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                logging.warning('Previous worker scope did not close within 45 seconds; continuing')
-                return
-            if not signaled or remaining < 15:
+            if remaining <= 0 and not forced:
+                logging.warning('Previous worker scope did not close within 45 seconds; forcing SIGKILL and waiting')
+                event('previous_scope_kill_requested', run_id=entry['run_id'], unit=observed)
+                forced = True
+            if not signaled or remaining <= 0:
                 with advisory():
-                    signal_scope(observed, signal.SIGTERM if not signaled else signal.SIGKILL)
+                    signal_scope(observed, signal.SIGKILL if remaining <= 0 else signal.SIGTERM)
                 signaled = True
             time.sleep(.25)
 
     def launch(entry, predecessor=None):
         nonlocal launch_ordinal
-        close_previous(entry)
+        if (not close_previous(entry) or stop_requested or
+                (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop)):
+            return None
         history = batch.attempts(entry)
         mode = 'resume' if history else 'run'
         launch_ordinal += 1

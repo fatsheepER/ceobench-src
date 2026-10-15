@@ -247,7 +247,7 @@ def test_bound_scope_kills_detached_session_after_worker_exit(tmp_path):
 
 
 @pytest.mark.parametrize('field', ['invocation_id', 'control_group'])
-def test_scope_identity_mismatch_refuses_signal(tmp_path, monkeypatch, field):
+def test_scope_identity_mismatch_warns_and_keeps_stop_available(tmp_path, monkeypatch, caplog, field):
     controller = controller_module()
     cgroup = tmp_path / 'scope'
     cgroup.mkdir()
@@ -264,9 +264,9 @@ def test_scope_identity_mismatch_refuses_signal(tmp_path, monkeypatch, field):
     monkeypatch.setattr(controller.subprocess, 'run', command)
     monkeypatch.setattr(controller, 'unit_status', lambda unit, **kwargs:
         dict(unit=unit, invocation_id=inv, result='running', errors=[]))
-    with pytest.raises(RuntimeError, match='identity changed'):
-        controller.signal_scope(record, signal.SIGKILL)
-    assert signals == []
+    controller.signal_scope(record, signal.SIGKILL)
+    assert 'Worker scope identity changed' in caplog.text
+    assert len(signals) == 1 and '--signal=SIGKILL' in signals[0]
 
 
 def test_controller_reaps_real_residual_scope_and_preserves_peer(observer, tmp_path, monkeypatch):
