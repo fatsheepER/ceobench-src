@@ -143,3 +143,33 @@ def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, mo
     assert result['result']['usage']['team']['billed_units'] == 0
     assert result['result']['waste']['roles']['ceo']['billed_units'] == 0
     assert result['result']['pending']['roles']['ceo']['billed_units'] == 1
+
+
+def test_missing_recovery_selection_keeps_previous_tail_pending(tmp_path):
+    entry = dict(output_dir=str(tmp_path), category='formal', run_id='git')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    private = first / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    log(private / 'model-usage.jsonl', receipts('pending', 'ceo', body(30, 4), cost=.2))
+    write_json(first / 'attempt.json', dict(status='paused', wall_seconds=10))
+    before, waste = batch.run_usage(entry, PRICES)
+    assert before['pending']['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    write_json(second / 'attempt.json', dict(status='paused', reason='missing_checkpoint',
+        execution_started=False, source_checkpoint=None))
+    after, waste = batch.run_usage(entry, PRICES)
+    assert after['pending']['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    timing = batch.wall_time([first, second])
+    assert timing['pending_wall_seconds'] == 10 and timing['waste_wall_seconds'] == 0
+
+
+def test_unreadable_old_attempt_metadata_does_not_block_usage_accounting(tmp_path, caplog):
+    entry = dict(output_dir=str(tmp_path), category='formal')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    write_json(first / 'attempt.json', None)
+    write_json(second / 'attempt.json', dict(status='finished'))
+    private = second / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    log(private / 'model-usage.jsonl', receipts('kept', 'ceo', body(10, 2), cost=.1))
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    assert 'accounting metadata is not an object' in caplog.text

@@ -415,6 +415,9 @@ def wall_time(history, current=None):
         except (OSError, ValueError) as exc:
             records[directory] = {}
             errors.append(dict(attempt=directory.name, error=str(exc)))
+    records = {directory: record for directory, record in records.items()
+               if not (record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False)}
+    history = [directory for directory in history if directory in records]
     def duration(directory, record):
         value = current[1] if current and directory == current[0] else record.get('wall_seconds')
         try:
@@ -485,8 +488,19 @@ def wall_time(history, current=None):
 
 def run_usage(entry, prices):
     from .team_usage import aggregate
-    from .team_recovery import latest_checkpoint
     history = attempts(entry)
+    for directory in history[:]:
+        path = directory / 'attempt.json'
+        if path.exists():
+            try:
+                record = read(path)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                logging.warning('Attempt accounting metadata is not an object: %s', path)
+                continue
+            if record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False:
+                history.remove(directory)
     def logs(private_roots):
         result = {entry['category']: [], 'simulator': []}
         for private in private_roots:
@@ -499,9 +513,8 @@ def run_usage(entry, prices):
     valid_root = all_roots[-1] if all_roots else None
     last = read(history[-1] / 'attempt.json') if history and (history[-1] / 'attempt.json').exists() else {}
     if last.get('status') in ('failed', 'paused', 'preparing'):
-        checkpoint = latest_checkpoint(entry)
-        if checkpoint:
-            valid_root = checkpoint / 'private'
+        checkpoint = last.get('checkpoint') or last.get('source_checkpoint')
+        valid_root = Path(checkpoint) / 'private' if checkpoint else None
     retained_logs = logs([valid_root] if valid_root else [])
     valid = aggregate(retained_logs, prices, category=entry['category'])
     valid['retained_logs'] = {key: [str(path) for path in paths] for key, paths in retained_logs.items()}
