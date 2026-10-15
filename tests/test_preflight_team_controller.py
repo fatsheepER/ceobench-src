@@ -91,6 +91,24 @@ def test_controller_requires_explicit_live_flag(controller):
     assert exc.value.code == 2
 
 
+@pytest.mark.parametrize('week', [None, 4])
+def test_resume_skips_finished_group_unless_week_selected(observer, controller, monkeypatch, caplog, week):
+    from test_preflight_group_join import group_batch
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    entry = observer.manifest['runs'][0]
+    previous = Path(entry['output_dir']) / 'attempt-001/attempt.json'
+    write_json(previous, dict(status='finished', attempt=1, day=28))
+    original = previous.read_bytes()
+    controller.module.supervise(controller.policy, resume=True, week=week)
+    assert launches == (['s101-pf'] if week is None else ['s101-git', 's101-pf'])
+    assert all(child.poll() is not None for _, child in children)
+    assert previous.read_bytes() == original
+    if week is None:
+        assert 'Skipping finished group s101-git' in caplog.text
+    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
+    assert not receipt['failed'] and not receipt['hold']
+
+
 def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):
     entry = observer.manifest['runs'][0]
     monkeypatch.setenv('CEOBENCH_WORKER_LAUNCH_ID', 'offline-launch')

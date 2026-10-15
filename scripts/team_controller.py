@@ -386,7 +386,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             entry = queues[group].pop(0)
             saved = latest(entry)
             try:
-                if not resume and week is None and saved and saved.get('status') == 'finished' and units.get(entry['run_id'], {}).get('result') != 'oom-kill':
+                if week is None and saved and saved.get('status') == 'finished':
+                    logging.warning('Skipping finished group %s; select --week explicitly to re-enter it', entry['run_id'])
                     terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
                                                     attempt=saved.get('attempt'))
                     continue
