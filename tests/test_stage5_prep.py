@@ -116,7 +116,7 @@ def test_prefix_stops_at_fork_day_then_git_and_pf_branches_continue(offline_runn
         assert outcome['outcome'] == 'stopped' and outcome['days_run'] == 28 and len(more) == 2
         assert branch._load_checkpoint()['day'] == 28
         assert (branch.evidence_store is None) == (mode == 'git')
-        assert not list(branch_dir.rglob('sql-evidence*')) if mode == 'git' else (branch_dir / 'sql-evidence.sqlite').exists()
+        assert not list(branch_dir.rglob('sql-evidence*')) if mode == 'git' else (branch.workspace_dir / 'sql-evidence.sqlite').exists()
 
 
 def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
