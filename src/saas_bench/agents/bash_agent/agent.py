@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import httpx
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
-from ...model_usage import MODEL_REQUEST_ATTEMPTS, ModelUsage, usage_values
+from ...model_usage import ModelUsage, usage_values
 from ...run_lifecycle import RunCancelled
 
 
@@ -76,22 +77,22 @@ def _stream_chat_completion(client, request, check=lambda: None):
                                 tool.function.model_fields_set.discard(field)
                 state.handle_chunk(chunk)
             if not received:
-                raise httpx.ReadError('Chat completion stream ended without an assistant chunk')
+                raise ValueError('Chat completion stream ended without an assistant chunk')
             snapshot = state.current_completion_snapshot
             if not snapshot.choices or any(not choice.finish_reason for choice in snapshot.choices):
-                raise httpx.ReadError('Chat completion stream ended without finish_reason')
+                raise ValueError('Chat completion stream ended without finish_reason')
             for choice in snapshot.choices:
                 for tool in choice.message.tool_calls or []:
                     if (not isinstance(tool.id, str) or not tool.id.strip() or tool.type != 'function'
                             or tool.function is None or not isinstance(tool.function.name, str)
                             or not tool.function.name.strip()):
-                        raise httpx.ReadError('Chat completion stream ended with incomplete tool metadata')
+                        raise ValueError('Chat completion stream ended with incomplete tool metadata')
                     try:
                         arguments = json.loads(tool.function.arguments)
                     except (TypeError, json.JSONDecodeError) as exc:
-                        raise httpx.ReadError('Chat completion stream ended with invalid tool arguments') from exc
+                        raise ValueError('Chat completion stream ended with invalid tool arguments') from exc
                     if not isinstance(arguments, dict):
-                        raise httpx.ReadError('Chat completion tool arguments must be a JSON object')
+                        raise ValueError('Chat completion tool arguments must be a JSON object')
         except (httpx.TransportError, json.JSONDecodeError, ValidationError) as exc:
             raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
         try:
@@ -451,7 +452,7 @@ class BashAgent(BaseAgent):
         return action
 
     def _retry_wait(self, seconds):
-        if getattr(self, '_llm_attempt', 0) >= MODEL_REQUEST_ATTEMPTS:
+        if getattr(self, '_llm_attempt', 0) >= 4:
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
@@ -460,7 +461,7 @@ class BashAgent(BaseAgent):
             time.sleep(seconds)
 
     def _request_model(self, api, request, invoke):
-        if getattr(self, '_llm_attempt', 0) >= MODEL_REQUEST_ATTEMPTS:
+        if getattr(self, '_llm_attempt', 0) >= 4:
             raise RunCancelled('model_attempt_limit')
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
@@ -724,7 +725,7 @@ class BashAgent(BaseAgent):
                         api_kwargs['reasoning_effort'] = 'none'
 
                 if not (_is_opencode and self.identity):
-                    api_kwargs['timeout'] = 60 if _is_opencode else 600
+                    api_kwargs['timeout'] = httpx.Timeout(60 if _is_opencode else 600, read=600)
                 if _is_opencode:
                     api_kwargs.update(stream=True, stream_options={'include_usage': True})
                 def invoke():
@@ -1235,7 +1236,7 @@ class BashAgent(BaseAgent):
                 use_streaming = True
 
             try:
-                api_kwargs['timeout'] = 60 if use_streaming else 600
+                api_kwargs['timeout'] = httpx.Timeout(60 if use_streaming else 600, read=600)
                 def invoke():
                     if use_streaming:
                         with anthropic_messages.stream(**api_kwargs) as stream:

@@ -437,14 +437,14 @@ def test_checked_client_uses_frozen_phase_timeouts(frozen, role):
     try:
         with client.chat.completions.create(**kwargs) as response:
             list(response)
-        expected = dict(connect=60, read=180, write=60, pool=60)
+        expected = dict(connect=60, read=600, write=60, pool=60)
         assert timeouts == [expected]
         assert manifest['parameters']['timeout_seconds'] == expected
     finally:
         client.close()
 
 
-def test_returned_model_mismatch_keeps_five_known_raw_receipts(tmp_path, monkeypatch):
+def test_returned_model_mismatch_keeps_one_raw_receipt_without_retry(tmp_path, monkeypatch):
     from saas_bench.model_usage import ModelUsage
     from saas_bench.run_lifecycle import RunCancelled
     def respond(request):
@@ -461,14 +461,14 @@ def test_returned_model_mismatch_keeps_five_known_raw_receipts(tmp_path, monkeyp
                   messages=[dict(role='user', content='offline')],
                   extra_body={'thinking': {'type': 'disabled'}})
     try:
-        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_request_failed'):
             recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
         rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
         assert rows[-1]['event'] == 'response' and rows[-1]['usage']['input_tokens'] == 20
         assert rows[-1]['error'] is not None
         assert next(row for row in rows if row['event'] == 'http_response')['body']
-        assert len([row for row in rows if row['event'] == 'http_request']) == 5
-        assert rows[-1]['model_attempts'] == 5
+        assert len([row for row in rows if row['event'] == 'http_request']) == 1
+        assert rows[-1]['model_attempts'] == 1
     finally:
         client.close()
 

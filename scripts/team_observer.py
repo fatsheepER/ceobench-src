@@ -10,7 +10,6 @@ import shutil
 import time
 
 import brotli
-import httpx
 
 import round5
 from team_model_monitor import finish_billing, record_billing
@@ -18,29 +17,6 @@ from saas_bench import team_batch as batch
 from saas_bench.model_usage import usage_values
 from saas_bench.run_state import file_hash, write_json
 from saas_bench.team_usage import _body
-
-
-QUOTA_RETRY_INITIAL_SECONDS = 5
-QUOTA_RETRY_MAX_SECONDS = 300
-QUOTA_OUTAGE_SECONDS = 900
-
-
-def quota_transient(exc):
-    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-        try:
-            payload = exc.response.json()
-        except ValueError:
-            pass
-        else:
-            if isinstance(payload, dict) and 'usage' in payload:
-                usage = payload['usage']
-                try:
-                    return (isinstance(usage, dict) and set(usage) == {'rolling', 'weekly', 'monthly'} and
-                        all(row.get('status') == 'ok' and row.get('percent', 100) < 100 for row in usage.values()))
-                except (TypeError, AttributeError):
-                    return False
-    return (isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)) or
-            isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 429, 500, 502, 503, 504))
 
 
 def tail_hash(path, offset):
@@ -220,37 +196,20 @@ def poll(manifest_path, output, expected, state, *, quota_fn=None,
         manifest = identity(manifest_path, expected)
     except Exception as exc:
         checks.append('freeze:' + str(exc))
-    now = time.time()
-    outage = state.get('quota_outage_started')
-    if outage is not None and now - outage >= QUOTA_OUTAGE_SECONDS:
-        quota_error = state['quota_error']
-        checks.append('quota_outage_timeout:' + quota_error.split(':', 1)[1])
-    elif now < state.get('quota_retry_at', 0):
-        quota_error = state['quota_error']
+    for key in ('quota_retry_at', 'quota_outage_started'):
+        state.pop(key, None)
+    try:
+        quota = quota_fn()
+        if set(quota) != {'rolling', 'weekly', 'monthly'}:
+            checks.append('quota_windows_changed')
+        if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
+            checks.append('quota_exhausted')
+    except Exception as exc:
+        quota_error = 'quota_unavailable:' + type(exc).__name__
+        checks.append(quota_error)
+        state.update(quota_failures=state.get('quota_failures', 0) + 1, quota_error=quota_error)
     else:
-        try:
-            quota = quota_fn()
-            if set(quota) != {'rolling', 'weekly', 'monthly'}:
-                checks.append('quota_windows_changed')
-            if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
-                checks.append('quota_exhausted')
-        except Exception as exc:
-            quota_error = 'quota_unavailable:' + type(exc).__name__
-            if quota_transient(exc):
-                finished = time.time()
-                failures = state.get('quota_failures', 0) + 1
-                start = outage if outage is not None else now
-                delay = min(QUOTA_RETRY_MAX_SECONDS, QUOTA_RETRY_INITIAL_SECONDS * 2**min(failures - 1, 16),
-                            max(0, QUOTA_OUTAGE_SECONDS - (finished - start)))
-                state.update(quota_failures=failures, quota_outage_started=start,
-                    quota_retry_at=finished + delay, quota_error=quota_error)
-                if finished - start >= QUOTA_OUTAGE_SECONDS:
-                    checks.append('quota_outage_timeout:' + type(exc).__name__)
-            else:
-                checks.append(quota_error)
-        else:
-            state.update(quota_failures=0, quota_outage_started=None, quota_retry_at=0,
-                quota_error=None, quota_last_success=now)
+        state.update(quota_failures=0, quota_error=None, quota_last_success=time.time())
     physical_requests = state.setdefault('physical_request_meta', {})
     cursors = state.setdefault('cursors', {})
     seen = state.setdefault('receipt_hashes', {})
@@ -433,7 +392,6 @@ def poll(manifest_path, output, expected, state, *, quota_fn=None,
         quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
         billing_warnings=bill_warnings,
         billing_coverage=state['billing_coverage'],
-        quota_retry_after=max(0, state.get('quota_retry_at', 0) - time.time()) if quota_error else 0,
         run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],
         progress=progress, units=units, coverage=coverage, state=state)
     write_json(output / 'health.json', health)
@@ -458,7 +416,7 @@ def main(argv=None):
         if args.once or args.drain:
             print(json.dumps({key: health[key] for key in ('time', 'status', 'checks', 'quota', 'coverage')}, indent=2))
             return
-        time.sleep(min(300, max(1, health['quota_retry_after'])) if health['quota_error'] else 300)
+        time.sleep(300)
 
 
 if __name__ == '__main__':

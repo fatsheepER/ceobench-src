@@ -44,7 +44,7 @@ def test_real_sdk_requests_shared_retries_and_simulator_usage(tmp_path, monkeypa
     def handle(request):
         requests.append(request)
         if len(requests) == 1:
-            return httpx.Response(500, json={'error': {'type': 'server_error', 'message': 'try again'}})
+            raise httpx.ConnectError('temporary disconnect', request=request)
         return httpx.Response(200, json=reply(api))
     http = httpx.Client(transport=httpx.MockTransport(handle))
     if provider == 'bedrock':
@@ -66,7 +66,8 @@ def test_real_sdk_requests_shared_retries_and_simulator_usage(tmp_path, monkeypa
     assert client.max_retries == 1
     assert len({r['call_id'] for r in entries}) == 1
     assert 'full input' in json.dumps(entries[0]['request'])
-    assert [r['status'] for r in entries if r['event'] == 'http_response'] == [500, 200]
+    assert [r['status'] for r in entries if r['event'] == 'http_response'] == [200]
+    assert len([r for r in entries if r['event'] == 'http_error']) == 1
     assert entries[-1]['response']['usage'] == reply(api)['usage']
     assert sim.usage_recorder.summary['known']['input_tokens'] == 10
     assert sim.usage_recorder.summary['missing_cost'] == 1
@@ -147,7 +148,7 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     def invoke():
         with client.messages.stream(**request) as stream:
             return stream.get_final_message()
-    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+    with pytest.raises(RunCancelled, match='model_request_failed'):
         recorder.call('messages', request, invoke, outer_attempt=1)
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
     assert len([r for r in entries if r['event'] == 'http_request']) == 5
@@ -167,7 +168,7 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('status', [503, 200])
-def test_agent_retry_records_full_request_and_missing_usage(tmp_path, monkeypatch, status):
+def test_agent_http_or_provider_error_fails_once_with_original_request(tmp_path, monkeypatch, status):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
@@ -183,15 +184,15 @@ def test_agent_retry_records_full_request_and_missing_usage(tmp_path, monkeypatc
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='original instructions', workspace_path=tmp_path, usage_recorder=recorder)
-    assert agent.act('dashboard', 0, False, {'day': 7}).tool == 'read_file'
+    with pytest.raises(RunCancelled, match='model_request_failed'):
+        agent.act('dashboard', 0, False, {'day': 7})
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
     calls = [r for r in entries if r['event'] == 'request']
     assert [r['outer_attempt'] for r in calls] == [1]
     assert all('original instructions' in json.dumps(r['request']['messages']) for r in calls)
-    assert agent.last_input_tokens is None
     assert recorder.summary['missing']['input_tokens'] == 1
     assert recorder.summary['known']['input_tokens'] is None
-    assert recorder.summary['errors'] == 0
+    assert recorder.summary['errors'] == 1
     assert recorder.summary['failed_http_attempts'] == 1
     client.close()
 
@@ -252,7 +253,7 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
                                   'missing_type', 'missing_name', 'missing_function', 'invalid_json',
                                   'non_object_arguments', 'empty_arguments', 'sse_json', 'null_choice',
                                   'null_delta', 'null_choices', 'null_tool'])
-def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, monkeypatch, fault):
+def test_go_malformed_stream_fails_once_without_exposing_partial_tools(tmp_path, monkeypatch, fault):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests, responses, payloads = [], [], []
@@ -298,17 +299,18 @@ def test_go_incomplete_stream_retries_without_exposing_partial_tools(tmp_path, m
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='instructions',
                       workspace_path=tmp_path, usage_recorder=recorder, response_callback=lambda **kwargs: responses.append(kwargs))
-    action = agent.act('dashboard', 0, False, {'day': 7})
-    assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
-    assert len(requests) == 2 and requests[0] == requests[1]
-    assert len(responses) == 1 and len(agent.conversation) == 3
+    with pytest.raises(RunCancelled, match='model_request_failed'):
+        agent.act('dashboard', 0, False, {'day': 7})
+    assert not agent._pending_tool_calls
+    assert len(requests) == 1
+    assert not responses and len(agent.conversation) == 2
     assert recorder.summary['calls'] == 1
-    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == 0
-    assert recorder.summary['known']['input_tokens'] == 10
-    assert recorder.summary['missing']['input_tokens'] == 0
+    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == 1
+    assert recorder.summary['known']['input_tokens'] is None
+    assert recorder.summary['missing']['input_tokens'] == 1
     entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
     logical = [row for row in entries if row['event'] == 'response']
-    assert len(logical) == 1 and logical[0]['error'] is None
+    assert len(logical) == 1 and logical[0]['error'] == 'RunCancelled'
     first_http = next(row for row in entries if row['event'] == 'http_response')
     assert first_http['body'] == payloads[0]
     done = fault not in ('missing_done', 'missing_both')
@@ -351,10 +353,10 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
                       system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
                       workspace_path=tmp_path, usage_recorder=recorder)
     try:
-        with pytest.raises(RunCancelled, match='model_attempt_limit' if fault == 'no_tool' else 'model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_attempt_limit' if fault == 'no_tool' else 'model_request_failed'):
             agent.act('dashboard', 0, False, {'day': 7})
-        assert len(requests) == 5
-        assert recorder.summary['calls'] == (5 if fault == 'no_tool' else 1)
+        assert len(requests) == {'no_tool': 4, 'connection': 5, 'status': 1}[fault]
+        assert recorder.summary['calls'] == (4 if fault == 'no_tool' else 1)
         assert recorder.summary['errors'] == (0 if fault == 'no_tool' else 1)
         assert agent._observation_recorded and not agent._pending_tool_calls
     finally:
@@ -363,7 +365,7 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
 
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
 @pytest.mark.parametrize('status', [400, 401, 403])
-def test_all_model_rejections_retry_five_times_without_feedback(tmp_path, monkeypatch, api, status):
+def test_model_rejections_fail_once_without_feedback(tmp_path, monkeypatch, api, status):
     from saas_bench.agents.bash_agent.agent import BashAgent
     from saas_bench.run_lifecycle import RunCancelled
     monkeypatch.setattr('time.sleep', lambda _: None)
@@ -382,9 +384,9 @@ def test_all_model_rejections_retry_five_times_without_feedback(tmp_path, monkey
                       system_prompt='instructions', reasoning_effort='high' if api == 'responses' else None,
                       workspace_path=tmp_path, usage_recorder=recorder)
     try:
-        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_request_failed'):
             agent.act('dashboard', 0, False, {'day': 7})
-        assert len(requests) == 5 and recorder.summary['calls'] == recorder.summary['errors'] == 1
+        assert len(requests) == recorder.summary['calls'] == recorder.summary['errors'] == 1
         assert recorder.summary['missing_cost'] == 1
         assert [message.role for message in agent.conversation] == ['system', 'user']
     finally:
@@ -412,11 +414,11 @@ def test_http200_error_body_is_a_failed_model_call(tmp_path, monkeypatch, provid
     store = SQLEvidenceStore(tmp_path / 'private.sqlite', identity(capture_scope='execution'))
     sim.usage_recorder.evidence_store = store
     try:
-        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_request_failed'):
             sim.complete_text(provider=provider, model='test-model', user='offline replay', max_tokens=30)
         summary = sim.usage_recorder.summary
         assert summary['calls'] == summary['errors'] == summary['missing_cost'] == 1
-        assert summary['http_attempts'] == summary['failed_http_attempts'] == summary['failed_attempts_without_usage'] == 5
+        assert summary['http_attempts'] == summary['failed_http_attempts'] == summary['failed_attempts_without_usage'] == 1
         assert summary['known'] == dict.fromkeys(FIELDS) and summary['known_cost_usd'] is None
         entries = [json.loads(line) for line in (tmp_path / 'simulator.jsonl').read_text().splitlines()]
         http_response = next(e for e in entries if e['event'] == 'http_response')
@@ -438,7 +440,7 @@ def test_malformed_response_is_recorded_before_returning(tmp_path, monkeypatch, 
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     malformed = reply(api)
     malformed[field] = None
-    with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
+    with pytest.raises(RunCancelled, match='model_request_failed') as error:
         recorder.call(api, {}, lambda: malformed)
     assert field in str(error.value.__cause__)
     assert recorder.summary['errors'] == 1

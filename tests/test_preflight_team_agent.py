@@ -88,7 +88,7 @@ def test_real_opencode_act_uses_team_phase_timeouts_and_preserves_single_agent(t
             system_prompt='Give business advice.', workspace_path=tmp_path, reasoning_effort='high',
             identity=SimpleNamespace(role='growth') if team else None, allow_final_text=True)
         assert agent.act('dashboard', 0, False, {'day': 0}) == FinalText('offline advice')
-        assert timeouts == [dict(connect=60, read=180 if team else 60, write=60, pool=60)]
+        assert timeouts == [dict(connect=60, read=600, write=60, pool=60)]
     finally:
         client.close()
 

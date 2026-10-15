@@ -260,7 +260,7 @@ def test_observer_records_final_response_fault_without_hold(observer, change, is
     assert health['route_errors'][0]['issue'] == issue
 
 
-def test_model_usage_pause_and_five_provider_errors_are_visible_without_hold(observer, monkeypatch):
+def test_model_usage_pause_and_provider_error_are_visible_without_hold(observer, monkeypatch):
     path = observer.log(role='pf')
     mode = ['pause']
     reply = dict(id='offline', object='chat.completion', created=1, model=observer.module.round5.MODEL,
@@ -292,7 +292,7 @@ def test_model_usage_pause_and_five_provider_errors_are_visible_without_hold(obs
         assert issues == ['transport_error', 'model_call_interrupted']
         mode[0] = 'provider_error'
         monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: None)
-        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_request_failed'):
             recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
         health = observer.poll()
         assert health['status'] in ('healthy', 'pending') and not observer.hold.exists()
@@ -330,7 +330,7 @@ def test_real_harness_transport_retry_uses_five_requests_without_hold(observer, 
         if recover:
             assert agent.act('dashboard', 0, False, {'day': 0}) == FinalText('recovered advice')
         else:
-            with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+            with pytest.raises(RunCancelled, match='model_request_failed'):
                 agent.act('dashboard', 0, False, {'day': 0})
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         logical = [row for row in rows if row['event'] == 'request']
@@ -346,12 +346,12 @@ def test_real_harness_transport_retry_uses_five_requests_without_hold(observer, 
         else:
             assert observer.poll()['status'] == 'healthy' and not observer.hold.exists()
             (path.parents[3] / 'attempt.json').write_text(json.dumps(dict(status='failed',
-                attempt='001', day=0, reason='failed', runtime_failure='model_request_attempt_limit',
+                attempt='001', day=0, reason='failed', runtime_failure='model_request_failed',
                 runtime_phase='ceo')))
             health = observer.poll()
             assert health['status'] in ('healthy', 'pending') and not observer.hold.exists()
             assert not any(check.startswith('model_attempt_limit:') for check in health['checks'])
-            assert health['progress']['pf']['runtime_failure'] == 'model_request_attempt_limit'
+            assert health['progress']['pf']['runtime_failure'] == 'model_request_failed'
         issues = [row['issue'] for event in events(observer) for row in event['transient_receipt_failures']]
         assert issues and set(issues) <= {'transport_error', 'model_call_interrupted'}
     finally:
@@ -359,7 +359,7 @@ def test_real_harness_transport_retry_uses_five_requests_without_hold(observer, 
 
 
 @pytest.mark.parametrize('error', [httpx.UnsupportedProtocol, httpx.LocalProtocolError, ValueError])
-def test_sdk_connection_wrapper_retries_configuration_errors_without_hold(observer, monkeypatch, error):
+def test_sdk_connection_wrapper_does_not_retry_local_configuration_errors(observer, monkeypatch, error):
     path = observer.log()
 
     def respond(request):
@@ -373,12 +373,12 @@ def test_sdk_connection_wrapper_retries_configuration_errors_without_hold(observ
     kwargs = dict(model=observer.module.round5.MODEL, messages=[], reasoning_effort='high',
                   extra_body=dict(thinking={'type': 'enabled'}))
     try:
-        with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+        with pytest.raises(RunCancelled, match='model_request_failed'):
             recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
-        assert json.loads(path.read_text().splitlines()[-1])['model_attempts'] == 5
+        assert json.loads(path.read_text().splitlines()[-1])['model_attempts'] == 1
         health = observer.poll()
         assert health['status'] in ('healthy', 'pending') and not observer.hold.exists()
-        assert [row['issue'] for row in health['route_errors']] == ['model_call_error'] * 5
+        assert [row['issue'] for row in health['route_errors']] == ['model_call_error']
     finally:
         client.close()
 

@@ -193,7 +193,8 @@ def test_manually_recomputed_team_and_all_resource_receipts(tmp_path):
     assert suffix['team']['complete']['uniform_cost_usd'] == pytest.approx(.004)
 
 
-def test_real_sdk_retry_counts_known_failed_http_usage_once(tmp_path, monkeypatch):
+def test_real_sdk_http_error_counts_known_failed_usage_once_without_retry(tmp_path, monkeypatch):
+    from saas_bench.run_lifecycle import RunCancelled
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
     def handle(request):
@@ -206,37 +207,39 @@ def test_real_sdk_retry_counts_known_failed_http_usage_once(tmp_path, monkeypatc
         http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[dict(role='user', content='offline')])
     try:
-        recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0)
+        with pytest.raises(RunCancelled, match='model_request_failed') as error:
+            recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0)
+        assert error.value.__cause__.status_code == 503
     finally:
         client.close()
     result = aggregate([recorder.path], PRICES)
-    assert len(requests) == result['attempts'] == result['team']['billed_units'] == 2
+    assert len(requests) == result['attempts'] == result['team']['billed_units'] == 1
     assert result['calls'] == 1
-    assert result['team']['complete']['input_tokens'] == 15
-    assert result['team']['complete']['output_tokens'] == 3
-    assert result['team']['complete']['total_tokens'] == 18
-    assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0165)
-    assert result['team']['complete']['raw_billed_cost_usd'] == pytest.approx(.03)
+    assert result['team']['complete']['input_tokens'] == 5
+    assert result['team']['complete']['output_tokens'] == 1
+    assert result['team']['complete']['total_tokens'] == 6
+    assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0052)
+    assert result['team']['complete']['raw_billed_cost_usd'] == pytest.approx(.01)
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
 
 
-def test_returned_model_mismatch_retries_five_times_after_raw_receipt(tmp_path, monkeypatch):
+def test_returned_model_mismatch_fails_without_network_retry(tmp_path, monkeypatch):
     from saas_bench.run_lifecycle import RunCancelled
     recorder = ModelUsage(tmp_path / 'model.jsonl', 'ceo', PRICES['rates'], expected_model='frozen-model')
     waits = []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
-    with pytest.raises(RunCancelled, match='model_request_attempt_limit') as error:
+    with pytest.raises(RunCancelled, match='model_request_failed') as error:
         recorder.call('chat', {'model': 'frozen-model'}, lambda: body(), day=0)
     assert isinstance(error.value.__cause__, ValueError)
-    assert waits == [10, 20, 40, 80]
+    assert waits == []
     row = json.loads(recorder.path.read_text().splitlines()[-1])
     assert row['response']['model'] == 'test-model' and row['usage']['input_tokens'] == 10
     assert row['error'] == 'RunCancelled' and recorder.summary['errors'] == 1
-    assert row['model_attempts'] == 5 and row['last_model_error'] == 'ValueError'
+    assert row['model_attempts'] == 1 and row['last_model_error'] == 'ValueError'
     assert row['cost_usd'] == pytest.approx(.0113)
     recorder.expected_model = 'test-model'
     assert recorder.call('chat', {}, lambda: body(), day=7)['model'] == 'test-model'
-    with pytest.raises(RunCancelled, match='model_request_attempt_limit'):
+    with pytest.raises(RunCancelled, match='model_request_failed'):
         recorder.call('chat', {}, lambda: None, day=14)
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] is None
 

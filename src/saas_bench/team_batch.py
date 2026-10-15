@@ -24,7 +24,7 @@ from .config import BenchmarkConfig, RUNTIME_CONFIG_FIELDS, SCENARIO_PACKS, Scen
 from .database import init_database
 from .db_protection import load_session_db, save_session_db
 from .model_usage import (load_pricing, MODEL_REQUEST_ATTEMPTS, MODEL_ATTEMPT_SECONDS,
-                          MODEL_REQUEST_SECONDS, MODEL_RETRY_DELAYS, check_model_call)
+                          MODEL_RETRY_DELAYS, check_model_call)
 from .multi_agent import MultiAgentRuntime
 from .payload_tokens import load_counter
 from .role_policy import ROLES
@@ -44,8 +44,8 @@ PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     temperature=1.0, max_tokens=16384, thinking='enabled', memory_characters=40000,
     total_days=500, effective_end=497, sdk_max_retries=2,
     model_request_attempts=MODEL_REQUEST_ATTEMPTS, model_attempt_seconds=MODEL_ATTEMPT_SECONDS,
-    model_request_seconds=MODEL_REQUEST_SECONDS, model_retry_delays=list(MODEL_RETRY_DELAYS),
-    timeout_seconds=dict(connect=60, read=180, write=60, pool=60),
+    model_retry_delays=list(MODEL_RETRY_DELAYS),
+    timeout_seconds=dict(connect=60, read=600, write=60, pool=60),
     simulator_thinking='disabled', simulator_reasoning_effort='none',
     analyst_bash_timeout=480, analyst_bash_warn_after=120,
     analyst_bash_scope='growth_and_ops_finance_model_bash_initial_and_ceo_followup')

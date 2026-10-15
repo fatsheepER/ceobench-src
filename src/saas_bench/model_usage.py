@@ -3,10 +3,13 @@
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import base64
+import errno
 import functools
 import json
 import math
 import os
+import socket
+import ssl
 from pathlib import Path
 import threading
 import time
@@ -18,12 +21,10 @@ from .run_lifecycle import RunCancelled, WorkerLifecycle
 
 
 _CALL = ContextVar('model_call', default=None)
-_DEADLINE = ContextVar('model_request_deadline', default=None)
 _ATTEMPT = ContextVar('model_request_attempt', default=None)
 MODEL_REQUEST_ATTEMPTS = 5
 MODEL_RETRY_DELAYS = (10, 20, 40, 80)
 MODEL_ATTEMPT_SECONDS = 600
-MODEL_REQUEST_SECONDS = MODEL_REQUEST_ATTEMPTS * MODEL_ATTEMPT_SECONDS + sum(MODEL_RETRY_DELAYS)
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
@@ -34,7 +35,29 @@ def check_model_call():
         current[0]._check_deadline()
 
 
+def is_network_error(exc):
+    from openai import APIConnectionError as OpenAIConnectionError
+    from anthropic import APIConnectionError as AnthropicConnectionError
+    chain, seen = [], set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol, httpx.PoolTimeout,
+                             httpx.HTTPStatusError)) or getattr(error, 'status_code', 0) for error in chain):
+        return False
+    network_errno = {errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+                     errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}
+    return any(isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException,
+                                  ssl.SSLError, socket.gaierror, ConnectionError, TimeoutError)) or
+               isinstance(error, OSError) and error.errno in network_errno for error in chain) or (
+        len(chain) == 1 and isinstance(exc, (OpenAIConnectionError, AnthropicConnectionError)))
+
+
 def plain(value):
+    if isinstance(value, httpx.Timeout):
+        return value.as_dict()
     if hasattr(value, 'model_dump'):
         value = value.model_dump(mode='json', exclude_unset=True)
     if isinstance(value, dict):
@@ -253,6 +276,8 @@ class _Stream(httpx.SyncByteStream):
         try:
             for chunk in self.source:
                 self.chunks.append(chunk)
+                if chunk and (attempt := _ATTEMPT.get()):
+                    attempt.reply_started()
                 self.check()
                 yield chunk
         except BaseException as exc:
@@ -261,7 +286,7 @@ class _Stream(httpx.SyncByteStream):
         else:
             if self.require_done and b'data: [DONE]' not in b''.join(self.chunks).splitlines():
                 self._finish('stream_closed_before_completion')
-                raise httpx.ReadError('Chat completion stream ended before [DONE]')
+                raise ValueError('Chat completion stream ended before [DONE]')
             self._finish()
 
     def close(self):
@@ -277,12 +302,26 @@ class _ModelAttempt(WorkerLifecycle):
     def __init__(self, lifecycle, deadline):
         super().__init__()
         self.lifecycle, self.deadline = lifecycle, deadline
+        self.received_reply = False
+        self.timer = None
+
+    def reply_started(self):
+        with self._socket_lock:
+            self.check()
+            self.received_reply = True
+            if self.timer:
+                self.timer.cancel()
+
+    def expire(self):
+        with self._socket_lock:
+            if not self.received_reply:
+                self.cancel('model_attempt_timeout')
 
     def check(self, *, retry=False):
         self.lifecycle.check(retry=retry)
-        if self.reason or time.monotonic() >= self.deadline:
-            self.cancel('model_attempt_timeout')
-            raise TimeoutError('Model request attempt exceeded its time budget')
+        if self.reason or not self.received_reply and time.monotonic() >= self.deadline:
+            self.expire()
+            raise TimeoutError('Model request received no response bytes within 600 seconds')
 
 
 class ModelUsage:
@@ -339,12 +378,10 @@ class ModelUsage:
             recorder, call_id = _CALL.get() or (self, None)
             recorder._check_deadline()
             recorder.request_check()
-            if deadline := _DEADLINE.get():
-                if attempt := _ATTEMPT.get():
-                    deadline = min(deadline, attempt.deadline)
-                remaining = max(.001, deadline - time.monotonic())
-                request.extensions['timeout'] = {phase: min(value, remaining) if value is not None else remaining
-                    for phase, value in request.extensions.get('timeout', {}).items()}
+            timeouts = dict(request.extensions.get('timeout', {}))
+            if timeouts.get('read') is not None and timeouts['read'] < MODEL_ATTEMPT_SECONDS:
+                timeouts['read'] = MODEL_ATTEMPT_SECONDS
+                request.extensions['timeout'] = timeouts
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
             with recorder.lock:
@@ -408,6 +445,8 @@ class ModelUsage:
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
                                body=body, error=error)
                 if response.is_stream_consumed:
+                    if response.content and (attempt := _ATTEMPT.get()):
+                        attempt.reply_started()
                     finish(response.content, None)
                 else:
                     require_done = (streaming and request.url.path.endswith('/chat/completions')
@@ -435,16 +474,12 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
-        deadline = time.monotonic() + MODEL_REQUEST_SECONDS
-        token = _DEADLINE.set(deadline)
         acquired = False
         policies = []
         try:
             while not acquired:
                 self.lifecycle.check()
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('Model call lock exceeded the request time budget')
-                acquired = self.call_lock.acquire(timeout=max(.001, min(.1, deadline - time.monotonic())))
+                acquired = self.call_lock.acquire(timeout=.1)
             self._check_deadline()
             for client in self._clients:
                 policies.append((client, client.max_retries))
@@ -452,12 +487,13 @@ class ModelUsage:
                 self.lifecycle.watch_client(client)
             with self.lifecycle.model_call():
                 return self._call(api, request, invoke, **context)
+        except Exception as exc:
+            raise RunCancelled('model_request_failed') from exc
         finally:
             for client, retries in policies:
                 client.max_retries = retries
             if acquired:
                 self.call_lock.release()
-            _DEADLINE.reset(token)
 
     def _check_deadline(self):
         self.lifecycle.check()
@@ -465,10 +501,11 @@ class ModelUsage:
             attempt.check()
 
     def _invoke_attempt(self, invoke):
-        remaining = max(.001, min(MODEL_ATTEMPT_SECONDS, _DEADLINE.get() - time.monotonic()))
+        remaining = MODEL_ATTEMPT_SECONDS
         attempt = _ModelAttempt(self.lifecycle, time.monotonic() + remaining)
         token = _ATTEMPT.set(attempt)
-        timer = threading.Timer(remaining, attempt.cancel, args=('model_attempt_timeout',))
+        timer = threading.Timer(remaining, attempt.expire)
+        attempt.timer = timer
         timer.daemon = True
         hooks = []
         try:
@@ -524,8 +561,8 @@ class ModelUsage:
                 except Exception as exc:
                     last_model_error = type(exc).__name__
                     self.lifecycle.check()
-                    if model_attempts == MODEL_REQUEST_ATTEMPTS:
-                        raise RunCancelled('model_request_attempt_limit') from exc
+                    if not is_network_error(exc) or model_attempts == MODEL_REQUEST_ATTEMPTS:
+                        raise RunCancelled('model_request_failed') from exc
                     self.lifecycle.sleep(MODEL_RETRY_DELAYS[model_attempts - 1])
         except BaseException as exc:
             error = type(exc).__name__

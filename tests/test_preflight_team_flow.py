@@ -549,7 +549,7 @@ def test_http_retry_attempt_limit_ignores_historical_hold(mode, monkeypatch):
     def unavailable(team, role, body):
         assert role != 'ceo'
         counts[role] += 1
-        return httpx.Response(503, json=dict(error=dict(message='offline retry probe', type='server_error')))
+        raise httpx.ConnectError('offline connection failure')
 
     with make_team(mode, unavailable, 'retry-limit') as team:
         outcome = team.run(stop_after_day=7)

@@ -113,7 +113,7 @@ def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, mo
                        lambda: (_ for _ in ()).throw(ValueError('offline failed request')), day=0)
         except RunCancelled:
             pass
-        team.failure = 'model_request_attempt_limit'
+        team.failure = 'model_request_failed'
         return RunOutcome(day=0, reason='failed')
     monkeypatch.setattr(team, 'run', fail_model)
     result = batch.execute(team, manifest, entry, directory, record, directory / 'STOP')

@@ -322,71 +322,47 @@ def test_compressed_physical_receipt_retains_served_model_and_usage_checks(obser
     assert [row['issue'] for row in health['route_errors']] == ['served_model_changed']
 
 
+
+
+
+
 @pytest.mark.parametrize('error', [httpx.ConnectError, httpx.ReadTimeout])
-def test_quota_outage_retries_with_backoff_survives_restart_then_reports(observer, monkeypatch, error):
-    calls = []
-    clock = [1000.0]
+def test_quota_is_observed_once_per_poll_without_retry_or_outage_budget(observer, monkeypatch, error):
+    clock, calls = [1000.0], []
     monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
-
+    state = dict(quota_retry_at=999999, quota_outage_started=0, quota_error='old')
     def unavailable():
-        calls.append(True)
-        raise error('temporary quota failure')
+        calls.append(clock[0])
+        raise error('unavailable')
+    for at in (1000, 1000, 4600, 86400):
+        clock[0] = at
+        health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+                                      state, quota_fn=unavailable)
+        assert health['status'] == 'pending'
+        assert health['checks'] == ['quota_unavailable:' + error.__name__]
+        assert 'quota_retry_after' not in health
+        assert 'quota_retry_at' not in state and 'quota_outage_started' not in state
+        assert not observer.hold.exists()
+        state = json.loads((observer.output / 'state.json').read_text())
+    assert calls == [1000, 1000, 4600, 86400]
+    assert state['quota_failures'] == 4
 
-    first = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
+
+def test_quota_success_resets_observation_errors_and_exhaustion_is_reported(observer):
+    def unavailable():
+        raise httpx.ConnectError('unavailable')
+    failed = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
                                  observer.state, quota_fn=unavailable)
-    assert first['status'] == 'pending'
-    assert first['checks'] == [] and not observer.hold.exists()
-    assert first['quota_error'] == 'quota_unavailable:' + error.__name__
-    assert first['quota'] is None
-    restarted = json.loads((observer.output / 'state.json').read_text())
-    second = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-                                  restarted, quota_fn=unavailable)
-    assert second['status'] == 'pending' and not observer.hold.exists()
-    assert restarted['quota_failures'] == 1 and len(calls) == 1
-    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
-    third = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-                                 restarted, quota_fn=unavailable)
-    assert third['status'] == 'pending' and len(calls) == 2
-    assert third['quota_retry_after'] == 2 * observer.module.QUOTA_RETRY_INITIAL_SECONDS
-    clock[0] = 1000 + observer.module.QUOTA_OUTAGE_SECONDS
-    expired = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-                                   restarted, quota_fn=unavailable)
-    assert expired['status'] == 'pending' and not observer.hold.exists()
-    assert expired['checks'] == ['quota_outage_timeout:' + error.__name__]
-    assert len(calls) == 2
-
-
-def test_quota_success_resets_failures_and_exhaustion_is_observed(observer, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
-    def unavailable():
-        raise httpx.ConnectError('temporary quota failure')
-
-    def failed_poll():
-        return observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-                                    observer.state, quota_fn=unavailable)
-
-    assert failed_poll()['status'] == 'pending'
-    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
+    assert failed['quota_error'] == 'quota_unavailable:ConnectError'
     healthy = observer.poll()
     assert healthy['status'] == 'healthy' and healthy['quota_error'] is None
     assert observer.state['quota_failures'] == 0
-    assert failed_poll()['status'] == 'pending'
-    assert not observer.hold.exists()
-    clock[0] += observer.module.QUOTA_RETRY_INITIAL_SECONDS
-    quota = observer.quota()
-    quota['rolling']['percent'] = 100
-    calls = []
-
-    def exhausted():
-        calls.append(True)
-        return quota
-
+    exhausted = observer.quota()
+    exhausted['rolling']['percent'] = 100
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-                                  observer.state, quota_fn=exhausted)
-    assert health['status'] == 'healthy' and not observer.hold.exists()
-    assert health['checks'] == ['quota_exhausted'] and len(calls) == 1
-    assert observer.state['quota_failures'] == 0
+                                  observer.state, quota_fn=lambda: exhausted)
+    assert health['status'] == 'healthy' and health['checks'] == ['quota_exhausted']
+    assert not observer.hold.exists()
 
 
 @pytest.mark.parametrize('status', [401, 403])
@@ -406,7 +382,6 @@ def test_quota_http_read_unavailability_and_exhaustion_remain_observations(obser
     health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
         observer.state, quota_fn=unavailable)
     assert health['status'] == 'pending' and not observer.hold.exists()
-    observer.state['quota_retry_at'] = 0
     exhausted = observer.quota()
     exhausted['rolling']['percent'] = 100
     def confirmed():
@@ -417,26 +392,6 @@ def test_quota_http_read_unavailability_and_exhaustion_remain_observations(obser
     assert health['status'] == 'pending' and not observer.hold.exists()
 
 
-def test_quota_backoff_caps_at_five_minutes_then_alerts_once(observer, monkeypatch):
-    clock, calls = [1000.0], []
-    monkeypatch.setattr(observer.module.time, 'time', lambda: clock[0])
-    def unavailable():
-        calls.append(clock[0])
-        raise httpx.ConnectError('offline')
-    delays = []
-    while clock[0] < 1000 + observer.module.QUOTA_OUTAGE_SECONDS:
-        health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-            observer.state, quota_fn=unavailable)
-        assert health['status'] == 'pending' and not observer.hold.exists()
-        delays.append(health['quota_retry_after'])
-        clock[0] = observer.state['quota_retry_at']
-    assert delays == [5, 10, 20, 40, 80, 160, 300, 285]
-    for _ in range(2):
-        health = observer.module.poll(observer.manifest_path, observer.output, observer.expected,
-            observer.state, quota_fn=unavailable)
-        assert health['status'] == 'pending'
-    assert len(calls) == 8
-    assert [row['new_checks'] for row in events(observer)] == [['quota_outage_timeout:ConnectError']]
 
 
 @pytest.mark.parametrize('usage', [{'rolling': {}}, {'rolling': {}, 'weekly': {}, 'monthly': {'percent': 'broken'}}])

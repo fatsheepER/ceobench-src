@@ -101,13 +101,13 @@ def test_model_failure_pauses_without_supervisor_and_restores_context(offline_ru
     try:
         result = runner.run(verbose=False)
         assert result['outcome'] == 'paused' and result['days_run'] == 0
-        assert result['reason'] == ('model_request_attempt_limit' if rejected else 'model_attempt_limit')
-        assert len(requests) == 5
+        assert result['reason'] == ('model_request_failed' if rejected else 'model_attempt_limit')
+        assert len(requests) == (1 if rejected else 4)
         checkpoint = runner._load_checkpoint()
         assert checkpoint['context_boundary'] == 'same_week'
-        assert checkpoint['usage']['calls'] == (1 if rejected else 5)
+        assert checkpoint['usage']['calls'] == (1 if rejected else 4)
         assert checkpoint['usage']['errors'] == int(rejected)
-        assert checkpoint['usage']['missing_cost'] == (1 if rejected else 5)
+        assert checkpoint['usage']['missing_cost'] == (1 if rejected else 4)
         original = runner.agent._snapshot_path.read_bytes()
         restored = offline_runner(runner.workspace_dir)
         assert restored.agent._snapshot_path.read_bytes() == original
