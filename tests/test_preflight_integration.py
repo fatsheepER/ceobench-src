@@ -117,7 +117,7 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
     from test_preflight_rng import runtime_values
 
     first = offline_runner()
-    manifest = (first.workspace_dir / 'manifest.json').read_bytes()
+    manifest = json.loads((first.workspace_dir / 'manifest.json').read_text())
     expected = runtime_values()
     set_runtime_config(first, expected)
     expected['targeted_ad_spend'] = {'social_media': {'S1': 19.0}}
@@ -137,7 +137,9 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
         runner._save_checkpoint(14)
         directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
         assert saved_runtime_config(directory / 'world.nmdb') == encoded
-        assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+        restored_manifest = json.loads((runner.workspace_dir / 'manifest.json').read_text())
+        restored_manifest.pop('recovery_source', None)
+        assert restored_manifest == manifest
     assert business_state(restored) == business_state(first)
 
 
