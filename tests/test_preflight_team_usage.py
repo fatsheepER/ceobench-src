@@ -1,6 +1,7 @@
 import copy
 import json
 import tracemalloc
+from types import SimpleNamespace
 
 import httpx
 from openai import OpenAI
@@ -463,10 +464,12 @@ def test_result_cash_scoring_terminal_statuses_and_pair_missingness(tmp_path):
         84: {'cash': dict(point=100, lower=90, upper=110)}}, 0)
     usage = aggregate([log(tmp_path / 'usage.jsonl', receipts('run', 'ceo', body()))], PRICES)
     args = dict(run_id='git-run', group='git', seed=11, repeat=1, day=112,
-        reason='observation_end', usage=usage)
+        reason='observation_end', usage=usage,
+        last_week_result=SimpleNamespace(day=112, cash=90, mrr=42))
     git = summarize_run(conn, **args)
     assert git['status'] == 'reached_d112'
     assert git['cash_at_advance'] == 90
+    assert git['business_metrics_day'] == 112 and git['mrr'] == 42
     assert git['predictions']['four_week_mean_interval_score'] == 10
     assert git['unexpired_predictions'][0]['target_day'] == 168
     assert git['unexpired_predictions'][0]['status'] == 'pending'
@@ -476,10 +479,12 @@ def test_result_cash_scoring_terminal_statuses_and_pair_missingness(tmp_path):
     assert result['pairs'][0]['comparison']['total_tokens']['pf_minus_git'] == 0
     assert result['pairs'][0]['comparison']['total_tokens']['pf_over_git'] == 1
     for reason, status in [('paused', 'paused'), ('failed', 'technical_failure')]:
-        run = summarize_run(conn, **dict(args, reason=reason, day=28))
+        run = summarize_run(conn, **dict(args, reason=reason, day=28,
+            last_week_result=SimpleNamespace(day=28, cash=100, mrr=30)))
         assert run['status'] == status and len(run['unexpired_predictions']) == 2
     conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (14,'operations',-200,'bankruptcy')")
-    bankrupt = summarize_run(conn, **dict(args, run_id='bankrupt', seed=12, day=14, reason='natural_end'))
+    bankrupt = summarize_run(conn, **dict(args, run_id='bankrupt', seed=12, day=14, reason='natural_end',
+        last_week_result=SimpleNamespace(day=14, cash=-100, mrr=0)))
     assert bankrupt['status'] == 'natural_bankruptcy'
     assert bankrupt['predictions']['status_counts']['unmatured_bankruptcy'] == 2
     partner = dict(pf, seed=12)
@@ -506,4 +511,21 @@ def test_result_cash_scoring_terminal_statuses_and_pair_missingness(tmp_path):
     assert summarize_pairs([git, failed])['pairs'][0]['statuses']['pf'] == 'technical_failure'
     with pytest.raises(ValueError, match='exactly one'):
         summarize_pairs([git, git])
+    conn.close()
+
+
+def test_result_uses_last_complete_week_after_partial_advance():
+    conn = init_database(':memory:')
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (0,'initial_funding',100,'initial')")
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (7,'operations',-10,'complete week')")
+    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES (8,'operations',-30,'partial advance')")
+    args = dict(run_id='pf-run', group='pf', seed=11, repeat=1, day=8, reason='paused', usage={})
+    result = summarize_run(conn, **args, last_week_result=SimpleNamespace(day=7, cash=90, mrr=42))
+    assert result['day'] == 8
+    assert result['business_metrics_day'] == 7
+    assert result['cash_at_advance'] == 90
+    assert result['mrr'] == 42
+    missing = summarize_run(conn, **args)
+    assert missing['business_metrics_day'] is None
+    assert missing['cash_at_advance'] is missing['mrr'] is None
     conn.close()

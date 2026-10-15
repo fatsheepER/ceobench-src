@@ -790,7 +790,7 @@ def _execute(team, manifest, entry, directory, record, hold):
     result = summarize_run(team.server.conn, run_id=entry['run_id'], group=entry['group'],
         seed=entry['seed'], repeat=entry['repeat'], day=outcome.day, reason=reason,
         usage=usage, attempt=record['attempt'], stop_after_day=entry['stop_after_day'],
-        wall_seconds=timing['wall_seconds'])
+        wall_seconds=timing['wall_seconds'], last_week_result=team.server._last_day_result)
     result.update(timing, waste=waste)
     write_json(directory / 'result.json', result)
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',

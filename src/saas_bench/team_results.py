@@ -1,14 +1,14 @@
 """Offline team outcomes and paired comparisons with explicit missing values."""
 
-from .database import get_cash, get_mrr
-from .scoring import cash_at_advance, score_predictions
+from .database import get_cash
+from .scoring import score_predictions
 
 
 PRIMARY_METRICS = ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd', 'wall_seconds')
 
 
 def summarize_run(conn, *, run_id, group, seed, repeat, day, reason, usage,
-                  attempt=None, stop_after_day=112, wall_seconds=None):
+                  attempt=None, stop_after_day=112, wall_seconds=None, last_week_result=None):
     if group not in ('git', 'pf'):
         raise ValueError('Unknown experiment group')
     cash = get_cash(conn)
@@ -26,7 +26,9 @@ def summarize_run(conn, *, run_id, group, seed, repeat, day, reason, usage,
     unexpired = [row for row in predictions['rows'] if row['target_day'] > day]
     return dict(run_id=run_id, group=group, seed=seed, repeat=repeat, attempt=attempt,
         status=status, day=day, stop_reason=reason, stop_after_day=stop_after_day,
-        cash_at_advance=cash_at_advance(conn, day), mrr=get_mrr(conn), wall_seconds=wall_seconds,
+        business_metrics_day=last_week_result.day if last_week_result is not None else None,
+        cash_at_advance=last_week_result.cash if last_week_result is not None else None,
+        mrr=last_week_result.mrr if last_week_result is not None else None, wall_seconds=wall_seconds,
         usage=usage, predictions=predictions, unexpired_predictions=unexpired)
 
 
