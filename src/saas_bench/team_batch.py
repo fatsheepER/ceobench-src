@@ -486,21 +486,34 @@ def wall_time(history, current=None):
     return result
 
 
+def read_attempt_record(directory):
+    path = directory / 'attempt.json'
+    try:
+        record = read(path)
+        if not isinstance(record, dict):
+            raise ValueError('Attempt accounting metadata is not an object')
+        if not isinstance(record.get('status'), str):
+            raise ValueError('Attempt status is missing or not text')
+        if record.get('result') is not None and not isinstance(record['result'], dict):
+            raise ValueError('Attempt result is not an object')
+        return record
+    except (OSError, ValueError) as exc:
+        logging.warning('Could not read attempt accounting metadata %s: %s', path, exc)
+        return None
+
+
 def run_usage(entry, prices):
     from .team_usage import aggregate
     history = attempts(entry)
+    records = {}
     for directory in history[:]:
-        path = directory / 'attempt.json'
-        if path.exists():
-            try:
-                record = read(path)
-            except (OSError, ValueError):
-                continue
-            if not isinstance(record, dict):
-                logging.warning('Attempt accounting metadata is not an object: %s', path)
-                continue
-            if record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False:
-                history.remove(directory)
+        record = read_attempt_record(directory)
+        if record is None:
+            continue
+        if record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False:
+            history.remove(directory)
+            continue
+        records[directory] = record
     def logs(private_roots):
         result = {entry['category']: [], 'simulator': []}
         for private in private_roots:
@@ -510,15 +523,18 @@ def run_usage(entry, prices):
                 result['simulator'].append(simulator)
         return result
     all_roots = [directory / 'runtime/private' for directory in history]
-    valid_root = all_roots[-1] if all_roots else None
-    last = read(history[-1] / 'attempt.json') if history and (history[-1] / 'attempt.json').exists() else {}
+    latest = next((index for index in reversed(range(len(history))) if history[index] in records), None)
+    valid_root = all_roots[latest] if latest is not None else None
+    last = records[history[latest]] if latest is not None else {}
+    pending_roots = all_roots[latest + 1:] if latest is not None else all_roots[:]
     if last.get('status') in ('failed', 'paused', 'preparing'):
+        pending_roots.append(all_roots[latest])
         checkpoint = last.get('checkpoint') or last.get('source_checkpoint')
         valid_root = Path(checkpoint) / 'private' if checkpoint else None
     retained_logs = logs([valid_root] if valid_root else [])
     valid = aggregate(retained_logs, prices, category=entry['category'])
     valid['retained_logs'] = {key: [str(path) for path in paths] for key, paths in retained_logs.items()}
-    pending = aggregate(logs(all_roots[-1:]) if last.get('status') in ('failed', 'paused', 'preparing') else [],
+    pending = aggregate(logs(pending_roots),
         prices, category=entry['category'], exclude_calls={record['call_id'] for record in valid['records']})
     pending['status'] = 'awaiting_operator_selection'
     valid['pending'] = pending
@@ -548,10 +564,7 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     missing_checkpoint = None
     previous = {}
     if history:
-        try:
-            previous = read(history[-1] / 'attempt.json')
-        except (OSError, ValueError):
-            previous = dict(attempt=int(history[-1].name.removeprefix('attempt-')))
+        previous = read_attempt_record(history[-1]) or {}
     if history or resume or week is not None:
         source = latest_checkpoint(entry, previous, week=week)
         if source is None and week != 1:
@@ -869,13 +882,17 @@ def summarize(path, resource_paths=None):
         if not history:
             rows.append(dict(entry, status='not_started', missing_reason='No attempt registered'))
             continue
-        last = read(history[-1] / 'attempt.json')
-        result = last.get('result', {})
+        last = read_attempt_record(history[-1])
+        if last is None:
+            last = dict(status='unknown', reason='unreadable_attempt_metadata',
+                        attempt=int(history[-1].name.removeprefix('attempt-')))
+        result = last.get('result') or {}
         fault = evidence_fault(history[-1], last)
         row = dict(entry, **{k: v for k, v in result.items() if k not in entry})
-        row.update(status='technical_failure' if last['status'] == 'failed' else result.get('status', last['status']),
-                   attempt_status=last['status'], evidence_fault=fault,
-                   attempt=last['attempt'], reason=last.get('reason'))
+        status = last.get('status', 'unknown')
+        row.update(status='technical_failure' if status == 'failed' else result.get('status', status),
+                   attempt_status=status, evidence_fault=fault,
+                   attempt=last.get('attempt', int(history[-1].name.removeprefix('attempt-'))), reason=last.get('reason'))
         row.update(wall_time(history))
         usage, waste = run_usage(entry, manifest['pricing'])
         row.update(usage=usage, waste=waste, pending=usage['pending'])

@@ -116,6 +116,29 @@ def test_checkpoint_discovery_survives_incomplete_attempt_metadata(tmp_path, cap
     assert str(first / 'attempt.json') in caplog.text
 
 
+@pytest.mark.parametrize('broken', ['{unfinished', 'null', '[]'])
+def test_register_attempt_continues_from_snapshot_with_unreadable_previous_metadata(tmp_path, caplog, broken):
+    from saas_bench import team_batch as batch
+    entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'), category='formal')
+    first = Path(entry['output_dir']) / 'attempt-001'
+    selected = snapshot(first / 'runtime/checkpoints/saved', entry['run_id'], '2026-10-15T01:00:00+00:00')
+    state = batch.read(selected / 'team.json')
+    state['source_root'] = str(first / 'runtime')
+    write_json(selected / 'team.json', state)
+    receipt = batch.read(selected / 'checkpoint.json')
+    receipt['files']['team.json'] = file_hash(selected / 'team.json')
+    write_json(selected / 'checkpoint.json', receipt)
+    record = first / 'attempt.json'
+    record.write_text(broken)
+    original = record.read_bytes()
+    path = tmp_path / 'manifest.json'
+    write_json(path, dict(runs=[entry]))
+    directory, resumed, source = batch.register_attempt(path, {}, entry, resume=True)
+    assert source == selected and resumed['source_checkpoint'] == str(selected)
+    assert 'missing_checkpoint' not in resumed and directory.name == 'attempt-002'
+    assert record.read_bytes() == original and str(record) in caplog.text
+
+
 def test_checkpoint_selection_warns_about_run_identity(tmp_path, monkeypatch, caplog):
     entry = dict(run_id='git-1', output_dir=str(tmp_path / 'git'))
     wrong = snapshot(Path(entry['output_dir']) / 'attempt-001/runtime/checkpoints/wrong', 'pf-1', '2026-10-15T01:00:00+00:00')
