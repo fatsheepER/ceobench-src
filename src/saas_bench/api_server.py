@@ -6,6 +6,7 @@ is via HTTP on localhost with a random OS-assigned port.
 """
 
 import json
+import logging
 import math
 import os
 import re
@@ -1268,9 +1269,10 @@ class NovaMindAPIServer:
 
         try:
             if self._operation_failed or self._step_day_timed_out:
-                if self._advance_outcome is not None:
-                    raise RuntimeError('Previous week advancement failed or timed out; restore a previous checkpoint')
-                raise RuntimeError('Previous operation outcome unknown; continuation refused')
+                message = 'Previous operation failed or remains unknown; HOLD for manual checkpoint resume'
+                logging.warning(message)
+                return dict(success=False, error='previous_operation_failed', message=message,
+                    day=self.tools.current_day, advance=self._advance_outcome, manual_resume_required=True)
             self._advance_outcome = None
             result = self._advance_week(predictions, rationale, on_settled=settle)
             if result.get('error') == 'prediction_save_failed':
