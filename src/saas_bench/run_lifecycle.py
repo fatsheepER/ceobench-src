@@ -56,6 +56,19 @@ class WorkerLifecycle:
                 except OSError:
                     pass
 
+    def watch_socket(self, channel):
+        attempt = getattr(self._model, 'attempt', None)
+        if attempt is not None:
+            attempt.watch_socket(channel)
+            return
+        with self._socket_lock:
+            self._sockets.add(channel)
+            if self.reason:
+                try:
+                    channel.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
     def watch_client(self, client):
         http_client = getattr(client, '_client', None)
         if http_client is None or not hasattr(http_client, 'event_hooks'):
@@ -87,19 +100,13 @@ class WorkerLifecycle:
                              'proxy.start_tls.complete'):
                     channel = info['return_value'].get_extra_info('socket')
                     if channel is not None:
-                        with self._socket_lock:
-                            self._sockets.add(channel)
-                            if self.reason:
-                                try:
-                                    channel.shutdown(socket.SHUT_RDWR)
-                                except OSError:
-                                    pass
+                        self.watch_socket(channel)
                 elif event in ('connection.start_tls.started', 'proxy.start_tls.started') and channel is not None:
                     with self._socket_lock:
                         # TLS takes the TCP fd before its blocking handshake completes.
                         tls_socket = socket.fromfd(channel.fileno(), channel.family, channel.type, channel.proto)
                         handshakes.add(tls_socket)
-                        self._sockets.add(tls_socket)
+                        self.watch_socket(tls_socket)
                 self.check()
 
             request.extensions['trace'] = traced

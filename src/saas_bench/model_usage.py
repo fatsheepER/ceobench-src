@@ -565,15 +565,13 @@ class ModelUsage:
         timer = threading.Timer(remaining, attempt.expire)
         attempt.timer = timer
         timer.daemon = True
-        hooks = []
+        previous = getattr(self.lifecycle._model, 'attempt', None)
+        self.lifecycle._model.attempt = attempt
         try:
             for client in self._clients:
                 http = client._client
                 for channel in list(http._ceobench_model_sockets):
                     attempt.watch_socket(channel)
-                previous = getattr(http, '_ceobench_lifecycle', None)
-                attempt.watch_client(client)
-                hooks.append((http, http.event_hooks['request'][-1], previous))
             timer.start()
             with attempt.model_call():
                 return invoke()
@@ -581,9 +579,7 @@ class ModelUsage:
             timer.cancel()
             if timer.ident is not None:
                 timer.join(timeout=1)
-            for http, hook, previous in hooks:
-                http.event_hooks['request'].remove(hook)
-                http._ceobench_lifecycle = previous
+            self.lifecycle._model.attempt = previous
             _ATTEMPT.reset(token)
 
     def _call(self, api, request, invoke, **context):
