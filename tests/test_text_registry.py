@@ -492,13 +492,13 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         assert [t['name'] for t in tools][-4:] == ['text_create', 'text_revise', 'text_retire', 'text_list']
 
 
-def test_runner_restores_checkpoint_registration_after_requested_change(offline_runner, tmp_path):
+def test_runner_applies_explicit_registration_change_after_checkpoint_restore(offline_runner, tmp_path):
     from saas_bench.agents.bash_agent.run_test import BashAgentRunner
     first = offline_runner(text_registration='prefix')
     first._save_checkpoint(0)
     assert first.execution_capture
     restored = offline_runner(first.workspace_dir, text_registration='pf')
-    assert restored.text_registration == 'prefix'
+    assert restored.text_registration == 'pf'
     assert restored.workspace_dir != first.workspace_dir
     with pytest.raises(ValueError, match='requires execution capture'):
         BashAgentRunner(workspace_base=tmp_path, text_registration='prefix', execution_capture=False)

@@ -54,7 +54,7 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
     def create(restore=None, **options):
         managed_checkpoints = options.pop('managed_checkpoints', True)
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
-                                total_days=options.pop('total_days', 42), workspace_base=tmp_path, continue_from=restore,
+                                total_days=options.pop('total_days', None if restore else 42), workspace_base=tmp_path, continue_from=restore,
                                 run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
         if not managed_checkpoints:
             server_environment = runner._server_environment
@@ -560,7 +560,9 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     restored = offline_runner(runner.workspace_dir)
     assert not restored.execution_capture and restored.evidence_store is None
     changed = offline_runner(runner.workspace_dir, execution_capture=True)
-    assert not changed.execution_capture
+    assert changed.execution_capture and changed.evidence_store is not None
+    assert json.loads((changed.workspace_dir / 'manifest.json').read_text())['capture_history'][
+        'source_checkpoint_coverage'] == 'sql_only'
     restored._http_post('/query', {'sql': sql})
     restored._save_checkpoint(7)
     assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 1

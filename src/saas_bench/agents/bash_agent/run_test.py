@@ -102,6 +102,8 @@ class BashAgentRunner:
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
+        self.configuration_overrides = []
+        explicit_sql_capture, explicit_execution_capture = sql_capture, execution_capture
         default_config = BenchmarkConfig()
         if continue_from:
             from saas_bench.run_state import recover_run
@@ -110,28 +112,16 @@ class BashAgentRunner:
             continue_from = recover_run(source, destination)
             saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
             saved = saved_manifest['configuration']
-            saved_registration = saved_manifest.get('text_registration', 'off')
-            if text_registration is not None and text_registration != saved_registration:
-                logging.warning('Resume uses checkpoint text registration; supplied value differs')
-            text_registration = saved_registration
-            saved_stale = saved_manifest.get('pf_stale_checks', False)
-            if pf_stale_checks is not None and pf_stale_checks != saved_stale:
-                logging.warning('Resume uses checkpoint stale check setting; supplied value differs')
-            pf_stale_checks = saved_stale
-            saved_capture = bool(saved_manifest.get('sql_evidence'))
-            saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
-            if execution_capture is not None and execution_capture != saved_execution:
-                logging.warning('Resume uses checkpoint execution capture; supplied value differs')
-            execution_capture = saved_execution
-            if sql_capture is not None and sql_capture != saved_capture:
-                logging.warning('Resume uses checkpoint SQL capture; supplied value differs')
-            sql_capture = saved_capture
-            if pricing_file and self.pricing_registration != saved_manifest.get('pricing'):
-                logging.warning('Resume uses checkpoint pricing; supplied value differs')
-            self.pricing_registration = saved_manifest.get('pricing')
             supplied = dict(model=model, provider=provider, base_url=base_url,
                             seed=seed, scenario=scenario, total_days=total_days,
-                            initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind)
+                            initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind,
+                            text_registration=text_registration, pf_stale_checks=pf_stale_checks,
+                            sql_capture=sql_capture, execution_capture=execution_capture)
+            saved = dict(saved, text_registration=saved_manifest.get('text_registration', 'off'),
+                pf_stale_checks=saved_manifest.get('pf_stale_checks', False),
+                sql_capture=bool(saved_manifest.get('sql_evidence')),
+                execution_capture=(saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution')
+            effective = dict(saved)
             for key, value in supplied.items():
                 if key == 'total_days' and value is not None:
                     value = value // 7 * 7
@@ -141,11 +131,24 @@ class BashAgentRunner:
                 if key == 'base_url' and expected is not None:
                     expected = expected.rstrip('/') + '/'
                 if value is not None and value != expected:
-                    logging.warning('Resume uses checkpoint %s; supplied value differs', key)
-            model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
+                    logging.warning('Resume applies explicit %s override: %r -> %r', key, expected, value)
+                    self.configuration_overrides.append(dict(field=key, old=expected, new=value,
+                        effective_at='new_recovery_attempt'))
+                if value is not None:
+                    effective[key] = value
+            model, provider, base_url = (effective[k] for k in ('model', 'provider', 'base_url'))
             seed, scenario, total_days, initial_cash, reasoning_effort = (
-                saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
-            run_kind = saved['run_kind']
+                effective[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
+            run_kind, text_registration, pf_stale_checks, sql_capture, execution_capture = (
+                effective[k] for k in ('run_kind', 'text_registration', 'pf_stale_checks', 'sql_capture', 'execution_capture'))
+            if supplied['pf_stale_checks'] is None and text_registration != 'pf':
+                pf_stale_checks = False
+            if pricing_file is None:
+                self.pricing_registration = saved_manifest.get('pricing')
+            elif self.pricing_registration != saved_manifest.get('pricing'):
+                self.configuration_overrides.append(dict(field='pricing', old=saved_manifest.get('pricing'),
+                    new=self.pricing_registration, effective_at='new_recovery_attempt'))
+        self._source_manifest = saved_manifest if continue_from else None
         self.text_registration = text_registration or 'off'
         self.pf_stale_checks = (self.text_registration == 'pf' if pf_stale_checks is None else pf_stale_checks)
         if self.pf_stale_checks and self.text_registration != 'pf':
@@ -153,11 +156,11 @@ class BashAgentRunner:
         if self.text_registration not in ('off', 'git', 'prefix', 'pf'):
             raise ValueError('Invalid text registration mode')
         if self.text_registration in ('prefix', 'pf'):
-            if execution_capture is False:
+            if explicit_execution_capture is False:
                 raise ValueError('Prefix/PF registration requires execution capture')
             execution_capture = True
         if execution_capture:
-            if sql_capture is False:
+            if explicit_sql_capture is False:
                 raise ValueError('Execution capture requires SQL capture')
             sql_capture = True
         self.execution_capture = bool(execution_capture)
@@ -219,13 +222,16 @@ class BashAgentRunner:
         from saas_bench.sql_evidence import FORMAT
         self.fork_source = saved_manifest.get('fork_source') if continue_from else None
         self.recovery_source = saved_manifest.get('recovery_source') if continue_from else None
-        self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
-            dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
-                 data_source_id=uuid.uuid4().hex) if sql_capture else None)
+        self.sql_evidence_config = (dict(saved_manifest['sql_evidence']) if continue_from and
+            saved_manifest.get('sql_evidence') else dict(format=FORMAT, run_id=self.run_id,
+                branch_id='prefix', data_source_id=uuid.uuid4().hex)) if sql_capture else None
 
-        if self.sql_evidence_config and self.execution_capture and not continue_from:
+        if self.sql_evidence_config and self.execution_capture:
             from saas_bench.execution_capture import EXCLUSIONS
             self.sql_evidence_config.update(capture_scope='execution', file_exclusions=EXCLUSIONS)
+        elif self.sql_evidence_config:
+            self.sql_evidence_config.pop('capture_scope', None)
+            self.sql_evidence_config.pop('file_exclusions', None)
 
         # Logs directory
         self.logs_dir = self.workspace_dir / "logs"
@@ -714,7 +720,7 @@ __pycache__/
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
         # Use the selected account for both roles unless explicitly overridden.
-        if self.provider in ("deepseek", "opencode"):
+        if not self.continue_from and self.provider in ("deepseek", "opencode"):
             env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", self.provider)
             env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", self.model)
         return env
@@ -728,7 +734,11 @@ __pycache__/
             'model', 'provider', 'base_url', 'seed', 'scenario', 'total_days',
             'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
         configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
-        config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
+        config = (BenchmarkConfig(**self._source_manifest['benchmark_config']) if self._source_manifest else
+            BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash))
+        config.seed, config.total_days, config.initial_cash = self.seed, self.total_days, self.initial_cash
+        config.agent_llm_model, config.agent_llm_provider = self.model, self.provider
+        config.agent_llm_reasoning_effort = self.reasoning_effort
         if self.pricing_registration:
             config.model_pricing = self.pricing_registration['rates']
         config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
@@ -739,6 +749,14 @@ __pycache__/
             if value:
                 for prefix in ('social_post_llm_', 'enterprise_llm_'):
                     setattr(config, prefix + suffix, value)
+        if self._source_manifest:
+            for field in ('social_post_llm_provider', 'social_post_llm_model', 'enterprise_llm_provider',
+                    'enterprise_llm_model', 'simulator_openai_base_url', 'simulator_anthropic_base_url'):
+                old, new = self._source_manifest['benchmark_config'].get(field), getattr(config, field)
+                if old != new:
+                    row = dict(field=field, old=old, new=new, effective_at='simulator_start_in_new_recovery_attempt')
+                    if row not in self.configuration_overrides:
+                        self.configuration_overrides.append(row)
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
@@ -760,13 +778,20 @@ __pycache__/
             manifest['pf_read_tokenizer'] = tokenizer_config(self.provider, self.model)
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
+        if self.configuration_overrides:
+            manifest['configuration_overrides'] = self.configuration_overrides
+        source_evidence = (self._source_manifest or {}).get('sql_evidence')
+        if self.execution_capture and self._source_manifest and (source_evidence or {}).get('capture_scope') != 'execution':
+            manifest['capture_history'] = dict(source_checkpoint_coverage='sql_only' if source_evidence else 'unavailable',
+                effective_at='new_recovery_attempt')
         manifest = json.loads(json.dumps(manifest))
         self._pricing = manifest['benchmark_config']['model_pricing']
         path = self.workspace_dir / 'manifest.json'
         if self.continue_from:
             if json.loads(path.read_text()) != manifest:
-                logging.warning('Run execution metadata changed; restoring checkpoint environment')
+                logging.warning('Run execution metadata changed; applying the selected configuration in the new recovery attempt')
                 write_json(self.workspace_dir / ('execution-revision-' + uuid.uuid4().hex + '.json'), manifest)
+                write_json(path, manifest)
         else:
             write_json(path, manifest)
 
@@ -990,11 +1015,13 @@ __pycache__/
         from saas_bench.run_state import checkpoint_directory, checkpoint_manifest, copy_workspace, restore_sql_evidence
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
         checkpoint_manifest(self.workspace_dir, directory)
-        if self.sql_evidence_config:
+        if self.sql_evidence_config and checkpoint.get('sql_evidence'):
             restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
             controls = directory / 'sql-evidence.controls.jsonl'
             if controls.exists() and not (self.workspace_dir / controls.name).exists():
                 shutil.copy2(controls, self.workspace_dir / controls.name)
+        elif self.sql_evidence_config:
+            logging.warning('Checkpoint has no historical SQL capture; new evidence starts in this recovery attempt')
         staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
         copy_workspace(directory / 'agent_workspace', staged)
         self._session_id = checkpoint['session_id']
@@ -1043,7 +1070,8 @@ __pycache__/
             def difference(current, baseline):
                 return {k: difference(v, baseline.get(k, {})) if isinstance(v, dict) else
                         v - (baseline.get(k) or 0) if type(v) in (int, float) else v for k, v in current.items()}
-            record['attempt_usage'] = {role: difference(record[role], self.recovery_source['usage'][role])
+            record['attempt_usage'] = {role: difference(record[role],
+                physical_usage_summary(self.recovery_source['usage'][role]) if role == 'agent' else self.recovery_source['usage'][role])
                                        for role in ('agent', 'simulator')}
             record['attempt_id'] = self.recovery_source['attempt_id']
         with (self.workspace_dir / 'weekly.jsonl').open('a') as stream:
@@ -1068,10 +1096,18 @@ __pycache__/
                           'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
                 setattr(self.agent, field, checkpoint[field])
             self.agent.usage_recorder.summary = checkpoint['usage']
-            if checkpoint['context_boundary'] == 'same_week':
+            new_capture_context = self.execution_capture and self._source_manifest and (
+                (self._source_manifest.get('sql_evidence') or {}).get('capture_scope') != 'execution')
+            if checkpoint['context_boundary'] == 'same_week' and not new_capture_context:
                 if not self.agent.load_conversation_snapshot(self.agent._snapshot_path):
                     raise ValueError('Cannot restore the checkpoint conversation')
+                if self.configuration_overrides:
+                    for message in self.agent.conversation:
+                        if message.role == 'system':
+                            message.content = self.agent._get_system_prompt_with_memory()
             else:
+                if new_capture_context:
+                    logging.warning('Historical execution capture is unavailable; starting a new model context in this recovery attempt')
                 self.agent.reset()
         self._suppress_force_step_day_once = True
 
