@@ -159,6 +159,9 @@ def test_retry_stop_checkpoint_restores_exact_conversation(offline_runner, tmp_p
     restored.agent.conversation.clear()
     rollout = round5_rollout.RolloutRunner.__new__(round5_rollout.RolloutRunner)
     rollout.agent = restored.agent
+    rollout.execution_capture = restored.execution_capture
+    rollout._source_manifest = restored._source_manifest
+    rollout.configuration_overrides = restored.configuration_overrides
     rollout._restore_from_checkpoint(checkpoint)
     assert [vars(m) for m in restored.agent.conversation] == before
     client.close()
