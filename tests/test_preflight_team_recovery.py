@@ -135,3 +135,51 @@ def test_recovery_cli_reports_checkpoint_without_approval(tmp_path, week):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == [dict(run_id='git-1', checkpoint=str(selected),
         day=21, stage='boundary', approval_required=False)]
+
+
+@pytest.mark.parametrize('week', [None, 2, 20])
+def test_missing_selected_world_holds_without_constructing_d0(tmp_path, monkeypatch, week):
+    from saas_bench import team_batch as batch
+    path = tmp_path / 'manifest.json'
+    entry = dict(run_id='git-1', output_dir=str(tmp_path / 'runs/git-1'), category='formal')
+    manifest = dict(runs=[entry])
+    write_json(path, manifest)
+    previous = Path(entry['output_dir']) / 'attempt-001/attempt.json'
+    write_json(previous, dict(status='failed', execution_started=True, day=21))
+    original = previous.read_bytes()
+    monkeypatch.setattr(batch, 'validate_manifest', lambda path: manifest)
+    monkeypatch.setattr(batch, 'make_team', lambda *args, **kwargs: pytest.fail('Selected world was replaced with D0'))
+    result = batch.prepare(path, entry['run_id'], resume=True, week=week)
+    assert result['status'] == 'paused' and result['reason'] == 'missing_checkpoint'
+    assert result['execution_started'] is False and result['source_checkpoint'] is None
+    assert (previous.parent.parent / 'attempt-002/HOLD').exists()
+    assert json.loads((previous.parent.parent / 'HOLD').read_text())['requested_week'] == week
+    assert previous.read_bytes() == original
+
+
+def test_explicit_week_one_uses_sealed_d0_after_missing_historical_point(tmp_path):
+    from saas_bench import team_batch as batch
+    entry = dict(run_id='git-1', output_dir=str(tmp_path / 'runs/git-1'), category='formal')
+    previous = Path(entry['output_dir']) / 'attempt-001/attempt.json'
+    write_json(previous, dict(status='failed', execution_started=True))
+    path = tmp_path / 'manifest.json'
+    write_json(path, dict(runs=[entry]))
+    directory, record, source = batch.register_attempt(path, {}, entry, resume=True, week=1)
+    assert source is None and 'missing_checkpoint' not in record
+    assert directory.name == 'attempt-002' and record['replay_week'] == 1
+
+
+def test_missing_explicit_checkpoint_holds_with_the_requested_path(tmp_path, monkeypatch):
+    from saas_bench import team_batch as batch
+    path = tmp_path / 'manifest.json'
+    entry = dict(run_id='pf-1', output_dir=str(tmp_path / 'runs/pf-1'), category='formal')
+    manifest = dict(runs=[entry])
+    write_json(path, manifest)
+    write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json', dict(status='failed'))
+    selected = tmp_path / 'missing-selected-checkpoint'
+    monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(selected)}))
+    monkeypatch.setattr(batch, 'validate_manifest', lambda path: manifest)
+    result = batch.prepare(path, entry['run_id'], resume=True)
+    assert result['status'] == 'paused' and result['source_checkpoint'] == str(selected)
+    assert str(selected) in result['hold_detail']
+    assert not result['execution_started']

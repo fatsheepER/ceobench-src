@@ -69,7 +69,8 @@ def latest_checkpoint(entry, previous=None, week=None):
             if requested:
                 return Path(requested).resolve()
     if week is not None and not valid:
-        logging.warning('No saved checkpoint for week %s in %s; continuation can use sealed D0', week, root)
+        logging.warning('No saved checkpoint for week %s in %s%s', week, root,
+                        '; week 1 can use sealed D0' if week == 1 else '; selected world data is missing')
     return max(valid)[-1] if valid else None
 
 

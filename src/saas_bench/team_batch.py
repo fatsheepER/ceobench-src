@@ -524,17 +524,27 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     from .team_recovery import latest_checkpoint
     history = attempts(entry)
     source = None
+    state = None
+    missing_checkpoint = None
     if history:
         try:
             previous = read(history[-1] / 'attempt.json')
         except (OSError, ValueError):
             previous = dict(attempt=int(history[-1].name.removeprefix('attempt-')))
         source = latest_checkpoint(entry, previous, week=week)
-        if source is None and previous.get('execution_started') is not False:
-            logging.warning('No checkpoint available; continuing from sealed D0')
+        if source is None and week != 1:
+            missing_checkpoint = 'No saved checkpoint for ' + ('week ' + str(week) if week is not None else 'the requested resume')
         if source:
             from .team_checkpoint import validate_snapshot
-            _, state = validate_snapshot(source)
+            try:
+                _, state = validate_snapshot(source)
+                missing = [name for name in ('world.nmdb', 'roles', 'private') if not (source / name).exists()]
+                if missing:
+                    missing_checkpoint = 'Selected checkpoint lacks ' + ', '.join(missing) + ': ' + str(source)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                missing_checkpoint = 'Selected checkpoint cannot be loaded: ' + str(source) + ': ' + str(exc)
+    elif (resume or week is not None) and week != 1:
+        missing_checkpoint = 'No saved checkpoint for ' + ('week ' + str(week) if week is not None else 'the requested resume')
     number = int(history[-1].name.removeprefix('attempt-')) + 1 if history else 1
     directory = Path(entry['output_dir']) / f'attempt-{number:03}'
     temporary = Path(tempfile.mkdtemp(prefix='.registration-', dir=directory.parent))
@@ -547,7 +557,9 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
         started_at=datetime.now(timezone.utc).isoformat(),
         execution_source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         execution_source_sha256=tree_hash(ROOT / 'src'))
-    if source:
+    if missing_checkpoint:
+        record['missing_checkpoint'] = missing_checkpoint
+    if source and not missing_checkpoint:
         checkpoint_at = state.get('saved_at') or datetime.fromtimestamp(
             (source / 'team.json').stat().st_mtime, timezone.utc).isoformat()
         discarded_until = previous.get('finished_at')
@@ -662,6 +674,16 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
         warnings.bind(record, directory)
         team = None
         try:
+            if record.get('missing_checkpoint'):
+                detail = record['missing_checkpoint'] + '; HOLD until an existing checkpoint or --week 1 is selected'
+                record.update(status='paused', hold=True, reason='missing_checkpoint', hold_detail=detail)
+                notice = dict(reason='missing_checkpoint', detail=detail, manual_resume_required=True,
+                              requested_week=week, time=datetime.now(timezone.utc).isoformat())
+                write_json(directory / 'attempt.json', record)
+                write_json(directory / 'HOLD', notice)
+                write_json(output / 'HOLD', notice)
+                logging.warning(detail)
+                return record
             counter = load_counter('opencode', MODEL)
             record['tokenizer_changed'] = canonical(counter.metadata if counter else None) != manifest['tokenizer']
             session = record['attempt_id']
