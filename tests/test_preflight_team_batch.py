@@ -160,9 +160,30 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
     permanent = fault not in (None, 'pending_tail', 'simulator_tail', 'historical_capture', 'historical_fault_file')
     assert pf['evidence_fault'] == permanent
     assert pf['day'] == 112 and pf['cash_at_advance'] == 123456 and pf['mrr'] == 654321
-    if fault == 'pending_tail':
-        assert pf['usage']['team']['known'] == results['pf']['usage']['team']['known']
-        assert all(value is None for value in pf['usage']['team']['complete'].values())
+    empty = aggregate([], manifest['pricing'], category='formal')
+    retained = {key: value for key, value in pf['usage'].items() if key not in ('retained_logs', 'pending')}
+    pending = pf['pending']
+    assert pending == pf['usage']['pending']
+    assert pending['status'] == 'awaiting_operator_selection'
+    if not historical and fault != 'simulator_tail':
+        assert retained == empty
+        assert pf['usage']['retained_logs'] == dict(formal=[], simulator=[])
+        assert {key: value for key, value in pf['waste'].items() if key != 'missing_receipts'} == {
+            key: value for key, value in empty.items() if key != 'missing_receipts'}
+        if fault == 'pending_tail':
+            for actual, expected in ((pending['team'], results['pf']['usage']['team']),
+                    (pending['roles']['ceo'], results['pf']['usage']['roles']['ceo']),
+                    (pending['resources']['formal'], results['pf']['usage']['resources']['formal']),
+                    (pending['all_resources'], results['pf']['usage']['all_resources'])):
+                assert actual['known'] == expected['known']
+                assert all(value is None for value in actual['complete'].values())
+            assert pending['calls'] == 1
+            assert next(gap for gap in pending['missing_receipts']
+                if gap['reason'] == 'unterminated_log_tail')['bytes'] > 0
+            assert pf['waste']['missing_receipts'] == pending['missing_receipts']
+        else:
+            assert {key: value for key, value in pending.items() if key != 'status'} == results['pf']['usage']
+            assert not pf['waste']['missing_receipts']
     elif fault == 'simulator_tail':
         assert pf['usage']['team'] == results['pf']['usage']['team']
         assert pf['usage']['roles'] == results['pf']['usage']['roles']
@@ -172,12 +193,16 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
         assert all(value is None for value in pf['usage']['all_resources']['complete'].values())
         assert pf['usage']['missing_receipts'][0]['category'] == 'simulator'
     else:
-        assert {key: value for key, value in pf['usage'].items() if key != 'retained_logs'} == results['pf']['usage']
-        if historical:
-            assert pf['waste']['team']['known']['input_tokens'] == 20
+        assert retained == results['pf']['usage']
+        assert pf['waste']['team']['known']['input_tokens'] == 20
+        assert {row['call_id'] for row in pf['waste']['records']} == {pf['run_id']}
+    if historical or fault == 'simulator_tail':
+        assert {key: value for key, value in pending.items() if key != 'status'} == empty
+    direct_usage, direct_waste = batch.run_usage(next(entry for entry in pair if entry['group'] == 'pf'), manifest['pricing'])
+    assert pf['usage'] == direct_usage and pf['waste'] == direct_waste
     for metric in ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd'):
         observed = comparison['comparison'][metric]
-        if permanent or fault == 'pending_tail':
+        if not historical and fault != 'simulator_tail':
             assert observed['pf_minus_git'] is None and observed['pf_over_git'] is None
             assert observed['missing_groups'] == ['pf']
         else:
@@ -186,14 +211,16 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
             assert observed['missing_groups'] == []
     assert all(path.read_bytes() == data for path, data in originals.items())
     if fault in ('pending_tail', 'simulator_tail'):
-        assert summary['resources']['team']['known']['input_tokens'] == 30
-        assert summary['resources']['team']['complete']['input_tokens'] == (30 if fault == 'simulator_tail' else None)
+        assert summary['resources']['team']['known']['input_tokens'] == (30 if fault == 'simulator_tail' else 10)
+        assert summary['resources']['team']['complete']['input_tokens'] == (30 if fault == 'simulator_tail' else 10)
         if fault == 'simulator_tail':
             assert summary['resources']['roles']['ceo']['complete']['total_tokens'] == 45
             assert summary['resources']['resources']['simulator']['known']['total_tokens'] == 30
             assert all(value is None for value in summary['resources']['resources']['simulator']['complete'].values())
-        assert next(gap for gap in summary['resources']['missing_receipts']
-            if gap['reason'] == 'unterminated_log_tail')['bytes'] > 0
+            assert next(gap for gap in summary['resources']['missing_receipts']
+                if gap['reason'] == 'unterminated_log_tail')['bytes'] > 0
+        else:
+            assert not summary['resources']['missing_receipts']
         assert not list(tmp_path.rglob('evidence.fault.json'))
 
 
@@ -549,7 +576,10 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     logs = [p for attempt in history for p in attempt.glob('runtime/private/*/model-usage.jsonl')]
     retained = resumed['result']['usage']['retained_logs']
     assert aggregate(retained, PRICES, category='engineering') == {
-        key: value for key, value in resumed['result']['usage'].items() if key != 'retained_logs'}
+        key: value for key, value in resumed['result']['usage'].items() if key not in ('retained_logs', 'pending')}
+    assert resumed['result']['pending'] == dict(aggregate([], PRICES, category='engineering'),
+        status='awaiting_operator_selection')
+    assert resumed['result']['usage']['pending'] == resumed['result']['pending']
     assert resumed['result']['waste']['calls'] == 1
     raw = [json.loads(line) for p in logs for line in p.read_text().splitlines()]
     assert len({row['attempt_id'] for row in raw if row['event'] == 'http_request'}) == len(wire)
