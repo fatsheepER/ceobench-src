@@ -312,7 +312,8 @@ sys.exit(2 if role == 'git' else 0)
     monkeypatch.setattr(controller.subprocess, 'Popen', launch)
     try:
         results = controller.supervise(policy)
-        assert [record['status'] for record in results] == ['failed', 'finished']
+        assert [record['status'] for record in results] == ['paused', 'finished']
+        assert results[0]['hold'] is True
         assert [child.returncode for child in children] == [2, 0]
         exit_record = batch.read(policy.parent / 'controller-exit.json')
         assert exit_record['failed'] and exit_record['children_reaped']
