@@ -602,7 +602,7 @@ def test_analyst_slow_batch_receipts_reach_next_request_and_ceo_followup(mode):
             automatic = team.server.role_executors[name]
             assert (automatic.bash_timeout, automatic.bash_warn_after) == (1200, None)
             description = next(tool['description'] for tool in runtime.agent.tool_descriptions if tool['name'] == 'bash')
-            assert ('300-second' in description) == (name != 'ceo')
+            assert ('1800 seconds' in description) == (name != 'ceo')
             events = [json.loads(line) for line in runtime.audit.path.read_text().splitlines()]
             events = [event for event in events if event['kind'] == 'tool_execution' and event['tool'] == 'bash']
             if name == 'ceo':

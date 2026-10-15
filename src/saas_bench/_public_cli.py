@@ -185,7 +185,14 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
     )
     try:
         advance_timeout = float(os.environ.get('CEOBENCH_ADVANCE_TIMEOUT_SECONDS', '0'))
-        timeout = (advance_timeout + 20 if advance_timeout else None) if path == '/next-week' else 1800
+        query_timeout = float(os.environ.get('CEOBENCH_SQL_TIMEOUT_SECONDS', '600'))
+        response_timeout = float(os.environ.get('CEOBENCH_SQL_RESPONSE_TIMEOUT_SECONDS', '120'))
+        completion_wait = float(os.environ.get('CEOBENCH_COMPLETION_WAIT_SECONDS', '30'))
+        timeout = 1800
+        if path == '/next-week':
+            timeout = advance_timeout + completion_wait if advance_timeout and completion_wait else None
+        elif path == '/query':
+            timeout = query_timeout + response_timeout + completion_wait if completion_wait else None
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
@@ -313,13 +320,14 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
 
     captured = script_start(code, source, env)
     timeout_error = None
+    script_timeout = float(os.environ.get('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '1800')) or None
     try:
         with subprocess.Popen(
             [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env, cwd=str(_base_dir()),
         ) as process:
             try:
-                stdout, stderr = process.communicate(timeout=300)
+                stdout, stderr = process.communicate(timeout=script_timeout)
             except subprocess.TimeoutExpired as exc:
                 process.kill()
                 process.wait()

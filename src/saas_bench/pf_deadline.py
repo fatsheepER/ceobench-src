@@ -8,7 +8,7 @@ from .run_lifecycle import RunCancelled
 
 
 CURRENT_BUDGET = ContextVar('pf_budget', default=None)
-CALL_TIMEOUT_SECONDS = 120
+CALL_TIMEOUT_SECONDS = 600
 
 
 class Budget:
@@ -51,7 +51,10 @@ def check():
 
 
 @contextmanager
-def budget_scope(*, timeout=CALL_TIMEOUT_SECONDS, budget=None):
+def budget_scope(*, timeout=None, budget=None):
+    from .runtime_options import runtime_value
+    if timeout is None:
+        timeout = runtime_value('pf_timeout', CALL_TIMEOUT_SECONDS) or float('inf')
     parent = budget or current_budget()
     deadline = time.monotonic() + timeout
     budget = Budget(min(deadline, parent.deadline) if parent else deadline,

@@ -69,7 +69,7 @@ class ShellService:
                 try:
                     budget = Budget(service.deadline, cancelled=service.cancelled,
                                     check=service.check_cancelled)
-                    with budget_scope(budget=budget) as budget:
+                    with budget_scope(timeout=executor.pf_timeout or float('inf'), budget=budget) as budget:
                         data = bytearray()
                         while not data.endswith(b'\n') and len(data) <= 65536:
                             self.connection.settimeout(min(30, budget.remaining()))

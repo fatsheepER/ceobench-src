@@ -244,9 +244,18 @@ class _APIHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
         except (ValueError, TypeError) as exc:
             raise RequestRejected('Invalid Content-Length') from exc
-        limit = 64 * 1024 * 1024 if self.path == '/_capture' else 2 * 1024 * 1024
-        if not 0 <= length <= limit or self.headers.get('Transfer-Encoding'):
-            raise RequestRejected(f'Request body must have Content-Length between 0 and {limit} bytes')
+        from .runtime_options import runtime_value
+        limit = 2 * 1024 * 1024
+        if self.path == '/query':
+            cell_limit = runtime_value('sql_cell_limit_bytes', 8 * 1024**2,
+                environment=getattr(self.server._api_server, 'runtime_environment', None))
+            limit = max(limit, 6 * cell_limit + 65536) if cell_limit else None
+        elif self.path == '/_capture':
+            response_limit = runtime_value('sql_response_limit_bytes', RESPONSE_LIMIT_BYTES,
+                environment=getattr(self.server._api_server, 'runtime_environment', None))
+            limit = max(64 * 1024**2, 4 * response_limit) if response_limit else None
+        if length < 0 or limit is not None and length > limit or self.headers.get('Transfer-Encoding'):
+            raise RequestRejected(f'Request body must have nonnegative Content-Length within the configured byte limit ({limit})')
         while len(self._request_body) < length:
             remaining = self._request_deadline - time.monotonic()
             if remaining <= 0:
@@ -737,13 +746,16 @@ class _APIHandler(BaseHTTPRequestHandler):
         chunks = []
         size = 0
         response_budget = self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS
+        from .runtime_options import runtime_value
+        response_limit = runtime_value('sql_response_limit_bytes', RESPONSE_LIMIT_BYTES,
+            environment=getattr(self.server._api_server, 'runtime_environment', None))
         deadline = started + (max(.05, response_budget) if status >= 400 else response_budget)
         for chunk in json.JSONEncoder(default=str).iterencode(data):
             check_deadline(deadline)
             payload = chunk.encode()
             size += len(payload)
-            if size > RESPONSE_LIMIT_BYTES:
-                raise QueryResultTooLarge(f'SQL response exceeded {RESPONSE_LIMIT_BYTES} bytes. Narrow the query.')
+            if response_limit and size > response_limit:
+                raise QueryResultTooLarge(f'SQL response exceeded {response_limit} bytes. Narrow the query.')
             chunks.append(payload)
         response = b''.join(chunks)
         check_deadline(deadline)
@@ -1076,9 +1088,12 @@ class NovaMindAPIServer:
                     raise ValueError('Registered script checksum mismatch: ' + name)
                 self._role_scripts[role][name] = content
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
-        from .runtime_options import runtime_value, timeout_value
+        from .runtime_options import runtime_environment_snapshot, runtime_value, timeout_value
+        self.runtime_environment = runtime_environment_snapshot()
         self.STEP_WEEK_TIMEOUT = timeout_value('advance_timeout', 0)
         self.advance_warn_after = runtime_value('advance_warn_after', 600)
+        self.QUERY_TIMEOUT_SECONDS = runtime_value('sql_timeout', 600)
+        self.QUERY_RESPONSE_TIMEOUT_SECONDS = runtime_value('sql_response_timeout', 120)
 
     def start(self):
         """Start the HTTP server in a background thread."""
@@ -1183,8 +1198,8 @@ class NovaMindAPIServer:
 
     # Lock wait, reader setup and SQL share this deadline. The world lock stays
     # held until the separate query connection closes.
-    QUERY_TIMEOUT_SECONDS = 120
-    QUERY_RESPONSE_TIMEOUT_SECONDS = 30
+    QUERY_TIMEOUT_SECONDS = 600
+    QUERY_RESPONSE_TIMEOUT_SECONDS = 120
 
     def checkpoint(self, expected_day):
         if not self._advance_lock.acquire(blocking=False):
@@ -1195,11 +1210,13 @@ class NovaMindAPIServer:
                 try:
                     if self.sql_evidence and self.sql_evidence.execution_capture:
                         self.sql_evidence.save_state('admission_paused', True)
-                    if not self._sql_lock.wait_for(lambda: self._sql_active == 0, timeout=180):
+                    from .runtime_options import timeout_value
+                    checkpoint_wait = timeout_value('checkpoint_wait', 600, environment=self.runtime_environment)
+                    if not self._sql_lock.wait_for(lambda: self._sql_active == 0, timeout=checkpoint_wait):
                         raise TimeoutError('SQL capture did not finish before checkpoint')
                     if self.sql_evidence is not None and self.sql_evidence.execution_capture:
                         import time
-                        deadline = time.monotonic() + 180
+                        deadline = time.monotonic() + checkpoint_wait if checkpoint_wait is not None else float('inf')
                         while True:
                             self.sql_evidence.assert_healthy(quiescent=False)
                             try:

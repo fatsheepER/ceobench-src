@@ -75,8 +75,10 @@ def test_sql_timeout_after_bash_exit_and_broken_headers_has_one_response(capture
 
 
 @pytest.mark.parametrize('inherited_pipe', [False, True])
-def test_public_cli_timeout_has_known_failed_child_and_allows_next_tool(captured, inherited_pipe):
+def test_public_cli_timeout_has_known_failed_child_and_allows_next_tool(captured, inherited_pipe, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '300')
     api, store, executor = captured
+    monkeypatch.setitem(executor.extra_env, 'CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '300')
     source = Path(__file__).parents[1] / 'src/saas_bench'
     shutil.copy(source / '_public_cli.py', executor.workspace_path / 'cli.py')
     shutil.copy(source / 'novamind_api/_capture.py', executor.workspace_path / '_client_capture.py')
@@ -129,10 +131,12 @@ except subprocess.TimeoutExpired as exc:
 
 @pytest.mark.parametrize('sql_first', [True, False], ids=['sql_before_python', 'sql_after_bash'])
 def test_public_cli_timeout_settles_inflight_sql_without_faking_receive(captured, monkeypatch, tmp_path, sql_first):
+    monkeypatch.setenv('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '300')
     from concurrent.futures import ThreadPoolExecutor
     import threading
     from saas_bench import public_sql
     api, store, executor = captured
+    monkeypatch.setitem(executor.extra_env, 'CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '300')
     source = Path(__file__).parents[1] / 'src/saas_bench'
     shutil.copy(source / '_public_cli.py', executor.workspace_path / 'cli.py')
     shutil.copy(source / 'novamind_api/_capture.py', executor.workspace_path / '_client_capture.py')
@@ -433,6 +437,7 @@ def test_timeout_sql_client_rechecks_stored_interruption_proof(timeout_sql_clien
 
 
 def test_public_cli_cleanup_failure_keeps_child_outcome_unknown(captured, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '300')
     import subprocess
     from saas_bench import _public_cli
     api, store, executor = captured
@@ -604,8 +609,10 @@ def test_http_business_failure_and_unknown_bare_client(captured):
     store.assert_healthy()
 
 
-def test_streams_truncation_failure_and_capture_equivalence(captured):
+def test_streams_truncation_failure_and_capture_equivalence(captured, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     _, store, executor = captured
+    monkeypatch.setitem(executor.runtime_environment, 'CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     command = "python -c \"import sys; sys.stdout.write('中'*31000); sys.stderr.write('bad'); sys.exit(3)\""
     actual = executor.execute('bash', {'command': command})
     expected = BashAgentToolExecutor(executor.workspace_path).execute('bash', {'command': command})
@@ -732,7 +739,9 @@ def test_descendants_finish_and_streams_drain_after_bash_error(captured, detache
 
 
 def test_raw_decode_failure_partial_write_and_limits(captured, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_SEARCH_MATCH_LIMIT', '200')
     api, store, executor = captured
+    monkeypatch.setitem(executor.runtime_environment, 'CEOBENCH_SEARCH_MATCH_LIMIT', '200')
     output = executor.execute('bash', {'command': "python -c \"import sys;sys.stdout.buffer.write(b'\\xff')\""})
     assert output.startswith('Error:')
     event = event_ids(store)[0]
@@ -936,8 +945,10 @@ def test_batch_partial_receipt_and_public_object_fields(captured, monkeypatch):
     assert any(o['basis'] == 'public_request_target' for o in meta['objects'])
 
 
-def test_empty_delete_glob_cap_and_invalid_limit(captured):
+def test_empty_delete_glob_cap_and_invalid_limit(captured, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_GLOB_LIMIT', '200')
     _, store, executor = captured
+    monkeypatch.setitem(executor.runtime_environment, 'CEOBENCH_GLOB_LIMIT', '200')
     ws = executor.workspace_path
     (ws / 'empty').touch()
     assert executor.execute('read_file', {'path': 'empty'}) == '     1\t'

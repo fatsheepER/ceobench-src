@@ -41,8 +41,9 @@ def test_trickled_headers_close_at_total_deadline(server):
 
 
 @pytest.mark.parametrize('length', ['-1', '2097153', 'garbage'])
-def test_invalid_body_length_rejected_without_capture_fault(captured, length):
+def test_invalid_body_length_rejected_without_capture_fault(captured, length, monkeypatch):
     api, store, _ = captured
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '262144')
     with socket.create_connection(('127.0.0.1', api.port), timeout=2) as connection:
         connection.sendall(f'POST /query HTTP/1.0\r\nContent-Length: {length}\r\n\r\n'.encode())
         response = connection.makefile('rb').read()
@@ -121,7 +122,8 @@ def test_body_and_sql_share_one_deadline(server):
     assert server._sql_active == 0
 
 
-def test_sql_cell_size_is_bounded_before_returning_a_value(server):
+def test_sql_cell_size_is_bounded_before_returning_a_value(server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
     with query_snapshot(server, time.monotonic() + 1) as (connection, _):
         import sqlite3
         assert connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) == 1048576
@@ -141,7 +143,7 @@ def test_sql_cell_size_is_bounded_before_returning_a_value(server):
 
 def test_large_result_rejected_with_explicit_http_receipt(captured, monkeypatch):
     api, store, _ = captured
-    monkeypatch.setattr(public_sql, 'RESULT_LIMIT_BYTES', 1024)
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_RESULT_LIMIT_BYTES', '1024')
     status, body = request(api, {'sql': "WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<100) SELECT n, printf('%40s','x') AS text FROM x"})
     assert status == 413
     assert body['error'] == 'SQL result exceeded 1024 bytes. Narrow or aggregate the query.'
@@ -155,7 +157,7 @@ def test_large_result_rejected_with_explicit_http_receipt(captured, monkeypatch)
 def test_serialized_response_budget_rejects_before_success_headers(captured, monkeypatch):
     from saas_bench import api_server
     api, store, _ = captured
-    monkeypatch.setattr(api_server, 'RESPONSE_LIMIT_BYTES', 256)
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '256')
     status, body = request(api, {'sql': "SELECT printf('%300s','x') AS text"})
     assert status == 413
     assert body['error'] == 'SQL response exceeded 256 bytes. Narrow the query.'

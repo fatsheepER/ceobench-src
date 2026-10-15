@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from saas_bench.runtime_options import runtime_environment_snapshot, runtime_value, timeout_value
+
 
 class NextDayTimeoutError(Exception):
     """Raised when ./novamind-operation next-week times out.
@@ -273,9 +275,11 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
             'described in your system instructions.'))
                        if t['name'] == 'bash' else t for t in definitions]
     if bash_warn_after is not None:
+        python_timeout = timeout_value('public_python_timeout', 1800)
+        python_limit = f'{python_timeout:g} seconds' if python_timeout is not None else 'no separate hard limit'
         definitions = [dict(t, description=t['description'] +
             f' The outer Bash task limit is {bash_timeout:g} seconds. Subtools may time out earlier; '
-            'the public CLI Python subcommand has its own 300-second limit. '
+            f'the public CLI Python subcommand has {python_limit}. '
             f'Completed commands taking at least {bash_warn_after:g} seconds receive one framework timing notice. '
             'Use existing output first; reduce the workload or correct the script before computing again. '
             'A notice only guides subsequent work and does not require a rerun. '
@@ -367,16 +371,19 @@ class BashAgentToolExecutor:
         if identity and not require_sandbox:
             raise ValueError('Team execution requires the Linux sandbox')
         self.workspace_path = Path(workspace_path).resolve()
-        self.extra_env = env or {}
+        self.runtime_environment = runtime_environment_snapshot()
+        self.extra_env = dict(self.runtime_environment)
+        self.extra_env.update(env or {})
         from saas_bench.run_warnings import advisory
         with advisory():
             validate_bash_limits(bash_timeout, bash_warn_after)
         self.bash_timeout = bash_timeout
         self.bash_warn_after = bash_warn_after
-        from saas_bench.runtime_options import runtime_value, timeout_value
-        advance_timeout = timeout_value('advance_timeout', 0)
-        self.advance_timeout = advance_timeout + 30 if advance_timeout else None
-        self.advance_warn_after = runtime_value('advance_warn_after', 600)
+        advance_timeout = timeout_value('advance_timeout', 0, environment=self.runtime_environment)
+        self.completion_wait = timeout_value('completion_wait', 30, environment=self.runtime_environment)
+        self.advance_timeout = advance_timeout + self.completion_wait + 10 if advance_timeout and self.completion_wait else None
+        self.advance_warn_after = runtime_value('advance_warn_after', 600, environment=self.runtime_environment)
+        self.pf_timeout = runtime_value('pf_timeout', 600, environment=self.runtime_environment)
         from saas_bench.process_boundary import command_memory_limit
         self.bash_memory_limit_bytes = command_memory_limit(bash_memory_limit_bytes)
         self.require_sandbox = require_sandbox
@@ -386,7 +393,8 @@ class BashAgentToolExecutor:
         self.pf_queries = None
         if text_registry and text_registry.mode == 'pf':
             from saas_bench.pf_queries import PFQueries
-            self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh)
+            self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh,
+                                       call_timeout=self.pf_timeout)
         if text_registry:
             text_registry.automatic_pf_checks = lambda: bool(self.pf_queries and self.pf_queries.stale_checks)
         self.capture = None
@@ -908,9 +916,6 @@ class BashAgentToolExecutor:
             'OMP_NUM_THREADS': '1',
         }
         env.update(self.extra_env)
-        for name in ('CEOBENCH_ADVANCE_TIMEOUT_SECONDS', 'CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS'):
-            if name in os.environ:
-                env[name] = os.environ[name]
         if getattr(self, '_pf_service', None):
             env['PATH'] = self._pf_service.guest + os.pathsep + env['PATH']
             env['PF_SOCKET'] = self._pf_service.guest + '/socket'
@@ -951,7 +956,7 @@ class BashAgentToolExecutor:
             if advance_started is not None:
                 if advance_finished is None:
                     advance_finished = now
-                return max(started_at + self.bash_timeout, advance_finished + 30)
+                return max(started_at + self.bash_timeout, advance_finished + self.completion_wait) if self.completion_wait else float('inf')
             return started_at + self.bash_timeout
 
         self._bash_facts['advance_timeout'] = self.advance_timeout
@@ -1056,17 +1061,20 @@ class BashAgentToolExecutor:
 
             output = '\n'.join(output_parts) if output_parts else "(no output)"
 
-            # Truncate very long output (same limit as Claude Code: 30K chars)
             if self.capture:
                 self.capture.origins = self._stream_origins(stdout, stderr)
-            if len(output) > 30000 and not getattr(self, 'registered_execution', False):
+            output_limit = runtime_value('bash_output_max_chars', 100000, environment=self.runtime_environment)
+            if output_limit and len(output) > output_limit and not getattr(self, 'registered_execution', False):
+                path = self._save_full_output(output)
+                head = output_limit // 2
+                tail = output_limit - head
+                marker = f'\n\n[output truncated at {output_limit} characters; full output: {path}]\n\n'
                 if self.capture:
                     self.capture.facts['output_truncated'] = True
                     from saas_bench.execution_capture import slice_origins
-                    marker = '\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n'
-                    self.capture.origins = (slice_origins(self.capture.origins, 0, 15000) +
-                        slice_origins(self.capture.origins, len(output) - 15000, len(output), 15000 + len(marker)))
-                output = output[:15000] + "\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n" + output[-15000:]
+                    self.capture.origins = (slice_origins(self.capture.origins, 0, head) +
+                        slice_origins(self.capture.origins, len(output) - tail, len(output), head + len(marker)))
+                output = output[:head] + marker + output[-tail:]
 
             return output
 
@@ -1168,6 +1176,14 @@ class BashAgentToolExecutor:
         finally:
             if self.capture:
                 self.capture.facts['stream_capture_seconds'] = time.monotonic() - started
+
+    def _save_full_output(self, text):
+        from saas_bench.workspace_io import open_file
+        raw = text.encode()
+        relative = Path('tool-outputs') / (hashlib.sha256(raw).hexdigest() + '.txt')
+        with open_file(self.workspace_path, self.workspace_path / relative, 'wb') as stream:
+            stream.write(raw)
+        return relative.as_posix()
 
     def _stream_origins(self, stdout, stderr):
         from saas_bench.execution_capture import origin
@@ -1277,8 +1293,10 @@ class BashAgentToolExecutor:
             files = sorted(f for f in resolved.rglob(glob_filter) if not self._hidden(f))
 
         target = 0
+        file_limit = runtime_value('search_file_limit', 1000, environment=self.runtime_environment)
+        match_limit = runtime_value('search_match_limit', 2000, environment=self.runtime_environment)
         scanned, skipped = [], []
-        for fpath in files[:100]:  # Limit file count
+        for fpath in files[:file_limit or None]:
             try:
                 checked = self._contained(fpath, str(fpath))
             except ValueError:
@@ -1300,17 +1318,24 @@ class BashAgentToolExecutor:
                     self._source(version, content, source_start, source_start + len(line), target + len(prefix))
                     matches.append(prefix + line)
                     target += len(prefix) + len(line) + 1
-                    if len(matches) >= 200:
-                        break
                 source_start += len(line) + 1
-            if len(matches) >= 200:
-                break
+
+        source_truncated = bool(file_limit and len(files) > file_limit or match_limit and len(matches) > match_limit)
+        if source_truncated:
+            full = '\n'.join(matches) or 'No matches found.'
+            if file_limit and len(files) > file_limit:
+                full += f'\n[Search scope: first {file_limit} of {len(files)} candidate files.]'
+            path = self._save_full_output(full)
+            matches = matches[:match_limit or None]
+            if self.capture:
+                from saas_bench.execution_capture import slice_origins
+                self.capture.origins = slice_origins(self.capture.origins, 0, len('\n'.join(matches)))
+            matches.append(f'[Search truncated: searched {len(scanned)} of {len(files)} candidate files; '
+                           f'showing at most {match_limit or "all"} matches. Full searched output: {path}]')
 
         if self.capture:
             self.capture.facts.update(scanned=scanned, skipped=skipped, candidates=len(files),
-                                      source_truncated=len(files) > 100 or len(matches) >= 200)
-        if len(files) > 100 or len(matches) >= 200:
-            matches.append('[Search truncated: at most 100 candidates and 200 matches.]')
+                                      source_truncated=source_truncated)
         if skipped:
             matches.append(f'[Skipped {len(skipped)} unreadable or out-of-workspace candidates.]')
         if not matches:
@@ -1339,15 +1364,17 @@ class BashAgentToolExecutor:
         if not matches:
             return "No matching files."
         result = []
-        for m in matches[:200]:
+        for m in matches:
             try:
                 self._contained(m, str(m))
                 rel = self._file_name(m)
                 result.append(str(rel))
             except ValueError:
                 result.append('[Skipped out-of-workspace path]')
-        if len(matches) > 200:
-            result.append('[Glob truncated: first 200 paths.]')
+        limit = runtime_value('glob_limit', 2000, environment=self.runtime_environment)
+        if limit and len(matches) > limit:
+            path = self._save_full_output('\n'.join(result))
+            result = result[:limit] + [f'[Glob truncated: first {limit} paths. Full output: {path}]']
         if self.capture:
-            self.capture.facts.update(candidates=len(matches), source_truncated=len(matches) > 200)
+            self.capture.facts.update(candidates=len(matches), source_truncated=bool(limit and len(matches) > limit))
         return '\n'.join(result)

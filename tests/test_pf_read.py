@@ -122,7 +122,8 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
     ("pf show facts.txt | grep observation", True),
     ("printf '%20000s' x; pf show facts.txt; printf '%20000s' y", True),
 ])
-def test_pf_final_shell_delivery_scope_on_model_wire(workspace, tmp_path, command, partial):
+def test_pf_final_shell_delivery_scope_on_model_wire(workspace, tmp_path, command, partial, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     store, _, executor = captured(workspace, tmp_path)
     (workspace / 'facts.txt').write_text(sample().replace('\r\n', '\n'))
     executor.execute('bash', {'command': 'true'})

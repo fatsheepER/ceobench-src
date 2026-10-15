@@ -6,6 +6,7 @@ import time
 
 from .execution_capture import READ_TOOLS, finish_http
 from .pf_deadline import Budget, current_budget
+from .runtime_options import runtime_value
 from .public_sql import (CELL_LIMIT_BYTES, FORMATTING_NULL_WARNING, FORMATTING_NULL_LOSS,
                          PUBLIC_POLICY_VERSION, RESPONSE_LIMIT_BYTES,
                          QueryDenied, QueryResultTooLarge, SnapshotUnavailable,
@@ -107,8 +108,9 @@ def refresh(server, versions, parent, *, store=None):
                             if code == sqlite3.SQLITE_INTERRUPT:
                                 raise TimeoutError('Query time limit exceeded') from exc
                             if code == sqlite3.SQLITE_TOOBIG:
+                                cell_limit = execution.get('sqlite_limits', {}).get('cell_bytes', CELL_LIMIT_BYTES)
                                 raise QueryResultTooLarge(
-                                    f'SQL value or row exceeded {CELL_LIMIT_BYTES} bytes. Narrow the query.') from exc
+                                    f'SQL value or row exceeded {cell_limit} bytes. Narrow the query.') from exc
                             raise
                         if snapshot.pop('_format_returned_null', False):
                             execution['losses'].append(FORMATTING_NULL_LOSS)
@@ -128,13 +130,15 @@ def refresh(server, versions, parent, *, store=None):
                             server.conn.set_progress_handler(None, 0)
                     check()
                     chunks, size = [], 0
+                    response_limit = runtime_value('sql_response_limit_bytes', RESPONSE_LIMIT_BYTES,
+                        environment=getattr(server, 'runtime_environment', None))
                     for chunk in json.JSONEncoder(default=str).iterencode(body):
                         check()
                         chunk = chunk.encode()
                         size += len(chunk)
-                        if size > RESPONSE_LIMIT_BYTES:
+                        if response_limit and size > response_limit:
                             raise QueryResultTooLarge(
-                                f'PF refresh response exceeded {RESPONSE_LIMIT_BYTES} bytes. Narrow the source.')
+                                f'PF refresh response exceeded {response_limit} bytes. Narrow the source.')
                         chunks.append(chunk)
                     raw = b''.join(chunks)
                     check()

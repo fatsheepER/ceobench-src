@@ -360,7 +360,7 @@ def test_same_seed_clones_share_d0_but_have_independent_sessions_worlds_and_hist
                 script = team.server.role_executors[role]
                 assert (script.bash_timeout, script.bash_warn_after) == (1200, None)
                 description = next(tool['description'] for tool in rr.agent.tool_descriptions if tool['name'] == 'bash')
-                assert ('480 seconds' in description and '120 seconds' in description and '300-second' in description) == (role != 'ceo')
+                assert ('480 seconds' in description and '120 seconds' in description and '1800 seconds' in description) == (role != 'ceo')
         teams[0].server.conn.execute('UPDATE config_history SET price_A = 17')
         teams[0].server.conn.commit()
         (teams[0].roles['ceo'].workspace / 'MEMORY.md').write_text('ONLY FIRST CLONE')

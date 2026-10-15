@@ -130,7 +130,8 @@ def test_policy_and_every_public_projection(server):
     assert execute_query(server, "SELECT amount AS actual_completion_day FROM ledger")['rows'] == [{'actual_completion_day': 42.0}]
 
 
-def test_legal_sql_results_and_limits(server):
+def test_legal_sql_results_and_limits(server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_ROW_LIMIT', '5000')
     query = '''WITH x AS (SELECT amount,note FROM ledger UNION ALL SELECT amount,note FROM ledger)
                SELECT amount,note,row_number() OVER(ORDER BY amount) AS n FROM x ORDER BY n DESC'''
     assert execute_query(server, query)['rows'] == [dict(amount=42.0,note=None,n=2),dict(amount=42.0,note=None,n=1)]

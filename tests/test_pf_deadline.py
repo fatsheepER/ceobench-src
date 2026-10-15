@@ -18,7 +18,8 @@ from test_public_sql import server
 from test_text_registry import workspace
 
 
-def test_pf_model_output_discloses_formatting_null_limit(workspace, tmp_path, server):
+def test_pf_model_output_discloses_formatting_null_limit(workspace, tmp_path, server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
     from test_pf_stale import chain, forward
     store, registry, executor = chain(workspace, tmp_path, server,
         sql="SELECT printf('%1048577s','x') AS n")
@@ -28,7 +29,7 @@ def test_pf_model_output_discloses_formatting_null_limit(workspace, tmp_path, se
     assert leaf['check']['affected'] is True
     assert 'SQLite formatting function returned NULL' in leaf['check']['reason']
     text = executor.execute('bash', {'command': 'pf depend r1'})
-    assert '1 MiB value limit' in text
+    assert 'configured value limit' in text
     assert 'SQLite formatting function returned NULL' in text
 
 
@@ -217,8 +218,9 @@ def test_real_refresh_transport_propagates_deadline(captured):
     store.assert_healthy()
 
 
-def test_refresh_large_sql_value_is_explicitly_rejected(captured):
+def test_refresh_large_sql_value_is_explicitly_rejected(captured, monkeypatch):
     api, store, _ = captured
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
     sql = "SELECT replace(printf('%1000000s','x'),' ','xxx') AS n"
     versions = [record_sql(store, 'SELECT 42 AS n', dict(columns=['n'], rows=[{'n': 42}])),
                 record_sql(store, sql, {})]
@@ -256,8 +258,9 @@ def test_refresh_sql_formatting_null_keeps_warning(captured, sql, warning):
     store.assert_healthy()
 
 
-def test_refresh_format_warning_does_not_leak_from_failed_source(captured):
+def test_refresh_format_warning_does_not_leak_from_failed_source(captured, monkeypatch):
     api, store, _ = captured
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
     sql = "SELECT printf('%2000000000s','x') AS a, replace(printf('%1000000s','x'),' ','xxx') AS b"
     versions = [record_sql(store, sql, {}), record_sql(store, 'SELECT 42 AS n', {})]
     parent = store.begin_event('pf_dependencies', {})
@@ -273,6 +276,7 @@ def test_refresh_format_warning_does_not_leak_from_failed_source(captured):
 
 def test_refresh_serialized_response_has_a_byte_limit(captured, monkeypatch):
     api, store, _ = captured
+    monkeypatch.setitem(api.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '64')
     monkeypatch.setattr('saas_bench.pf_refresh.RESPONSE_LIMIT_BYTES', 64)
     version = record_sql(store, 'SELECT 42 AS n', {})
     parent = store.begin_event('pf_dependencies', {})

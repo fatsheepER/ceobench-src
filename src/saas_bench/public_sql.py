@@ -7,18 +7,19 @@ import time
 import uuid
 
 from .database import TABLE_DOCS, SharedMemoryConnection
+from .runtime_options import runtime_value
 
 
 PUBLIC_POLICY_VERSION = 'public-sql-v1'
 PUBLIC_COLUMNS = {table: tuple(doc['columns']) for table, doc in TABLE_DOCS.items()}
-ROW_LIMIT = 5000
-CELL_LIMIT_BYTES = 1024 * 1024
-RESULT_LIMIT_BYTES = 8 * 1024 * 1024
-RESPONSE_LIMIT_BYTES = 16 * 1024 * 1024
+ROW_LIMIT = 20000
+CELL_LIMIT_BYTES = 8 * 1024 * 1024
+RESULT_LIMIT_BYTES = 32 * 1024 * 1024
+RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024
 FORMATTING_NULL_LOSS = 'sqlite_formatting_null_requires_review'
 FORMATTING_NULL_WARNING = (
     'A SQLite formatting function returned NULL. SQLite returns NULL for empty or invalid '
-    'formats and when formatting exceeds the 1 MiB value limit. Check the format and narrow '
+    'formats and when formatting exceeds the configured value limit. Check the format and narrow '
     'the value before using this result.'
 )
 FUNCTIONS = frozenset('''
@@ -113,6 +114,11 @@ def query_snapshot(server, deadline, metadata=None):
     metadata = metadata if metadata is not None else {}
     metadata.update(snapshot_ref=uuid.uuid4().hex, public_policy_version=PUBLIC_POLICY_VERSION,
                     oracle=server.oracle_mode, snapshot_status='failed')
+    environment = getattr(server, 'runtime_environment', None)
+    metadata['limits'] = dict(rows=runtime_value('sql_row_limit', ROW_LIMIT, environment=environment),
+        result_bytes=runtime_value('sql_result_limit_bytes', RESULT_LIMIT_BYTES, environment=environment),
+        cell_bytes=runtime_value('sql_cell_limit_bytes', CELL_LIMIT_BYTES, environment=environment),
+        columns=runtime_value('sql_column_limit', 512, environment=environment))
     stage = 'lock'
     try:
         # ponytail: serialize queries and world writes; use frozen readers if contention matters.
@@ -153,10 +159,15 @@ def query_snapshot(server, deadline, metadata=None):
             try:
                 formatter = sqlite3.connect(':memory:')
                 conn.row_factory = sqlite3.Row
-                conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, CELL_LIMIT_BYTES)
-                conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, CELL_LIMIT_BYTES)
-                conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 128)
-                formatter.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, CELL_LIMIT_BYTES)
+                cell_limit = metadata['limits']['cell_bytes']
+                conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, cell_limit or conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH))
+                conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, cell_limit or conn.getlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH))
+                column_limit = metadata['limits']['columns']
+                conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, column_limit or conn.getlimit(sqlite3.SQLITE_LIMIT_COLUMN))
+                formatter.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, cell_limit or formatter.getlimit(sqlite3.SQLITE_LIMIT_LENGTH))
+                metadata['sqlite_limits'] = dict(cell_bytes=conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH),
+                    sql_bytes=conn.getlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH),
+                    columns=conn.getlimit(sqlite3.SQLITE_LIMIT_COLUMN))
                 def bounded_format(*values):
                     if time.monotonic() >= deadline:
                         metadata['_format_timed_out'] = True
@@ -231,8 +242,9 @@ def execute_query(server, sql, *, metadata=None):
         if code & 0xff == sqlite3.SQLITE_INTERRUPT:
             raise TimeoutError('Query time limit exceeded') from exc
         if code & 0xff == sqlite3.SQLITE_TOOBIG:
+            cell_limit = metadata.get('sqlite_limits', {}).get('cell_bytes', CELL_LIMIT_BYTES)
             raise QueryResultTooLarge(
-                f'SQL value or row exceeded {CELL_LIMIT_BYTES} bytes. Narrow or aggregate the query.') from exc
+                f'SQL value or row exceeded {cell_limit} bytes. Narrow or aggregate the query.') from exc
         raise
 
 
@@ -244,27 +256,30 @@ def execute_snapshot(conn, sql, deadline, metadata):
     metadata['executed_sql'] = sql
     columns = [desc[0] for desc in cursor.description] if cursor.description else []
     raw, size = [], 0
+    row_limit = metadata.get('limits', {}).get('rows', ROW_LIMIT)
+    result_limit = metadata.get('limits', {}).get('result_bytes', RESULT_LIMIT_BYTES)
     for row in cursor:
         check_deadline(deadline)
         for chunk in json.JSONEncoder(default=str).iterencode(dict(row)):
             check_deadline(deadline)
             size += len(chunk.encode())
-            if size > RESULT_LIMIT_BYTES:
+            if result_limit and size > result_limit:
                 raise QueryResultTooLarge(
-                    f'SQL result exceeded {RESULT_LIMIT_BYTES} bytes. Narrow or aggregate the query.')
+                    f'SQL result exceeded {result_limit} bytes. Narrow or aggregate the query.')
         raw.append(row)
-        if len(raw) > ROW_LIMIT:
+        if row_limit and len(raw) > row_limit:
             break
+    delivered = raw[:row_limit or None]
     metadata['losses'] = ['blob_coercion'] if any(
-        isinstance(value, bytes) for row in raw[:ROW_LIMIT] for value in row) else []
+        isinstance(value, bytes) for row in delivered for value in row) else []
     check_deadline(deadline)
     result = {'success': True, 'columns': columns,
-              'rows': [dict(row) for row in raw[:ROW_LIMIT]],
-              'row_count': min(len(raw), ROW_LIMIT)}
-    if len(raw) > ROW_LIMIT:
+              'rows': [dict(row) for row in delivered],
+              'row_count': len(delivered)}
+    if row_limit and len(raw) > row_limit:
         result['truncated'] = True
         result['warning'] = (
-            f'Result exceeded {ROW_LIMIT} rows and was truncated. '
+            f'Result exceeded {row_limit} rows and was truncated. '
             'Add a LIMIT clause to your query, or use COUNT/GROUP BY to '
             'aggregate results instead of fetching all rows.'
         )

@@ -56,6 +56,7 @@ _ENGINE_MODULES = [
     "process_boundary",
     "runtime_temp",
     "runtime_options",
+    "systemd_guard",
     "config",
     "customer_llm",
     "database",

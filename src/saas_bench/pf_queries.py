@@ -155,7 +155,9 @@ def noise(path):
 
 
 class PFQueries:
-    def __init__(self, registry, *, stale_checks=True, refresh=None):
+    def __init__(self, registry, *, stale_checks=True, refresh=None, call_timeout=None):
+        from .runtime_options import runtime_value
+        self.call_timeout = runtime_value('pf_timeout', 600) if call_timeout is None else call_timeout
         if registry.mode != 'pf':
             raise ValueError('PF queries require PF mode')
         self.store, self.resolver = registry.store, registry.resolver
@@ -282,7 +284,7 @@ class PFQueries:
     def answer(self, operation, args):
         """Structured page for one query; pf_read content and diff return their delivered text."""
         try:
-            with budget_scope(), self.resolver.cached():
+            with budget_scope(timeout=self.call_timeout or float('inf')), self.resolver.cached():
                 return self._answer(operation, args)
         except TimeoutError:
             self.__dict__.pop('_indexed', None)
