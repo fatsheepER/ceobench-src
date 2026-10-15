@@ -380,7 +380,7 @@ def test_same_seed_clones_share_d0_but_have_independent_sessions_worlds_and_hist
         for team in teams:
             assert len({r.registry.workspace for r in team.roles.values()}) == 3
             for role, rr in team.roles.items():
-                assert rr.agent.client.max_retries == 2
+                assert rr.agent.client.max_retries == 0
                 assert rr.agent.model == batch.MODEL and rr.agent.reasoning_effort == 'high'
                 assert rr.usage.pricing == PRICES['rates']
                 assert (rr.executor.bash_timeout, rr.executor.bash_warn_after) == ((1200, None) if role == 'ceo' else (480, 120))
