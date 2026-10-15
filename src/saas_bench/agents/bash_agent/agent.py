@@ -18,8 +18,9 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
-from ...model_usage import ModelUsage, usage_values
+from ...model_usage import ModelUsage, plain, usage_values
 from ...run_lifecycle import RunCancelled
+from ...runtime_options import nonnegative_integer, runtime_value
 
 
 @dataclass(frozen=True)
@@ -131,12 +132,16 @@ class BashAgent(BaseAgent):
         pf: bool = False,
         identity=None,
         allow_final_text=False,
+        invalid_generation_attempts=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
         super().__init__(tool_descriptions)
         self.identity = identity
         self.allow_final_text = allow_final_text
+        self.invalid_generation_attempts = (runtime_value('invalid_generation_attempts', 4)
+            if invalid_generation_attempts is None else nonnegative_integer(invalid_generation_attempts))
+        self._last_invalid_generation = None
         self.role = identity.role if identity else "ceo"
         self.client = client
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
@@ -437,6 +442,7 @@ class BashAgent(BaseAgent):
         if self._pending_tool_calls:
             raise RuntimeError('Finish the current tool batch before requesting another model response')
         self._llm_attempt = 0
+        self._last_invalid_generation = None
         try:
             action = self._call_llm()
         except RunCancelled:
@@ -452,17 +458,39 @@ class BashAgent(BaseAgent):
         return action
 
     def _retry_wait(self, seconds):
-        if getattr(self, '_llm_attempt', 0) >= 4:
-            raise RunCancelled('model_attempt_limit')
+        self._check_generation_limit()
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
             lifecycle.sleep(seconds)
         else:
             time.sleep(seconds)
 
+    def _check_generation_limit(self):
+        attempts = getattr(self, '_llm_attempt', 0)
+        if self.invalid_generation_attempts and attempts >= self.invalid_generation_attempts:
+            detail = (f'No valid reply after {attempts} model requests. Last invalid generation '
+                + json.dumps(self._last_invalid_generation, ensure_ascii=False)
+                + '. Continue with scripts/team_driver.py --policy <policy.json> --live --resume --week <existing-week>.')
+            raise RunCancelled('model_attempt_limit', detail)
+
+    def _record_invalid_generation(self, reason, response, feedback):
+        record = dict(reason=reason, output=plain(response), feedback=feedback,
+                      attempt=self._llm_attempt, day=self.current_day)
+        self._last_invalid_generation = record
+        if self.usage_recorder.path:
+            path = self.usage_recorder.path.with_name('invalid-generations.jsonl')
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open('a') as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as exc:
+                raise RunCancelled('invalid_generation_evidence_failed', str(exc)) from exc
+        self.conversation.append(Message(role='user', content=feedback))
+
     def _request_model(self, api, request, invoke):
-        if getattr(self, '_llm_attempt', 0) >= 4:
-            raise RunCancelled('model_attempt_limit')
+        self._check_generation_limit()
         lifecycle = getattr(self, 'lifecycle', None)
         if lifecycle:
             self.usage_recorder.lifecycle = lifecycle
@@ -769,8 +797,9 @@ class BashAgent(BaseAgent):
                     for tc in assistant_msg.tool_calls:
                         if tc.function.arguments:
                             try:
-                                json.loads(tc.function.arguments)
-                            except json.JSONDecodeError as je:
+                                if not isinstance(json.loads(tc.function.arguments), dict):
+                                    raise ValueError('Tool arguments must be a JSON object')
+                            except (ValueError, TypeError) as je:
                                 json_validation_error = (
                                     tc.function.name,
                                     str(je),
@@ -781,16 +810,13 @@ class BashAgent(BaseAgent):
                 if json_validation_error:
                     name, err, preview = json_validation_error
                     print(f"  Invalid JSON in tool_call `{name}`: {err}. Feeding error back to LLM and regenerating.")
-                    self.conversation.append(Message(
-                        role='user',
-                        content=(
+                    self._record_invalid_generation('arguments', response, (
                             f"Your previous response contained invalid JSON in the `{name}` tool_call arguments.\n"
                             f"JSON decode error: {err}\n"
                             f"Arguments started with: {preview}...\n\n"
                             f"Valid JSON escape sequences are limited to: \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX. "
                             f"Shell-style escapes like \\$ or \\! are NOT valid JSON. "
                             f"Please re-emit the tool call with valid JSON."
-                        )
                     ))
                     continue
 
@@ -824,14 +850,16 @@ class BashAgent(BaseAgent):
 
                 if not assistant_msg.tool_calls:
                     if (self.allow_final_text and response.choices[0].finish_reason == 'stop'
+                            and not getattr(assistant_msg, 'refusal', None)
                             and isinstance(assistant_msg.content, str) and assistant_msg.content.strip()):
                         return FinalText(assistant_msg.content)
                     # LLM emitted no tool_call — feed feedback and retry.
                     print("  LLM returned no tool_call. Feeding feedback and regenerating.")
-                    self.conversation.append(Message(
-                        role='user',
-                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
-                    ))
+                    reason = ('provider_refusal' if getattr(assistant_msg, 'refusal', None)
+                        or response.choices[0].finish_reason == 'content_filter' else
+                        'output_truncation' if response.choices[0].finish_reason == 'length' else 'no_tool')
+                    self._record_invalid_generation(reason, response,
+                        getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK))
                     continue
 
                 self._pending_tool_calls = [dict(id=tc.id, name=tc.function.name,
@@ -964,8 +992,9 @@ class BashAgent(BaseAgent):
                 for fc in function_calls:
                     if fc.arguments:
                         try:
-                            json.loads(fc.arguments)
-                        except json.JSONDecodeError as je:
+                            if not isinstance(json.loads(fc.arguments), dict):
+                                raise ValueError('Tool arguments must be a JSON object')
+                        except (ValueError, TypeError) as je:
                             json_validation_error = (
                                 fc.name,
                                 str(je),
@@ -976,16 +1005,13 @@ class BashAgent(BaseAgent):
                 if json_validation_error:
                     name, err, preview = json_validation_error
                     print(f"  Invalid JSON in function_call `{name}`: {err}. Feeding error back to LLM and regenerating.")
-                    self.conversation.append(Message(
-                        role='user',
-                        content=(
+                    self._record_invalid_generation('arguments', response, (
                             f"Your previous response contained invalid JSON in the `{name}` tool_call arguments.\n"
                             f"JSON decode error: {err}\n"
                             f"Arguments started with: {preview}...\n\n"
                             f"Valid JSON escape sequences are limited to: \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX. "
                             f"Shell-style escapes like \\$ or \\! are NOT valid JSON. "
                             f"Please re-emit the tool call with valid JSON."
-                        )
                     ))
                     continue
 
@@ -997,14 +1023,16 @@ class BashAgent(BaseAgent):
 
                 if not function_calls:
                     text = getattr(response, 'output_text', '')
-                    if self.allow_final_text and getattr(response, 'status', '') == 'completed' and text.strip():
+                    refused = any(getattr(part, 'type', '') == 'refusal' for item in response.output
+                                  for part in getattr(item, 'content', []) or [])
+                    if self.allow_final_text and not refused and getattr(response, 'status', '') == 'completed' and text.strip():
                         return FinalText(text)
                     # LLM emitted no tool_call — feed feedback and retry.
                     print("  LLM returned no function_call. Feeding feedback and regenerating.")
-                    self.conversation.append(Message(
-                        role='user',
-                        content=getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK)
-                    ))
+                    reason = ('provider_refusal' if refused else 'output_truncation'
+                        if getattr(response, 'status', '') == 'incomplete' else 'no_tool')
+                    self._record_invalid_generation(reason, response,
+                        getattr(self, 'no_tool_feedback', NO_TOOL_FEEDBACK))
                     continue
 
                 self._pending_tool_calls = [dict(id=fc.call_id, name=fc.name,
@@ -1274,12 +1302,16 @@ class BashAgent(BaseAgent):
                     )
 
                 assistant_content = response.content
+                tool_use_blocks = [block for block in assistant_content if block.type == 'tool_use']
+                if any(not isinstance(block.input, dict) for block in tool_use_blocks):
+                    self._record_invalid_generation('arguments', response,
+                        'Tool arguments must be a JSON object. Re-emit one complete tool call with object arguments.')
+                    continue
                 self.conversation.append(Message(
                     role='assistant',
                     content=assistant_content
                 ))
 
-                tool_use_blocks = [block for block in assistant_content if block.type == 'tool_use']
                 if not tool_use_blocks:
                     text = self._anthropic_content_text(assistant_content)
                     if self.allow_final_text and getattr(response, 'stop_reason', '') == 'end_turn' and text.strip():
@@ -1298,10 +1330,10 @@ class BashAgent(BaseAgent):
                         f"  Anthropic returned no tool_use "
                         f"(stop_reason={stop_reason!r}); feeding feedback and regenerating."
                     )
-                    self.conversation.append(Message(
-                        role='user',
-                        content=self._anthropic_no_tool_feedback(response, assistant_content),
-                    ))
+                    reason = ('provider_refusal' if stop_reason == 'refusal' else
+                              'output_truncation' if stop_reason == 'max_tokens' else 'no_tool')
+                    self._record_invalid_generation(reason, response,
+                        self._anthropic_no_tool_feedback(response, assistant_content))
                     continue
 
                 self._pending_tool_calls = [dict(id=block.id, name=block.name,
