@@ -144,6 +144,29 @@ def test_startup_failure_preserves_finished_attempt_and_runs_peer(observer, cont
     assert terminal['s101-pf']['status'] == 'finished'
 
 
+@pytest.mark.parametrize('source', ['attempt', 'units', 'events'])
+def test_corrupt_management_history_warns_preserves_original_and_runs_peer(
+        observer, controller, monkeypatch, caplog, source):
+    from test_preflight_group_join import group_batch
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    entry = observer.manifest['runs'][0]
+    corrupt = (Path(entry['output_dir']) / 'attempt-001/attempt.json' if source == 'attempt' else
+        controller.policy.parent / ('controller-units.json' if source == 'units' else 'controller-events.jsonl'))
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    original = b'{"unfinished":'
+    corrupt.write_bytes(original)
+    controller.module.supervise(controller.policy, resume=True)
+    assert launches == ['s101-git', 's101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    assert corrupt.read_bytes() == original
+    assert str(corrupt) in caplog.text and 'unavailable' in caplog.text
+    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
+    assert receipt['children_reaped'] and not receipt['hold'] and not receipt['failed']
+    assert set(batch.read(receipt['units_path'])) == set(launches)
+    events = [json.loads(line) for line in Path(receipt['events_path']).read_text().splitlines()]
+    assert {row['run_id'] for row in events if row['event'] == 'worker_launched'} == set(launches)
+
+
 def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):
     entry = observer.manifest['runs'][0]
     monkeypatch.setenv('CEOBENCH_WORKER_LAUNCH_ID', 'offline-launch')

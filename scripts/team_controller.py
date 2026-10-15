@@ -160,7 +160,17 @@ class RequestGate:
 
 def latest(entry):
     history = batch.attempts(entry)
-    return batch.read(history[-1] / 'attempt.json') if history else None
+    if not history:
+        return None
+    path = history[-1] / 'attempt.json'
+    try:
+        record = batch.read(path)
+        if not isinstance(record, dict):
+            raise ValueError('Attempt metadata is not an object')
+        return record
+    except (OSError, ValueError) as exc:
+        logging.warning('Historical attempt metadata unavailable at %s: %s; preserving it and continuing', path, exc)
+        return None
 
 
 def run_stopped(entry, *, after_attempt=None):
@@ -243,12 +253,30 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
     events_path = directory / 'controller-events.jsonl'
     terminal, children, streams = {}, [], []
     units_path = directory / 'controller-units.json'
-    units = batch.read(units_path) if units_path.exists() else {}
+    history_errors = []
+    units = {}
+    if units_path.exists():
+        try:
+            units = batch.read(units_path)
+            if not isinstance(units, dict) or any(not isinstance(row, dict) or not row.get('unit') for row in units.values()):
+                raise ValueError('Worker scope history is not a map of unit records')
+        except (OSError, ValueError) as exc:
+            logging.warning('Historical controller metadata unavailable at %s: %s; preserving it and continuing', units_path, exc)
+            history_errors.append(dict(path=str(units_path), error=type(exc).__name__ + ': ' + str(exc)))
+            units_path = directory / ('controller-units-' + uuid.uuid4().hex + '.json')
+            units = {}
     launch_ordinal = 0
     if events_path.exists():
-        for line in events_path.read_text().splitlines():
-            row = json.loads(line)
-            launch_ordinal = max(launch_ordinal, row.get('launch_ordinal', 0))
+        try:
+            for line in events_path.read_text().splitlines():
+                row = json.loads(line)
+                if not isinstance(row, dict) or type(row.get('launch_ordinal', 0)) is not int:
+                    raise ValueError('Controller event has no valid launch ordinal')
+                launch_ordinal = max(launch_ordinal, row.get('launch_ordinal', 0))
+        except (OSError, ValueError) as exc:
+            logging.warning('Historical controller metadata unavailable at %s: %s; preserving it and continuing', events_path, exc)
+            history_errors.append(dict(path=str(events_path), error=type(exc).__name__ + ': ' + str(exc)))
+            events_path = directory / ('controller-events-' + uuid.uuid4().hex + '.jsonl')
     state = {}
     stop_requested = False
     sampler = MemorySampler(host_logs / 'host-memory.jsonl')
@@ -261,6 +289,9 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             stream.write(json.dumps(dict(fields, time=datetime.now(timezone.utc).isoformat(), event=kind)) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
+
+    for error in history_errors:
+        event('controller_history_warning', **error)
 
     def alarm(entry, reason, **details):
         record = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
@@ -280,7 +311,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         run_id = slot['entry']['run_id']
         if units.get(run_id) != observed:
             units[run_id] = observed
-            write_json(directory / 'controller-units.json', units)
+            write_json(units_path, units)
         return observed
 
     def close_previous(entry):
@@ -299,7 +330,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 logging.warning('Previous worker scope cannot be verified: %s; waiting before launch', exc)
                 observed = dict(saved, scope_empty=False, scope_observation_unknown=True)
             units[entry['run_id']] = observed
-            write_json(directory / 'controller-units.json', units)
+            write_json(units_path, units)
             if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
                 return False
             if observed.get('scope_empty') and not observed.get('scope_observation_unknown'):
@@ -369,10 +400,10 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         notice = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
             time=datetime.now(timezone.utc).isoformat(), manual_resume_required=True, unit=unit)
         if history:
-            record = batch.read(history[-1] / 'attempt.json')
+            record = latest(entry) or {}
             notice['checkpoint'] = record.get('checkpoint') or record.get('source_checkpoint')
             notice['detail'] = record.get('hold_detail') or reason
-            if history[-1].name != prior_attempt:
+            if record and history[-1].name != prior_attempt:
                 record.update(status='paused', hold=True, hold_detail=record.get('hold_detail') or reason)
                 write_json(history[-1] / 'attempt.json', record)
                 write_json(history[-1] / 'HOLD', notice)
@@ -548,6 +579,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                     any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
+                units_path=str(units_path), events_path=str(events_path), history_read_errors=history_errors,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
                 auto_resume=False))
 
