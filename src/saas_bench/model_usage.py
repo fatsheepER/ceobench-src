@@ -38,6 +38,15 @@ def check_model_call():
         current[0]._check_deadline()
 
 
+def exception_details(exc):
+    details, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        details.append(type(exc).__name__ + ': ' + str(exc))
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return '; '.join(details)
+
+
 def is_network_error(exc):
     from openai import APIConnectionError as OpenAIConnectionError
     from anthropic import APIConnectionError as AnthropicConnectionError
@@ -546,7 +555,7 @@ class ModelUsage:
             with self.lifecycle.model_call():
                 return self._call(api, request, invoke, **context)
         except Exception as exc:
-            raise RunCancelled('model_request_failed') from exc
+            raise RunCancelled('model_request_failed', exception_details(exc)) from exc
         finally:
             for client, retries in policies:
                 client.max_retries = retries
@@ -622,7 +631,7 @@ class ModelUsage:
                     last_model_error = type(exc).__name__
                     self.lifecycle.check()
                     if not is_network_error(exc) or model_attempts == MODEL_REQUEST_ATTEMPTS:
-                        raise RunCancelled('model_request_failed') from exc
+                        raise RunCancelled('model_request_failed', exception_details(exc)) from exc
                     pending_retry_http_attempts = self.summary['failed_http_attempts'] - failures_before
                     self.lifecycle.sleep(MODEL_RETRY_DELAYS[model_attempts - 1])
         except BaseException as exc:

@@ -10,7 +10,9 @@ import weakref
 
 
 class RunCancelled(BaseException):
-    pass
+    def __init__(self, reason, detail=None):
+        self.reason, self.detail = reason, detail
+        super().__init__(str(reason) + (': ' + detail if detail else ''))
 
 
 class BusinessOutcomeUnknown(RuntimeError):

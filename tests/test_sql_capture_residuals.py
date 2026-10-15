@@ -19,7 +19,7 @@ from test_sql_evidence import identity, settled
 
 def test_shared_fault_during_wire_capture_blocks_model_transport(captured, monkeypatch):
     import httpx
-    from openai import APIConnectionError, OpenAI
+    from openai import OpenAI
     from saas_bench.model_usage import ModelUsage
     from test_preflight_usage import reply
     _, store, _ = captured
@@ -41,15 +41,18 @@ def test_shared_fault_during_wire_capture_blocks_model_transport(captured, monke
     with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
         payload = dict(model='test-model', messages=[dict(role='user', content='hello')])
-        with pytest.raises(APIConnectionError, match='Connection error') as raised:
+        with pytest.raises(RunCancelled, match='capture failed') as raised:
             usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
-        assert 'capture failed' in str(raised.value.__cause__)
+        cause = raised.value.__cause__
+        while cause is not None and not isinstance(cause, RuntimeError):
+            cause = cause.__cause__
+        assert isinstance(cause, RuntimeError) and 'capture failed' in str(cause)
     assert sent == []
 
 
 def test_completed_missing_receive_blocks_model_despite_other_pending_event(captured):
     import httpx
-    from openai import APIConnectionError, OpenAI
+    from openai import OpenAI
     from saas_bench.model_usage import ModelUsage
     from saas_bench.public_sql import PUBLIC_POLICY_VERSION
     from test_preflight_usage import reply
@@ -71,9 +74,12 @@ def test_completed_missing_receive_blocks_model_despite_other_pending_event(capt
     with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
         payload = dict(model='test-model', messages=[dict(role='user', content='hello')])
-        with pytest.raises(APIConnectionError) as raised:
+        with pytest.raises(RunCancelled, match='Unconfirmed client receive outcome') as raised:
             usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
-        assert 'Unconfirmed client receive outcome' in str(raised.value.__cause__)
+        cause = raised.value.__cause__
+        while cause is not None and not isinstance(cause, RuntimeError):
+            cause = cause.__cause__
+        assert isinstance(cause, RuntimeError) and 'Unconfirmed client receive outcome' in str(cause)
     assert sent == []
     assert 'Unconfirmed client receive outcome' in store.fault['reason']
 

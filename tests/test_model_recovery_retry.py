@@ -295,7 +295,8 @@ def test_threaded_agent_retries_five_network_requests(monkeypatch):
         worker.start()
         worker.join(timeout=2)
         assert not worker.is_alive() and len(requests) == 5
-        assert len(failures) == 1 and str(failures[0]) == 'model_request_failed'
+        assert len(failures) == 1 and failures[0].reason == 'model_request_failed'
+        assert 'ConnectError: offline' in str(failures[0])
     finally:
         client.close()
 

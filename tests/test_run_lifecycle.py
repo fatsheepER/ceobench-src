@@ -102,6 +102,8 @@ def test_model_failure_pauses_without_supervisor_and_restores_context(offline_ru
         result = runner.run(verbose=False)
         assert result['outcome'] == 'paused' and result['days_run'] == 0
         assert result['reason'] == ('model_request_failed' if rejected else 'model_attempt_limit')
+        if rejected:
+            assert 'offline rejection' in json.loads((runner.workspace_dir / 'pause-receipt.json').read_text())['detail']
         assert len(requests) == (1 if rejected else 4)
         checkpoint = runner._load_checkpoint()
         assert checkpoint['context_boundary'] == 'same_week'

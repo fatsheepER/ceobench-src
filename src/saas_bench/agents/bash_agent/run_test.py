@@ -937,7 +937,8 @@ __pycache__/
         checkpoint['usage'] = json.loads(json.dumps(self.agent.usage_recorder.summary)) if self.agent else None
         if getattr(self, '_last_weekly_day', None) != day:
             write_json(self.workspace_dir / 'usage_summary.json', {
-                'snapshot_id': snapshot_id, 'day': day, 'agent': physical_usage_summary(checkpoint['usage']),
+                'snapshot_id': snapshot_id, 'day': day,
+                'agent': physical_usage_summary(checkpoint['usage']) if checkpoint['usage'] is not None else None,
                 'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                       'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
@@ -1222,7 +1223,7 @@ __pycache__/
                 try:
                     return self._run(verbose)
                 except RunCancelled as exc:
-                    return self._pause(str(exc))
+                    return self._pause(exc.reason, exc.detail)
         except BaseException as exc:
             write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
             raise
@@ -1240,7 +1241,7 @@ __pycache__/
                 if not preserve:
                     self._stop_server()
 
-    def _pause(self, reason):
+    def _pause(self, reason, detail=None):
         from saas_bench.run_state import write_json
         self._check_capture_health()
         status = self._get_game_status()
@@ -1259,6 +1260,8 @@ __pycache__/
         receipt = dict(day=day, reason=reason, status='paused',
                        snapshot_id=checkpoint['snapshot_id'],
                        context_boundary=checkpoint['context_boundary'])
+        if detail:
+            receipt['detail'] = detail
         write_json(self.workspace_dir / 'pause-receipt.json', receipt)
         return dict(run_id=self.run_id, seed=self.seed, scenario=self.scenario,
                     final_cash=status['cash'], days_run=day, outcome='paused',
