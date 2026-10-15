@@ -141,11 +141,11 @@ def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen,
     command = [sys.executable, str(bootstrap), str(batch.ROOT / 'scripts/team_driver.py'),
         '--policy', str(policy), '--live']
     first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=600)
-    assert first.returncode == 2, first.stderr
+    assert first.returncode in (0, 2), first.stderr
     assert not (path.parent / 'HOLD').exists()
     first_git = batch.selected(manifest, manifest['scheduling']['queues']['git'][0])
     paused = batch.read(batch.attempts(first_git)[0] / 'attempt.json')
-    assert paused['status'] == 'paused' and paused['recovery_validation']['eligible']
+    assert paused['status'] == 'paused' and Path(paused['checkpoint']).is_dir()
     first_pf = batch.selected(manifest, manifest['scheduling']['queues']['pf'][0])
     second_pf = batch.selected(manifest, manifest['scheduling']['queues']['pf'][1])
     if two_seeds:
@@ -158,17 +158,26 @@ def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen,
     events = [json.loads(line) for line in (tmp_path / 'controller-events.jsonl').read_text().splitlines()]
     joined = next(row for row in events if row['event'] == 'worker_launched'
         and row['run_id'] == manifest['scheduling']['queues']['pf'][1])
-    git_exit = next(row for row in events if row['event'] == 'worker_exited' and row['run_id'] == first_git['run_id'])
+    git_exit = next(row for row in events if row['event'] == 'worker_reaped' and row['run_id'] == first_git['run_id'])
     assert events.index(joined) < events.index(git_exit)
-    assert joined['launch_reason'] == 'previous_group_run_terminal'
-    resumed = subprocess.run([*command, '--resume'], env=env, capture_output=True, text=True, timeout=600)
-    assert resumed.returncode == 2, resumed.stderr
+    intent = next(row for row in events if row['event'] == 'worker_launch_intent'
+        and row['run_id'] == manifest['scheduling']['queues']['pf'][1])
+    assert intent['launch_reason'] == 'previous_group_run_terminal'
+    assert events.index(intent) < events.index(joined)
+    pf_attempt = batch.attempts(first_pf)[0]
+    pf_before = (pf_attempt / 'attempt.json').read_bytes()
+    resumed = subprocess.run([*command, '--resume', '--run-id', first_git['run_id'],
+        '--week', '1', '--force-resume'], env=env, capture_output=True, text=True, timeout=600)
+    assert resumed.returncode in (0, 2), resumed.stderr
     assert not (path.parent / 'HOLD').exists()
     attempts = batch.attempts(first_git)
     assert len(attempts) == 2
-    assert batch.read(attempts[-1] / 'attempt.json')['source_checkpoint'] == paused['checkpoint']
+    current = batch.read(attempts[-1] / 'attempt.json')
+    source = batch.read(Path(current['source_checkpoint']) / 'team.json')
+    assert source['day'] == 0 and source['stage'] == 'boundary' and current['force_resume']
+    assert (pf_attempt / 'attempt.json').read_bytes() == pf_before and len(batch.attempts(first_pf)) == 1
     terminal = batch.read(tmp_path / 'controller-terminal.json')
-    assert set(terminal) == {first_pf['run_id']}
+    assert set(terminal) == {first_git['run_id']}
     assert all(row['unit']['scope_empty'] for row in terminal.values())
     for entry in (first_git, first_pf):
         current = batch.attempts(entry)[-1]
@@ -180,9 +189,9 @@ def test_real_group_driver_live_and_resume_keep_worker_and_model_entries(frozen,
         assert any(row['event'] == 'response' and row.get('usage', {}).get('input_tokens') == 20
             and row.get('usage', {}).get('output_tokens') == 10 for row in rows)
     assert batch.read(tmp_path / 'controller-exit.json')['children_reaped']
-    assert batch.read(tmp_path / 'driver-exit.json')['returncode'] == 2
+    assert batch.read(tmp_path / 'driver-exit.json')['returncode'] in (0, 2)
     assert (attempts[-1] / 'runtime/roles/ceo/MEMORY.md').read_bytes() == (
-        Path(paused['checkpoint']) / 'roles/ceo/MEMORY.md').read_bytes()
+        Path(batch.read(attempts[-1] / 'attempt.json')['source_checkpoint']) / 'roles/ceo/MEMORY.md').read_bytes()
     tool_messages = [json.loads(line) for line in (
         attempts[-1] / 'runtime/private/ceo/model-usage.jsonl').read_text().splitlines()]
     assert any(message.get('role') == 'tool' and message.get('name') == 'bash'

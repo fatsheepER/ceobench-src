@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import json
+import logging
 from pathlib import Path
 
 from saas_bench import team_batch as batch
@@ -46,7 +47,7 @@ def _main(argv, warnings):
         parser.error('--resume requires --live')
     config, manifest = verify_controls(args.policy)
     if args.week is not None and args.week < 1:
-        parser.error('--week must be positive; week 1 starts at day 0')
+        logging.warning('Recovery week is not a positive integer; week 1 starts at day 0')
     if args.run_id is not None:
         manifest = dict(manifest, runs=[batch.selected(manifest, args.run_id)])
     if args.check:

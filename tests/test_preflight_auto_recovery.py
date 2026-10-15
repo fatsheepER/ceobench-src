@@ -66,6 +66,9 @@ def test_worker_memory_defaults_and_driver_forwarding(observer, monkeypatch):
     assert module.main(['--policy', str(policy), '--live', '--run-id', 'pf', '--week', '1']) == 0
     assert calls[-1] == dict(resume=False, memory_high=17179869184,
                             memory_max=21474836480, memory_swap_max=0, run_id='pf', week=1)
+    assert module.main(['--policy', str(policy), '--live', '--run-id', 'pf', '--week', '0']) == 0
+    assert calls[-1]['week'] == 0
+    assert any('week' in row['message'].lower() for row in calls[-1]['startup_warnings'])
 
 
 def test_driver_reports_clean_operator_stop_without_requiring_unstarted_runs(observer, monkeypatch):

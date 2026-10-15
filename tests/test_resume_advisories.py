@@ -1,3 +1,4 @@
+import pytest
 
 from saas_bench import team_batch as batch
 from saas_bench.multi_agent import MultiAgentRuntime
@@ -81,3 +82,13 @@ def test_public_archive_contains_advisory_dependency():
         "assert advisory.__module__ == 'saas_bench.run_warnings'", str(archive)],
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('duration', ['invalid', -1, float('nan'), 10**400])
+def test_invalid_duration_remains_unknown(tmp_path, duration):
+    directory = tmp_path / 'attempt-001'
+    write_json(directory / 'attempt.json', dict(wall_seconds=None))
+    from unittest.mock import patch
+    with patch.object(batch, 'read', return_value=dict(wall_seconds=duration)):
+        result = batch.wall_time([directory])
+    assert result['wall_seconds'] is None and result['time_metadata_errors']

@@ -9,12 +9,12 @@ from saas_bench.run_lifecycle import WorkerLifecycle
 from test_preflight_group_join import group_batch
 from test_preflight_team_controller import controller
 from test_preflight_team_observer import observer
-from test_preflight_team_batch import changed_manifest, frozen
+from test_preflight_team_batch import changed_manifest, frozen, managed_team
 from test_preflight_team_flow import completion, final
 
 
 @pytest.mark.parametrize('failure', ['failed', 'oom-kill', 'paused'])
-def test_failed_group_holds_once_and_only_manual_invocation_restarts(observer, controller, monkeypatch, failure):
+def test_failed_group_holds_once_and_only_manual_invocation_restarts(observer, controller, monkeypatch, failure, caplog):
     launches, children = group_batch(observer, controller, monkeypatch, first_status=failure)
     controller.module.supervise(controller.policy)
     assert launches.count('s101-pf') == 1 and 's102-pf' not in launches
@@ -25,10 +25,15 @@ def test_failed_group_holds_once_and_only_manual_invocation_restarts(observer, c
     first = batch.attempts(entry)[0]
     before = (first / 'attempt.json').read_bytes()
     assert (Path(entry['output_dir']) / 'HOLD').exists()
-    controller.module.supervise(controller.policy, resume=True, run_id='s101-pf', week=1, force_resume=True)
+    week = 0 if failure == 'paused' else 1
+    controller.module.supervise(controller.policy, resume=True, run_id='s101-pf', week=week, force_resume=True)
     assert launches.count('s101-pf') == 2 and len(batch.attempts(entry)) == 2
     assert (first / 'attempt.json').read_bytes() == before
     assert '--force-resume' in controller.module.worker_arguments[-1]
+    if week == 0:
+        assert 'week' in caplog.text.lower()
+        saved = batch.read(batch.attempts(entry)[-1] / 'attempt.json')
+        assert any('week' in row['message'].lower() for row in saved['validation_warnings'])
 
 
 @pytest.mark.parametrize('failure,requests', [('network', 5), ('invalid_reply', 4)])
@@ -83,3 +88,19 @@ def test_unknown_public_business_result_holds_for_manual_resume(frozen, tmp_path
     assert record['hold'] and len(batch.attempts(entry)) == 1
     assert 'unknown' in record['hold_detail'].lower()
     assert list((batch.attempts(entry)[0] / 'runtime/private/operations').glob('*.json'))
+
+
+def test_unknown_outcome_discovered_at_final_checkpoint_holds(managed_team, tmp_path, monkeypatch):
+    from saas_bench.run_state import write_json
+    team, directory, record, manifest, entry = managed_team
+    checkpoint = record['checkpoint']
+    write_json(team.root / 'private/operations/unknown-at-stop.json',
+        dict(kind='api:set_prices', status='running'))
+    monkeypatch.setattr(team, 'run', lambda **options: type('Outcome', (),
+        dict(day=entry['stop_after_day'], reason='observation_end'))())
+    result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'STOP')
+    assert result['status'] == 'paused' and result['hold']
+    assert result['runtime_failure'] == 'business_operation_unknown'
+    assert result['checkpoint'] == checkpoint
+    notice = batch.read(directory / 'HOLD')
+    assert notice['manual_resume_required'] and 'unknown' in notice['detail'].lower()

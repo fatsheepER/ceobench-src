@@ -218,7 +218,7 @@ def supervise(policy, *, resume=False, force_resume=False, memory_high=16 * 1024
 
 def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_swap_max, week, run_id, warnings):
     if week is not None and (type(week) is not int or week < 1):
-        raise ValueError('Week must be a positive integer; week 1 starts at day 0')
+        logging.warning('Recovery week is not a positive integer; week 1 starts at day 0')
     with advisory():
         scope_command([], 'ceobench-validation.scope', memory_high=memory_high,
                       memory_max=memory_max, memory_swap_max=memory_swap_max)

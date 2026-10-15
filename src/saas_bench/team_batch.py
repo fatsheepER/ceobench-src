@@ -9,6 +9,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import random
@@ -170,7 +171,8 @@ def verify_d0(path, *, seed):
             logging.warning('Sealed D0 checksum mismatch')
         if read(path / 'configuration.json')['seed'] != seed:
             logging.warning('Sealed D0 configuration seed mismatch')
-    return dict(path=str(path), seal_sha256=optional_hash(path / 'seal.json'), **receipt)
+    return dict(path=str(path), seal_sha256=optional_hash(path / 'seal.json'),
+                **(receipt if isinstance(receipt, dict) else {}))
 
 
 def open_d0(source, root, config, *, client=None):
@@ -400,9 +402,22 @@ def wall_time(history, current=None):
     for directory in history:
         try:
             records[directory] = read(directory / 'attempt.json')
+            if not isinstance(records[directory], dict):
+                errors.append(dict(attempt=directory.name, error='Attempt time metadata is not an object'))
+                records[directory] = {}
         except (OSError, ValueError) as exc:
             records[directory] = {}
             errors.append(dict(attempt=directory.name, error=str(exc)))
+    def duration(directory, record):
+        value = current[1] if current and directory == current[0] else record.get('wall_seconds')
+        try:
+            invalid = value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0)
+        except OverflowError:
+            invalid = True
+        if invalid:
+            errors.append(dict(attempt=directory.name, error='Invalid wall_seconds'))
+            return None
+        return value
     retained = {}
     if history:
         last = records[history[-1]]
@@ -413,39 +428,39 @@ def wall_time(history, current=None):
                 owner = Path(state['source_root']).parent
                 if owner not in records or owner in retained:
                     raise ValueError('Checkpoint time lineage is outside this run or cyclic')
-            except (OSError, ValueError, KeyError) as exc:
+            except (OSError, ValueError, KeyError, TypeError) as exc:
                 errors.append(dict(checkpoint=str(source), error=str(exc)))
                 break
             record = records[owner]
             try:
-                duration = current[1] if current and owner == current[0] else record.get('wall_seconds')
+                elapsed = duration(owner, record)
                 start = record.get('execution_started_at')
-                if not start and record.get('finished_at') and duration is not None:
-                    start = (datetime.fromisoformat(record['finished_at']) - timedelta(seconds=duration)).isoformat()
+                if not start and record.get('finished_at') and elapsed is not None:
+                    start = (datetime.fromisoformat(record['finished_at']) - timedelta(seconds=elapsed)).isoformat()
                 start = start or record.get('started_at')
                 saved = state.get('saved_at')
-                retained[owner] = (min(duration, max(0.0, (datetime.fromisoformat(saved) -
+                retained[owner] = (min(elapsed, max(0.0, (datetime.fromisoformat(saved) -
                     datetime.fromisoformat(start)).total_seconds()))
-                    if duration is not None and start and saved else None)
+                    if elapsed is not None and start and saved else None)
             except (ValueError, TypeError, OverflowError) as exc:
                 retained[owner] = None
                 errors.append(dict(checkpoint=str(source), error=str(exc)))
             source = record.get('source_checkpoint')
     known, missing, wasted, waste_missing = 0.0, [], 0.0, []
     for directory, record in records.items():
-        duration = current[1] if current and directory == current[0] else record.get('wall_seconds')
+        elapsed = duration(directory, record)
         inherited = bool(retained)
-        kept = (retained.get(directory, 0.0) if inherited else duration)
+        kept = (retained.get(directory, 0.0) if inherited else elapsed)
         if directory == history[-1] and records[directory].get('status') not in ('failed', 'paused'):
-            kept = duration
+            kept = elapsed
         if kept is None:
             missing.append(directory.name)
         else:
             known += kept
-        if duration is None or kept is None:
+        if elapsed is None or kept is None:
             waste_missing.append(directory.name)
         else:
-            wasted += max(0.0, duration - kept)
+            wasted += max(0.0, elapsed - kept)
     result = dict(wall_seconds=None if missing or errors else known, wall_seconds_known=known,
                 wall_seconds_missing_attempts=missing,
                 waste_wall_seconds=None if waste_missing or errors else wasted,
@@ -537,8 +552,8 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
                 seconds = (datetime.fromisoformat(discarded_until) - datetime.fromisoformat(checkpoint_at)).total_seconds()
                 if seconds >= 0:
                     discarded_wall_seconds = seconds
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logging.warning('Checkpoint rollback time metadata is invalid: %s', exc)
         rollback = dict(checkpoint=str(source), checkpoint_sha256=optional_hash(source / 'checkpoint.json'),
             source_attempt=str(Path(state['source_root']).parent), source_root=state['source_root'],
             day=state['day'], stage=state['stage'], checkpoint_at=checkpoint_at,
@@ -698,6 +713,23 @@ def execute(team, manifest, entry, directory, record, hold):
         return _execute(team, manifest, entry, directory, record, hold)
 
 
+def hold_attempt(team, entry, directory, record, reason):
+    detail = getattr(team, 'failure_detail', None) or team.failure or reason
+    if team.failure == 'model_attempt_limit':
+        detail = 'No valid reply after 4 model requests in this turn; manual checkpoint resume required'
+    elif team.failure == 'model_request_failed':
+        detail = 'Model request failed; network errors receive 5 attempts (10/20/40/80 seconds). ' + detail
+    elif team.failure in ('business_operation_unknown', 'world_operation_failed', 'business_operation_pending'):
+        detail = 'Business operation outcome cannot be confirmed. ' + detail
+    record.update(hold=True, hold_detail=detail)
+    notice = dict(reason=team.failure or reason, detail=detail, manual_resume_required=True,
+                  checkpoint=record.get('checkpoint'), time=datetime.now(timezone.utc).isoformat())
+    write_json(directory / 'HOLD', notice)
+    write_json(Path(entry['output_dir']) / 'HOLD', notice)
+    logging.warning('HOLD %s: %s', entry['run_id'], detail)
+    return 'paused'
+
+
 def _execute(team, manifest, entry, directory, record, hold):
     from .team_usage import aggregate
     from .team_results import summarize_run
@@ -717,20 +749,7 @@ def _execute(team, manifest, entry, directory, record, hold):
     reason = outcome.reason
     operator_pause = team.failure in ('hold', 'hold_during_retry', 'requested_pause', 'supervisor_cancelled')
     if reason in ('failed', 'paused') and not operator_pause:
-        detail = getattr(team, 'failure_detail', None) or team.failure or reason
-        if team.failure == 'model_attempt_limit':
-            detail = 'No valid reply after 4 model requests in this turn; manual checkpoint resume required'
-        elif team.failure == 'model_request_failed':
-            detail = 'Model request failed; network errors receive 5 attempts (10/20/40/80 seconds). ' + detail
-        elif team.failure in ('business_operation_unknown', 'world_operation_failed', 'business_operation_pending'):
-            detail = 'Business operation outcome cannot be confirmed. ' + detail
-        reason = 'paused'
-        record.update(hold=True, hold_detail=detail)
-        notice = dict(reason=team.failure or outcome.reason, detail=detail, manual_resume_required=True,
-                      checkpoint=record.get('checkpoint'), time=datetime.now(timezone.utc).isoformat())
-        write_json(directory / 'HOLD', notice)
-        write_json(Path(entry['output_dir']) / 'HOLD', notice)
-        logging.warning('HOLD %s: %s', entry['run_id'], detail)
+        reason = hold_attempt(team, entry, directory, record, reason)
     reuse = (last_boundary is not None and reason == 'observation_end' and
         outcome.day == entry['stop_after_day'] == team.server.tools.current_day and
         last_boundary['boundary'] == 'week_boundary' and last_boundary['day'] == outcome.day and
@@ -746,6 +765,10 @@ def _execute(team, manifest, entry, directory, record, hold):
     if not reuse and reason not in ('failed', 'paused'):
         try:
             save_checkpoint(team, directory, record, 'final')
+        except BusinessOutcomeUnknown as exc:
+            team.failure, team.failure_detail = 'business_operation_unknown', str(exc)
+            record['checkpoint_error'] = str(exc)
+            reason = hold_attempt(team, entry, directory, record, reason)
         except (ValueError, RuntimeError) as exc:
             record['checkpoint_error'] = str(exc)
             try:

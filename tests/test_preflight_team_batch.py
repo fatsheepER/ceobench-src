@@ -138,7 +138,7 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
             resumed_private.mkdir(parents=True)
             resumed_log = resumed_private / 'model-usage.jsonl'
             resumed_log.write_text(logfile.read_text().replace(entry['run_id'], entry['run_id'] + '-resumed'))
-            result = dict(result, usage=aggregate([logfile, resumed_log], manifest['pricing'], category='formal'))
+            result = dict(result, usage=aggregate([resumed_log], manifest['pricing'], category='formal'))
             write_json(resumed / 'attempt.json', dict(attempt=2, status='finished', result=result,
                 reason='observation_end', wall_seconds=3))
             write_json(resumed / 'result.json', result)
@@ -154,9 +154,9 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
     historical = fault in ('historical_capture', 'historical_fault_file')
     assert pf['status'] == ('reached_d112' if historical or fault == 'simulator_tail' else 'technical_failure')
     assert pf['attempt_status'] == ('finished' if historical or fault == 'simulator_tail' else 'failed')
-    assert comparison['complete_d112'] == (fault == 'simulator_tail')
-    assert summary['pairs']['complete_d112_pairs'] == int(fault == 'simulator_tail')
-    permanent = fault not in (None, 'pending_tail', 'simulator_tail')
+    assert comparison['complete_d112'] == (historical or fault == 'simulator_tail')
+    assert summary['pairs']['complete_d112_pairs'] == int(historical or fault == 'simulator_tail')
+    permanent = fault not in (None, 'pending_tail', 'simulator_tail', 'historical_capture', 'historical_fault_file')
     assert pf['evidence_fault'] == permanent
     assert pf['day'] == 112 and pf['cash_at_advance'] == 123456 and pf['mrr'] == 654321
     if fault == 'pending_tail':
@@ -171,7 +171,9 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
         assert all(value is None for value in pf['usage']['all_resources']['complete'].values())
         assert pf['usage']['missing_receipts'][0]['category'] == 'simulator'
     else:
-        assert pf['usage'] == results['pf']['usage']
+        assert {key: value for key, value in pf['usage'].items() if key != 'retained_logs'} == results['pf']['usage']
+        if historical:
+            assert pf['waste']['team']['known']['input_tokens'] == 20
     for metric in ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd'):
         observed = comparison['comparison'][metric]
         if permanent or fault == 'pending_tail':
@@ -288,8 +290,8 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
     assert calls_sent.count('ceo') >= 2
     assert log.read_bytes() == original and not list(directory.rglob('evidence.fault.json'))
     assert resumed['result']['usage']['team']['known']['input_tokens'] > 0
-    assert all(value is None for value in resumed['result']['usage']['team']['complete'].values())
-    assert any(gap['reason'] == 'unterminated_log_tail' for gap in resumed['result']['usage']['missing_receipts'])
+    assert resumed['result']['usage']['team']['complete']['input_tokens'] > 0
+    assert any(gap['reason'] == 'unterminated_log_tail' for gap in resumed['result']['waste']['missing_receipts'])
     assert batch.summarize(path)['pairs']['complete_d112_pairs'] == 0
 
 
@@ -491,7 +493,7 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     publication_checks = []
     save = batch.save_checkpoint
     def checked_save(team, directory, record, boundary):
-        before = {p: tree_hash(p) for p in (team.root / 'checkpoints').iterdir()
+        before = {p: tree_hash(p) for p in (team.root / 'checkpoints').glob('*')
                   if p.is_dir() and (p / 'checkpoint.json').exists()}
         snapshot = save(team, directory, record, boundary)
         assert {p: tree_hash(p) for p in before} == before
@@ -505,7 +507,8 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
             wire.append(dict(role=role, body=body))
             if role == 'ceo' and pause_once[0]:
                 pause_once[0] = False
-                (tmp_path / 'HOLD').touch()
+                active = batch.attempts(batch.selected(copied, run_id))[-1]
+                (active / 'STOP').touch()
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Use existing public data.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(role, 'offline', transport=httpx.MockTransport(respond))
@@ -516,7 +519,6 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
         first.pop('wall_seconds')
         entry = batch.selected(copied, run_id)
         write_json(batch.attempts(entry)[0] / 'attempt.json', first)
-    (tmp_path / 'HOLD').unlink()
     resumed = batch.prepare(path, run_id, live=True, resume=True, client_factory=client, simulator_factory=batch.simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28
     assert resumed['checkpoint_reused_at_stop'] is True and resumed['runtime_phase'] == 'stopped'
@@ -525,7 +527,10 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     assert len(batch.attempts(batch.selected(copied, run_id))) == 2
     assert (resumed['result']['wall_seconds'] is None) == missing_first_duration
     known_seconds = resumed['wall_seconds'] + first.get('wall_seconds', 0)
-    assert resumed['result']['wall_seconds_known'] == known_seconds
+    assert resumed['wall_seconds'] <= resumed['result']['wall_seconds_known'] <= known_seconds
+    if not missing_first_duration:
+        assert resumed['result']['waste_wall_seconds_known'] == pytest.approx(
+            known_seconds - resumed['result']['wall_seconds_known'])
     assert resumed['result']['wall_seconds_missing_attempts'] == (['attempt-001'] if missing_first_duration else [])
     summarized = next(row for row in batch.summarize(path)['runs'] if row['run_id'] == run_id)
     for key in ('wall_seconds', 'wall_seconds_known', 'wall_seconds_missing_attempts'):
@@ -546,7 +551,10 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     assert [m['status'] for m in terminal['messages']].count('delivered') == 8
     assert sum(m['status'] == 'delivered' for m in messages) == 8
     logs = [p for attempt in history for p in attempt.glob('runtime/private/*/model-usage.jsonl')]
-    assert aggregate(dict(engineering=logs, simulator=[]), PRICES, category='engineering') == resumed['result']['usage']
+    retained = resumed['result']['usage']['retained_logs']
+    assert aggregate(retained, PRICES, category='engineering') == {
+        key: value for key, value in resumed['result']['usage'].items() if key != 'retained_logs'}
+    assert resumed['result']['waste']['calls'] == 1
     raw = [json.loads(line) for p in logs for line in p.read_text().splitlines()]
     assert len({row['attempt_id'] for row in raw if row['event'] == 'http_request'}) == len(wire)
     if group == 'pf':
@@ -564,8 +572,8 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
     assert terminal_resume['checkpoint_reused_at_stop'] is False
     assert batch.read(Path(terminal_resume['checkpoint']) / 'team.json')['phase'] == 'stopped'
     assert len(wire) == calls_before and tree_hash(snapshot) == before
-    assert {key: value for key, value in terminal_resume['result']['usage'].items() if key != 'duplicates'} == {
-        key: value for key, value in resumed['result']['usage'].items() if key != 'duplicates'}
+    for key in ('team', 'roles', 'resources', 'all_resources'):
+        assert terminal_resume['result']['usage'][key] == resumed['result']['usage'][key]
     write_json(base / f'offline-batch-wire-{group}.json', wire)
 
 
@@ -629,7 +637,7 @@ batch.prepare(sys.argv[1], sys.argv[2])
     resumed = batch.prepare(path, entry['run_id'], resume=True)
     assert resumed['status'] == 'ready' and resumed['attempt'] == 2
     assert batch.read(Path(resumed['checkpoint']) / 'team.json')['day'] == 0
-    assert batch.read(first / 'attempt.json')['reason'] == 'host_interrupted'
+    assert batch.read(first / 'attempt.json') == original
     assert len(batch.attempts(entry)) == 2
     assert all(file_hash(directory / 'manifest.json') == file_hash(path) for directory in batch.attempts(entry))
 
@@ -679,7 +687,7 @@ batch.prepare(sys.argv[1], sys.argv[2], live=True, client_factory=client, simula
     assert batch.read(first / 'attempt.json')['status'] == 'running'
     summary = batch.summarize(path)
     row = next(row for row in summary['runs'] if row['run_id'] == entry['run_id'])
-    assert row['status'] == 'technical_failure' and row['reason'] == 'host_interrupted'
+    assert row['status'] == 'running'
     checkpoint = batch.read(first / 'attempt.json')['checkpoint']
     def restore_failure(*args, **kwargs):
         raise ValueError('offline preparation failure')
@@ -699,7 +707,7 @@ batch.prepare(sys.argv[1], sys.argv[2], live=True, client_factory=client, simula
         client_factory=client, simulator_factory=batch.simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28
     assert resumed['attempt'] == 3 and len(batch.attempts(entry)) == 3
-    assert batch.read(first / 'attempt.json')['status'] == 'failed'
+    assert batch.read(first / 'attempt.json')['status'] == 'running'
     assert batch.read(second / 'attempt.json')['status'] == 'failed'
     assert Path(checkpoint).is_dir()
 
@@ -808,8 +816,9 @@ def test_checkpoint_publication_failure_preserves_previous_snapshots_and_origina
             raise OSError('injected publication failure')
         write(path, value)
     monkeypatch.setattr(module, 'write_json', failed_publish)
-    with pytest.raises(OSError, match='injected publication failure'):
-        batch.save_checkpoint(team, directory, record, 'week_boundary')
+    assert batch.save_checkpoint(team, directory, record, 'week_boundary') is None
+    assert record['checkpoint_error'] == 'injected publication failure'
+    monkeypatch.undo()
     assert {p: tree_hash(p) for p in before} == before
     assert batch.read(first.parent / '.retention.json') == ledger
     assert len(list(first.parent.glob('*/checkpoint.json'))) == 3
@@ -817,17 +826,17 @@ def test_checkpoint_publication_failure_preserves_previous_snapshots_and_origina
 
 @pytest.mark.parametrize('reason,failure', [('paused', 'requested_pause'), ('paused', 'sql_evidence_pending'),
                                            ('failed', 'offline business failure')])
-def test_paused_and_failed_outcomes_still_freeze_final_state(managed_team, tmp_path, monkeypatch, reason, failure):
+def test_paused_and_failed_outcomes_keep_previous_checkpoint(managed_team, tmp_path, monkeypatch, reason, failure):
     team, directory, record, manifest, entry = managed_team
     previous = record['checkpoint']
     monkeypatch.setattr(team, 'run', lambda **options: type('Outcome', (), dict(day=0, reason=reason))())
     team.failure = failure
     team._set_phase('paused')
     result = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
-    assert result['status'] == reason and result['checkpoint'] != previous
+    assert result['status'] == 'paused' and result['checkpoint'] == previous
     assert result['checkpoint_reused_at_stop'] is False
     state = batch.read(Path(result['checkpoint']) / 'team.json')
-    assert state['phase'] == 'paused' and state['failure'] == failure
+    assert state['stage'] == 'boundary' and state['failure'] is None
 
 
 @pytest.mark.parametrize('operation', ['covered', 'new_completed', 'unknown'])
@@ -884,7 +893,7 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert batch.read(directory / 'attempt.json')['status'] == 'paused'
             assert result['checkpoint'] == previous
             assert 'checkpoint_error' not in result
-            assert result['recovery_validation']['eligible'] is (operation == 'covered')
+            assert result['hold'] and (directory / 'HOLD').exists()
             assert growth.store.fault is None and not growth.store.fault_path.exists()
             assert sent == []
             with closing(growth.store.connect()) as conn:
@@ -897,8 +906,8 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             for role in ('growth', 'ops_finance'):
                 team.roles[role].store.assert_healthy()
             if operation != 'covered':
-                with pytest.raises(RuntimeError, match='Business operation'):
-                    batch.register_attempt(path, manifest, entry, resume=True)
+                _, continued, source = batch.register_attempt(path, manifest, entry, resume=True)
+                assert str(source) == previous and continued['attempt'] == 2
         finally:
             release.set()
             batch.close_team(team)
