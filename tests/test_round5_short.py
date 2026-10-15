@@ -75,7 +75,7 @@ def test_preparation_restores_world_blocks_writes_and_counts_regeneration(offlin
         result = runner.run_preparation(specification)
         if limited:
             assert result['status'] == 'limit' and result['usage']['calls'] == 2
-            assert not (fork / 'submission.json').exists()
+            assert not (runner.workspace_dir / 'submission.json').exists()
             client.close()
             return
         assert result['status'] == 'submitted'
@@ -83,14 +83,14 @@ def test_preparation_restores_world_blocks_writes_and_counts_regeneration(offlin
         assert result['usage']['missing_cost'] == 0
         assert any('submit_decision' in m.get('content', '') for m in requests[1]['messages'] if m['role'] == 'user')
         assert result['input_attribution']['text_tokens']['system:content']['repeated'] > 0
-        score = json.loads((fork / 'automatic-score.json').read_text())
+        score = json.loads((runner.workspace_dir / 'automatic-score.json').read_text())
         assert all(score['facts'].values()) and score['semantic_status'] == 'pending_blind_review'
         assert all(c['quote_matches'] for c in score['citations'])
         runner.submission['facts'][0]['value'] /= 1000000
         runner.submission['facts'][0]['evidence'][0]['quote'] = 'invented support'
         invalid = round5_short.score_submission(runner, specification)
         assert not invalid['facts']['current_cash_usd'] and not invalid['citations'][0]['quote_matches']
-        assert (fork / 'submission.json').exists()
+        assert (runner.workspace_dir / 'submission.json').exists()
         if group == 'pf':
             with runner.evidence_store.connect() as conn:
                 assert conn.execute("SELECT COUNT(*) FROM requests WHERE request LIKE '%submit_decision%'").fetchone()[0]
