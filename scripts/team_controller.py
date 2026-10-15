@@ -256,6 +256,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
     terminal, children, streams = {}, [], []
     units_path = directory / 'controller-units.json'
     history_errors = []
+    previous_units_unavailable = None
     units = {}
     if units_path.exists():
         try:
@@ -264,7 +265,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 raise ValueError('Worker scope history is not a map of unit records')
         except (OSError, ValueError) as exc:
             logging.warning('Historical controller metadata unavailable at %s: %s; preserving it and continuing', units_path, exc)
-            history_errors.append(dict(path=str(units_path), error=type(exc).__name__ + ': ' + str(exc)))
+            previous_units_unavailable = dict(path=str(units_path), error=type(exc).__name__ + ': ' + str(exc))
+            history_errors.append(previous_units_unavailable)
             units_path = directory / ('controller-units-' + uuid.uuid4().hex + '.json')
             units = {}
     launch_ordinal = 0
@@ -599,7 +601,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                     any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
-                previous_units=previous_units, previous_scopes_closed=all(unit.get('scope_empty') and
+                previous_units=previous_units, previous_units_unavailable=previous_units_unavailable,
+                previous_scopes_closed=previous_units_unavailable is None and all(unit.get('scope_empty') and
                     not unit.get('scope_observation_unknown') for unit in previous_units.values()),
                 units_path=str(units_path), events_path=str(events_path), history_read_errors=history_errors,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],

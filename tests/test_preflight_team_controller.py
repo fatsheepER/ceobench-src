@@ -163,6 +163,9 @@ def test_corrupt_management_history_warns_preserves_original_and_runs_peer(
     assert str(corrupt) in caplog.text and 'unavailable' in caplog.text
     receipt = batch.read(controller.policy.parent / 'controller-exit.json')
     assert receipt['children_reaped'] and not receipt['hold'] and not receipt['failed']
+    if source == 'units':
+        assert not receipt['previous_scopes_closed']
+        assert receipt['previous_units_unavailable']['path'] == str(corrupt)
     assert set(batch.read(receipt['units_path'])) == set(launches)
     events = [json.loads(line) for line in Path(receipt['events_path']).read_text().splitlines()]
     assert {row['run_id'] for row in events if row['event'] == 'worker_launched'} == set(launches)
