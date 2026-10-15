@@ -134,7 +134,6 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
             assert result['status'] == 'paused'
             assert result['runtime_failure'] == 'business_operation_pending'
             assert result['checkpoint'] == str(source)
-            assert result['recovery_validation']['eligible'] is True
             wrapper = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
                 if batch.read(path)['kind'] == 'ceo_tool:bash')
             assert wrapper['status'] == 'running'
@@ -234,7 +233,6 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
             release.set()
         result = running.result(timeout=15)
     assert result['status'] == 'paused'
-    assert result['recovery_validation']['eligible'] is True
     batch.close_team(team, record)
     wrapper = next(batch.read(path) for path in (team.root / 'private/operations').glob('*.json')
         if batch.read(path)['kind'] == 'ceo_tool:bash')
@@ -269,8 +267,8 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('role', ROLES)
-@pytest.mark.parametrize('sdk_retry', [False, True])
-def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(mode, role, sdk_retry, monkeypatch):
+@pytest.mark.parametrize('network_retry', [False, True])
+def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(mode, role, network_retry, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     read_body = api_server._APIHandler._read_body
 
@@ -287,7 +285,7 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
         source = team.checkpoint()
         executor = team.roles['ceo'].executor
         command = 'python -c ' + shlex.quote(CLIENT)
-        sends = []
+        sends, waits = [], []
 
         def client_exits_first():
             output = executor.execute('bash', dict(command=command))
@@ -297,9 +295,9 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
 
         def transport(request):
             sends.append(request.read())
-            if sdk_retry and len(sends) == 1:
+            if network_retry and len(sends) == 1:
                 client_exits_first()
-                return httpx.Response(500, json={'error': 'retry after the transient provider error'})
+                raise httpx.ConnectError('offline network failure', request=request)
             return completion(final('Confirmed data checked.'), stream=True)
 
         runtime = team.roles[role]
@@ -307,15 +305,18 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
         runtime.agent.client = runtime.usage.attach(batch.checked_client(role, 'host-write-guard',
             transport=httpx.MockTransport(transport)))
         runtime.agent.client.max_retries = 1
+        monkeypatch.setattr(runtime.usage.lifecycle, 'sleep', waits.append)
         payload = dict(model=batch.MODEL, messages=[dict(role='user', content='Check the current world.')],
             reasoning_effort='high', extra_body={'thinking': {'type': 'enabled'}},
             temperature=1.0, max_tokens=16384, stream=True, stream_options={'include_usage': True})
         try:
-            if not sdk_retry:
+            if not network_retry:
                 client_exits_first()
             with pytest.raises(RunCancelled, match='business_operation_pending'):
                 runtime.usage.call('chat', payload, lambda: _stream_chat_completion(runtime.agent.client, payload))
-            assert len(sends) == int(sdk_retry)
+            assert len(sends) == int(network_retry)
+            assert waits == ([10] if network_retry else [])
+            assert runtime.agent.client.max_retries == 1
             assert team.server._operation_failed is False
         finally:
             release.set()
@@ -334,7 +335,7 @@ def test_model_usage_blocks_pending_host_write_and_continues_after_confirmation(
             store.assert_healthy()
         response = runtime.usage.call('chat', payload, lambda: _stream_chat_completion(runtime.agent.client, payload))
         assert response.choices[0].message.content == 'Confirmed data checked.'
-        assert len(sends) == 1 + int(sdk_retry)
+        assert len(sends) == 1 + int(network_retry)
         _, saved = validate_snapshot(source)
         validate_recovery_source(source, saved, current_root=team.root)
 

@@ -8,7 +8,7 @@ import urllib.request
 
 import pytest
 
-from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor, validate_bash_limits
 from saas_bench.execution_capture import CapturedText, text_sources, model_request
 from saas_bench.sql_evidence import SQLEvidenceStore
 from test_sql_evidence import identity, event_ids, settled
@@ -818,25 +818,29 @@ def test_model_retries_identical_sources_and_unsent_result(captured, monkeypatch
     from saas_bench.model_usage import ModelUsage
     from test_preflight_usage import reply
     _, store, executor = captured
-    monkeypatch.setattr('time.sleep', lambda _: None)
     texts = []
     for name in ('a', 'b', 'unsent'):
         (executor.workspace_path / name).write_text('same text')
         texts.append(executor.execute('read_file', {'path': name}))
-    attempts = []
+    attempts, waits = [], []
     def handle(request):
         attempts.append(request.read())
-        return httpx.Response(500, json={'error': {'message': 'retry'}}) if len(attempts) == 1 else httpx.Response(200, json=reply('chat'))
+        if len(attempts) < 5:
+            raise httpx.ConnectError('temporary disconnect', request=request)
+        return httpx.Response(200, json=reply('chat'))
     usage = ModelUsage(None, 'agent', evidence_store=store)
-    monkeypatch.setattr(usage.lifecycle, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(usage.lifecycle, 'sleep', waits.append)
     with usage.attach(OpenAI(api_key='offline-only', max_retries=1,
             http_client=httpx.Client(transport=httpx.MockTransport(handle)))) as client:
         request = dict(model='test-model', messages=[dict(role='user', content=x) for x in texts[:2]])
         usage.call('chat', request, lambda: client.chat.completions.create(**request))
     events = [r for r in records(store) if r['request']['kind'] == 'model_request']
-    assert len(events) == 2
-    assert [r['result']['http_status'] for r in events] == [500, 200]
-    assert len({r['request']['request']['attempt_id'] for r in events}) == 2
+    assert len(events) == 5
+    assert waits == [10, 20, 40, 80]
+    assert attempts == [attempts[0]] * 5
+    assert [r['result'].get('http_status') for r in events] == [None] * 4 + [200]
+    assert [r['result']['status'] for r in events] == ['failed'] * 4 + ['succeeded']
+    assert len({r['request']['request']['attempt_id'] for r in events}) == 5
     assert len({r['request']['request']['call_id'] for r in events}) == 1
     for row in events:
         mapped = json.loads(store.get_content(row['request']['event_id'] + ':occurrences')[1])
@@ -1111,9 +1115,12 @@ def test_timeout_signal_oserror_runs_fallback_or_preserves_boundary(captured, mo
 
 @pytest.mark.parametrize('hard, soft', [(0, None), (True, None), (float('inf'), None),
     (float('nan'), None), (1, 0), (1, True), (1, 1), (1, 2), (1, float('nan')), (1, float('inf'))])
-def test_bash_threshold_validation(tmp_path, hard, soft):
-    with pytest.raises(ValueError, match='bash_'):
-        BashAgentToolExecutor(tmp_path, bash_timeout=hard, bash_warn_after=soft)
+def test_bash_threshold_validation(tmp_path, caplog, hard, soft):
+    with pytest.raises(ValueError, match='bash_') as error:
+        validate_bash_limits(hard, soft)
+    executor = BashAgentToolExecutor(tmp_path, bash_timeout=hard, bash_warn_after=soft)
+    assert f'ValueError: {error.value}; continuing as requested' in caplog.messages
+    assert executor.bash_timeout is hard and executor.bash_warn_after is soft
 
 
 @pytest.mark.parametrize('elapsed, exit_code, notice', [(119.999, 0, False), (120, 0, True),
