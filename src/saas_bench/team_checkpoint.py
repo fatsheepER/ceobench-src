@@ -156,13 +156,15 @@ def checkpoint(runtime, destination=None):
         stack.callback(unpause)
         with server._sql_lock:
             server._sql_paused = True
-            if not server._sql_lock.wait_for(lambda: server._sql_active == 0, timeout=timeout_value('checkpoint_wait', 600)):
+            if not server._sql_lock.wait_for(lambda: server._sql_active == 0,
+                    timeout=timeout_value('checkpoint_wait', 600, environment=server.runtime_environment)):
                 raise RuntimeError('World query is still in flight')
         with server._request_lock:
             def quiescent():
                 requests = server.public_request_state()
                 return not requests['active'] and not requests['queued']
-            if not server._request_lock.wait_for(quiescent, timeout=timeout_value('completion_wait', 30)):
+            if not server._request_lock.wait_for(quiescent,
+                    timeout=timeout_value('completion_wait', 30, environment=server.runtime_environment)):
                 raise RuntimeError('Public HTTP operation is still in flight')
         if not server._lock.acquire(blocking=False):
             raise RuntimeError('World API operation is still in flight')
@@ -178,7 +180,8 @@ def checkpoint(runtime, destination=None):
             raise BusinessOutcomeUnknown('World operation outcome unknown; HOLD for manual checkpoint resume')
         for role in runtime.roles.values():
             if role.store:
-                role.store.assert_healthy(settle=3)
+                role.store.assert_healthy(settle=timeout_value('checkpoint_wait', 600,
+                    environment=server.runtime_environment) or float('inf'))
             role.agent._save_conversation_snapshot(strict=True)
         if server.conn is None or not hasattr(server.simulator, 'save_rng_states'):
             raise ValueError('Team checkpoint requires a persistent world and complete simulator RNG state')
@@ -254,6 +257,7 @@ def _freeze(runtime, directory):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
     state = dict(version=1, saved_at=datetime.now(timezone.utc).isoformat(),
         source_root=str(runtime.root), configuration=runtime.configuration,
+        runtime_environment=dict(server.runtime_environment),
         benchmark_config=asdict(server.tools.config), day=server.tools.current_day,
         seed=server.tools.seed, tools_rng=server.tools.rng.bit_generator.state,
         shared_rng=server.tools.rng is server.simulator.rng,
@@ -330,18 +334,32 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
     source_changed = tree_hash(Path(__file__).parent) != state['source_sha256']
     public_changed = artifact_hashes(public) != state['public_artifacts']
-    configuration = state['configuration']
+    configuration = dict(state['configuration'])
     with advisory():
         validate_executor_settings(configuration, state['roles'])
+    changes = {}
+    policy_keys = ('analyst_bash_timeout', 'analyst_bash_warn_after', 'ceo_bash_timeout', 'ceo_bash_warn_after')
+    from .runtime_options import OPTIONS, runtime_value
+    environment_before = {env: os.environ.get(env) for env, _, _ in OPTIONS.values()}
+    for key in policy_keys:
+        env = OPTIONS[key][0]
+        if environment_before[env] is not None and key not in options:
+            value = runtime_value(key, None)
+            options[key] = value or None if key.endswith('_warn_after') else value
     for key in list(options):
-        if key in configuration:
-            if options.pop(key) != configuration[key]:
-                logging.warning('Recovery restores checkpoint setting for %s; supplied value differs', key)
-        elif key in ('analyst_bash_timeout', 'analyst_bash_warn_after'):
-            field = 'bash_timeout' if key == 'analyst_bash_timeout' else 'bash_warn_after'
+        if key in configuration or key in policy_keys:
             requested = options.pop(key)
-            if any(saved['executor'].get(field) != requested for name, saved in state['roles'].items() if name != 'ceo'):
-                logging.warning('Recovery restores checkpoint analyst setting for %s; supplied value differs', key)
+            previous = configuration.get(key)
+            configuration[key] = requested
+            if requested != previous:
+                changes[key] = dict(old=previous, new=requested, effective_at='new_attempt')
+                logging.warning('Recovery explicitly changes %s from %r to %r in the new attempt', key, previous, requested)
+            if key in policy_keys:
+                field = 'bash_timeout' if key.endswith('_timeout') else 'bash_warn_after'
+                for name, saved in state['roles'].items():
+                    if (name == 'ceo') == key.startswith('ceo_'):
+                        saved['executor'][field] = requested
+    state['_configuration_changes'] = changes
     if state['live_customer'] and simulator_factory is None:
         logging.warning('Live simulator recovery has no customer client factory')
     root.mkdir(parents=True, exist_ok=True)
@@ -359,13 +377,26 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
         source_root=str(source), attempt_id=uuid.uuid4().hex,
         checkpoint_sha256=optional_hash(snapshot / 'checkpoint.json'),
         source_revision_changed=source_changed, public_build_changed=public_changed,
-        discard_post_checkpoint_operations=True, force_resume=force_resume))
+        discard_post_checkpoint_operations=True, force_resume=force_resume, configuration_overrides=changes,
+        runtime_environment_overrides={env: dict(old=value, new=environment_before[env], effective_at='new_attempt')
+            for env, value in state.get('runtime_environment', {}).items()
+            if env in environment_before and environment_before[env] is not None and value != environment_before[env]}))
     world = root / 'world.nmdb'
     if (snapshot / 'world.nmdb').resolve() != world.resolve():
         shutil.copy2(snapshot / 'world.nmdb', world)
     conn = load_session_db(world)
     try:
+        for env, value in state.get('runtime_environment', {}).items():
+            if env in environment_before and environment_before[env] is None:
+                os.environ[env] = value
         config = BenchmarkConfig(**state['benchmark_config'])
+        for key, fields in dict(model=('agent_llm_model', 'social_post_llm_model', 'enterprise_llm_model'),
+                reasoning_effort=('agent_llm_reasoning_effort',), total_days=('total_days',)).items():
+            if key in changes:
+                for field in fields:
+                    setattr(config, field, configuration[key])
+        if 'model_pricing' in changes:
+            config.model_pricing = (configuration['model_pricing'] or {}).get('rates', {})
         rng = default_rng(config.seed)
         simulator = simulator_factory(conn, config, rng) if simulator_factory else Simulator(conn, config, rng)
         simulator.initialize(resume=True)
@@ -388,6 +419,12 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     except BaseException:
         conn.close()
         raise
+    finally:
+        for env, value in environment_before.items():
+            if value is None:
+                os.environ.pop(env, None)
+            else:
+                os.environ[env] = value
 
 
 def _relocate_prompt(text, original, destination):
@@ -449,13 +486,17 @@ def restore_runtime_state(runtime, state):
         role.usage.weekly_check = saved.get('weekly_check')
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
-        role.usage.expected_model = saved['expected_model']
-        role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
+        role.usage.expected_model = role.agent.model if 'model' in state.get('_configuration_changes', {}) else saved['expected_model']
+        regenerate_prompt = bool(state.get('_configuration_changes'))
+        if not regenerate_prompt:
+            role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
         if not role.agent.load_conversation_snapshot(role.agent._snapshot_path):
             logging.warning('Cannot restore %s role conversation; continuing with available conversation', name)
         for message in role.agent.conversation:
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)
+            if regenerate_prompt and message.role == 'system':
+                message.content = role.agent._get_system_prompt_with_memory()
         role.agent._last_observation = _relocate_prompt(role.agent._last_observation, old_workspace, new_workspace)
         role.agent.total_turns = saved['total_turns']
     customer = server.simulator.customer_simulator
@@ -465,8 +506,11 @@ def restore_runtime_state(runtime, state):
         if _client_configuration(customer.client) != saved['client']:
             logging.warning('Recovery simulator client configuration differs from checkpoint')
         usage.path = runtime.root / 'private' / 'simulator-model-usage.jsonl'
-        usage.summary, usage.context_id, usage.pricing = saved['summary'], saved['context_id'], saved['pricing']
-        usage.expected_model = saved['expected_model']
+        usage.summary, usage.context_id = saved['summary'], saved['context_id']
+        if 'model_pricing' not in state.get('_configuration_changes', {}):
+            usage.pricing = saved['pricing']
+        usage.expected_model = (server.tools.config.social_post_llm_model if 'model' in state.get('_configuration_changes', {})
+                                else saved['expected_model'])
     if 'event_logger' in state:
         from .event_logger import EventLogger, RunMetadata
         saved = state['event_logger']

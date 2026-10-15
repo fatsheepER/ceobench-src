@@ -244,7 +244,7 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             run_id=entry['run_id'], world_id=manifest['d0'][str(entry['seed'])]['world_id'],
             model=MODEL, reasoning_effort='high', total_days=500,
             model_pricing=manifest['pricing'], token_counter=token_counter,
-            **analyst_bash_settings(manifest))
+            **(analyst_bash_settings(manifest) | explicit_bash_settings()))
     except BaseException:
         conn.close()
         raise
@@ -253,6 +253,13 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
 def analyst_bash_settings(manifest):
     parameters = manifest['parameters']
     return {key: parameters[key] for key in ('analyst_bash_timeout', 'analyst_bash_warn_after')}
+
+
+def explicit_bash_settings():
+    from .runtime_options import OPTIONS, runtime_value
+    return {key: (runtime_value(key, None) or None) if key.endswith('_warn_after') else runtime_value(key, None)
+            for key in ('ceo_bash_timeout', 'ceo_bash_warn_after', 'analyst_bash_timeout', 'analyst_bash_warn_after')
+            if OPTIONS[key][0] in os.environ}
 
 
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
@@ -701,18 +708,20 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
                 client = checked_client('simulator', session, no_models=not live, config=config, **guard_options)
                 sim = simulator(conn, config, rng, client=client)
                 sim.customer_simulator.usage_recorder.path = directory / 'runtime' / 'private' / 'simulator-model-usage.jsonl'
-                sim.customer_simulator.usage_recorder.expected_model = MODEL
+                sim.customer_simulator.usage_recorder.expected_model = config.social_post_llm_model
                 return sim
             sim_factory = simulator_factory or world_factory
             if source:
                 team = MultiAgentRuntime.restore(source, directory / 'runtime', client_factory=factory,
                     public_dir=ROOT / 'public', token_counter=counter, simulator_factory=sim_factory,
-                    model=MODEL, reasoning_effort='high', total_days=500, model_pricing=manifest['pricing'],
-                    force_resume=force_resume,
-                    **analyst_bash_settings(manifest))
+                    force_resume=force_resume, **explicit_bash_settings())
             else:
                 team = make_team(manifest, entry, directory, client_factory=factory,
                                  simulator_factory=sim_factory, token_counter=counter)
+            record['effective_configuration'] = team.configuration
+            record['runtime_environment'] = team.server.runtime_environment
+            if source:
+                record['configuration_overrides'] = read(team.root / 'recovery.json')['configuration_overrides']
             record['prompt_templates_changed'] = canonical(prompt_templates(team)) != manifest['prompts'][entry['group']]
             team._lifecycle.parent_pid = parent_pid
             for runtime in team.roles.values():

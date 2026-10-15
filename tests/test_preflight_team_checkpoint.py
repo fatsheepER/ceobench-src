@@ -383,7 +383,9 @@ def test_checkpoint_guards_and_frozen_configuration(tmp_path, monkeypatch):
         changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'wrong',
             client_factory=clients(), model='different-model')
         try:
-            assert changed.roles['ceo'].agent.model == runtime.roles['ceo'].agent.model
+            assert changed.roles['ceo'].agent.model == 'different-model'
+            assert changed.server.tools.config.social_post_llm_model == 'different-model'
+            assert changed.server.simulator.config is changed.server.tools.config
         finally:
             dispose(changed)
         with pytest.raises(FileExistsError):
@@ -470,7 +472,7 @@ def test_bash_policy_checkpoint_roundtrip_and_save_drift(tmp_path, mode):
         assert '[Framework timing notice]' in restored.roles['growth'].executor.execute('bash', dict(command='sleep .08; echo 42'))
         changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'drift', client_factory=clients(), analyst_bash_warn_after=.1)
         try:
-            assert changed.roles['growth'].executor.bash_warn_after == .05
+            assert changed.roles['growth'].executor.bash_warn_after == .1
         finally:
             dispose(changed)
         runtime.roles['growth'].executor.bash_timeout = 3
@@ -510,8 +512,8 @@ def test_legacy_checkpoint_preserves_custom_hard_limit_and_absent_soft(tmp_path,
                                ('new-soft', dict(analyst_bash_warn_after=1))]:
             changed = MultiAgentRuntime.restore(snapshot, tmp_path / name, client_factory=clients(), **settings)
             try:
-                assert changed.roles['growth'].executor.bash_timeout == 17
-                assert changed.roles['growth'].executor.bash_warn_after is None
+                assert changed.roles['growth'].executor.bash_timeout == settings.get('analyst_bash_timeout', 17)
+                assert changed.roles['growth'].executor.bash_warn_after == settings['analyst_bash_warn_after']
             finally:
                 dispose(changed)
     finally:
@@ -539,3 +541,70 @@ def test_checkpoint_preserves_saved_executor_policy_disagreement(tmp_path, monke
             dispose(restored)
     finally:
         dispose(runtime)
+
+
+def test_explicit_recovery_config_reaches_requests_executors_and_simulator(tmp_path):
+    runtime = make_team(tmp_path / 'override-source', 'git', total_days=42,
+                        analyst_bash_timeout=2, analyst_bash_warn_after=.05)
+    restored = None
+    requests = []
+    try:
+        snapshot = runtime.checkpoint()
+        original = (snapshot / 'team.json').read_bytes()
+        factory = clients()
+        def create(role):
+            client = factory(role)
+            client._client.event_hooks['request'].append(lambda request: requests.append(json.loads(request.content)))
+            return client
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'override-restored',
+            client_factory=create, simulator_factory=fast_simulator,
+            model='override-model', reasoning_effort='low', total_days=56,
+            ceo_bash_timeout=19, analyst_bash_timeout=7, analyst_bash_warn_after=.1)
+        assert restored.total_days == restored.server.tools.config.total_days == 56
+        assert restored.server.tools.config is restored.server.simulator.config
+        assert restored.server.tools.config.social_post_llm_model == 'override-model'
+        assert restored.roles['ceo'].executor.bash_timeout == 19
+        for name in ('growth', 'ops_finance'):
+            assert restored.roles[name].executor.bash_timeout == 7
+            assert restored.roles[name].executor.bash_warn_after == .1
+        assert restored.run(stop_after_day=7).reason == 'observation_end'
+        assert requests and all(body['model'] == 'override-model' for body in requests)
+        assert all('maximize final cash over about 56 days' in body['messages'][0]['content']
+                   for body in requests)
+        changes = json.loads((restored.root / 'recovery.json').read_text())['configuration_overrides']
+        assert changes['total_days'] == dict(old=42, new=56, effective_at='new_attempt')
+        assert (snapshot / 'team.json').read_bytes() == original
+    finally:
+        if restored:
+            dispose(restored)
+        dispose(runtime)
+
+
+def test_recovery_retains_numeric_settings_unless_explicitly_overridden(tmp_path, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '9')
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '45678')
+    runtime = make_team(tmp_path / 'numeric-source', 'git')
+    restored = changed = None
+    try:
+        snapshot = runtime.checkpoint()
+        monkeypatch.delenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS')
+        monkeypatch.delenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS')
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'numeric-restored',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert all(role.usage.model_request_attempts == 9 for role in restored.roles.values())
+        assert restored.roles['ceo'].executor.runtime_environment['CEOBENCH_BASH_OUTPUT_MAX_CHARS'] == '45678'
+        import os
+        assert 'CEOBENCH_MODEL_REQUEST_ATTEMPTS' not in os.environ
+        assert 'CEOBENCH_BASH_OUTPUT_MAX_CHARS' not in os.environ
+        monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '7')
+        changed = MultiAgentRuntime.restore(snapshot, tmp_path / 'numeric-changed',
+            client_factory=clients(), simulator_factory=fast_simulator)
+        assert all(role.usage.model_request_attempts == 7 for role in changed.roles.values())
+        assert all(role.usage.model_request_attempts == 9 for role in restored.roles.values())
+        saved = json.loads((changed.root / 'recovery.json').read_text())['runtime_environment_overrides']
+        assert saved['CEOBENCH_MODEL_REQUEST_ATTEMPTS']['old'] == '9'
+        assert saved['CEOBENCH_MODEL_REQUEST_ATTEMPTS']['new'] == '7'
+    finally:
+        for team in (changed, restored, runtime):
+            if team:
+                dispose(team)

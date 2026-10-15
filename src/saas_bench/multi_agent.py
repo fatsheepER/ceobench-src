@@ -63,7 +63,7 @@ class MultiAgentRuntime:
                  simulator=None, public_dir=None, run_id=None, world_id=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
-                 analyst_bash_warn_after=None, **server_options):
+                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
@@ -71,6 +71,7 @@ class MultiAgentRuntime:
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
             total_days=total_days, model_pricing=model_pricing)
+        self.configuration.update(ceo_bash_timeout=ceo_bash_timeout, ceo_bash_warn_after=ceo_bash_warn_after)
         from .run_warnings import advisory
         with advisory():
             validate_bash_limits(analyst_bash_timeout, analyst_bash_warn_after)
@@ -141,7 +142,8 @@ class MultiAgentRuntime:
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
                 require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role],
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
-            settings = dict(bash_timeout=analyst_bash_timeout, bash_warn_after=analyst_bash_warn_after) if role != 'ceo' else {}
+            settings = (dict(bash_timeout=analyst_bash_timeout, bash_warn_after=analyst_bash_warn_after) if role != 'ceo'
+                        else dict(bash_timeout=ceo_bash_timeout, bash_warn_after=ceo_bash_warn_after))
             script_settings = {}
             if _restored_state:
                 settings = _restored_state['roles'][role]['executor']
@@ -477,7 +479,7 @@ class MultiAgentRuntime:
 
     def _check_model_send(self):
         from .runtime_options import timeout_value
-        timeout = timeout_value('completion_wait', 30)
+        timeout = timeout_value('completion_wait', 30, environment=self.server.runtime_environment)
         deadline = time.monotonic() + timeout if timeout is not None else float('inf')
         while True:
             self._lifecycle.check(retry=True)
