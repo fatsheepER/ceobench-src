@@ -1,5 +1,6 @@
 """Real independent Git/PF worlds; only model responses use the offline transport."""
 import json
+from pathlib import Path
 
 import httpx
 from openai import OpenAI
@@ -58,6 +59,7 @@ def test_three_week_rollouts_keep_500_day_goal_and_fresh_context(offline_runner,
     monkeypatch.setattr(round5_rollout.RolloutRunner,'setup',prepare)
     destination = tmp_path/'episode'
     result = round5_rollout.execute(source,destination,group,'offline-'+group,tmp_path,api_key='offline-only')
+    destination = Path(result['result']['workspace_dir'])
     assert result['reached_stop'] and result['public_outcomes']['end_day']==start+21
     assert result['public_outcomes']['completed_weeks']==3 and len(requests)==3
     assert result['usage']['agent']['calls']==3 and result['usage']['agent']['known']['input_tokens']==300

@@ -70,6 +70,7 @@ def execute(source, destination, group, identity, output, *, api_key=None):
     end = start + 21
     round5.environment()
     runner = RolloutRunner(continue_from=destination, stop_after_day=end, api_key=api_key)
+    destination = runner.workspace_dir
     round5.environment()
     round5.install_pause(runner, output / 'rollout-hold.json')
     record = dict(status='running', start_day=start, target_day=end, goal_days=500, expected_weeks=3, group=group, identity=identity, request_log_begin_bytes=cutoffs, started_at=datetime.now(timezone.utc).isoformat())
