@@ -190,7 +190,8 @@ def probe_ceo_frozen(team):
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode):
+def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_MEMORY_MAX_CHARS', '40000')
     initial_barriers = {day: threading.Barrier(2) for day in (0, 7)}
     ask_barriers = {day: threading.Barrier(2) for day in (0, 7)}
     counters, completed, sessions, script_hashes = {}, {}, {}, {}

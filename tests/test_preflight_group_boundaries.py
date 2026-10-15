@@ -118,6 +118,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
         def new_agent():
             value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off', mode == 'pf'), client,
                 workspace_path=workspace, total_days=42, text_registration=mode != 'off', pf=mode == 'pf',
+                memory_max_chars=40000,
                 reasoning_effort='low' if api == 'responses' else None,
                 usage_recorder=ModelUsage(None, 'agent', evidence_store=store))
             value._snapshot_path = workspace / 'conversation.json'

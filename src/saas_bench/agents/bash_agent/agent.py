@@ -18,9 +18,9 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
-from ...model_usage import ModelUsage, plain, usage_values
+from ...model_usage import ModelUsage, physical_usage_summary, plain, usage_values
 from ...run_lifecycle import RunCancelled
-from ...runtime_options import nonnegative_integer, runtime_value
+from ...runtime_options import nonnegative_integer, positive_integer, runtime_value
 
 
 @dataclass(frozen=True)
@@ -133,6 +133,8 @@ class BashAgent(BaseAgent):
         identity=None,
         allow_final_text=False,
         invalid_generation_attempts=None,
+        memory_max_chars=None,
+        max_output_tokens=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -142,6 +144,8 @@ class BashAgent(BaseAgent):
         self.invalid_generation_attempts = (runtime_value('invalid_generation_attempts', 4)
             if invalid_generation_attempts is None else nonnegative_integer(invalid_generation_attempts))
         self._last_invalid_generation = None
+        self.memory_max_chars = (runtime_value('memory_max_chars', 100000)
+            if memory_max_chars is None else nonnegative_integer(memory_max_chars))
         self.role = identity.role if identity else "ceo"
         self.client = client
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
@@ -159,6 +163,8 @@ class BashAgent(BaseAgent):
         client_type = type(client).__name__
         self.use_anthropic = client_type in ('Anthropic', 'AnthropicBedrock')
         self.use_portkey = client_type == 'Portkey'
+        self.max_output_tokens = (runtime_value('model_max_output_tokens', 128000 if self.use_anthropic else 32768)
+            if max_output_tokens is None else positive_integer(max_output_tokens))
 
         # Detect if the endpoint supports OpenAI Responses API.
         # Only OpenAI's own endpoint implements /v1/responses. Google's OpenAI-compat
@@ -289,12 +295,13 @@ class BashAgent(BaseAgent):
                     memory_version = capture.file('MEMORY.md', original_memory, memory_text)
                     if memory_version and memory_content:
                         begin = len(memory_text) - len(memory_text.lstrip())
-                        memory_origin = origin(memory_version, memory_text, begin, begin + min(40000, len(memory_content)))
+                        limit = self.memory_max_chars or len(memory_content)
+                        memory_origin = origin(memory_version, memory_text, begin, begin + min(limit, len(memory_content)))
                     if capture.event:
                         capture.safe(capture.store.complete, capture.event)
                 if memory_content:
-                    max_memory_chars = 40_000
-                    if len(memory_content) > max_memory_chars:
+                    max_memory_chars = self.memory_max_chars
+                    if max_memory_chars and len(memory_content) > max_memory_chars:
                         memory_content = memory_content[:max_memory_chars] + (
                             "\n\n--- MEMORY.md TRUNCATED ---\n"
                             f"Showing first {max_memory_chars:,} of {len(memory_content):,} characters. "
@@ -501,8 +508,9 @@ class BashAgent(BaseAgent):
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
                                                 turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
         finally:
+            known = physical_usage_summary(self.usage_recorder.summary)['known']
             for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
-                setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)
+                setattr(self, 'total_' + field, known[field] or 0)
         for field, value in usage_values(response, api).items():
             setattr(self, 'last_' + field, value)
         return response
@@ -732,9 +740,9 @@ class BashAgent(BaseAgent):
                 # OpenAI-compat gateways (DeepSeek, OpenCode Go) reject
                 # max_completion_tokens; native OpenAI accepts both.
                 if _is_deepseek_compat:
-                    api_kwargs['max_tokens'] = 16384
+                    api_kwargs['max_tokens'] = self.max_output_tokens
                 else:
-                    api_kwargs['max_completion_tokens'] = 16384
+                    api_kwargs['max_completion_tokens'] = self.max_output_tokens
                 if self._wants_reasoning():
                     api_kwargs['reasoning_effort'] = self.reasoning_effort
                 if _is_together_deepseek:
@@ -948,7 +956,7 @@ class BashAgent(BaseAgent):
                     'input': input_items,
                     'tools': tools,
                     'tool_choice': 'auto',
-                    'max_output_tokens': 16384,
+                    'max_output_tokens': self.max_output_tokens,
                     'instructions': self._context_system_prompt(),
                 }
                 if self.reasoning_effort:
@@ -1240,7 +1248,7 @@ class BashAgent(BaseAgent):
 
             api_kwargs = {
                 'model': self.model,
-                'max_tokens': 128000,
+                'max_tokens': self.max_output_tokens,
                 'system': system_content,
                 'messages': messages,
                 'tools': tools,

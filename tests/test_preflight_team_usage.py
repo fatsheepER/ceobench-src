@@ -195,6 +195,8 @@ def test_manually_recomputed_team_and_all_resource_receipts(tmp_path):
 
 
 def test_real_sdk_http_retry_retains_known_failed_usage_once(tmp_path, monkeypatch):
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
     from saas_bench.model_usage import physical_usage_summary, summarize_usage_log
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
@@ -207,8 +209,11 @@ def test_real_sdk_http_retry_retains_known_failed_usage_once(tmp_path, monkeypat
     client = recorder.attach(OpenAI(api_key='offline', max_retries=1,
         http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[dict(role='user', content='offline')])
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
+                      system_prompt='instructions', usage_recorder=recorder)
+    agent.current_day = 0
     try:
-        assert recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0).model == 'test-model'
+        assert agent._request_model('chat', request, lambda: client.chat.completions.create(**request)).model == 'test-model'
     finally:
         client.close()
     result = aggregate([recorder.path], PRICES)
@@ -220,6 +225,7 @@ def test_real_sdk_http_retry_retains_known_failed_usage_once(tmp_path, monkeypat
     assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0165)
     assert result['team']['complete']['raw_billed_cost_usd'] == pytest.approx(.03)
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
+    assert agent.total_input_tokens == 15 and agent.total_output_tokens == 3
     for report in (physical_usage_summary(recorder.summary), summarize_usage_log(recorder.path)):
         assert report['calls'] == 2 and report['errors'] == 1
         assert report['known']['input_tokens'] == 15 and report['known']['output_tokens'] == 3

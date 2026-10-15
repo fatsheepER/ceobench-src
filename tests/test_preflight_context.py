@@ -24,6 +24,7 @@ def agent(tmp_path, anthropic=False):
     value.use_anthropic = anthropic
     value._skip_next_refresh = False
     value.max_turns_per_day = 0
+    value.memory_max_chars = 40000
     value._call_llm = lambda: 'action'
     return value
 
