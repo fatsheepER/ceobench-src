@@ -21,6 +21,71 @@ from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
 
 
+@pytest.mark.parametrize('attempt_limit', [2, 7, 0, None])
+def test_configured_model_retry_attempts_intervals_and_fresh_call(tmp_path, monkeypatch, attempt_limit):
+    recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo', model_request_attempts=attempt_limit,
+                          model_retry_delays=(.01, .02), model_attempt_seconds=30)
+    waits, requests = [], []
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
+    def handle(request):
+        requests.append(request)
+        if len(requests) < 7:
+            return httpx.Response(503, json={'error': {'message': 'temporary provider overload'}})
+        return httpx.Response(200, json=reply('chat'))
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle))))
+    request = dict(model='test-model', messages=[dict(role='user', content='same')])
+    try:
+        if attempt_limit == 2:
+            with pytest.raises(RunCancelled, match='after 2 attempts') as failure:
+                recorder.call('chat', request, lambda: client.chat.completions.create(**request))
+            assert failure.value.reason == 'model_request_failed'
+            assert 'temporary provider overload' in failure.value.detail and '--live --resume' in failure.value.detail
+            assert len(requests) == 2 and waits == [.01]
+            recorder.model_request_attempts = 7
+        response = recorder.call('chat', request, lambda: client.chat.completions.create(**request))
+        assert response.model == 'test-model'
+        assert len(requests) == 7 and client.max_retries == 2
+        rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+        logical = [row for row in rows if row['event'] == 'response']
+        assert logical[-1]['model_attempts'] == (5 if attempt_limit == 2 else 7)
+        assert logical[-1]['error'] is None
+        assert 'temporary provider overload' in logical[-1]['last_model_error']
+        if attempt_limit != 2:
+            assert waits == [.01] + [.02] * 5
+        assert len([row for row in rows if row['event'] == 'http_request']) == 7
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('first_byte_seconds', [.125, 0])
+def test_environment_model_retry_settings_reach_sdk_and_unlimited_first_byte(tmp_path, monkeypatch, first_byte_seconds):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '2')
+    monkeypatch.setenv('CEOBENCH_MODEL_RETRY_DELAYS', '.01,.02')
+    monkeypatch.setenv('CEOBENCH_MODEL_ATTEMPT_SECONDS', str(first_byte_seconds))
+    recorder = ModelUsage(tmp_path / 'usage.jsonl', 'simulator')
+    assert recorder.model_request_attempts == 2
+    assert recorder.model_retry_delays == (.01, .02)
+    assert recorder.model_attempt_seconds == first_byte_seconds
+    if not first_byte_seconds:
+        monkeypatch.setattr('saas_bench.model_usage.threading.Timer',
+                            lambda *_: pytest.fail('Unlimited first-byte wait must not start a watchdog'))
+    def handle(request):
+        assert request.extensions['timeout']['read'] == (first_byte_seconds or None)
+        attempt = _ATTEMPT.get()
+        assert (attempt.deadline is None) == (not first_byte_seconds)
+        return httpx.Response(200, json=reply('chat'))
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=0,
+        http_client=httpx.Client(timeout=.01, transport=httpx.MockTransport(handle))))
+    request = dict(model='test-model', messages=[dict(role='user', content='same')])
+    try:
+        recorder.call('chat', request, lambda: client.chat.completions.create(**request))
+        logged = json.loads(recorder.path.read_text().splitlines()[0])['retry_policy']
+        assert logged == dict(attempts=2, delays=[.01, .02], first_byte_seconds=first_byte_seconds)
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize('physical_http', [False, True])
 def test_physical_reporting_counts_only_receipted_retry_failures(tmp_path, monkeypatch, physical_http):
     recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo')
@@ -153,8 +218,8 @@ def test_http_errors_retry_temporary_rejections_and_preserve_cause(monkeypatch, 
 
 
 def test_each_silent_attempt_timeout_wakes_own_socket_without_cancelling_peer(monkeypatch):
-    recorder, waits, calls = ModelUsage(None, 'ceo'), [], []
     monkeypatch.setattr('saas_bench.model_usage.MODEL_ATTEMPT_SECONDS', .01)
+    recorder, waits, calls = ModelUsage(None, 'ceo'), [], []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     def invoke():
         calls.append(1)

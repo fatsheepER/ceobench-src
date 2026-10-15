@@ -21,6 +21,7 @@ import weakref
 import httpx
 
 from .run_lifecycle import RunCancelled, WorkerLifecycle
+from .runtime_options import nonnegative_integer, nonnegative_number, runtime_value
 
 
 _CALL = ContextVar('model_call', default=None)
@@ -28,6 +29,7 @@ _ATTEMPT = ContextVar('model_request_attempt', default=None)
 MODEL_REQUEST_ATTEMPTS = 5
 MODEL_RETRY_DELAYS = (10, 20, 40, 80)
 MODEL_ATTEMPT_SECONDS = 600
+_DEFAULT = object()
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
@@ -125,17 +127,20 @@ def usage_values(response, api):
 
 def usage_delta(previous, current):
     """Known subtotals and missing counts for calls made since a summary snapshot."""
-    retries = current.get('retried_http_attempts', 0) - previous.get('retried_http_attempts', 0)
-    calls = current['calls'] - previous['calls'] + retries
-    missing = {field: current['missing'][field] - previous['missing'][field] + retries for field in FIELDS}
+    previous, current = physical_usage_summary(previous), physical_usage_summary(current)
+    calls = current['calls'] - previous['calls']
+    missing = {field: current['missing'][field] - previous['missing'][field] for field in FIELDS}
     known = {field: None if calls and missing[field] == calls else
              (current['known'][field] or 0) - (previous['known'][field] or 0) for field in FIELDS}
     return dict(calls=calls, known=known, missing=missing)
 
 
 def physical_usage_summary(summary):
-    """Include failed HTTP retries whose usage could not be confirmed."""
+    """Include every failed HTTP retry, retaining reported or unknown usage."""
     result = copy.deepcopy(summary)
+    if 'retry_usage' in result:
+        merge_usage_totals(result, result['retry_usage'])
+        return result
     retries = result.get('retried_http_attempts', 0)
     for field in ('calls', 'errors', 'missing_cost'):
         result[field] += retries
@@ -170,6 +175,8 @@ def summarize_usage_log(path, start_day=0, end_day=None):
                 summary['calls'] += 1
                 summary['errors'] += row.get('error') is not None
                 summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + row.get('retried_http_attempts', 0)
+                if 'retry_usage' in row:
+                    merge_usage_totals(summary.setdefault('retry_usage', empty_usage_totals()), row['retry_usage'])
                 usage = row.get('usage') or {}
                 for field in FIELDS:
                     value = usage.get(field)
@@ -294,6 +301,35 @@ def add_billing(totals, cost):
         category['subtotal_usd'] = (category['subtotal_usd'] or 0) + cost['usd']
 
 
+def empty_usage_totals():
+    return dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
+                known_cost_usd=None, missing_cost=0, costs=billing_totals())
+
+
+def merge_usage_totals(target, source):
+    for field, value in source.items():
+        if isinstance(value, dict):
+            merge_usage_totals(target[field], value)
+        elif value is not None:
+            target[field] = (target[field] or 0) + value
+
+
+def add_usage(total, usage, cost, billing, *, failed):
+    totals = total.setdefault('costs', dict(billing_totals(), unclassified_prior_calls=total['calls']))
+    total['calls'] += 1
+    total['errors'] += failed
+    for field, value in usage.items():
+        if value is None:
+            total['missing'][field] += 1
+        else:
+            total['known'][field] = (total['known'][field] or 0) + value
+    if cost is None:
+        total['missing_cost'] += 1
+    else:
+        total['known_cost_usd'] = (total['known_cost_usd'] or 0) + cost
+    add_billing(totals, billing)
+
+
 class _Stream(httpx.SyncByteStream):
     def __init__(self, source, finish, require_done=False, check=lambda: None):
         self.source, self.finish = source, finish
@@ -334,9 +370,10 @@ class _Stream(httpx.SyncByteStream):
 
 
 class _ModelAttempt(WorkerLifecycle):
-    def __init__(self, lifecycle, deadline):
+    def __init__(self, lifecycle, deadline, timeout_seconds):
         super().__init__()
         self.lifecycle, self.deadline = lifecycle, deadline
+        self.timeout_seconds = timeout_seconds
         self.received_reply = False
         self.timer = None
 
@@ -365,13 +402,25 @@ class _ModelAttempt(WorkerLifecycle):
 
     def check(self, *, retry=False):
         self.lifecycle.check(retry=retry)
-        if self.reason or not self.received_reply and time.monotonic() >= self.deadline:
+        if self.reason or (self.deadline is not None and not self.received_reply
+                           and time.monotonic() >= self.deadline):
             self.expire()
-            raise TimeoutError('Model request received no response bytes within 600 seconds')
+            raise TimeoutError(f'Model request received no response bytes within {self.timeout_seconds:g} seconds')
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None, expected_model=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None, expected_model=None,
+                 *, model_request_attempts=_DEFAULT, model_retry_delays=None, model_attempt_seconds=_DEFAULT):
+        self.model_request_attempts = (runtime_value('model_request_attempts', MODEL_REQUEST_ATTEMPTS)
+            if model_request_attempts is _DEFAULT else nonnegative_integer(model_request_attempts))
+        self.model_attempt_seconds = (runtime_value('model_attempt_seconds', MODEL_ATTEMPT_SECONDS)
+            if model_attempt_seconds is _DEFAULT else nonnegative_number(model_attempt_seconds))
+        delays = model_retry_delays if model_retry_delays is not None else runtime_value(
+            'model_retry_delays', ','.join(map(str, MODEL_RETRY_DELAYS)))
+        self.model_retry_delays = tuple(nonnegative_number(value) for value in (
+            delays.split(',') if isinstance(delays, str) else delays))
+        if not self.model_retry_delays:
+            raise ValueError('Model retry intervals must contain at least one delay')
         self.identity = identity
         self.expected_model = expected_model
         self.message_ids = []
@@ -423,12 +472,17 @@ class ModelUsage:
 
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
-            recorder, call_id = _CALL.get() or (self, None)
+            current = _CALL.get()
+            recorder, call_id = current[:2] if current else (self, None)
+            http_state = current[2] if current else None
             recorder._check_deadline()
             recorder.request_check()
             timeouts = dict(request.extensions.get('timeout', {}))
-            if timeouts.get('read') is not None and timeouts['read'] < MODEL_ATTEMPT_SECONDS:
-                timeouts['read'] = MODEL_ATTEMPT_SECONDS
+            if not recorder.model_attempt_seconds:
+                timeouts['read'] = None
+                request.extensions['timeout'] = timeouts
+            elif timeouts.get('read') is not None and timeouts['read'] < recorder.model_attempt_seconds:
+                timeouts['read'] = recorder.model_attempt_seconds
                 request.extensions['timeout'] = timeouts
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
@@ -502,6 +556,8 @@ class ModelUsage:
                     except UnicodeDecodeError:
                         body = {'base64': base64.b64encode(content).decode('ascii')}
                     if response.status_code >= 400 or error:
+                        if http_state is not None:
+                            http_state['failed_response'] = reported
                         with recorder.lock:
                             recorder.summary['failed_http_attempts'] += 1
                             recorder.summary['failed_attempts_without_usage'] += not bool(
@@ -568,12 +624,13 @@ class ModelUsage:
             attempt.check()
 
     def _invoke_attempt(self, invoke):
-        remaining = MODEL_ATTEMPT_SECONDS
-        attempt = _ModelAttempt(self.lifecycle, time.monotonic() + remaining)
+        remaining = self.model_attempt_seconds
+        attempt = _ModelAttempt(self.lifecycle, time.monotonic() + remaining if remaining else None, remaining)
         token = _ATTEMPT.set(attempt)
-        timer = threading.Timer(remaining, attempt.expire)
+        timer = threading.Timer(remaining, attempt.expire) if remaining else None
         attempt.timer = timer
-        timer.daemon = True
+        if timer:
+            timer.daemon = True
         previous = getattr(self.lifecycle._model, 'attempt', None)
         self.lifecycle._model.attempt = attempt
         try:
@@ -581,13 +638,15 @@ class ModelUsage:
                 http = client._client
                 for channel in list(http._ceobench_model_sockets):
                     attempt.watch_socket(channel)
-            timer.start()
+            if timer:
+                timer.start()
             with attempt.model_call():
                 return invoke()
         finally:
-            timer.cancel()
-            if timer.ident is not None:
-                timer.join(timeout=1)
+            if timer:
+                timer.cancel()
+                if timer.ident is not None:
+                    timer.join(timeout=1)
             self.lifecycle._model.attempt = previous
             _ATTEMPT.reset(token)
 
@@ -607,16 +666,25 @@ class ModelUsage:
             self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
-        token = _CALL.set((self, call_id))
+        http_state = dict(failed_response=None)
+        token = _CALL.set((self, call_id, http_state))
         response, error, model_attempts, last_model_error = None, None, 0, None
         retried_http_attempts = pending_retry_http_attempts = 0
-        self.write('request', call_id=call_id, api=api, request=request, **context)
+        retry_usage, pending_retry_usage = empty_usage_totals(), None
+        retry_policy = dict(attempts=self.model_request_attempts, delays=self.model_retry_delays,
+                            first_byte_seconds=self.model_attempt_seconds)
+        self.write('request', call_id=call_id, api=api, request=request, retry_policy=retry_policy, **context)
         try:
-            for model_attempts in range(1, MODEL_REQUEST_ATTEMPTS + 1):
+            while not self.model_request_attempts or model_attempts < self.model_request_attempts:
                 self._check_deadline()
+                model_attempts += 1
                 retried_http_attempts += pending_retry_http_attempts
                 pending_retry_http_attempts = 0
+                if pending_retry_usage is not None:
+                    add_usage(retry_usage, *pending_retry_usage, failed=True)
+                    pending_retry_usage = None
                 response = None
+                http_state['failed_response'] = None
                 failures_before = self.summary['failed_http_attempts']
                 try:
                     response = self._invoke_attempt(invoke)
@@ -628,45 +696,45 @@ class ModelUsage:
                         logging.warning('Returned model differs from frozen configuration')
                     return response
                 except Exception as exc:
-                    last_model_error = type(exc).__name__
+                    last_model_error = exception_details(exc)
                     self.lifecycle.check()
-                    if not is_network_error(exc) or model_attempts == MODEL_REQUEST_ATTEMPTS:
-                        raise RunCancelled('model_request_failed', exception_details(exc)) from exc
+                    if not is_network_error(exc) or model_attempts == self.model_request_attempts:
+                        detail = (f'Model request stopped after {model_attempts} attempts. Last error {last_model_error}. '
+                            'Continue with scripts/team_driver.py --policy <policy.json> --live --resume '
+                            '--week <existing-week>.')
+                        raise RunCancelled('model_request_failed', detail) from exc
                     pending_retry_http_attempts = self.summary['failed_http_attempts'] - failures_before
-                    self.lifecycle.sleep(MODEL_RETRY_DELAYS[model_attempts - 1])
+                    if pending_retry_http_attempts:
+                        failed = http_state['failed_response']
+                        failed_usage = usage_values(failed, api)
+                        rates = self.pricing.get(failed.get('model')) if isinstance(failed, dict) else None
+                        failed_cost = cost_usd(failed_usage, api, rates, at=started)
+                        pending_retry_usage = (failed_usage, failed_cost, billing_assessment(
+                            failed_usage, api, rates, at=started, recorded_cost=failed_cost))
+                    delay = self.model_retry_delays[min(model_attempts - 1, len(self.model_retry_delays) - 1)]
+                    self.lifecycle.sleep(delay)
         except BaseException as exc:
             error = type(exc).__name__
             raise
         finally:
             try:
                 raw = plain(response)
-                usage = usage_values(raw, api)
-                served_model = raw.get('model') if isinstance(raw, dict) else None
+                accounting = raw if raw is not None else http_state['failed_response']
+                usage = usage_values(accounting, api)
+                served_model = accounting.get('model') if isinstance(accounting, dict) else None
                 cost = cost_usd(usage, api, self.pricing.get(served_model), at=started)
                 billing = billing_assessment(usage, api, self.pricing.get(served_model),
                                              at=started, recorded_cost=cost)
                 with self.lock:
                     summary = self.summary
-                    totals = summary.setdefault('costs', dict(billing_totals(),
-                                                              unclassified_prior_calls=summary['calls']))
-                    summary['calls'] += 1
+                    add_usage(summary, usage, cost, billing, failed=error is not None)
                     summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + retried_http_attempts
-                    summary['errors'] += error is not None
-                    for field, value in usage.items():
-                        if value is None:
-                            summary['missing'][field] += 1
-                        else:
-                            summary['known'][field] = (summary['known'][field] or 0) + value
-                    if cost is None:
-                        summary['missing_cost'] += 1
-                    else:
-                        summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
-                    add_billing(totals, billing)
+                    merge_usage_totals(summary.setdefault('retry_usage', empty_usage_totals()), retry_usage)
                     self.write('response', call_id=call_id, api=api, response=raw, usage=usage,
                                error=error, cost_usd=cost, pricing=self.pricing.get(served_model),
                                cost=billing, request_timestamp=started.isoformat(),
                                model_attempts=model_attempts, last_model_error=last_model_error,
-                               retried_http_attempts=retried_http_attempts)
+                               retried_http_attempts=retried_http_attempts, retry_usage=retry_usage)
             finally:
                 _CALL.reset(token)
                 if replacements:

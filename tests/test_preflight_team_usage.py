@@ -194,8 +194,8 @@ def test_manually_recomputed_team_and_all_resource_receipts(tmp_path):
     assert suffix['team']['complete']['uniform_cost_usd'] == pytest.approx(.004)
 
 
-def test_real_sdk_http_error_counts_known_failed_usage_once_without_retry(tmp_path, monkeypatch):
-    from saas_bench.run_lifecycle import RunCancelled
+def test_real_sdk_http_retry_retains_known_failed_usage_once(tmp_path, monkeypatch):
+    from saas_bench.model_usage import physical_usage_summary, summarize_usage_log
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
     def handle(request):
@@ -208,20 +208,22 @@ def test_real_sdk_http_error_counts_known_failed_usage_once_without_retry(tmp_pa
         http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[dict(role='user', content='offline')])
     try:
-        with pytest.raises(RunCancelled, match='model_request_failed') as error:
-            recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0)
-        assert error.value.__cause__.status_code == 503
+        assert recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0).model == 'test-model'
     finally:
         client.close()
     result = aggregate([recorder.path], PRICES)
-    assert len(requests) == result['attempts'] == result['team']['billed_units'] == 1
+    assert len(requests) == result['attempts'] == result['team']['billed_units'] == 2
     assert result['calls'] == 1
-    assert result['team']['complete']['input_tokens'] == 5
-    assert result['team']['complete']['output_tokens'] == 1
-    assert result['team']['complete']['total_tokens'] == 6
-    assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0052)
-    assert result['team']['complete']['raw_billed_cost_usd'] == pytest.approx(.01)
+    assert result['team']['complete']['input_tokens'] == 15
+    assert result['team']['complete']['output_tokens'] == 3
+    assert result['team']['complete']['total_tokens'] == 18
+    assert result['team']['complete']['uniform_cost_usd'] == pytest.approx(.0165)
+    assert result['team']['complete']['raw_billed_cost_usd'] == pytest.approx(.03)
     assert result['failed_attempt_usage']['complete']['input_tokens'] == 5
+    for report in (physical_usage_summary(recorder.summary), summarize_usage_log(recorder.path)):
+        assert report['calls'] == 2 and report['errors'] == 1
+        assert report['known']['input_tokens'] == 15 and report['known']['output_tokens'] == 3
+        assert report['missing']['input_tokens'] == 0
 
 
 def test_model_mismatch_preserves_raw_usage_and_continues(tmp_path, monkeypatch, caplog):
@@ -242,6 +244,85 @@ def test_model_mismatch_preserves_raw_usage_and_continues(tmp_path, monkeypatch,
     with pytest.raises(RunCancelled, match='model_request_failed'):
         recorder.call('chat', {}, lambda: None, day=14)
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] is None
+
+
+def test_terminal_http_error_keeps_reported_usage_in_logical_and_physical_reports(tmp_path):
+    from saas_bench.model_usage import physical_usage_summary, summarize_usage_log
+    from saas_bench.run_lifecycle import RunCancelled
+    recorder = ModelUsage(tmp_path / 'ceo.jsonl', 'ceo', PRICES['rates'], model_request_attempts=1)
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda _: httpx.Response(503, json=body(5, 1, 2, 1, bill=.01))))))
+    request = dict(model='test-model', messages=[dict(role='user', content='offline')])
+    try:
+        with pytest.raises(RunCancelled, match='after 1 attempts'):
+            recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0)
+    finally:
+        client.close()
+    for report in (recorder.summary, physical_usage_summary(recorder.summary), summarize_usage_log(recorder.path)):
+        assert report['calls'] == report['errors'] == 1
+        assert report['known']['input_tokens'] == 5 and report['known']['output_tokens'] == 1
+        assert report['missing']['input_tokens'] == 0
+    assert aggregate([recorder.path], PRICES)['team']['complete']['input_tokens'] == 5
+
+
+def test_shared_recorder_threads_keep_failed_usage_local_to_each_call(tmp_path):
+    import threading
+    from saas_bench.model_usage import physical_usage_summary
+    from saas_bench.run_lifecycle import RunCancelled
+    entered, release, second_started = threading.Event(), threading.Event(), threading.Event()
+    recorder = ModelUsage(tmp_path / 'ceo.jsonl', 'simulator', PRICES['rates'], model_request_attempts=1)
+    outcomes = {}
+    def handle(request):
+        owner = json.loads(request.content)['messages'][0]['content']
+        if owner == 'first':
+            entered.set()
+            assert release.wait(3)
+            return httpx.Response(503, json=body(5, 1, 2, 1))
+        return httpx.Response(200, json=body())
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle))))
+    def call(owner):
+        request = dict(model='test-model', messages=[dict(role='user', content=owner)])
+        try:
+            recorder.call('chat', request, lambda: client.chat.completions.create(**request), day=0, owner=owner)
+        except RunCancelled as exc:
+            outcomes[owner] = exc.reason
+    def second():
+        second_started.set()
+        def fail_without_http():
+            raise ValueError('local failure without HTTP')
+        try:
+            recorder.call('chat', {}, fail_without_http, day=0, owner='generic')
+        except RunCancelled as exc:
+            outcomes['generic'] = exc.reason
+        call('second')
+    first, other = threading.Thread(target=lambda: call('first')), threading.Thread(target=second)
+    try:
+        first.start()
+        assert entered.wait(3)
+        other.start()
+        assert second_started.wait(3)
+        release.set()
+        first.join(3)
+        other.join(3)
+        assert not first.is_alive() and not other.is_alive()
+        assert outcomes == dict(first='model_request_failed', generic='model_request_failed')
+        rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+        owners = {row['call_id']: row['owner'] for row in rows if row['event'] == 'request'}
+        replies = {owners[row['call_id']]: row['usage'] for row in rows if row['event'] == 'response'}
+        assert replies['first']['input_tokens'] == 5
+        assert replies['generic']['input_tokens'] is None
+        assert replies['second']['input_tokens'] == 10
+        report = physical_usage_summary(recorder.summary)
+        assert report['calls'] == 3 and report['known']['input_tokens'] == 15
+        assert report['missing']['input_tokens'] == 1
+    finally:
+        release.set()
+        for thread in (first, other):
+            if thread.ident is not None:
+                thread.join(3)
+        client.close()
 
 
 def test_interleaved_recovery_paths_do_not_choose_final_attempt_by_file_order(tmp_path):
