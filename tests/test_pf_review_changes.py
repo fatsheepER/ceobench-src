@@ -6,6 +6,19 @@ import pytest
 from saas_bench.pf_stale import compare
 from test_text_registry import workspace, captured, call, declaration
 from test_pf_stale import record_sql, cite
+from test_text_registry import send
+
+
+def test_file_refresh_is_labeled_as_reread_in_detail_and_history(workspace, tmp_path):
+    _, registry, executor = captured(workspace, tmp_path)
+    send(registry.store, executor.execute('read_file', {'path': 'evidence.json'}))
+    call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    executor.weekly_check(14)
+    detail = executor.execute('bash', {'command': 'pf depend r1 --detail'})
+    history = executor.execute('bash', {'command': 'pf log evidence.json'})
+    assert 'not recomputed by PF' in detail
+    assert '[reread by PF check]' in history
+    assert '[rerun by PF check]' not in detail + history
 
 
 def table(rows, columns=('n',), **extra):

@@ -1040,7 +1040,8 @@ class PFQueries:
             result['checked_day'] = self._check_day
             result['refresh_hint'] = 'research_group completes a new survey; calling get_group_insights again only retrieves it'
         if self._rerun(version):
-            result['what'] += ' [rerun by PF check]'
+            result['what'] += (' [reread by PF check]' if meta['layer'] == 'file_bytes'
+                               else ' [rerun by PF check]')
         if meta['layer'] == 'file_bytes':
             result['path'] = meta['object_id']
         if query:
@@ -1228,8 +1229,6 @@ class PFQueries:
                 item['note'] = note
             if same := handles.same_as(member):
                 item['same_content_as'] = same
-            if self._rerun(member):
-                item['what'] += ' [rerun by PF check]'
             return item
         return self._page(groups[::-1], offset, describe, root=self._describe(target))
 
