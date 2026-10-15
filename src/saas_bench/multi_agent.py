@@ -476,7 +476,9 @@ class MultiAgentRuntime:
         self._lifecycle.check(retry=True)
 
     def _check_model_send(self):
-        deadline = time.monotonic() + 3
+        from .runtime_options import timeout_value
+        timeout = timeout_value('completion_wait', 30)
+        deadline = time.monotonic() + timeout if timeout is not None else float('inf')
         while True:
             self._lifecycle.check(retry=True)
             with self.server._request_lock:
@@ -734,9 +736,9 @@ class MultiAgentRuntime:
                     self._close_week()
                     self._boundary('week_boundary')
         except RunCancelled as exc:
-            self.failure = str(exc)
+            self.failure = getattr(exc, 'reason', str(exc))
             cause = exc.__cause__
-            details = []
+            details = [exc.detail] if getattr(exc, 'detail', None) else []
             while cause is not None:
                 details.append(type(cause).__name__ + ': ' + str(cause))
                 cause = cause.__cause__

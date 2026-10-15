@@ -17,6 +17,7 @@ import httpx
 from .run_state import artifact_hashes, copy_workspace, file_hash, tree_hash, write_json
 from .run_warnings import advisory, optional_hash
 from .run_lifecycle import BusinessOutcomeUnknown
+from .runtime_options import timeout_value
 
 
 @contextmanager
@@ -155,13 +156,13 @@ def checkpoint(runtime, destination=None):
         stack.callback(unpause)
         with server._sql_lock:
             server._sql_paused = True
-            if not server._sql_lock.wait_for(lambda: server._sql_active == 0, timeout=180):
+            if not server._sql_lock.wait_for(lambda: server._sql_active == 0, timeout=timeout_value('checkpoint_wait', 600)):
                 raise RuntimeError('World query is still in flight')
         with server._request_lock:
             def quiescent():
                 requests = server.public_request_state()
                 return not requests['active'] and not requests['queued']
-            if not server._request_lock.wait_for(quiescent, timeout=3):
+            if not server._request_lock.wait_for(quiescent, timeout=timeout_value('completion_wait', 30)):
                 raise RuntimeError('Public HTTP operation is still in flight')
         if not server._lock.acquire(blocking=False):
             raise RuntimeError('World API operation is still in flight')
