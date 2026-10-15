@@ -40,7 +40,7 @@ def managed_git(frozen, tmp_path, request):
 def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monkeypatch, interruption):
     from saas_bench import api_server
     team, directory, record, manifest, entry = managed_git
-    hold = tmp_path / 'HOLD'
+    stop = tmp_path / 'STOP'
     entered, release = threading.Event(), threading.Event()
     original = api_server.execute_query
     wire = []
@@ -99,7 +99,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         elif interruption == 'symlink' and len(wire) == 2:
             message = calls(('read_file', dict(path='MEMORY.md')))
         else:
-            hold.touch()
+            stop.touch()
             message = calls(('bash', dict(command=ADVANCE)))
         return completion(message, body.get('stream', False))
 
@@ -118,7 +118,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
         role.executor.bash_warn_after = .1
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        running = pool.submit(batch.execute, team, manifest, entry, directory, record, hold)
+        running = pool.submit(batch.execute, team, manifest, entry, directory, record, stop)
         try:
             if interruption in ('cancelled', 'cancelled_write'):
                 audit = role.audit.path
@@ -181,7 +181,7 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
             return completion(message, body.get('stream', False))
         return batch.checked_client(name, 'resume-test', transport=httpx.MockTransport(resume_response))
 
-    hold.unlink(missing_ok=True)
+    stop.unlink(missing_ok=True)
     resumed = batch.prepare(tmp_path / 'manifest.json', entry['run_id'], resume=True, live=True,
         client_factory=resume_client, simulator_factory=fast_simulator)
     assert resumed['status'] == 'finished' and resumed['day'] == 28

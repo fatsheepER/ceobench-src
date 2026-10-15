@@ -78,7 +78,7 @@ def test_prestart_enospc_pauses_at_boundary_without_script_error_model_input(mod
         assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b''
         from saas_bench.team_checkpoint import validate_snapshot
         _, state = validate_snapshot(snapshots[-1])
-        assert state['day'] == 0
+        assert state['day'] == 7
         assert all(item['day'] == 0 for item in team.test_wire)
 
 
@@ -257,7 +257,7 @@ def test_unknown_registered_business_write_retains_receipt_and_skips_model(mode,
             raise OSError(errno.EIO, 'write completion lost')
         monkeypatch.setitem(api_server._TOOL_DISPATCH, 'set_prices', fail_after_write)
         outcome = team.run(stop_after_day=7)
-        assert outcome.reason == 'failed'
+        assert (outcome.day, outcome.reason, team.failure) == (0, 'paused', 'business_operation_unknown')
         assert team.server._operation_failed is True
         record = team.server.role_script_results['ceo'][0]
         assert record['classification'] == 'unknown'
@@ -322,7 +322,7 @@ def test_pre_auth_open_streams_preserve_partial_host_evidence_and_skip_model(mod
         monkeypatch.setattr(registered, '_build_bwrap_cmd', lambda *args: ['bash', '-c', "printf 'PARTIAL-HOST\\n' >&2; sleep 60 & exit 1"])
         try:
             outcome = team.run(stop_after_day=7)
-            assert outcome.reason == 'failed'
+            assert (outcome.day, outcome.reason, team.failure) == (0, 'paused', 'business_operation_unknown')
             record = team.server.role_script_results['ceo'][0]
             assert record['classification'] == 'unknown'
             assert record['facts']['boundary_closed'] is False
