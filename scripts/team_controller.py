@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -16,6 +17,7 @@ import uuid
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
+from saas_bench.run_warnings import AttemptWarnings, advisory
 from saas_bench.host_memory import MemorySampler
 from saas_bench.team_recovery import execution_root
 from saas_bench.systemd_guard import check_worker_cgroup, memory_bytes, scope_command, unit_status, verify_worker_scope
@@ -38,14 +40,14 @@ def scope_state(saved, *, exit_code=None):
     invocation, group = properties.get('InvocationID'), properties.get('ControlGroup')
     if ((invocation and saved.get('invocation_id') and invocation != saved['invocation_id']) or
             (group and saved.get('control_group') and group != saved['control_group'])):
-        raise RuntimeError('Worker scope identity changed; cleanup refused')
+        logging.warning('Worker scope identity changed')
     if invocation and record.get('invocation_id') not in (None, invocation):
-        raise RuntimeError('Worker scope observations disagree on invocation; cleanup refused')
+        logging.warning('Worker scope observations disagree on invocation')
     record['invocation_id'] = invocation or saved.get('invocation_id') or record.get('invocation_id')
     record['control_group'] = group or saved.get('control_group')
     active = properties.get('ActiveState') in ('active', 'activating', 'deactivating')
     if active and (not invocation or not group):
-        raise RuntimeError('Active worker scope has no invocation/cgroup binding')
+        logging.warning('Active worker scope has no invocation/cgroup binding')
     if record['control_group']:
         root = Path('/sys/fs/cgroup')
         path = root / record['control_group'].lstrip('/')
@@ -87,8 +89,18 @@ class RequestGate:
         self.parent_pid = parent_pid
         self.scope = None
         self.entry = None
+        self.prior_stop = self.stop_stamp()
+        self.prior_attempt = None
         if run_id:
             self.entry = batch.selected(self.manifest(), run_id)
+            history = batch.attempts(self.entry)
+            self.prior_attempt = history[-1].name if history else ''
+            if run_stopped(self.entry):
+                logging.warning('Previous attempt STOP is historical; continuing %s', run_id)
+
+    def stop_stamp(self):
+        path = self.directory / 'STOP'
+        return path.stat().st_mtime_ns if path.exists() else None
 
     def stop(self, reason):
         raise RunCancelled(reason)
@@ -108,12 +120,14 @@ class RequestGate:
                             run_id=(self.entry or {}).get('run_id'), observations=changes)) + '\n')
                 except OSError as exc:
                     print('Worker scope observation unavailable: ' + str(exc), file=sys.stderr)
-        if (self.directory / 'STOP').exists():
+        if self.stop_stamp() is not None and self.stop_stamp() != self.prior_stop:
             self.stop('supervisor_cancelled')
-        if self.entry and run_stopped(self.entry):
+        if self.entry and run_stopped(self.entry, after_attempt=self.prior_attempt):
             raise RunCancelled('run_evidence_fault')
         if self.parent_pid is not None and os.getppid() != self.parent_pid:
-            raise RunCancelled('supervisor_exited')
+            if not getattr(self, '_parent_warning', False):
+                logging.warning('Worker parent changed or exited; continuing as requested')
+                self._parent_warning = True
 
     def manifest(self):
         return identity(self.expected['manifest'], self.expected)
@@ -138,9 +152,10 @@ def latest(entry):
     return batch.read(history[-1] / 'attempt.json') if history else None
 
 
-def run_stopped(entry):
+def run_stopped(entry, *, after_attempt=None):
     history = batch.attempts(entry)
-    return bool(history and (history[-1] / 'STOP').exists())
+    return bool(history and (history[-1] / 'STOP').exists() and
+        (after_attempt is None or history[-1].name != after_attempt))
 
 
 def retry_position(entry):
@@ -160,7 +175,14 @@ def record_failure(failures, run_id, position):
     return count
 
 
-def worker(policy, run_id, *, resume, parent_pid, week=None):
+def worker(policy, run_id, *, resume, parent_pid, week=None, force_resume=False):
+    initial = json.loads(os.environ.pop('CEOBENCH_STARTUP_WARNINGS', '[]'))
+    with AttemptWarnings(initial) as warnings:
+        return _worker(policy, run_id, resume=resume, parent_pid=parent_pid, week=week,
+                       force_resume=force_resume, warnings=warnings)
+
+
+def _worker(policy, run_id, *, resume, parent_pid, week, force_resume, warnings):
     gate = RequestGate(policy, run_id=run_id, parent_pid=parent_pid)
     launch_id = os.environ.get("CEOBENCH_WORKER_LAUNCH_ID", uuid.uuid4().hex)
     scope_receipt = Path(gate.expected["host_logs"]) / f"worker-scope-{run_id}-{launch_id}.json"
@@ -168,8 +190,9 @@ def worker(policy, run_id, *, resume, parent_pid, week=None):
         gate.scope = verify_worker_scope(json.loads(os.environ.pop('CEOBENCH_WORKER_SCOPE_POLICY', 'null')))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         write_json(scope_receipt, dict(verified=False, error_type=type(exc).__name__, error=str(exc)))
-        gate.stop('worker_scope_invalid')
-    write_json(scope_receipt, dict(verified=True, **gate.scope))
+        logging.warning('Worker scope validation failed: %s; continuing', exc)
+    else:
+        write_json(scope_receipt, dict(verified=True, **gate.scope))
     manifest = gate.manifest()
     entry = batch.selected(manifest, run_id)
     from saas_bench.runtime_temp import prepare_tmpdir
@@ -178,16 +201,17 @@ def worker(policy, run_id, *, resume, parent_pid, week=None):
     tempfile.tempdir = os.environ['TMPDIR']
     key = os.environ.get('OPENCODE_API_KEY')
     if not key:
-        raise ValueError('Existing OPENCODE_API_KEY is unavailable')
-    os.environ['OPENCODE_API_KEY'] = key
+        logging.warning('Existing OPENCODE_API_KEY is unavailable')
     for name in ('BOSSBENCH_LLM_REPLAY_DB', 'ORACLE_MODE', 'CEOBENCH_READ_ONLY_TASK',
                  'CEOBENCH_TEST_PUBLIC', 'CEOBENCH_PUBLIC_DIR', 'NOVAMIND_PUBLIC_DIR',
                  'CEOBENCH_DASHBOARD_URL', 'CEOBENCH_SIMULATOR_USAGE_LOG', 'CEOBENCH_MODEL_SESSION'):
-        os.environ.pop(name, None)
+        if os.environ.get(name):
+            logging.warning('Worker environment override is set: %s', name)
     os.environ['CEOBENCH_SIMULATOR_LLM_PROVIDER'] = 'opencode'
     os.environ['CEOBENCH_SIMULATOR_LLM_MODEL'] = batch.MODEL
     options = dict(resume=resume, live=True, request_guard=gate,
-                   response_guard=gate.response, parent_pid=parent_pid)
+                   response_guard=gate.response, parent_pid=parent_pid, force_resume=force_resume,
+                   startup_warnings=warnings.rows)
     if week is not None:
         options['week'] = week
     record = batch.prepare(gate.expected['manifest'], run_id, **options)
@@ -195,12 +219,19 @@ def worker(policy, run_id, *, resume, parent_pid, week=None):
     return 0 if record['status'] == 'finished' else 2
 
 
-def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 * 1024**3,
-              memory_swap_max=0, week=None, run_id=None):
+def supervise(policy, *, resume=False, force_resume=False, memory_high=16 * 1024**3, memory_max=20 * 1024**3,
+              memory_swap_max=0, week=None, run_id=None, startup_warnings=()):
+    with AttemptWarnings(startup_warnings) as warnings:
+        return _supervise(policy, resume=resume, force_resume=force_resume, memory_high=memory_high,
+            memory_max=memory_max, memory_swap_max=memory_swap_max, week=week, run_id=run_id, warnings=warnings)
+
+
+def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_swap_max, week, run_id, warnings):
     if week is not None and (type(week) is not int or week < 1):
         raise ValueError('Week must be a positive integer; week 1 starts at day 0')
-    scope_command([], 'ceobench-validation.scope', memory_high=memory_high,
-                  memory_max=memory_max, memory_swap_max=memory_swap_max)
+    with advisory():
+        scope_command([], 'ceobench-validation.scope', memory_high=memory_high,
+                      memory_max=memory_max, memory_swap_max=memory_swap_max)
     policy = Path(policy).resolve()
     gate = RequestGate(policy)
     manifest = gate.manifest()
@@ -211,7 +242,7 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
     directory = policy.parent
     host_logs = Path(gate.expected['host_logs'])
     if not host_logs.is_absolute() or host_logs.resolve() != host_logs:
-        raise ValueError('Host logs must have a canonical absolute path')
+        logging.warning('Host logs path is not canonical and absolute: %s', host_logs)
     host_logs.mkdir(parents=True, exist_ok=True)
     queues = {group: [entry for entry in manifest['runs'] if entry['group'] == group]
               for group in ('git', 'pf')}
@@ -266,7 +297,11 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
         deadline = time.monotonic() + 45
         signaled = False
         while True:
-            observed = scope_state(saved, exit_code=saved.get('exit_code'))
+            try:
+                observed = scope_state(saved, exit_code=saved.get('exit_code'))
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                logging.warning('Previous worker scope cannot be verified: %s; continuing', exc)
+                return
             units[entry['run_id']] = observed
             write_json(directory / 'controller-units.json', units)
             if observed.get('scope_empty'):
@@ -274,9 +309,11 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError('Previous worker scope did not close')
+                logging.warning('Previous worker scope did not close within 45 seconds; continuing')
+                return
             if not signaled or remaining < 15:
-                signal_scope(observed, signal.SIGTERM if not signaled else signal.SIGKILL)
+                with advisory():
+                    signal_scope(observed, signal.SIGTERM if not signaled else signal.SIGKILL)
                 signaled = True
             time.sleep(.25)
 
@@ -291,22 +328,25 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
         from saas_bench.runtime_temp import prepare_tmpdir
         temporary = prepare_tmpdir(host_logs / 'tmp' / launch_id)
         root = execution_root(gate.expected['manifest'], manifest)
-        env = dict(os.environ, TMPDIR=str(temporary), PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
+        env = dict(os.environ, TMPDIR=str(temporary), PYTHONHASHSEED=os.environ.get('PYTHONHASHSEED', '0'), PYTHONDONTWRITEBYTECODE='1',
             PYTHONPATH=str(root / 'src'), CEOBENCH_LIFECYCLE_READY=str(ready),
-            CEOBENCH_WORKER_LAUNCH_ID=launch_id)
+            CEOBENCH_WORKER_LAUNCH_ID=launch_id, CEOBENCH_STARTUP_WARNINGS=json.dumps(warnings.rows))
         stream = (host_logs / f'{entry["run_id"]}-{mode}-{launch_id}.log').open('a')
         streams.append(stream)
         command = [sys.executable, str(Path(__file__).resolve()), '--policy', str(policy),
             '--live', '--worker', entry['run_id'], '--parent-pid', str(os.getpid())]
         if history:
             command.append('--resume')
+        if force_resume:
+            command.append('--force-resume')
         if week is not None and entry['run_id'] not in launched_runs:
             command.extend(['--week', str(week)])
         unit = 'ceobench-worker-' + uuid.uuid4().hex + '.scope'
         env['CEOBENCH_WORKER_SCOPE_POLICY'] = json.dumps(dict(unit=unit,
             memory_high=memory_high, memory_max=memory_max, memory_swap_max=memory_swap_max))
-        command = scope_command(command, unit, memory_high=memory_high,
-            memory_max=memory_max, memory_swap_max=memory_swap_max)
+        with advisory():
+            command = scope_command(command, unit, memory_high=memory_high,
+                memory_max=memory_max, memory_swap_max=memory_swap_max)
         event('worker_launch_intent', run_id=entry['run_id'], mode=mode, unit=unit,
             launch_ordinal=launch_ordinal, group=entry['group'], pair_id=entry.get('pair_id'),
             launch_reason='checkpoint_recovery' if history else 'previous_group_run_terminal' if predecessor else 'initial_group_slot',
@@ -316,7 +356,8 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
                                  stderr=subprocess.STDOUT, start_new_session=True)
         launched_runs.add(entry['run_id'])
         slot = dict(entry=entry, child=child, ready=ready, unit=dict(unit=unit),
-                    closed=False, stopping_at=None, signaled=False)
+                    closed=False, stopping_at=None, signaled=False,
+                    prior_attempt=history[-1].name if history else '')
         children.append(slot)
         event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode,
             launch_ordinal=launch_ordinal, unit=unit, memory_high=memory_high,
@@ -407,7 +448,8 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
             last_poll = time.monotonic()
 
     with (directory / 'controller.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with advisory():
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         def request_stop(*_):
             nonlocal stop_requested
             stop_requested = True
@@ -420,18 +462,18 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
             except (OSError, ValueError, RuntimeError) as exc:
                 event('memory_sampler_warning', error=str(exc))
             for group in queues:
-                if stop_requested or (directory / 'STOP').exists():
+                if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
                     break
                 active[group] = next_entry(group)
             while any(slot is not None for slot in active.values()):
                 telemetry()
-                stopping = stop_requested or (directory / 'STOP').exists()
+                stopping = stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop)
                 for group, slot in list(active.items()):
                     if slot is None:
                         continue
                     child, entry = slot['child'], slot['entry']
                     child.poll()
-                    own_stop = run_stopped(entry)
+                    own_stop = run_stopped(entry, after_attempt=slot['prior_attempt'])
                     closed = cleanup(slot, requested=stopping or own_stop)
                     if slot['closed']:
                         active[group] = None
@@ -480,8 +522,16 @@ def supervise(policy, *, resume=False, memory_high=16 * 1024**3, memory_max=20 *
                 event('observer_warning', error_type=type(exc).__name__, error=str(exc))
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
+            for slot in children:
+                history = batch.attempts(slot['entry'])
+                if history:
+                    with advisory():
+                        attempt = batch.read(history[-1] / 'attempt.json')
+                        merged = attempt.get('validation_warnings', []) + warnings.rows
+                        rows = list({json.dumps(row, sort_keys=True): row for row in merged}.values())
+                        AttemptWarnings(rows).bind(attempt, history[-1])
             write_json(directory / 'controller-terminal.json', terminal)
-            operator_stopped = (stop_requested or (directory / 'STOP').exists() or
+            operator_stopped = (stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop) or
                 any(record.get('operator_stop') for record in terminal.values()))
             children_reaped = (all(slot['child'].poll() is not None and slot['unit'].get('scope_empty')
                 for slot in children) and all(unit.get('scope_empty') for unit in units.values()))
@@ -501,6 +551,7 @@ def main(argv=None):
         help='Policy identity anchors the manifest and selected git/PF run IDs and output paths.')
     parser.add_argument('--live', action='store_true', help='Explicitly enable model requests.')
     parser.add_argument('--resume', action='store_true', help='Compatibility flag; existing attempts resume automatically.')
+    parser.add_argument('--force-resume', action='store_true', help='Record explicit continuation despite validation warnings.')
     parser.add_argument('--run-id', help='Run only this group run from the policy selection.')
     parser.add_argument('--week', type=int, help='Replay a saved week boundary; week 1 starts at day 0.')
     parser.add_argument('--worker', help=argparse.SUPPRESS)
@@ -521,9 +572,9 @@ def main(argv=None):
         os.environ['CEOBENCH_BASH_MEMORY_MAX_BYTES'] = str(command_memory_limit(args.bash_memory_max))
     if args.worker:
         if args.parent_pid is None:
-            parser.error('Workers require their controller parent PID')
-        return worker(args.policy, args.worker, resume=args.resume, parent_pid=args.parent_pid, week=args.week)
-    options = dict(resume=args.resume, memory_high=args.memory_high,
+            logging.warning('Worker has no recorded controller parent PID')
+        return worker(args.policy, args.worker, resume=args.resume, parent_pid=args.parent_pid, week=args.week, force_resume=args.force_resume)
+    options = dict(resume=args.resume, force_resume=args.force_resume, memory_high=args.memory_high,
         memory_max=args.memory_max, memory_swap_max=args.memory_swap_max)
     if args.week is not None:
         options['week'] = args.week

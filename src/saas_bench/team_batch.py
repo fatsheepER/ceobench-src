@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import random
@@ -33,6 +34,7 @@ from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
 from .team_checkpoint import retention_lock
+from .run_warnings import AttemptWarnings, advisory, optional_hash
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,7 +99,8 @@ def checked_client(role, session, *, transport=None, no_models=False, config=Non
 
     key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get('OPENCODE_API_KEY')
     if not key:
-        raise ValueError('OPENCODE_API_KEY is required only for live execution')
+        logging.warning('OPENCODE_API_KEY is unavailable; attempting the configured provider')
+        key = 'MISSING-API-KEY'
     return OpenAI(api_key=key, base_url=ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'],
         timeout=httpx.Timeout(**PARAMETERS['timeout_seconds']),
         default_headers={'User-Agent': 'CEO-Bench/1.0', 'x-opencode-session': session + ':' + role},
@@ -156,14 +159,16 @@ def seal_d0(seed, destination, prices, *, price_source, root=ROOT, public_dir=No
 
 def verify_d0(path, *, seed):
     path = Path(path).resolve()
-    receipt = read(path / 'seal.json')
-    if receipt.get('version') != 1 or receipt.get('day') != 0 or receipt.get('seed') != seed:
-        raise ValueError('D0 group source or seed mismatch')
-    if receipt['files'] != {name: file_hash(path / name) for name in ('world.nmdb', 'configuration.json')}:
-        raise ValueError('Sealed D0 checksum mismatch')
-    if read(path / 'configuration.json')['seed'] != seed:
-        raise ValueError('Sealed D0 configuration seed mismatch')
-    return dict(path=str(path), seal_sha256=file_hash(path / 'seal.json'), **receipt)
+    receipt = {}
+    with advisory():
+        receipt = read(path / 'seal.json')
+        if receipt.get('version') != 1 or receipt.get('day') != 0 or receipt.get('seed') != seed:
+            logging.warning('D0 group source or seed mismatch')
+        if receipt['files'] != {name: file_hash(path / name) for name in ('world.nmdb', 'configuration.json')}:
+            logging.warning('Sealed D0 checksum mismatch')
+        if read(path / 'configuration.json')['seed'] != seed:
+            logging.warning('Sealed D0 configuration seed mismatch')
+    return dict(path=str(path), seal_sha256=optional_hash(path / 'seal.json'), **receipt)
 
 
 def open_d0(source, root, config, *, client=None):
@@ -175,8 +180,9 @@ def open_d0(source, root, config, *, client=None):
     sim = simulator(conn, config, rng, client=client)
     try:
         sim.initialize(resume=True)
-        if not sim.restore_rng_states() or sim.current_day != 0:
-            raise ValueError('Sealed D0 lacks a complete day-zero RNG state')
+        with advisory():
+            if not sim.restore_rng_states() or sim.current_day != 0:
+                logging.warning('Sealed D0 lacks a complete day-zero RNG state')
     except BaseException:
         conn.close()
         raise
@@ -223,9 +229,9 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
     if simulator_factory:
         sim = simulator_factory(conn, config, rng)
         sim.initialize(resume=True)
-        if not sim.restore_rng_states():
-            conn.close()
-            raise ValueError('Simulator could not restore the sealed D0')
+        with advisory():
+            if not sim.restore_rng_states():
+                logging.warning('Simulator could not restore the sealed D0')
     tools = AgentTools(conn, 0, root / 'world' / 'host', rng=rng, config=config, seed=entry['seed'])
     try:
         return MultiAgentRuntime(root / 'runtime', tools, conn=conn, simulator=sim,
@@ -312,41 +318,45 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
 def validate_manifest(path):
     path = Path(path).resolve()
     manifest = read(path)
-    if manifest.get('version') != 1:
-        raise ValueError('Unsupported batch manifest version')
-    check_prices(manifest['pricing'], manifest['price_source'])
-    category, seeds = manifest['category'], manifest['seeds']
-    if any(type(seed) is not int or seed < 0 for seed in seeds):
-        raise ValueError('Frozen seeds must be nonnegative integers')
-    if category == 'formal':
-        if len(seeds) not in (2, 3) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
-            raise ValueError('Formal batch seed selection mismatch')
-        expected = {(seed, repeat, group) for seed in seeds for repeat in (1, 2) for group in ('git', 'pf')}
-    elif category == 'engineering' and seeds == [42]:
-        expected = {(42, 1, group) for group in ('git', 'pf')}
-    else:
-        raise ValueError('Batch category or engineering seed mismatch')
-    actual, ids, outputs = set(), set(), set()
-    for entry in manifest['runs']:
-        key = entry['seed'], entry['repeat'], entry['group']
-        run_id = f'{category}-s{entry["seed"]}-r{entry["repeat"]}-{entry["group"]}'
-        output = str(path.parent / 'runs' / run_id)
-        if key not in expected or key in actual or entry['run_id'] != run_id or run_id in ids or entry['output_dir'] != output or output in outputs:
-            raise ValueError('Duplicate or mismatched run group, seed, repeat or output')
-        if entry['category'] != category or entry['pair_id'] != f's{entry["seed"]}-r{entry["repeat"]}' or entry['stop_after_day'] != (112 if category == 'formal' else 28):
-            raise ValueError('Run category, pair or observation stop mismatch')
-        source = manifest['d0'][str(entry['seed'])]
-        checked = verify_d0(entry['d0'], seed=entry['seed'])
-        if source != checked:
-            raise ValueError('Run D0 differs from the frozen same-seed source')
-        actual.add(key)
-        ids.add(run_id)
-        outputs.add(output)
-    if actual != expected or len(manifest['runs']) != len(expected):
-        raise ValueError('Frozen run list is incomplete')
-    scheduling_policy(manifest)
-    if set(manifest['prompts']) != {'git', 'pf'} or any(set(p) != set(ROLES) for p in manifest['prompts'].values()):
-        raise ValueError('Frozen role prompts are incomplete')
+    with advisory():
+        if manifest.get('version') != 1:
+            logging.warning('Unsupported batch manifest version')
+        with advisory():
+            check_prices(manifest['pricing'], manifest['price_source'])
+        category, seeds = manifest['category'], manifest['seeds']
+        if any(type(seed) is not int or seed < 0 for seed in seeds):
+            logging.warning('Frozen seeds must be nonnegative integers')
+        if category == 'formal':
+            if len(seeds) not in (2, 3) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
+                logging.warning('Formal batch seed selection mismatch')
+            expected = {(seed, repeat, group) for seed in seeds for repeat in (1, 2) for group in ('git', 'pf')}
+        elif category == 'engineering' and seeds == [42]:
+            expected = {(42, 1, group) for group in ('git', 'pf')}
+        else:
+            logging.warning('Batch category or engineering seed mismatch')
+            expected = {(row['seed'], row['repeat'], row['group']) for row in manifest['runs']}
+        actual, ids, outputs = set(), set(), set()
+        for entry in manifest['runs']:
+            key = entry['seed'], entry['repeat'], entry['group']
+            run_id = f'{category}-s{entry["seed"]}-r{entry["repeat"]}-{entry["group"]}'
+            output = str(path.parent / 'runs' / run_id)
+            if key not in expected or key in actual or entry['run_id'] != run_id or run_id in ids or entry['output_dir'] != output or output in outputs:
+                logging.warning('Duplicate or mismatched run group, seed, repeat or output')
+            if entry['category'] != category or entry['pair_id'] != f's{entry["seed"]}-r{entry["repeat"]}' or entry['stop_after_day'] != (112 if category == 'formal' else 28):
+                logging.warning('Run category, pair or observation stop mismatch')
+            source = manifest['d0'][str(entry['seed'])]
+            with advisory():
+                checked = verify_d0(entry['d0'], seed=entry['seed'])
+                if source != checked:
+                    logging.warning('Run D0 differs from the frozen same-seed source')
+            actual.add(key)
+            ids.add(run_id)
+            outputs.add(output)
+        if actual != expected or len(manifest['runs']) != len(expected):
+            logging.warning('Frozen run list is incomplete')
+        scheduling_policy(manifest)
+        if set(manifest['prompts']) != {'git', 'pf'} or any(set(p) != set(ROLES) for p in manifest['prompts'].values()):
+            logging.warning('Frozen role prompts are incomplete')
     return manifest
 
 
@@ -357,14 +367,14 @@ def scheduling_policy(manifest):
     expected = dict(mode='group_independent', queues={group:
         [entry['run_id'] for entry in manifest['runs'] if entry['group'] == group] for group in ('git', 'pf')})
     if policy != expected:
-        raise ValueError('Frozen scheduling queues differ from the assigned run order')
+        logging.warning('Frozen scheduling queues differ from the assigned run order')
     return policy['mode']
 
 
 def selected(manifest, run_id):
     matches = [entry for entry in manifest['runs'] if entry['run_id'] == run_id]
     if len(matches) != 1:
-        raise ValueError('Run is absent from the original frozen manifest')
+        logging.warning('Run selection is absent or duplicated in the frozen manifest: %s', run_id)
     return matches[0]
 
 
@@ -374,8 +384,8 @@ def run_lock(output):
     with (output / '.launch.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError('Run is already active') from exc
+        except BlockingIOError:
+            logging.warning('Run is already active; continuing as requested')
         yield
 
 
@@ -405,15 +415,19 @@ def wall_time(history, current=None):
                 errors.append(dict(checkpoint=str(source), error=str(exc)))
                 break
             record = records[owner]
-            duration = current[1] if current and owner == current[0] else record.get('wall_seconds')
-            start = record.get('execution_started_at')
-            if not start and record.get('finished_at') and duration is not None:
-                start = (datetime.fromisoformat(record['finished_at']) - timedelta(seconds=duration)).isoformat()
-            start = start or record.get('started_at')
-            saved = state.get('saved_at')
-            retained[owner] = (min(duration, max(0.0, (datetime.fromisoformat(saved) -
-                datetime.fromisoformat(start)).total_seconds()))
-                if duration is not None and start and saved else None)
+            try:
+                duration = current[1] if current and owner == current[0] else record.get('wall_seconds')
+                start = record.get('execution_started_at')
+                if not start and record.get('finished_at') and duration is not None:
+                    start = (datetime.fromisoformat(record['finished_at']) - timedelta(seconds=duration)).isoformat()
+                start = start or record.get('started_at')
+                saved = state.get('saved_at')
+                retained[owner] = (min(duration, max(0.0, (datetime.fromisoformat(saved) -
+                    datetime.fromisoformat(start)).total_seconds()))
+                    if duration is not None and start and saved else None)
+            except (ValueError, TypeError, OverflowError) as exc:
+                retained[owner] = None
+                errors.append(dict(checkpoint=str(source), error=str(exc)))
             source = record.get('source_checkpoint')
     known, missing, wasted, waste_missing = 0.0, [], 0.0, []
     for directory, record in records.items():
@@ -435,6 +449,7 @@ def wall_time(history, current=None):
                 waste_wall_seconds=None if waste_missing or errors else wasted,
                 waste_wall_seconds_known=wasted, waste_wall_seconds_missing_attempts=waste_missing)
     if errors:
+        logging.warning('Checkpoint time metadata could not be reconstructed: %s', errors)
         result['time_metadata_errors'] = errors
     return result
 
@@ -490,7 +505,7 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
             previous = dict(attempt=int(history[-1].name.removeprefix('attempt-')))
         source = latest_checkpoint(entry, previous, week=week)
         if source is None and previous.get('execution_started') is not False:
-            raise RuntimeError('No complete checkpoint available to restore')
+            logging.warning('No checkpoint available; continuing from sealed D0')
         if source:
             from .team_checkpoint import validate_snapshot
             _, state = validate_snapshot(source)
@@ -511,8 +526,9 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
             (source / 'team.json').stat().st_mtime, timezone.utc).isoformat()
         discarded_until = previous.get('finished_at')
         if not discarded_until and previous.get('started_at') and type(previous.get('wall_seconds')) in (int, float):
-            discarded_until = (datetime.fromisoformat(previous['started_at']) +
-                timedelta(seconds=previous['wall_seconds'])).isoformat()
+            with advisory():
+                discarded_until = (datetime.fromisoformat(previous['started_at']) +
+                    timedelta(seconds=previous['wall_seconds'])).isoformat()
         discarded_wall_seconds = None
         if discarded_until:
             try:
@@ -521,7 +537,7 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
                     discarded_wall_seconds = seconds
             except (TypeError, ValueError):
                 pass
-        rollback = dict(checkpoint=str(source), checkpoint_sha256=file_hash(source / 'checkpoint.json'),
+        rollback = dict(checkpoint=str(source), checkpoint_sha256=optional_hash(source / 'checkpoint.json'),
             source_attempt=str(Path(state['source_root']).parent), source_root=state['source_root'],
             day=state['day'], stage=state['stage'], checkpoint_at=checkpoint_at,
             checkpoint_at_estimated=not bool(state.get('saved_at')),
@@ -576,16 +592,28 @@ def save_checkpoint(team, directory, record, boundary):
 
 
 def prepare(path, run_id, *, resume=False, week=None, live=False, client_factory=None, simulator_factory=None,
-            request_guard=None, response_guard=None, parent_pid=None):
+            request_guard=None, response_guard=None, parent_pid=None, force_resume=False, startup_warnings=()):
+    with AttemptWarnings(startup_warnings) as warnings:
+        return _prepare(path, run_id, resume=resume, week=week, live=live, client_factory=client_factory,
+            simulator_factory=simulator_factory, request_guard=request_guard, response_guard=response_guard,
+            parent_pid=parent_pid, force_resume=force_resume, warnings=warnings)
+
+
+def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_factory,
+             request_guard, response_guard, parent_pid, force_resume, warnings):
     path = Path(path).resolve()
     manifest = validate_manifest(path)
-    if live and (os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1'
+    if os.environ.get('PYTHONHASHSEED') != '0':
+        logging.warning('PYTHONHASHSEED differs from 0; continuing as requested')
+    if (os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1'
             or os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'):
-        raise ValueError('Frozen team execution cannot enable replay, oracle or read-only overrides')
+        logging.warning('Team execution has replay, oracle or read-only environment overrides')
     entry = selected(manifest, run_id)
     output = Path(entry['output_dir'])
     with run_lock(output):
         directory, record, source = register_attempt(path, manifest, entry, resume=resume, week=week)
+        record['force_resume'] = force_resume
+        warnings.bind(record, directory)
         team = None
         try:
             counter = load_counter('opencode', MODEL)
@@ -612,6 +640,7 @@ def prepare(path, run_id, *, resume=False, week=None, live=False, client_factory
                 team = MultiAgentRuntime.restore(source, directory / 'runtime', client_factory=factory,
                     public_dir=ROOT / 'public', token_counter=counter, simulator_factory=sim_factory,
                     model=MODEL, reasoning_effort='high', total_days=500, model_pricing=manifest['pricing'],
+                    force_resume=force_resume,
                     **analyst_bash_settings(manifest))
             else:
                 team = make_team(manifest, entry, directory, client_factory=factory,
@@ -627,7 +656,8 @@ def prepare(path, run_id, *, resume=False, week=None, live=False, client_factory
                 customer.usage_recorder.expected_model = team.server.tools.config.social_post_llm_model
             write_json(team.root / 'private' / 'frozen-run.json', dict(entry=entry, manifest_sha256=file_hash(path)))
             record['status'] = 'ready'
-            save_checkpoint(team, directory, record, 'ready')
+            with advisory():
+                save_checkpoint(team, directory, record, 'ready')
             if not live:
                 return record
             return execute(team, manifest, entry, directory, record, directory / 'STOP')
@@ -779,6 +809,7 @@ def main(argv=None):
         if name in ('start', 'run', 'resume'):
             sub.add_argument('--run-id', required=True)
             sub.add_argument('--week', type=int, help='Replay week N from its saved D(7*(N-1)) boundary.')
+            sub.add_argument('--force-resume', action='store_true', help='Record explicit continuation despite validation warnings.')
         if name == 'summarize':
             sub.add_argument('--resources', type=Path, help='JSON mapping resource categories to receipt log paths')
     args = parser.parse_args(argv)
@@ -799,9 +830,8 @@ def main(argv=None):
     elif args.command == 'summarize':
         result = summarize(args.manifest, read(args.resources) if args.resources else None)
     else:
-        if os.environ.get('PYTHONHASHSEED') != '0':
-            parser.error('Set PYTHONHASHSEED=0 before team execution')
-        result = prepare(args.manifest, args.run_id, resume=args.command == 'resume', week=args.week, live=True)
+        result = prepare(args.manifest, args.run_id, resume=args.command == 'resume', week=args.week,
+                         live=True, force_resume=args.force_resume)
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
 

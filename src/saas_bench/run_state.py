@@ -91,7 +91,7 @@ def copy_workspace(source, destination, *, omit_session_world=None, exact=False)
     source = Path(source).resolve()
     for path in source.rglob('*'):
         if path.is_symlink() and (Path(os.readlink(path)).is_absolute() or not path.resolve().is_relative_to(source)):
-            raise ValueError('Workspace symlink escapes a portable checkpoint: ' + str(path.relative_to(source)))
+            logging.warning('Workspace symlink escapes the checkpoint: %s', path.relative_to(source))
     base_ignore = shutil.ignore_patterns('__pycache__', '*.pyc', '*.pid', '.server.port')
     def ignore(directory, names):
         ignored = set() if exact else base_ignore(directory, names)
@@ -108,7 +108,7 @@ def copy_workspace(source, destination, *, omit_session_world=None, exact=False)
         except OSError:
             shutil.copy2(src, dst)
         return dst
-    shutil.copytree(source, destination, symlinks=True, ignore=ignore, copy_function=freeze_file)
+    shutil.copytree(source, destination, symlinks=True, ignore=ignore, copy_function=freeze_file, dirs_exist_ok=True)
 
 
 def checkpoint_directory(run, checkpoint):

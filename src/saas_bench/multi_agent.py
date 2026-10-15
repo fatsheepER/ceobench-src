@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass, replace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 import json
+import logging
 import os
 from pathlib import Path
 import threading
@@ -70,7 +71,9 @@ class MultiAgentRuntime:
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
             total_days=total_days, model_pricing=model_pricing)
-        validate_bash_limits(analyst_bash_timeout, analyst_bash_warn_after)
+        from .run_warnings import advisory
+        with advisory():
+            validate_bash_limits(analyst_bash_timeout, analyst_bash_warn_after)
         if not _restored_state or 'analyst_bash_timeout' in _restored_state['configuration']:
             self.configuration.update(analyst_bash_timeout=analyst_bash_timeout,
                                       analyst_bash_warn_after=analyst_bash_warn_after)
@@ -100,9 +103,9 @@ class MultiAgentRuntime:
             identities = [_restored_state['roles'][role]['identity'] for role in ROLES]
             saved_run, saved_world = identities[0]['run_id'], identities[0]['world_id']
             if any((item['run_id'], item['world_id']) != (saved_run, saved_world) for item in identities):
-                raise ValueError('Restored roles disagree on run or world identity')
+                logging.warning('Restored roles disagree on run or world identity')
             if run_id not in (None, saved_run) or world_id not in (None, saved_world):
-                raise ValueError('Recovery run or world identity changed')
+                logging.warning('Recovery run or world identity changed')
             run_id, world_id = saved_run, saved_world
         else:
             run_id, world_id = run_id or uuid.uuid4().hex, world_id or uuid.uuid4().hex

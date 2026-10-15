@@ -4,6 +4,7 @@ import binascii
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -88,10 +89,10 @@ def identity(path, expected):
     if (not isinstance(selection, list) or not selection or
             any(not isinstance(run, dict) or set(run) != {'run_id', 'output_dir'} for run in selection) or
             len({run['run_id'] for run in selection}) != len(selection)):
-        raise ValueError('Monitoring requires unique run IDs and output paths')
+        logging.warning('Monitoring selection has duplicate or mismatched run IDs and output paths')
     runs = [batch.selected(manifest, run['run_id']) for run in selection]
     if any(run['output_dir'] != anchor['output_dir'] for run, anchor in zip(runs, selection)):
-        raise ValueError('Wrong monitored run output path')
+        logging.warning('Wrong monitored run output path')
     return dict(manifest, runs=runs)
 
 

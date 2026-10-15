@@ -25,12 +25,11 @@ def test_long_owned_socket_path_roundtrips_and_keeps_file_in_directory(tmp_path)
 
 
 @pytest.mark.parametrize('bytes_available,inodes,total', [(1, 999999, 1000000), (999999999, 1, 1000000)])
-def test_storage_gate_rejects_bytes_and_inode_exhaustion(tmp_path, monkeypatch, bytes_available, inodes, total):
+def test_storage_precheck_warns_about_bytes_and_inode_exhaustion(tmp_path, monkeypatch, bytes_available, inodes, total, caplog):
     monkeypatch.setattr('os.statvfs', lambda path: SimpleNamespace(f_bavail=bytes_available,
         f_frsize=1, f_favail=inodes, f_files=total))
-    with pytest.raises(OSError, match='Insufficient temporary storage') as error:
-        check_tmpdir(tmp_path)
-    assert error.value.errno == 28
+    assert check_tmpdir(tmp_path)['available_bytes'] == bytes_available
+    assert 'Insufficient temporary storage' in caplog.text
 
 
 def test_btrfs_unreported_inode_count_uses_real_file_probe(tmp_path, monkeypatch):

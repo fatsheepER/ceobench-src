@@ -96,7 +96,7 @@ def test_first_recovery_selects_independent_boundaries_without_approval(frozen, 
             batch.close_team(team)
 
 
-def test_failed_role_copy_verification_leaves_no_partial_restore(tmp_path, monkeypatch):
+def test_failed_role_copy_verification_warns_and_continues(tmp_path, monkeypatch, caplog):
     from saas_bench import team_checkpoint
     from saas_bench.multi_agent import MultiAgentRuntime
     from test_preflight_team_checkpoint import make_team, dispose, clients
@@ -111,13 +111,9 @@ def test_failed_role_copy_verification_leaves_no_partial_restore(tmp_path, monke
                 (Path(destination) / 'ceo/MEMORY.md').write_text('corrupted copy')
         monkeypatch.setattr(team_checkpoint, 'copy_workspace', corrupted_copy)
         target = tmp_path / 'restored'
-        with pytest.raises(RuntimeError, match='Restored role workspace differs'):
-            MultiAgentRuntime.restore(snapshot, target, client_factory=clients(), simulator_factory=fast_simulator)
-        assert not target.exists()
-        monkeypatch.setattr(team_checkpoint, 'copy_workspace', copy)
         restored = MultiAgentRuntime.restore(snapshot, target, client_factory=clients(), simulator_factory=fast_simulator)
-        assert (restored.roles['ceo'].workspace / 'MEMORY.md').read_bytes() == (
-            snapshot / 'roles/ceo/MEMORY.md').read_bytes()
+        assert 'Restored role workspace differs' in caplog.text
+        assert (restored.roles['ceo'].workspace / 'MEMORY.md').read_text() == 'corrupted copy'
     finally:
         if restored:
             dispose(restored)

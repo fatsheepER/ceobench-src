@@ -1,6 +1,7 @@
 """Owned temporary storage and Unix sockets under long run directories."""
 from contextlib import contextmanager
 import os
+import logging
 from pathlib import Path
 import tempfile
 
@@ -35,7 +36,7 @@ def check_tmpdir(path, *, min_bytes=64 * 1024**2, min_inodes=4096):
     available_bytes = status.f_bavail * status.f_frsize
     available_inodes = status.f_favail if status.f_files else None
     if available_bytes < min_bytes or available_inodes is not None and available_inodes < min_inodes:
-        raise OSError(28, f'Insufficient temporary storage at {path}: {available_bytes} bytes, {available_inodes} inodes')
+        logging.warning('Insufficient temporary storage at %s: %s bytes, %s inodes', path, available_bytes, available_inodes)
     # Btrfs does not report an inode limit. Prove the directory accepts a file.
     with tempfile.TemporaryFile(dir=path) as probe:
         probe.write(b'tmpdir-precheck')
@@ -46,7 +47,7 @@ def check_tmpdir(path, *, min_bytes=64 * 1024**2, min_inodes=4096):
 def prepare_tmpdir(path):
     path = Path(path)
     if path.is_symlink():
-        raise ValueError('Temporary directory cannot be a symlink')
+        logging.warning('Temporary directory is a symlink: %s', path)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     check_tmpdir(path)
     return path.resolve()

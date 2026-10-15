@@ -40,12 +40,13 @@ def test_wall_time_keeps_missing_attempts_separate_from_zero(tmp_path, prior):
     assert batch.wall_time([first, second], current=(second, 0))['wall_seconds_known'] == known - 3.5
 
 
-def test_live_batch_refuses_read_only_environment_before_registration(tmp_path, monkeypatch):
-    monkeypatch.setattr(batch, 'validate_manifest', lambda path: {})
+def test_live_batch_warns_about_read_only_environment_before_registration(frozen, tmp_path, monkeypatch):
+    path = changed_manifest(frozen, tmp_path, lambda manifest: None)
+    entry = batch.read(path)['runs'][0]
     monkeypatch.setenv('CEOBENCH_READ_ONLY_TASK', '1')
-    with pytest.raises(ValueError, match='read-only'):
-        batch.prepare(tmp_path / 'manifest.json', 'unused', live=True)
-    assert not (tmp_path / 'runs').exists()
+    record = batch.prepare(path, entry['run_id'], simulator_factory=batch.simulator)
+    assert record['status'] == 'ready'
+    assert any('read-only' in row['message'] for row in record['validation_warnings'])
 
 
 @pytest.fixture(scope='module')
@@ -300,10 +301,10 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
     lambda m: m['runs'][0].update(output_dir=m['runs'][1]['output_dir']),
     lambda m: m['runs'][0].update(stop_after_day=28),
 ])
-def test_validation_rejects_mismatch_and_duplicate(frozen, tmp_path, change):
+def test_validation_warns_about_mismatch_and_duplicate(frozen, tmp_path, change, caplog):
     path = changed_manifest(frozen, tmp_path, change)
-    with pytest.raises(ValueError):
-        batch.validate_manifest(path)
+    assert batch.validate_manifest(path) == batch.read(path)
+    assert caplog.records
 
 
 def test_validation_allows_historical_timeout_metadata(frozen, tmp_path):
@@ -463,11 +464,11 @@ def test_returned_model_mismatch_keeps_one_raw_receipt_without_retry(tmp_path, m
                   messages=[dict(role='user', content='offline')],
                   extra_body={'thinking': {'type': 'disabled'}})
     try:
-        with pytest.raises(RunCancelled, match='model_request_failed'):
-            recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
+        response = recorder.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs), day=0)
+        assert response.model == 'unexpected-model'
         rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
         assert rows[-1]['event'] == 'response' and rows[-1]['usage']['input_tokens'] == 20
-        assert rows[-1]['error'] is not None
+        assert rows[-1]['error'] is None
         assert next(row for row in rows if row['event'] == 'http_response')['body']
         assert len([row for row in rows if row['event'] == 'http_request']) == 1
         assert rows[-1]['model_attempts'] == 1
@@ -634,7 +635,7 @@ batch.prepare(sys.argv[1], sys.argv[2])
 
 
 @pytest.mark.parametrize('started', [True, None])
-def test_missing_checkpoint_after_execution_cannot_restart_from_d0(frozen, tmp_path, started):
+def test_missing_checkpoint_after_execution_warns_and_can_restart_from_d0(frozen, tmp_path, started):
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
     manifest = batch.validate_manifest(path)
     entry = manifest['runs'][0]
@@ -642,9 +643,9 @@ def test_missing_checkpoint_after_execution_cannot_restart_from_d0(frozen, tmp_p
         directory, record, _ = batch.register_attempt(path, manifest, entry)
         record.update(status='failed', execution_started=started)
         batch.write_json(directory / 'attempt.json', record)
-        with pytest.raises(ValueError, match='safe checkpoint'):
-            batch.register_attempt(path, manifest, entry, resume=True)
-    assert len(batch.attempts(entry)) == 1
+        _, resumed, source = batch.register_attempt(path, manifest, entry, resume=True)
+        assert source is None and resumed['attempt'] == 2
+    assert len(batch.attempts(entry)) == 2
 
 
 def test_killed_host_and_failed_restore_retain_safe_checkpoint(frozen, tmp_path, monkeypatch):

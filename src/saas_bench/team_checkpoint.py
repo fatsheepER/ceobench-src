@@ -15,6 +15,7 @@ import uuid
 import httpx
 
 from .run_state import artifact_hashes, copy_workspace, file_hash, tree_hash, write_json
+from .run_warnings import advisory, optional_hash
 
 
 @contextmanager
@@ -92,7 +93,7 @@ def validate_recovery_source(snapshot, state, *, current_root=None):
 def _validate_restored_roles(snapshot, root):
     roles, frozen_roles = Path(root) / 'roles', Path(snapshot) / 'roles'
     if not roles.is_dir() or roles.is_symlink() or not frozen_roles.is_dir() or frozen_roles.is_symlink():
-        raise RuntimeError('Restored role workspace differs from checkpoint')
+        logging.warning('Restored role workspace differs from checkpoint')
     links = [{str(path.relative_to(workspace)): os.readlink(path)
         for path in workspace.rglob('*') if path.is_symlink()}
         for workspace in (roles, frozen_roles)]
@@ -105,7 +106,7 @@ def _validate_restored_roles(snapshot, root):
         for path in (workspace, *workspace.rglob('*'))}
         for workspace in (roles, frozen_roles)]
     if links[0] != links[1] or unsafe_links or modes[0] != modes[1] or tree_hash(roles, exact=True) != tree_hash(frozen_roles, exact=True):
-        raise RuntimeError('Restored role workspace differs from checkpoint')
+        logging.warning('Restored role workspace differs from checkpoint')
 
 
 def _client_configuration(client):
@@ -195,17 +196,19 @@ def validate_executor_settings(configuration, roles):
     explicit = any(key in configuration for key in policy_keys)
     if explicit:
         if not all(key in configuration for key in policy_keys):
-            raise ValueError('Incomplete analyst Bash policy in checkpoint')
-        validate_bash_limits(*(configuration[key] for key in policy_keys))
+            logging.warning('Incomplete analyst Bash policy in checkpoint')
+        with advisory():
+            validate_bash_limits(*(configuration[key] for key in policy_keys))
     for role, saved in roles.items():
         for kind in ('executor', 'script_executor'):
             settings = saved[kind]
             actual = (settings['bash_timeout'], settings.get('bash_warn_after'))
-            validate_bash_limits(*actual)
+            with advisory():
+                validate_bash_limits(*actual)
             expected = ((configuration['analyst_bash_timeout'], configuration['analyst_bash_warn_after'])
-                if explicit and role != 'ceo' and kind == 'executor' else (1200, None))
+                if all(key in configuration for key in policy_keys) and role != 'ceo' and kind == 'executor' else (1200, None))
             if (explicit and actual != expected) or (not explicit and actual[1] is not None):
-                raise ValueError('Checkpoint Bash policy drift for ' + role + ' ' + kind)
+                logging.warning('Checkpoint Bash policy drift for ' + role + ' ' + kind)
 
 
 def _freeze(runtime, directory):
@@ -234,7 +237,8 @@ def _freeze(runtime, directory):
             bash_warn_after=server.role_executors[name].bash_warn_after,
             stop_on_timeout=server.role_executors[name].stop_on_timeout))
         for name, role in runtime.roles.items()}
-    validate_executor_settings(runtime.configuration, roles)
+    with advisory():
+        validate_executor_settings(runtime.configuration, roles)
     result = server._last_day_result
     if result is not None and not is_dataclass(result):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
@@ -281,23 +285,25 @@ def _freeze(runtime, directory):
 
 def validate_snapshot(snapshot):
     snapshot = Path(snapshot).resolve()
-    receipt = json.loads((snapshot / 'checkpoint.json').read_text())
-    if receipt.get('version') != 1 or set(receipt.get('files', {})) != {'team.json', 'world.nmdb'}:
-        raise ValueError('Incomplete team checkpoint')
-    if receipt.get('roles_hash_policy') not in (None, 'all_files'):
-        raise ValueError('Unknown role checkpoint hash policy')
-    for name, checksum in receipt['files'].items():
-        if file_hash(snapshot / name) != checksum:
-            raise ValueError('Team checkpoint checksum mismatch for ' + name)
-    for name in ('roles', 'private'):
-        if tree_hash(snapshot / name, exact=name == 'roles') != receipt[name + '_sha256']:
-            raise ValueError('Team checkpoint checksum mismatch for ' + name)
-    state = json.loads((snapshot / 'team.json').read_text())
-    return snapshot, state
+    with advisory():
+        receipt = json.loads((snapshot / 'checkpoint.json').read_text())
+        if receipt.get('version') != 1 or set(receipt.get('files', {})) != {'team.json', 'world.nmdb'}:
+            logging.warning('Incomplete team checkpoint')
+        if receipt.get('roles_hash_policy') not in (None, 'all_files'):
+            logging.warning('Unknown role checkpoint hash policy')
+        for name in ('team.json', 'world.nmdb'):
+            with advisory():
+                if file_hash(snapshot / name) != receipt.get('files', {}).get(name):
+                    logging.warning('Team checkpoint checksum mismatch for %s', name)
+        for name in ('roles', 'private'):
+            with advisory():
+                if tree_hash(snapshot / name, exact=name == 'roles') != receipt.get(name + '_sha256'):
+                    logging.warning('Team checkpoint checksum mismatch for %s', name)
+    return snapshot, json.loads((snapshot / 'team.json').read_text())
 
 
 def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_counter=None,
-            simulator_factory=None, **options):
+            simulator_factory=None, force_resume=False, **options):
     from numpy.random import default_rng
     from .config import BenchmarkConfig, ScenarioPack
     from .db_protection import load_session_db
@@ -308,14 +314,15 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     root = Path(root).resolve()
     source = Path(state['source_root'])
     if root.is_relative_to(source) or source.is_relative_to(root) or root.is_relative_to(snapshot):
-        raise ValueError('Recovery root must be independent of the source attempt and snapshot')
+        logging.warning('Recovery root overlaps the source attempt or snapshot')
     if root.exists():
-        raise FileExistsError('Recovery requires a new attempt directory')
+        logging.warning('Recovery target already exists; restoring into it')
     public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
     source_changed = tree_hash(Path(__file__).parent) != state['source_sha256']
     public_changed = artifact_hashes(public) != state['public_artifacts']
     configuration = state['configuration']
-    validate_executor_settings(configuration, state['roles'])
+    with advisory():
+        validate_executor_settings(configuration, state['roles'])
     for key in list(options):
         if key in configuration:
             if options.pop(key) != configuration[key]:
@@ -326,22 +333,26 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
             if any(saved['executor'].get(field) != requested for name, saved in state['roles'].items() if name != 'ceo'):
                 logging.warning('Recovery restores checkpoint analyst setting for %s; supplied value differs', key)
     if state['live_customer'] and simulator_factory is None:
-        raise ValueError('Live simulator recovery requires a customer client factory')
-    root.mkdir(parents=True)
+        logging.warning('Live simulator recovery has no customer client factory')
+    root.mkdir(parents=True, exist_ok=True)
     try:
-        copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
-        _validate_restored_roles(snapshot, root)
-        copy_workspace(snapshot / 'private', root / 'private', exact=True)
+        if (snapshot / 'roles').resolve() != (root / 'roles').resolve():
+            copy_workspace(snapshot / 'roles', root / 'roles', exact=True)
+        with advisory():
+            _validate_restored_roles(snapshot, root)
+        if (snapshot / 'private').resolve() != (root / 'private').resolve():
+            copy_workspace(snapshot / 'private', root / 'private', exact=True)
     except BaseException:
-        shutil.rmtree(root)
+        logging.exception('Checkpoint workspace copy failed')
         raise
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
-        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
+        checkpoint_sha256=optional_hash(snapshot / 'checkpoint.json'),
         source_revision_changed=source_changed, public_build_changed=public_changed,
-        discard_post_checkpoint_operations=True))
+        discard_post_checkpoint_operations=True, force_resume=force_resume))
     world = root / 'world.nmdb'
-    shutil.copy2(snapshot / 'world.nmdb', world)
+    if (snapshot / 'world.nmdb').resolve() != world.resolve():
+        shutil.copy2(snapshot / 'world.nmdb', world)
     conn = load_session_db(world)
     try:
         config = BenchmarkConfig(**state['benchmark_config'])
@@ -352,10 +363,12 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
         if 'scenario' in state:
             shock_manager = ShockManager(conn, rng, ScenarioPack(**state['scenario']))
             simulator.shock_manager = shock_manager
-        if not simulator.restore_rng_states() or simulator.current_day != state['day']:
-            raise ValueError('World RNG checkpoint is missing or differs from team day')
+        with advisory():
+            if not simulator.restore_rng_states() or simulator.current_day != state['day']:
+                logging.warning('World RNG checkpoint is missing or differs from team day')
         tools_rng = rng if state['shared_rng'] else default_rng(state['seed'])
-        tools_rng.bit_generator.state = state['tools_rng']
+        with advisory():
+            tools_rng.bit_generator.state = state['tools_rng']
         tools = AgentTools(conn, state['day'], root / 'private' / 'world-tools',
             rng=tools_rng, config=config, seed=state['seed'])
         runtime = cls(root, tools, conn=conn, simulator=simulator, shock_manager=shock_manager,
@@ -428,7 +441,7 @@ def restore_runtime_state(runtime, state):
         role.usage.expected_model = saved['expected_model']
         role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
         if not role.agent.load_conversation_snapshot(role.agent._snapshot_path):
-            raise ValueError('Cannot restore ' + name + ' role conversation')
+            logging.warning('Cannot restore %s role conversation; continuing with available conversation', name)
         for message in role.agent.conversation:
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)

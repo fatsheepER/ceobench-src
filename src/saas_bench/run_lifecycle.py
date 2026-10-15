@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
-import select
+import logging
 import signal
 import socket
 import threading
@@ -20,7 +20,6 @@ class WorkerLifecycle:
         self.reason = None
         self._model = threading.local()
         self._wake = threading.Event()
-        self._thread = None
         self._depth = 0
         self._sockets = weakref.WeakSet()
         self._socket_lock = threading.RLock()
@@ -31,33 +30,12 @@ class WorkerLifecycle:
             return self
         self._depth = 1
         self._old_handler = signal.signal(signal.SIGUSR1, self._signal) if threading.current_thread() is threading.main_thread() else None
-        if self.parent_pid is not None:
-            try:
-                self._parent = os.pidfd_open(self.parent_pid)
-                if os.getppid() != self.parent_pid:
-                    self.reason = 'supervisor_exited'
-                self._pipe = os.pipe()
-                self._thread = threading.Thread(target=self._watch, daemon=True)
-                self._thread.start()
-            except BaseException:
-                if self._old_handler is not None:
-                    signal.signal(signal.SIGUSR1, self._old_handler)
-                if hasattr(self, '_parent'):
-                    os.close(self._parent)
-                raise
         ready = os.environ.get('CEOBENCH_LIFECYCLE_READY')
         self._ready = Path(ready) if ready else None
         if ready:
             from .run_state import write_json
             write_json(Path(ready), dict(pid=os.getpid()))
         return self
-
-    def _watch(self):
-        ready, _, _ = select.select([self._parent, self._pipe[0]], [], [])
-        if self._parent in ready:
-            self.reason = 'supervisor_exited'
-            self._wake.set()
-            os.kill(os.getpid(), signal.SIGUSR1)
 
     def _signal(self, signum, frame):
         self.cancel('supervisor_cancelled')
@@ -126,9 +104,10 @@ class WorkerLifecycle:
         http_client.event_hooks['request'].append(request_hook)
 
     def check(self, *, retry=False):
-        if self.parent_pid is not None and hasattr(self, '_parent'):
-            if select.select([self._parent], [], [], 0)[0]:
-                self.reason = 'supervisor_exited'
+        if self.parent_pid is not None and os.getppid() != self.parent_pid:
+            if not getattr(self, '_parent_warning', False):
+                logging.warning('Worker parent changed or exited; continuing as requested')
+                self._parent_warning = True
         if retry and self.hold and self.hold.name == 'STOP' and self.hold.exists():
             self.cancel('requested_pause')
         if self.reason:
@@ -163,12 +142,6 @@ class WorkerLifecycle:
         if self._depth:
             return
         self._model.active = False
-        if self._thread:
-            os.write(self._pipe[1], b'x')
-            self._thread.join()
-            for fd in (*self._pipe, self._parent):
-                os.close(fd)
-            del self._parent
         if self._old_handler is not None:
             # A supervisor may already have queued a signal after reading ready.
             handler = signal.SIG_IGN if self._ready and self._old_handler == signal.SIG_DFL else self._old_handler

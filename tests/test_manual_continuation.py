@@ -30,7 +30,7 @@ def test_manual_resumes_have_no_cumulative_limit(frozen, tmp_path, legacy_cap):
     assert len(batch.attempts(entry)) == 6
 
 
-def test_resume_ignores_historical_hold_and_operation_tail_but_keeps_active_lock(managed_team):
+def test_resume_ignores_historical_hold_operation_tail_and_active_lock(managed_team, caplog):
     _, directory, record, manifest, entry = managed_team
     path = directory / 'manifest.json'
     record['status'] = 'paused'
@@ -46,9 +46,9 @@ def test_resume_ignores_historical_hold_and_operation_tail_but_keeps_active_lock
     created, resumed, source = batch.register_attempt(path, manifest, entry, resume=True)
     assert source == Path(record['checkpoint']) and created.name == 'attempt-005'
     assert hold.exists()
-    with pytest.raises(ValueError, match='already active'):
-        with batch.run_lock(Path(entry['output_dir'])):
-            pass
+    with batch.run_lock(Path(entry['output_dir'])):
+        pass
+    assert 'already active' in caplog.text
     operations = directory / 'runtime/private/operations'
     operations.mkdir(parents=True)
     write_json(operations / 'unsnapshotted.json', dict(status='completed'))

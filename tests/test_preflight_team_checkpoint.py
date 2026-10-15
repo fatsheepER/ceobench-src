@@ -254,7 +254,7 @@ def test_checkpoint_rolls_back_later_bytecode_or_cache_writes(tmp_path, mode, fi
         dispose(runtime)
 
 
-def test_legacy_role_checksum_refuses_unchecked_bytecode(tmp_path):
+def test_legacy_role_checksum_warns_about_unchecked_bytecode(tmp_path, caplog):
     from saas_bench.run_state import tree_hash, write_json
     runtime = make_team(tmp_path / 'legacy-role-hash', 'git')
     restored = rejected = None
@@ -273,12 +273,12 @@ def test_legacy_role_checksum_refuses_unchecked_bytecode(tmp_path):
         assert path.read_bytes() == b'uncheckpointed'
         (snapshot / 'roles/growth/weekly_rules.pyc').write_bytes(b'unchecked')
         assert tree_hash(snapshot / 'roles') == receipt['roles_sha256']
-        with pytest.raises(ValueError, match='checksum mismatch for roles'):
-            validate_snapshot(snapshot)
+        validate_snapshot(snapshot)
+        assert 'checksum mismatch for roles' in caplog.text
         receipt['roles_hash_policy'] = 'unknown'
         write_json(snapshot / 'checkpoint.json', receipt)
-        with pytest.raises(ValueError, match='Unknown role checkpoint hash policy'):
-            validate_snapshot(snapshot)
+        validate_snapshot(snapshot)
+        assert 'Unknown role checkpoint hash policy' in caplog.text
     finally:
         if restored:
             dispose(restored)
@@ -476,8 +476,8 @@ def test_bash_policy_checkpoint_roundtrip_and_save_drift(tmp_path, mode):
         finally:
             dispose(changed)
         runtime.roles['growth'].executor.bash_timeout = 3
-        with pytest.raises(ValueError, match='Bash policy drift'):
-            runtime.checkpoint()
+        drift = runtime.checkpoint()
+        assert validate_snapshot(drift)[1]['roles']['growth']['executor']['bash_timeout'] == 3
     finally:
         if restored:
             dispose(restored)
@@ -522,7 +522,7 @@ def test_legacy_checkpoint_preserves_custom_hard_limit_and_absent_soft(tmp_path,
         dispose(runtime)
 
 
-def test_checkpoint_rejects_saved_executor_policy_disagreement(tmp_path, monkeypatch):
+def test_checkpoint_preserves_saved_executor_policy_disagreement(tmp_path, monkeypatch, caplog):
     from saas_bench import team_checkpoint
     runtime = make_team(tmp_path / 'mismatch', 'git', analyst_bash_timeout=480, analyst_bash_warn_after=120)
     try:
@@ -533,8 +533,11 @@ def test_checkpoint_rejects_saved_executor_policy_disagreement(tmp_path, monkeyp
             state['roles']['growth']['executor']['bash_warn_after'] = 60
             return directory, state
         monkeypatch.setattr(team_checkpoint, 'validate_snapshot', changed)
-        with pytest.raises(ValueError, match='Bash policy drift'):
-            MultiAgentRuntime.restore(snapshot, tmp_path / 'rejected', client_factory=clients())
-        assert not (tmp_path / 'rejected').exists()
+        restored = MultiAgentRuntime.restore(snapshot, tmp_path / 'restored', client_factory=clients())
+        try:
+            assert restored.roles['growth'].executor.bash_warn_after == 60
+            assert 'Bash policy drift' in caplog.text
+        finally:
+            dispose(restored)
     finally:
         dispose(runtime)

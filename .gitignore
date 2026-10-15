@@ -122,6 +122,7 @@ sequence-diagram/
 # tests/ is internal-only, except selected source-level regression tests that
 # must ship so a fresh clone can rebuild and verify public/.
 tests/*
+!tests/test_resume_advisories.py
 !tests/conftest.py
 !tests/test_docs_coverage.py
 !tests/test_ceobench_customer_choice.py

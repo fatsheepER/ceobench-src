@@ -7,6 +7,7 @@ and file manipulation (read, write, edit, search, glob).
 import fnmatch
 import hashlib
 import json
+import logging
 import math
 import os
 import platform
@@ -195,14 +196,15 @@ def agent_runtime(verify=False) -> Dict[str, Any]:
     directory = agent_runtime_dir()
     try:
         record = json.loads((directory / 'runtime.json').read_text())
-    except FileNotFoundError:
-        raise RuntimeError(f'Agent runtime missing at {directory}; run scripts/build_agent_runtime.py') from None
+    except (OSError, ValueError) as exc:
+        logging.warning('Agent runtime metadata unavailable at %s: %s', directory, exc)
+        record = {}
     if record.get('python') != platform.python_version():
-        raise RuntimeError('Agent runtime Python differs from the host interpreter; rebuild the agent runtime')
+        logging.warning('Agent runtime Python differs from the host interpreter; rebuild the agent runtime')
     if verify:
         from saas_bench.run_state import tree_hash
-        if tree_hash(directory / 'python') != record['sha256']:
-            raise RuntimeError('Agent runtime differs from its runtime.json; rebuild the agent runtime')
+        if tree_hash(directory / 'python') != record.get('sha256'):
+            logging.warning('Agent runtime differs from its runtime.json; rebuild the agent runtime')
     return record
 
 
@@ -366,7 +368,9 @@ class BashAgentToolExecutor:
             raise ValueError('Team execution requires the Linux sandbox')
         self.workspace_path = Path(workspace_path).resolve()
         self.extra_env = env or {}
-        validate_bash_limits(bash_timeout, bash_warn_after)
+        from saas_bench.run_warnings import advisory
+        with advisory():
+            validate_bash_limits(bash_timeout, bash_warn_after)
         self.bash_timeout = bash_timeout
         self.bash_warn_after = bash_warn_after
         from saas_bench.process_boundary import command_memory_limit

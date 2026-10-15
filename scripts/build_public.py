@@ -52,6 +52,7 @@ _ENGINE_MODULES = [
     "pf_refresh",
     "pf_deadline",
     "run_lifecycle",
+    "run_warnings",
     "process_boundary",
     "runtime_temp",
     "config",

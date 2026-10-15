@@ -6,6 +6,7 @@ import base64
 import errno
 import functools
 import json
+import logging
 import math
 import os
 import socket
@@ -577,7 +578,7 @@ class ModelUsage:
                     if message := response_error(raw, api):
                         raise ValueError(message)
                     if self.expected_model is not None and raw.get('model') != self.expected_model:
-                        raise ValueError('Returned model differs from frozen configuration')
+                        logging.warning('Returned model differs from frozen configuration')
                     return response
                 except Exception as exc:
                     last_model_error = type(exc).__name__
