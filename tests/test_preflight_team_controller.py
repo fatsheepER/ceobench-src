@@ -109,6 +109,41 @@ def test_resume_skips_finished_group_unless_week_selected(observer, controller, 
     assert not receipt['failed'] and not receipt['hold']
 
 
+@pytest.mark.parametrize('failure', ['popen', 'worker'])
+def test_startup_failure_preserves_finished_attempt_and_runs_peer(observer, controller, monkeypatch, failure):
+    from test_preflight_group_join import group_batch
+    popen = subprocess.Popen
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    entry = observer.manifest['runs'][0]
+    previous = Path(entry['output_dir']) / 'attempt-001/attempt.json'
+    write_json(previous, dict(status='finished', attempt=1, day=28))
+    original = previous.read_bytes()
+    launch = controller.module.subprocess.Popen
+    failed_children = []
+
+    def fail_start(command, **kwargs):
+        if '--worker' in command and command[command.index('--worker') + 1] == entry['run_id']:
+            if failure == 'popen':
+                raise OSError('injected worker startup failure')
+            child = popen([sys.executable, '-c', 'raise SystemExit(2)'], **kwargs)
+            failed_children.append(child)
+            return child
+        return launch(command, **kwargs)
+
+    monkeypatch.setattr(controller.module.subprocess, 'Popen', fail_start)
+    controller.module.supervise(controller.policy, resume=True, week=4)
+    assert previous.read_bytes() == original
+    assert not (previous.parent / 'HOLD').exists()
+    assert launches == ['s101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    assert all(child.poll() is not None for child in failed_children)
+    notice = batch.read(previous.parent.parent / 'HOLD')
+    assert notice['manual_resume_required'] and notice['run_id'] == entry['run_id']
+    terminal = batch.read(controller.policy.parent / 'controller-terminal.json')
+    assert terminal[entry['run_id']]['disposition'] == 'hold'
+    assert terminal['s101-pf']['status'] == 'finished'
+
+
 def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):
     entry = observer.manifest['runs'][0]
     monkeypatch.setenv('CEOBENCH_WORKER_LAUNCH_ID', 'offline-launch')

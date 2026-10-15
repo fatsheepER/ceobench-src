@@ -364,7 +364,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             memory_max=memory_max, memory_swap_max=memory_swap_max, scope=observe(slot))
         return slot
 
-    def hold_group(entry, *, reason, unit=None):
+    def hold_group(entry, *, reason, unit=None, prior_attempt=None):
         history = batch.attempts(entry)
         notice = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
             time=datetime.now(timezone.utc).isoformat(), manual_resume_required=True, unit=unit)
@@ -372,9 +372,13 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             record = batch.read(history[-1] / 'attempt.json')
             notice['checkpoint'] = record.get('checkpoint') or record.get('source_checkpoint')
             notice['detail'] = record.get('hold_detail') or reason
-            record.update(status='paused', hold=True, hold_detail=record.get('hold_detail') or reason)
-            write_json(history[-1] / 'attempt.json', record)
-            write_json(history[-1] / 'HOLD', notice)
+            if history[-1].name != prior_attempt:
+                record.update(status='paused', hold=True, hold_detail=record.get('hold_detail') or reason)
+                write_json(history[-1] / 'attempt.json', record)
+                write_json(history[-1] / 'HOLD', notice)
+            else:
+                notice['startup_failure'] = True
+                notice['preserved_attempt'] = prior_attempt
         write_json(Path(entry['output_dir']) / 'HOLD', notice)
         terminal[entry['run_id']] = dict(disposition='hold', **notice)
         logging.warning('HOLD %s: %s; manual checkpoint resume required', entry['run_id'], reason)
@@ -385,6 +389,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         while queues[group]:
             entry = queues[group].pop(0)
             saved = latest(entry)
+            history = batch.attempts(entry)
+            prior_attempt = history[-1].name if history else ''
             try:
                 if week is None and saved and saved.get('status') == 'finished':
                     logging.warning('Skipping finished group %s; select --week explicitly to re-enter it', entry['run_id'])
@@ -393,7 +399,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                     continue
                 return launch(entry, predecessor)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                return hold_group(entry, reason=type(exc).__name__ + ': ' + str(exc))
+                return hold_group(entry, reason=type(exc).__name__ + ': ' + str(exc), prior_attempt=prior_attempt)
         return None
 
     def cleanup(slot, *, requested=False):
@@ -501,7 +507,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                         active[group] = next_entry(group, predecessor=entry['run_id'])
                     else:
                         active[group] = hold_group(entry, reason=str(saved.get('runtime_failure') or
-                            saved.get('reason') or 'worker_exit:' + str(child.returncode)), unit=slot['unit'])
+                            saved.get('reason') or 'worker_exit:' + str(child.returncode)), unit=slot['unit'],
+                            prior_attempt=slot['prior_attempt'])
                     write_json(directory / 'controller-terminal.json', terminal)
                 time.sleep(1)
             return [latest(entry) for entry in manifest['runs']]
@@ -524,7 +531,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 signal.signal(sig, handler)
             for slot in children:
                 history = batch.attempts(slot['entry'])
-                if history:
+                if history and history[-1].name != slot['prior_attempt']:
                     with advisory():
                         attempt = batch.read(history[-1] / 'attempt.json')
                         merged = attempt.get('validation_warnings', []) + warnings.rows
