@@ -546,11 +546,13 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     source = None
     state = None
     missing_checkpoint = None
+    previous = {}
     if history:
         try:
             previous = read(history[-1] / 'attempt.json')
         except (OSError, ValueError):
             previous = dict(attempt=int(history[-1].name.removeprefix('attempt-')))
+    if history or resume or week is not None:
         source = latest_checkpoint(entry, previous, week=week)
         if source is None and week != 1:
             missing_checkpoint = 'No saved checkpoint for ' + ('week ' + str(week) if week is not None else 'the requested resume')
@@ -563,8 +565,6 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
                     missing_checkpoint = 'Selected checkpoint lacks ' + ', '.join(missing) + ': ' + str(source)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 missing_checkpoint = 'Selected checkpoint cannot be loaded: ' + str(source) + ': ' + str(exc)
-    elif (resume or week is not None) and week != 1:
-        missing_checkpoint = 'No saved checkpoint for ' + ('week ' + str(week) if week is not None else 'the requested resume')
     number = int(history[-1].name.removeprefix('attempt-')) + 1 if history else 1
     directory = Path(entry['output_dir']) / f'attempt-{number:03}'
     temporary = Path(tempfile.mkdtemp(prefix='.registration-', dir=directory.parent))

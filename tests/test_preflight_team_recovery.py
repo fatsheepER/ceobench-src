@@ -183,3 +183,22 @@ def test_missing_explicit_checkpoint_holds_with_the_requested_path(tmp_path, mon
     assert result['status'] == 'paused' and result['source_checkpoint'] == str(selected)
     assert str(selected) in result['hold_detail']
     assert not result['execution_started']
+
+
+def test_explicit_existing_checkpoint_can_start_a_new_output_history(tmp_path, monkeypatch):
+    from saas_bench import team_batch as batch
+    entry = dict(run_id='git-1', output_dir=str(tmp_path / 'new-history'), category='formal')
+    Path(entry['output_dir']).mkdir()
+    selected = snapshot(tmp_path / 'old-history/attempt-001/runtime/checkpoints/selected',
+        entry['run_id'], '2026-10-15T01:00:00+00:00')
+    state = batch.read(selected / 'team.json')
+    state['source_root'] = str(selected.parents[1])
+    write_json(selected / 'team.json', state)
+    original = (selected / 'team.json').read_bytes()
+    monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(selected)}))
+    path = tmp_path / 'manifest.json'
+    write_json(path, dict(runs=[entry]))
+    directory, record, source = batch.register_attempt(path, {}, entry, resume=True)
+    assert source == selected and record['source_checkpoint'] == str(selected)
+    assert 'missing_checkpoint' not in record and directory.name == 'attempt-001'
+    assert (selected / 'team.json').read_bytes() == original
