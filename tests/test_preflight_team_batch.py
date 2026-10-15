@@ -36,7 +36,8 @@ def test_wall_time_keeps_missing_attempts_separate_from_zero(tmp_path, prior):
         wall_seconds=None if missing else known, wall_seconds_known=known,
         wall_seconds_missing_attempts=['attempt-001'] if missing else [],
         waste_wall_seconds=None if missing else 0, waste_wall_seconds_known=0,
-        waste_wall_seconds_missing_attempts=['attempt-001'] if missing else [])
+        waste_wall_seconds_missing_attempts=['attempt-001'] if missing else [],
+        pending_wall_seconds=0, pending_wall_seconds_known=0, pending_wall_seconds_missing_attempts=[])
     assert batch.wall_time([first, second], current=(second, 0))['wall_seconds_known'] == known - 3.5
 
 

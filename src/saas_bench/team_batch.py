@@ -446,25 +446,30 @@ def wall_time(history, current=None):
                 retained[owner] = None
                 errors.append(dict(checkpoint=str(source), error=str(exc)))
             source = record.get('source_checkpoint')
-    known, missing, wasted, waste_missing = 0.0, [], 0.0, []
+    known, missing, wasted, waste_missing, pending, pending_missing = 0.0, [], 0.0, [], 0.0, []
     for directory, record in records.items():
         elapsed = duration(directory, record)
         inherited = bool(retained)
         kept = (retained.get(directory, 0.0) if inherited else elapsed)
-        if directory == history[-1] and records[directory].get('status') not in ('failed', 'paused'):
-            kept = elapsed
+        unresolved = directory == history[-1] and record.get('status') in ('failed', 'paused', 'preparing')
+        if directory == history[-1]:
+            kept = retained.get(directory, 0.0) if unresolved else elapsed
         if kept is None:
             missing.append(directory.name)
         else:
             known += kept
         if elapsed is None or kept is None:
-            waste_missing.append(directory.name)
+            (pending_missing if unresolved else waste_missing).append(directory.name)
+        elif unresolved:
+            pending += max(0.0, elapsed - kept)
         else:
             wasted += max(0.0, elapsed - kept)
     result = dict(wall_seconds=None if missing or errors else known, wall_seconds_known=known,
                 wall_seconds_missing_attempts=missing,
                 waste_wall_seconds=None if waste_missing or errors else wasted,
-                waste_wall_seconds_known=wasted, waste_wall_seconds_missing_attempts=waste_missing)
+                waste_wall_seconds_known=wasted, waste_wall_seconds_missing_attempts=waste_missing,
+                pending_wall_seconds=None if pending_missing or errors else pending,
+                pending_wall_seconds_known=pending, pending_wall_seconds_missing_attempts=pending_missing)
     if errors:
         logging.warning('Checkpoint time metadata could not be reconstructed: %s', errors)
         result['time_metadata_errors'] = errors
@@ -493,9 +498,13 @@ def run_usage(entry, prices):
     retained_logs = logs([valid_root] if valid_root else [])
     valid = aggregate(retained_logs, prices, category=entry['category'])
     valid['retained_logs'] = {key: [str(path) for path in paths] for key, paths in retained_logs.items()}
+    pending = aggregate(logs(all_roots[-1:]) if last.get('status') in ('failed', 'paused', 'preparing') else [],
+        prices, category=entry['category'], exclude_calls={record['call_id'] for record in valid['records']})
+    pending['status'] = 'awaiting_operator_selection'
+    valid['pending'] = pending
     try:
         waste = aggregate(logs(all_roots), prices, category=entry['category'],
-                          exclude_calls={record['call_id'] for record in valid['records']})
+                          exclude_calls={record['call_id'] for record in valid['records'] + pending['records']})
     except (OSError, ValueError) as exc:
         waste = aggregate([], prices, category=entry['category'])
         waste['missing_receipts'].append(dict(reason='discarded_log_unreadable', error=str(exc)))
@@ -795,7 +804,7 @@ def _execute(team, manifest, entry, directory, record, hold):
         seed=entry['seed'], repeat=entry['repeat'], day=outcome.day, reason=reason,
         usage=usage, attempt=record['attempt'], stop_after_day=entry['stop_after_day'],
         wall_seconds=timing['wall_seconds'], last_week_result=team.server._last_day_result)
-    result.update(timing, waste=waste)
+    result.update(timing, waste=waste, pending=usage['pending'])
     write_json(directory / 'result.json', result)
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
         day=outcome.day, reason=reason, runtime_failure=team.failure, result=result,
@@ -825,7 +834,7 @@ def summarize(path, resource_paths=None):
                    attempt=last['attempt'], reason=last.get('reason'))
         row.update(wall_time(history))
         usage, waste = run_usage(entry, manifest['pricing'])
-        row.update(usage=usage, waste=waste)
+        row.update(usage=usage, waste=waste, pending=usage['pending'])
         rows.append(row)
         for category, paths in usage['retained_logs'].items():
             categorized[category].extend(Path(value) for value in paths)

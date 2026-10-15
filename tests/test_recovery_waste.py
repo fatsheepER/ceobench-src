@@ -54,7 +54,7 @@ def test_pair_comparison_uses_valid_time_and_exposes_waste_separately():
     assert pair['waste']['git']['wall_seconds'] == 90
 
 
-def test_preparation_failure_uses_checkpoint_logs_and_final_failure_tail_is_waste(tmp_path):
+def test_tail_remains_pending_until_a_new_attempt_selects_checkpoint(tmp_path):
     entry = dict(output_dir=str(tmp_path), category='formal', run_id='git')
     first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
     private = first / 'runtime/private/ceo'
@@ -75,6 +75,11 @@ def test_preparation_failure_uses_checkpoint_logs_and_final_failure_tail_is_wast
         roles_sha256=tree_hash(checkpoint / 'roles', exact=True),
         private_sha256=tree_hash(checkpoint / 'private')))
     write_json(first / 'attempt.json', dict(status='failed', checkpoint=str(checkpoint)))
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['team']['complete']['total_tokens'] == 12
+    assert valid['pending']['team']['complete']['total_tokens'] == 34
+    assert valid['pending']['status'] == 'awaiting_operator_selection'
+    assert not waste['records']
     write_json(second / 'attempt.json', dict(status='failed', attempt=2, source_checkpoint=str(checkpoint)))
     valid, waste = batch.run_usage(entry, PRICES)
     assert valid['team']['complete']['total_tokens'] == 12
@@ -99,6 +104,22 @@ def test_unreadable_historical_time_metadata_remains_unknown(tmp_path):
     assert report['time_metadata_errors'][0]['attempt'] == 'attempt-001'
 
 
+def test_paused_time_is_pending_until_operator_selects_a_checkpoint(tmp_path):
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    source = first / 'runtime/checkpoints/complete'
+    write_json(source / 'team.json', dict(source_root=str(first / 'runtime'),
+        saved_at='2026-10-15T00:01:20+00:00'))
+    write_json(first / 'attempt.json', dict(status='paused', wall_seconds=100,
+        execution_started_at='2026-10-15T00:00:00+00:00', checkpoint=str(source)))
+    before = batch.wall_time([first])
+    assert before['wall_seconds'] == 80 and before['pending_wall_seconds'] == 20
+    assert before['waste_wall_seconds'] == 0
+    write_json(second / 'attempt.json', dict(status='finished', source_checkpoint=str(source), wall_seconds=30))
+    after = batch.wall_time([first, second])
+    assert after['wall_seconds'] == 110 and after['pending_wall_seconds'] == 0
+    assert after['waste_wall_seconds'] == 20
+
+
 def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, monkeypatch):
     from saas_bench.multi_agent import RunOutcome
     from saas_bench.run_lifecycle import RunCancelled
@@ -120,4 +141,5 @@ def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, mo
     assert result['checkpoint'] == original
     assert set((team.root / 'checkpoints').iterdir()) == before
     assert result['result']['usage']['team']['billed_units'] == 0
-    assert result['result']['waste']['roles']['ceo']['billed_units'] == 1
+    assert result['result']['waste']['roles']['ceo']['billed_units'] == 0
+    assert result['result']['pending']['roles']['ceo']['billed_units'] == 1
