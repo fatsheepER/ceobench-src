@@ -3,6 +3,8 @@
 import sqlite3
 import math
 import json
+import logging
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
@@ -729,7 +731,7 @@ class Simulator:
         for gid in CUSTOMER_GROUPS:
             group_seed = int(self.rng.integers(0, 2**63))
             # XOR with hash of group_id for extra differentiation
-            gid_hash = hash(gid) & 0xFFFFFFFF
+            gid_hash = zlib.crc32(gid.encode('utf-8'))
             self._group_rngs[gid] = Generator(PCG64(group_seed ^ gid_hash))
 
         if not resume:
@@ -823,6 +825,7 @@ class Simulator:
 
         states = {
             'version': 3,
+            'group_seed_hash': 'crc32',
             'runtime_config': normalize_runtime_config(
                 {name: getattr(self.config, name) for name in RUNTIME_CONFIG_FIELDS}),
             'rng': _serialize_state(self.rng),
@@ -892,6 +895,9 @@ class Simulator:
             return False
 
         states = _json.loads(row['state_json'])
+        if states.get('group_seed_hash') != 'crc32':
+            logging.warning('Checkpoint group RNG hash scheme is %s; restoring saved RNG states, new D0 uses crc32',
+                            states.get('group_seed_hash', 'python-hash'))
         required = {'rng', '_macro_rng', '_competitor_rng', '_competitor_post_noise_rng',
                     '_competitor_template_rng', '_quality_rng', '_customer_quality_noise_rng',
                     '_customer_pick_rng', '_group_rngs', '_sim_state', 'runtime_config'}
@@ -1004,7 +1010,7 @@ class Simulator:
             self._group_rngs = {}
             for gid in CUSTOMER_GROUPS:
                 group_seed = int(self.rng.integers(0, 2**63))
-                gid_hash = hash(gid) & 0xFFFFFFFF
+                gid_hash = zlib.crc32(gid.encode('utf-8'))
                 self._group_rngs[gid] = Generator(PCG64(group_seed ^ gid_hash))
             grng = self._group_rngs[group_id]
 
@@ -7510,7 +7516,7 @@ Guidelines:
             self._group_rngs = {}
             for gid in CUSTOMER_GROUPS:
                 group_seed = int(self.rng.integers(0, 2**63))
-                gid_hash = hash(gid) & 0xFFFFFFFF
+                gid_hash = zlib.crc32(gid.encode('utf-8'))
                 self._group_rngs[gid] = Generator(PCG64(group_seed ^ gid_hash))
 
         self.current_day += 1
