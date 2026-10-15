@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 import fcntl
 import json
 import logging
+import os
 from pathlib import Path
 
 from saas_bench import team_batch as batch
 from saas_bench.run_state import write_json
 from saas_bench.run_warnings import AttemptWarnings
+from saas_bench.runtime_options import add_runtime_arguments, runtime_environment
 from saas_bench.systemd_guard import memory_bytes
 import team_controller as controller
 from team_observer import identity
@@ -42,7 +44,9 @@ def _main(argv, warnings):
     parser.add_argument('--memory-high', type=memory_bytes, default=16 * 1024**3)
     parser.add_argument('--memory-max', type=memory_bytes, default=20 * 1024**3)
     parser.add_argument('--memory-swap-max', type=memory_bytes, default=0)
+    add_runtime_arguments(parser)
     args = parser.parse_args(argv)
+    os.environ.update(runtime_environment(args))
     if args.resume and not args.live:
         parser.error('--resume requires --live')
     config, manifest = verify_controls(args.policy)
@@ -54,6 +58,7 @@ def _main(argv, warnings):
         print(json.dumps(dict(status='validated', batch_id=manifest['batch_id'],
             scheduling='group_independent', runs=[row['run_id'] for row in manifest['runs']],
             memory_high=args.memory_high, memory_max=args.memory_max,
+            runtime_limits=runtime_environment(args),
             model_requests=0, credential_read=False, new_attempts=0)))
         return 0
     directory = args.policy.resolve().parent

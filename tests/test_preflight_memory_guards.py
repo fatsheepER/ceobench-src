@@ -225,7 +225,7 @@ def test_controller_main_returns_failure_and_passes_memory_settings(controller, 
     assert controller.module.main(['--policy', str(controller.policy), '--live',
         '--memory-high', '128M', '--memory-max', '256M', '--memory-swap-max', '0',
         '--bash-memory-max', '64M']) == (2 if failed else 0)
-    assert calls == [dict(resume=False, memory_high=134217728, memory_max=268435456, memory_swap_max=0)]
+    assert calls == [dict(resume=False, force_resume=False, memory_high=134217728, memory_max=268435456, memory_swap_max=0)]
     assert os.environ['CEOBENCH_BASH_MEMORY_MAX_BYTES'] == '67108864'
 
 
@@ -234,6 +234,22 @@ def test_invalid_cgroup_limits_are_rejected(high, maximum, swap):
     from saas_bench.systemd_guard import scope_command
     with pytest.raises(ValueError, match='MemoryHigh'):
         scope_command([], 'test.scope', memory_high=high, memory_max=maximum, memory_swap_max=swap)
+
+
+@pytest.mark.parametrize('value', ['max', 'infinity'])
+def test_unlimited_worker_memory_is_passed_to_controller(controller, monkeypatch, value):
+    calls = []
+    def supervise(policy, **kwargs):
+        calls.append(kwargs)
+        (policy.parent / 'controller-exit.json').write_text(json.dumps(dict(failed=False)))
+    monkeypatch.setattr(controller.module, 'supervise', supervise)
+    assert controller.module.main(['--policy', str(controller.policy), '--live',
+        '--memory-high', value, '--memory-max', value]) == 0
+    assert calls == [dict(resume=False, force_resume=False,
+        memory_high='max', memory_max='max', memory_swap_max=0)]
+    from saas_bench.systemd_guard import scope_command
+    command = scope_command([], 'test.scope', memory_high='max', memory_max='max')
+    assert '--property=MemoryHigh=infinity' in command and '--property=MemoryMax=infinity' in command
 
 
 def test_real_cgroup_oom_is_detected_and_peer_survives(tmp_path):

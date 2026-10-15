@@ -19,6 +19,7 @@ from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
 from saas_bench.run_warnings import AttemptWarnings, advisory
+from saas_bench.runtime_options import add_runtime_arguments, runtime_environment
 from saas_bench.host_memory import MemorySampler
 from saas_bench.team_recovery import execution_root
 from saas_bench.systemd_guard import check_worker_cgroup, memory_bytes, scope_command, unit_status, verify_worker_scope
@@ -622,14 +623,11 @@ def main(argv=None):
         help='Per-worker cgroup MemoryMax (default 20G). Each group gets a separate scope.')
     parser.add_argument('--memory-swap-max', type=memory_bytes, default=0,
         help='Per-worker cgroup MemorySwapMax (default 0).')
-    parser.add_argument('--bash-memory-max', type=memory_bytes,
-        help='Per-process Bash address-space limit; default 1G or CEOBENCH_BASH_MEMORY_MAX_BYTES.')
+    add_runtime_arguments(parser)
     args = parser.parse_args(argv)
     if not args.live:
         parser.error('Execution requires explicit --live')
-    if args.bash_memory_max is not None:
-        from saas_bench.process_boundary import command_memory_limit
-        os.environ['CEOBENCH_BASH_MEMORY_MAX_BYTES'] = str(command_memory_limit(args.bash_memory_max))
+    os.environ.update(runtime_environment(args))
     if args.worker:
         if args.parent_pid is None:
             logging.warning('Worker has no recorded controller parent PID')

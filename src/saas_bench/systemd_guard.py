@@ -13,22 +13,26 @@ WORKER_SLICE = 'ceobench.slice'
 
 
 def memory_bytes(value):
+    if value.lower() in ('max', 'infinity'):
+        return 'max'
     match = re.fullmatch(r'(\d+)([KMGT]?)', value, re.IGNORECASE)
     if not match:
-        raise argparse.ArgumentTypeError('Use bytes or an integer with K, M, G or T; unlimited memory is not allowed')
+        raise argparse.ArgumentTypeError('Use bytes, an integer with K, M, G or T, or max/infinity')
     return int(match[1]) * 1024**('KMGT'.index(match[2].upper()) + 1 if match[2] else 0)
 
 
 def scope_command(command, unit, *, memory_high=16 * 1024**3, memory_max=20 * 1024**3, memory_swap_max=0):
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+\.scope', unit):
         raise ValueError('Invalid worker scope name')
-    if any(type(value) is not int for value in (memory_high, memory_max, memory_swap_max)) or not (
-            0 < memory_high <= memory_max and memory_swap_max >= 0):
-        raise ValueError('Require 0 < MemoryHigh <= MemoryMax and MemorySwapMax >= 0')
+    if (any(value != 'max' and (type(value) is not int or value < 0)
+            for value in (memory_high, memory_max, memory_swap_max)) or memory_high == 0 or memory_max == 0 or
+            type(memory_high) is int and type(memory_max) is int and memory_high > memory_max):
+        raise ValueError('Require positive MemoryHigh/MemoryMax or max, MemoryHigh <= MemoryMax, and nonnegative MemorySwapMax')
     return ['systemd-run', '--user', '--scope', '--quiet', '--unit=' + unit,
         '--slice=' + WORKER_SLICE, '--property=ManagedOOMPreference=omit',
-        '--property=MemoryHigh=' + str(memory_high), '--property=MemoryMax=' + str(memory_max),
-        '--property=MemorySwapMax=' + str(memory_swap_max), '--property=OOMPolicy=kill', *command]
+        *['--property=' + name + '=' + ('infinity' if value == 'max' else str(value))
+          for name, value in (('MemoryHigh', memory_high), ('MemoryMax', memory_max), ('MemorySwapMax', memory_swap_max))],
+        '--property=OOMPolicy=kill', *command]
 
 
 def check_worker_cgroup(proof):
@@ -70,7 +74,7 @@ def verify_worker_scope(policy):
     group = f'/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/{WORKER_SLICE}/{policy["unit"]}'
     expected = dict(Slice=WORKER_SLICE, ControlGroup=group, OOMPolicy='kill', ManagedOOMPreference='omit',
         ManagedOOMMemoryPressure='auto', ManagedOOMSwap='auto',
-        **{name: str(policy[key]) for name, key in (
+        **{name: 'infinity' if policy[key] == 'max' else str(policy[key]) for name, key in (
             ('MemoryHigh', 'memory_high'), ('MemoryMax', 'memory_max'), ('MemorySwapMax', 'memory_swap_max'))})
     if not observed.get('InvocationID') or not observed.get('ControlGroup'):
         raise RuntimeError('Worker scope has no invocation/cgroup binding')

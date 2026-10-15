@@ -193,9 +193,10 @@ def test_unknown_previous_scope_has_bounded_cleanup_and_keeps_new_attempt_isolat
         return dict(old, scope_empty=True, scope_observation_unknown=True)
 
     def pause(_):
-        elapsed[0] += 5
-        if elapsed[0] > 200:
-            (controller.policy.parent / 'STOP').touch()
+        if not launches:
+            elapsed[0] += 5
+            if elapsed[0] > 200:
+                (controller.policy.parent / 'STOP').touch()
         sleep(.01)
 
     monkeypatch.setattr(module.time, 'monotonic', lambda: clock() + elapsed[0])
@@ -207,7 +208,7 @@ def test_unknown_previous_scope_has_bounded_cleanup_and_keeps_new_attempt_isolat
     assert all(child.poll() is not None for _, child in children)
     assert original.read_bytes() == original_bytes
     assert (original.parent.parent / 'attempt-002/attempt.json').exists()
-    assert [signum for _, signum in signals] == [signal.SIGTERM, signal.SIGKILL]
+    assert [signum for saved, signum in signals if saved['unit'] == old['unit']] == [signal.SIGTERM, signal.SIGKILL]
     assert 'Previous worker scope remains unconfirmed' in caplog.text
     receipt = batch.read(controller.policy.parent / 'controller-exit.json')
     assert receipt['children_reaped'] and not receipt['failed'] and not receipt['hold']
@@ -215,6 +216,38 @@ def test_unknown_previous_scope_has_bounded_cleanup_and_keeps_new_attempt_isolat
     previous = receipt['previous_units'][entry['run_id']]
     assert previous['unit'] == old['unit'] and previous['scope_observation_unknown']
     assert receipt['units'][entry['run_id']]['unit'] != old['unit']
+
+
+def test_driver_runtime_limits_reach_controller_and_worker_environment(observer, controller, monkeypatch):
+    from test_preflight_group_join import group_batch
+    launches, children = group_batch(observer, controller, monkeypatch, paired=True)
+    path = Path(__file__).resolve().parents[1] / 'scripts/team_driver.py'
+    spec = importlib.util.spec_from_file_location('runtime_test_driver', path)
+    driver = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(driver)
+    monkeypatch.setattr(driver, 'controller', controller.module)
+    monkeypatch.setattr(driver, 'verify_controls', lambda _: ({}, observer.manifest))
+    monkeypatch.setattr(os, 'environ', dict(os.environ))
+    launch = controller.module.subprocess.Popen
+    settings = []
+
+    def inspect(command, **kwargs):
+        if '--worker' in command:
+            settings.append({key: kwargs['env'][key] for key in (
+                'CEOBENCH_BASH_MEMORY_MAX_BYTES', 'CEOBENCH_MODEL_REQUEST_ATTEMPTS', 'CEOBENCH_PF_TIMEOUT_SECONDS')})
+        return launch(command, **kwargs)
+
+    monkeypatch.setattr(controller.module.subprocess, 'Popen', inspect)
+    assert driver.main(['--policy', str(controller.policy), '--live', '--memory-high', 'infinity',
+        '--memory-max', 'max', '--bash-memory-max', 'unlimited', '--model-request-attempts', '9',
+        '--pf-timeout', '900']) == 0
+    assert launches == ['s101-git', 's101-pf']
+    assert all(child.poll() is not None for _, child in children)
+    assert settings == [dict(CEOBENCH_BASH_MEMORY_MAX_BYTES='0',
+        CEOBENCH_MODEL_REQUEST_ATTEMPTS='9', CEOBENCH_PF_TIMEOUT_SECONDS='900.0')] * 2
+    events = [json.loads(line) for line in (controller.policy.parent / 'controller-events.jsonl').read_text().splitlines()]
+    assert all(row['memory_high'] == row['memory_max'] == 'max'
+        for row in events if row['event'] == 'worker_launched')
 
 
 def test_worker_entry_uses_own_tmpdir_before_prepare(observer, controller, monkeypatch):

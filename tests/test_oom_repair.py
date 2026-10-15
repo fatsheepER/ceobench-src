@@ -90,13 +90,15 @@ def test_scope_startup_records_policy_drift_and_requires_resource_identity(monke
     assert calls and all(0 < value <= 5 for value in calls)
 
 @pytest.mark.parametrize('omit', [False, True])
-def test_real_worker_scope_proof_precedes_model_usage(observer, controller, tmp_path, omit):
+@pytest.mark.parametrize('unlimited', [False, True])
+def test_real_worker_scope_proof_precedes_model_usage(observer, controller, tmp_path, omit, unlimited):
     from saas_bench.systemd_guard import scope_command
     observer.expected['source_root'] = observer.manifest['source_root'] = str(batch.ROOT)
     write_json(controller.policy, dict(identity=observer.expected))
     observer.poll()
     unit = 'ceobench-134-model-proof-' + uuid.uuid4().hex + '.scope'
-    scope_policy = dict(unit=unit, memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0)
+    scope_policy = dict(unit=unit, memory_high='max' if unlimited else 2 * 1024**3,
+        memory_max='max' if unlimited else 3 * 1024**3, memory_swap_max=0)
     manifest_file = tmp_path / 'offline-manifest.json'
     write_json(manifest_file, observer.manifest)
     usage_path = tmp_path / 'worker-model.jsonl'
@@ -132,7 +134,8 @@ else:print(json.dumps(dict(wires=len(wires))))
     env = dict(os.environ, OPENCODE_API_KEY='offline', CEOBENCH_WORKER_SCOPE_POLICY=json.dumps(scope_policy),
         CEOBENCH_WORKER_LAUNCH_ID='offline-proof')
     command = scope_command([sys.executable, '-c', code, str(batch.ROOT), str(controller.policy),
-        str(manifest_file), str(usage_path)], unit)
+        str(manifest_file), str(usage_path)], unit, **{key: scope_policy[key]
+            for key in ('memory_high', 'memory_max', 'memory_swap_max')})
     if not omit:
         command.remove('--property=ManagedOOMPreference=omit')
     try:
@@ -144,8 +147,10 @@ else:print(json.dumps(dict(wires=len(wires))))
         assert proof['verified'] is True
         if omit:
             assert proof['slice'] == 'ceobench.slice' and '/app.slice/' not in proof['control_group']
-            assert proof['memory_high'] == 2 * 1024**3 and proof['memory_max'] == 3 * 1024**3
+            assert proof['memory_high'] == scope_policy['memory_high'] and proof['memory_max'] == scope_policy['memory_max']
             assert proof['memory_swap_max'] == 0
+            assert not any('MemoryHigh' in row or 'MemoryMax' in row or 'memory.high' in row or 'memory.max' in row
+                for row in proof['observations'])
         else:
             assert any('ManagedOOMPreference' in item for item in proof['observations'])
             assert not observer.hold.exists()
