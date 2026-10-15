@@ -565,9 +565,13 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     previous = {}
     if history:
         previous = read_attempt_record(history[-1]) or {}
+    continuing_preparation = (week is None and isinstance(previous, dict) and
+        previous.get('execution_started') is False and previous.get('status') in ('preparing', 'ready', 'failed') and
+        not previous.get('checkpoint') and not previous.get('source_checkpoint') and
+        not previous.get('missing_checkpoint') and previous.get('replay_week') in (None, 1))
     if history or resume or week is not None:
         source = latest_checkpoint(entry, previous, week=week)
-        if source is None and week != 1:
+        if source is None and week != 1 and not continuing_preparation:
             missing_checkpoint = 'No saved checkpoint for ' + ('week ' + str(week) if week is not None else 'the requested resume')
         if source:
             from .team_checkpoint import validate_snapshot
@@ -590,6 +594,10 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
         started_at=datetime.now(timezone.utc).isoformat(),
         execution_source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         execution_source_sha256=tree_hash(ROOT / 'src'))
+    if source is None and continuing_preparation:
+        record['continued_preparation_from'] = str(history[-1])
+        record['replay_week'] = previous.get('replay_week')
+        logging.warning('Continuing interrupted preparation from sealed D0; prior attempt preserved: %s', history[-1])
     if missing_checkpoint:
         record['missing_checkpoint'] = missing_checkpoint
     if source and not missing_checkpoint:

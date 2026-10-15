@@ -660,10 +660,12 @@ batch.prepare(sys.argv[1], sys.argv[2])
     original = batch.read(first / 'attempt.json')
     assert original['status'] == 'preparing' and original['checkpoint'] is None
     assert original['execution_started'] is False
+    original_bytes = (first / 'attempt.json').read_bytes()
     resumed = batch.prepare(path, entry['run_id'], resume=True)
     assert resumed['status'] == 'ready' and resumed['attempt'] == 2
     assert batch.read(Path(resumed['checkpoint']) / 'team.json')['day'] == 0
     assert batch.read(first / 'attempt.json') == original
+    assert (first / 'attempt.json').read_bytes() == original_bytes
     assert len(batch.attempts(entry)) == 2
     assert all(file_hash(directory / 'manifest.json') == file_hash(path) for directory in batch.attempts(entry))
 
