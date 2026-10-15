@@ -160,6 +160,7 @@ class Simulator:
         self.conn = conn
         self.config = config
         self.rng = rng
+        self._group_seed_hash = 'crc32'
         self.current_day = 0
         self.consecutive_negative_cash_days = 0
         self.shutdown_mode = False
@@ -728,7 +729,6 @@ class Simulator:
         # regardless of how many customers other groups generate (agent actions don't
         # affect the attribute sequence within a group).
         self._group_rngs: Dict[str, Generator] = {}
-        self._group_seed_hash = 'crc32'
         for gid in CUSTOMER_GROUPS:
             group_seed = int(self.rng.integers(0, 2**63))
             # XOR with hash of group_id for extra differentiation

@@ -55,3 +55,19 @@ def test_legacy_rng_hash_scheme_warns_and_restores_saved_states(make_initialized
     assert 'Checkpoint group RNG hash scheme is python-hash' in caplog.text
     sim.save_rng_states()
     assert json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])['group_seed_hash'] == 'python-hash'
+
+
+def test_rng_state_can_be_saved_before_world_initialization():
+    from numpy.random import default_rng
+    from saas_bench.config import BenchmarkConfig
+    from saas_bench.database import init_database
+    from saas_bench.simulation import Simulator
+    conn = init_database(':memory:')
+    try:
+        sim = Simulator(conn, BenchmarkConfig(seed=1045), default_rng(1045))
+        sim.save_rng_states()
+        saved = json.loads(conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()[0])
+        assert saved['group_seed_hash'] == 'crc32'
+        assert saved['rng'] == sim.rng.bit_generator.state
+    finally:
+        conn.close()
