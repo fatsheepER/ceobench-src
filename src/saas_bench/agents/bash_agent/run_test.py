@@ -35,7 +35,7 @@ if str(package_root) not in sys.path:
 from openai import OpenAI
 from saas_bench.config import BenchmarkConfig
 from saas_bench.execution_capture import join_text as _joined
-from saas_bench.model_usage import usage_delta
+from saas_bench.model_usage import physical_usage_summary, usage_delta
 
 try:
     import anthropic
@@ -937,7 +937,7 @@ __pycache__/
         checkpoint['usage'] = json.loads(json.dumps(self.agent.usage_recorder.summary)) if self.agent else None
         if getattr(self, '_last_weekly_day', None) != day:
             write_json(self.workspace_dir / 'usage_summary.json', {
-                'snapshot_id': snapshot_id, 'day': day, 'agent': checkpoint['usage'],
+                'snapshot_id': snapshot_id, 'day': day, 'agent': physical_usage_summary(checkpoint['usage']),
                 'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                       'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
@@ -1036,7 +1036,7 @@ __pycache__/
         metrics = self._http_post('/run-metrics', {})
         if metrics['day'] != status['day']:
             raise ValueError('Weekly metrics day differs from world')
-        record = dict(status, agent=self.agent.usage_recorder.summary, simulator=metrics['usage'],
+        record = dict(status, agent=physical_usage_summary(self.agent.usage_recorder.summary), simulator=metrics['usage'],
                       model_turns=self.agent.total_turns)
         if self.recovery_source:
             def difference(current, baseline):

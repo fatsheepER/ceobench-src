@@ -15,9 +15,49 @@ from saas_bench.config import BenchmarkConfig
 from saas_bench.customer_llm import CustomerSimulator
 from saas_bench.database import init_database
 from saas_bench.llm import AgentLLM, CostTracker
-from saas_bench.model_usage import ModelUsage, _ATTEMPT, _Stream, check_model_call, is_network_error
+from saas_bench.model_usage import (ModelUsage, _ATTEMPT, _Stream, check_model_call, is_network_error,
+                                   physical_usage_summary, summarize_usage_log, usage_delta)
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
+
+
+@pytest.mark.parametrize('physical_http', [False, True])
+def test_physical_reporting_counts_only_receipted_retry_failures(tmp_path, monkeypatch, physical_http):
+    recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo')
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
+    previous = json.loads(json.dumps(recorder.summary))
+    requests = []
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(503, json={'error': {'message': 'temporary'}}) if len(requests) == 1 else httpx.Response(200, json=reply('chat'))
+    client = recorder.attach(OpenAI(api_key='offline', max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle))))
+    request = dict(model='test-model', messages=[dict(role='user', content='same')])
+    invocations = []
+    def invoke():
+        invocations.append(1)
+        if physical_http:
+            return client.chat.completions.create(**request)
+        if len(invocations) == 1:
+            raise httpx.ConnectError('local invocation without an HTTP request')
+        return reply('chat')
+    try:
+        recorder.call('chat', request, invoke, day=7)
+    finally:
+        client.close()
+    rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+    failed_receipts = [row for row in rows if row['event'] == 'http_response' and row['status'] == 503]
+    assert len(invocations) == 2 and recorder.summary['calls'] == 1
+    view = physical_usage_summary(recorder.summary)
+    delta = usage_delta(previous, recorder.summary)
+    logged = summarize_usage_log(recorder.path, start_day=7, end_day=14)
+    assert len(failed_receipts) == int(physical_http)
+    assert view['calls'] == delta['calls'] == logged['calls'] == 1 + len(failed_receipts)
+    assert view['missing']['input_tokens'] == delta['missing']['input_tokens'] == logged['missing']['input_tokens'] == len(failed_receipts)
+    assert view['known']['input_tokens'] == logged['known']['input_tokens'] == 10
+    assert view['known']['cache_creation_tokens'] is None
+    assert view['known_cost_usd'] is logged['known_cost_usd'] is None
+    assert view['missing_cost'] == logged['missing_cost'] == view['calls']
 
 
 @pytest.mark.parametrize('provider,api', [('opencode', 'chat'), ('deepseek', 'chat'),
@@ -88,11 +128,11 @@ def test_generic_sdk_connection_error_does_not_hide_a_nonnetwork_cause(cause):
     assert not is_network_error(wrapped)
 
 
-@pytest.mark.parametrize('status', [400, 401, 408, 409, 429, 500, 503])
-def test_http_errors_fail_once_and_preserve_cause(monkeypatch, status):
-    requests = []
+@pytest.mark.parametrize('status', [400, 401, 403, 408, 409, 429, 500, 503])
+def test_http_errors_retry_temporary_rejections_and_preserve_cause(monkeypatch, status):
+    requests, waits = [], []
     recorder = ModelUsage(None, 'ceo')
-    monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: pytest.fail('HTTP errors must not retry'))
+    monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     def handle(request):
         requests.append(request)
         return httpx.Response(status, json={'error': {'message': 'provider rejection'}})
@@ -103,7 +143,10 @@ def test_http_errors_fail_once_and_preserve_cause(monkeypatch, status):
         with pytest.raises(RunCancelled, match='model_request_failed') as error:
             recorder.call('chat', request, lambda: client.chat.completions.create(**request))
         assert error.value.__cause__.status_code == status
-        assert len(requests) == 1 and client.max_retries == 2
+        retryable = status in (408, 409, 429) or status >= 500
+        assert len(requests) == (5 if retryable else 1) and client.max_retries == 2
+        assert waits == ([10, 20, 40, 80] if retryable else [])
+        assert recorder.summary['failed_http_attempts'] == len(requests)
         assert requests[0].extensions['timeout']['read'] >= 600
     finally:
         client.close()

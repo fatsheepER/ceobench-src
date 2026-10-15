@@ -168,7 +168,7 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('status', [503, 200])
-def test_agent_http_or_provider_error_fails_once_with_original_request(tmp_path, monkeypatch, status):
+def test_agent_retries_http_rejection_but_holds_provider_error_with_original_request(tmp_path, monkeypatch, status):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests = []
@@ -184,15 +184,21 @@ def test_agent_http_or_provider_error_fails_once_with_original_request(tmp_path,
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='original instructions', workspace_path=tmp_path, usage_recorder=recorder)
-    with pytest.raises(RunCancelled, match='model_request_failed'):
-        agent.act('dashboard', 0, False, {'day': 7})
+    if status == 503:
+        action = agent.act('dashboard', 0, False, {'day': 7})
+        assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+        assert len(requests) == 2 and requests[0] == requests[1]
+    else:
+        with pytest.raises(RunCancelled, match='model_request_failed'):
+            agent.act('dashboard', 0, False, {'day': 7})
+        assert len(requests) == 1
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
     calls = [r for r in entries if r['event'] == 'request']
     assert [r['outer_attempt'] for r in calls] == [1]
     assert all('original instructions' in json.dumps(r['request']['messages']) for r in calls)
     assert recorder.summary['missing']['input_tokens'] == 1
     assert recorder.summary['known']['input_tokens'] is None
-    assert recorder.summary['errors'] == 1
+    assert recorder.summary['errors'] == int(status != 503)
     assert recorder.summary['failed_http_attempts'] == 1
     client.close()
 
@@ -253,7 +259,7 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
                                   'missing_type', 'missing_name', 'missing_function', 'invalid_json',
                                   'non_object_arguments', 'empty_arguments', 'sse_json', 'null_choice',
                                   'null_delta', 'null_choices', 'null_tool'])
-def test_go_malformed_stream_fails_once_without_exposing_partial_tools(tmp_path, monkeypatch, fault):
+def test_go_malformed_stream_preserves_partial_tools_and_retries_transport_truncation(tmp_path, monkeypatch, fault):
     from saas_bench.agents.bash_agent.agent import BashAgent
     monkeypatch.setattr('time.sleep', lambda _: None)
     requests, responses, payloads = [], [], []
@@ -299,18 +305,25 @@ def test_go_malformed_stream_fails_once_without_exposing_partial_tools(tmp_path,
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='instructions',
                       workspace_path=tmp_path, usage_recorder=recorder, response_callback=lambda **kwargs: responses.append(kwargs))
-    with pytest.raises(RunCancelled, match='model_request_failed'):
-        agent.act('dashboard', 0, False, {'day': 7})
-    assert not agent._pending_tool_calls
-    assert len(requests) == 1
-    assert not responses and len(agent.conversation) == 2
+    truncated = fault in ('missing_done', 'missing_both')
+    if truncated:
+        action = agent.act('dashboard', 0, False, {'day': 7})
+        assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+        assert len(requests) == 2 and requests[0] == requests[1]
+        assert len(responses) == 1
+    else:
+        with pytest.raises(RunCancelled, match='model_request_failed'):
+            agent.act('dashboard', 0, False, {'day': 7})
+        assert not agent._pending_tool_calls
+        assert len(requests) == 1
+        assert not responses and len(agent.conversation) == 2
     assert recorder.summary['calls'] == 1
-    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == 1
-    assert recorder.summary['known']['input_tokens'] is None
-    assert recorder.summary['missing']['input_tokens'] == 1
+    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == int(not truncated)
+    assert recorder.summary['known']['input_tokens'] == (10 if truncated else None)
+    assert recorder.summary['missing']['input_tokens'] == int(not truncated)
     entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
     logical = [row for row in entries if row['event'] == 'response']
-    assert len(logical) == 1 and logical[0]['error'] == 'RunCancelled'
+    assert len(logical) == 1 and logical[0]['error'] == (None if truncated else 'RunCancelled')
     first_http = next(row for row in entries if row['event'] == 'http_response')
     assert first_http['body'] == payloads[0]
     done = fault not in ('missing_done', 'missing_both')
@@ -355,7 +368,7 @@ def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkey
     try:
         with pytest.raises(RunCancelled, match='model_attempt_limit' if fault == 'no_tool' else 'model_request_failed'):
             agent.act('dashboard', 0, False, {'day': 7})
-        assert len(requests) == {'no_tool': 4, 'connection': 5, 'status': 1}[fault]
+        assert len(requests) == {'no_tool': 4, 'connection': 5, 'status': 5}[fault]
         assert recorder.summary['calls'] == (4 if fault == 'no_tool' else 1)
         assert recorder.summary['errors'] == (0 if fault == 'no_tool' else 1)
         assert agent._observation_recorded and not agent._pending_tool_calls

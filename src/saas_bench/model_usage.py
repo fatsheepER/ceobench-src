@@ -1,6 +1,7 @@
 """Private SDK call and HTTP attempt receipts; unknown usage stays unknown."""
 
 from contextvars import ContextVar
+import copy
 from datetime import datetime, timezone
 import base64
 import errno
@@ -46,8 +47,13 @@ def is_network_error(exc):
         seen.add(id(current))
         chain.append(current)
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
-    if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol, httpx.PoolTimeout,
-                             httpx.HTTPStatusError)) or getattr(error, 'status_code', 0) for error in chain):
+    for error in chain:
+        status = getattr(error, 'status_code', 0) or (
+            error.response.status_code if isinstance(error, httpx.HTTPStatusError) else 0)
+        if status:
+            return status in (408, 409, 429) or 500 <= status < 600
+    if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol,
+                             httpx.PoolTimeout)) for error in chain):
         return False
     network_errno = {errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
                      errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}
@@ -110,11 +116,28 @@ def usage_values(response, api):
 
 def usage_delta(previous, current):
     """Known subtotals and missing counts for calls made since a summary snapshot."""
-    calls = current['calls'] - previous['calls']
-    missing = {field: current['missing'][field] - previous['missing'][field] for field in FIELDS}
+    retries = current.get('retried_http_attempts', 0) - previous.get('retried_http_attempts', 0)
+    calls = current['calls'] - previous['calls'] + retries
+    missing = {field: current['missing'][field] - previous['missing'][field] + retries for field in FIELDS}
     known = {field: None if calls and missing[field] == calls else
              (current['known'][field] or 0) - (previous['known'][field] or 0) for field in FIELDS}
     return dict(calls=calls, known=known, missing=missing)
+
+
+def physical_usage_summary(summary):
+    """Include failed HTTP retries whose usage could not be confirmed."""
+    result = copy.deepcopy(summary)
+    retries = result.get('retried_http_attempts', 0)
+    for field in ('calls', 'errors', 'missing_cost'):
+        result[field] += retries
+    for field in FIELDS:
+        result['missing'][field] += retries
+    if 'costs' in result:
+        for field in ('unknown_calls', 'missing_field_calls'):
+            result['costs'][field] += retries
+        for field in result['costs']['missing_fields']:
+            result['costs']['missing_fields'][field] += retries
+    return result
 
 
 def summarize_usage_log(path, start_day=0, end_day=None):
@@ -137,6 +160,7 @@ def summarize_usage_log(path, start_day=0, end_day=None):
                 timestamp = pending.pop(call_id)
                 summary['calls'] += 1
                 summary['errors'] += row.get('error') is not None
+                summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + row.get('retried_http_attempts', 0)
                 usage = row.get('usage') or {}
                 for field in FIELDS:
                     value = usage.get(field)
@@ -152,7 +176,7 @@ def summarize_usage_log(path, start_day=0, end_day=None):
                 add_billing(summary['costs'], billing_assessment(usage, row.get('api'), row.get('pricing'),
                     at=datetime.fromisoformat(timestamp) if timestamp else None, recorded_cost=cost))
     summary['unreturned_requests'] = len(pending)
-    return summary
+    return physical_usage_summary(summary)
 
 
 def load_pricing(path):
@@ -288,7 +312,7 @@ class _Stream(httpx.SyncByteStream):
         else:
             if self.require_done and b'data: [DONE]' not in b''.join(self.chunks).splitlines():
                 self._finish('stream_closed_before_completion')
-                raise ValueError('Chat completion stream ended before [DONE]')
+                raise httpx.RemoteProtocolError('Chat completion stream ended before [DONE]')
             self._finish()
 
     def close(self):
@@ -580,11 +604,15 @@ class ModelUsage:
         started = datetime.now(timezone.utc)
         token = _CALL.set((self, call_id))
         response, error, model_attempts, last_model_error = None, None, 0, None
+        retried_http_attempts = pending_retry_http_attempts = 0
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:
             for model_attempts in range(1, MODEL_REQUEST_ATTEMPTS + 1):
                 self._check_deadline()
+                retried_http_attempts += pending_retry_http_attempts
+                pending_retry_http_attempts = 0
                 response = None
+                failures_before = self.summary['failed_http_attempts']
                 try:
                     response = self._invoke_attempt(invoke)
                     self._check_deadline()
@@ -599,6 +627,7 @@ class ModelUsage:
                     self.lifecycle.check()
                     if not is_network_error(exc) or model_attempts == MODEL_REQUEST_ATTEMPTS:
                         raise RunCancelled('model_request_failed') from exc
+                    pending_retry_http_attempts = self.summary['failed_http_attempts'] - failures_before
                     self.lifecycle.sleep(MODEL_RETRY_DELAYS[model_attempts - 1])
         except BaseException as exc:
             error = type(exc).__name__
@@ -616,6 +645,7 @@ class ModelUsage:
                     totals = summary.setdefault('costs', dict(billing_totals(),
                                                               unclassified_prior_calls=summary['calls']))
                     summary['calls'] += 1
+                    summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + retried_http_attempts
                     summary['errors'] += error is not None
                     for field, value in usage.items():
                         if value is None:
@@ -630,7 +660,8 @@ class ModelUsage:
                     self.write('response', call_id=call_id, api=api, response=raw, usage=usage,
                                error=error, cost_usd=cost, pricing=self.pricing.get(served_model),
                                cost=billing, request_timestamp=started.isoformat(),
-                               model_attempts=model_attempts, last_model_error=last_model_error)
+                               model_attempts=model_attempts, last_model_error=last_model_error,
+                               retried_http_attempts=retried_http_attempts)
             finally:
                 _CALL.reset(token)
                 if replacements:
