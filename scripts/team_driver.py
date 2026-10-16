@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run selected Git/PF groups; resume held groups only on an explicit invocation."""
+"""Run selected Git/PF groups; resume held groups only on an explicit invocation.
+
+Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 controller/resource failure.
+"""
 
 import argparse
 from datetime import datetime, timezone
@@ -81,8 +84,8 @@ def _main(argv, warnings):
             controller.supervise(args.policy, **options)
             exit_record = batch.read(directory / 'controller-exit.json')
             terminal = batch.read(directory / 'controller-terminal.json') if (directory / 'controller-terminal.json').exists() else {}
-            outcome = 0 if (exit_record['children_reaped'] and not exit_record['hold'] and
-                not exit_record['failed'] and (exit_record.get('operator_stopped') or
+            outcome = controller.exit_code(exit_record) if (exit_record['children_reaped'] and
+                (exit_record['hold'] or exit_record.get('operator_stopped') or
                     set(terminal) == {entry['run_id'] for entry in manifest['runs']})) else 2
             return outcome
         finally:

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Supervise independent groups once; failures HOLD for manual checkpoint resume."""
+"""Supervise independent groups once; failures HOLD for manual checkpoint resume.
+
+Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 controller/resource failure.
+"""
 
 import argparse
 from datetime import datetime, timezone
@@ -595,10 +598,13 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 any(record.get('operator_stop') for record in terminal.values()))
             children_reaped = all(slot['child'].poll() is not None and slot['unit'].get('scope_empty') and
                 not slot['unit'].get('scope_observation_unknown') for slot in children)
-            write_json(directory / 'controller-exit.json', dict(hold=any(row.get('disposition') == 'hold' for row in terminal.values()),
+            held_groups = {entry['group'] for entry in manifest['runs']
+                if terminal.get(entry['run_id'], {}).get('disposition') == 'hold'}
+            write_json(directory / 'controller-exit.json', dict(hold=bool(held_groups),
                 failed=not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
                     for record in terminal.values()) or not operator_stopped and
-                    any((latest(entry) or {}).get('status') != 'finished' for entry in manifest['runs']),
+                    any((latest(entry) or {}).get('status') != 'finished' and entry['group'] not in held_groups
+                        for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
                 memory_sampler=sampler_receipt, units=units,
                 previous_units=previous_units, previous_units_unavailable=previous_units_unavailable,
@@ -607,6 +613,10 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 units_path=str(units_path), events_path=str(events_path), history_read_errors=history_errors,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
                 auto_resume=False))
+
+
+def exit_code(record):
+    return 2 if record['failed'] else 3 if record['hold'] else 0
 
 
 def main(argv=None):
@@ -642,7 +652,7 @@ def main(argv=None):
     if args.run_id is not None:
         options['run_id'] = args.run_id
     supervise(args.policy, **options)
-    return 2 if batch.read(args.policy.resolve().parent / 'controller-exit.json')['failed'] else 0
+    return exit_code(batch.read(args.policy.resolve().parent / 'controller-exit.json'))
 
 
 if __name__ == '__main__':

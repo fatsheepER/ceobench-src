@@ -219,7 +219,7 @@ def test_controller_main_returns_failure_and_passes_memory_settings(controller, 
     calls = []
     def supervise(policy, **kwargs):
         calls.append(kwargs)
-        (policy.parent / 'controller-exit.json').write_text(json.dumps(dict(failed=failed)))
+        (policy.parent / 'controller-exit.json').write_text(json.dumps(dict(failed=failed, hold=False)))
     monkeypatch.setattr(controller.module, 'supervise', supervise)
     monkeypatch.setenv('CEOBENCH_BASH_MEMORY_MAX_BYTES', '1073741824')
     assert controller.module.main(['--policy', str(controller.policy), '--live',
@@ -241,7 +241,7 @@ def test_unlimited_worker_memory_is_passed_to_controller(controller, monkeypatch
     calls = []
     def supervise(policy, **kwargs):
         calls.append(kwargs)
-        (policy.parent / 'controller-exit.json').write_text(json.dumps(dict(failed=False)))
+        (policy.parent / 'controller-exit.json').write_text(json.dumps(dict(failed=False, hold=False)))
     monkeypatch.setattr(controller.module, 'supervise', supervise)
     assert controller.module.main(['--policy', str(controller.policy), '--live',
         '--memory-high', value, '--memory-max', value]) == 0

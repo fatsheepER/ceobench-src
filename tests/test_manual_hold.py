@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 
@@ -11,6 +12,36 @@ from test_preflight_team_controller import controller
 from test_preflight_team_observer import observer
 from test_preflight_team_batch import changed_manifest, frozen, managed_team
 from test_preflight_team_flow import completion, final
+
+
+@pytest.mark.parametrize('entrypoint', ['controller', 'driver'])
+@pytest.mark.parametrize('state,code', [('finished', 0), ('hold', 3),
+    ('unconfirmed_scope', 2), ('hold_unconfirmed_scope', 2)])
+def test_group_exit_distinguishes_hold_from_failed_resources(observer, controller, monkeypatch, entrypoint, state, code):
+    held = state.startswith('hold')
+    launches, children = group_batch(observer, controller, monkeypatch,
+        first_status='paused' if held else 'finished')
+    if state.endswith('unconfirmed_scope'):
+        scope = controller.module.scope_state
+        monkeypatch.setattr(controller.module, 'scope_state',
+            lambda *args, **kwargs: dict(scope(*args, **kwargs), scope_observation_unknown=True))
+    module = controller.module
+    if entrypoint == 'driver':
+        spec = importlib.util.spec_from_file_location('hold_exit_driver', batch.ROOT / 'scripts/team_driver.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(module, 'controller', controller.module)
+        monkeypatch.setattr(module, 'verify_controls', lambda _: ({}, observer.manifest))
+    assert module.main(['--policy', str(controller.policy), '--live']) == code
+    assert all(child.poll() is not None for _, child in children)
+    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
+    assert receipt['hold'] == held
+    assert receipt['failed'] == state.endswith('unconfirmed_scope')
+    assert 's102-git' in launches
+    if held:
+        assert launches.count('s101-pf') == 1 and 's102-pf' not in launches
+    if entrypoint == 'driver':
+        assert batch.read(controller.policy.parent / 'driver-exit.json')['returncode'] == code
 
 
 @pytest.mark.parametrize('failure', ['failed', 'oom-kill', 'paused'])
