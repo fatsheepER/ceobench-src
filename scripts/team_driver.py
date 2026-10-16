@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run selected Git/PF groups; resume held groups only on an explicit invocation.
 
-Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 controller/resource failure.
+Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 supervision/resource-closure failure.
 """
 
 import argparse

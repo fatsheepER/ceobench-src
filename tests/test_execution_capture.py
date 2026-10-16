@@ -156,13 +156,14 @@ def test_public_cli_timeout_settles_inflight_sql_without_faking_receive(captured
         finally:
             conn.set_progress_handler(None, 0)
     monkeypatch.setattr(public_sql, 'execute_snapshot', blocking_snapshot)
-    complete = store.complete
-    def ordered_complete(event, *args, **kwargs):
-        if sql_first and store.read_event(event)['request']['kind'] == 'cli_python':
+    parent = store.parent
+    def ordered_parent(token, *args, **kwargs):
+        event = parent(token, *args, **kwargs)
+        if sql_first and kwargs.get('active') is False and store.read_event(event)['request']['kind'] == 'cli_python':
             release.set()
             settled(api)
-        return complete(event, *args, **kwargs)
-    monkeypatch.setattr(store, 'complete', ordered_complete)
+        return event
+    monkeypatch.setattr(store, 'parent', ordered_parent)
     driver = '''import os, subprocess, time
 from pathlib import Path
 import cli

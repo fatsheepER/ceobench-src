@@ -316,7 +316,8 @@ sys.exit(2 if role == 'git' else 0)
         assert results[0]['hold'] is True
         assert [child.returncode for child in children] == [2, 0]
         exit_record = batch.read(policy.parent / 'controller-exit.json')
-        assert exit_record['failed'] and exit_record['children_reaped']
+        assert exit_record['hold'] and not exit_record['failed'] and exit_record['children_reaped']
+        assert controller.exit_code(exit_record) == 3
         assert all(record['scope_empty'] for record in exit_record['units'].values())
         assert not observer.hold.exists()
         if marker.exists():

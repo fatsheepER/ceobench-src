@@ -186,6 +186,8 @@ class SQLEvidenceStore:
                 raise RuntimeError('SQL evidence capture failed; collection stopped')
             if not quiescent:
                 return
+            if self.execution_capture:
+                self.settle_interrupted_scripts()
             with self._writer() as conn:
                 pending = conn.execute('''SELECT event_id, event_id IN (SELECT event_id FROM results) FROM requests
                     WHERE (? IS NULL OR json_extract(request,'$.role')=?) AND (event_id NOT IN (SELECT event_id FROM results)
@@ -212,6 +214,30 @@ class SQLEvidenceStore:
             raise EvidencePending('Unconfirmed SQL evidence outcome: ' + pending[0])
         if unbound:
             raise EvidencePending('Unbound client receipt: ' + unbound[0])
+
+    def settle_interrupted_scripts(self, parent=None, facts=None):
+        from .execution_capture import closed_execution
+        children = []
+        with self.batch(), self._writer() as conn:
+            rows = conn.execute('''SELECT c.event_id,p.event_id,b.record FROM requests c
+                JOIN requests p ON p.event_id=json_extract(c.request, '$.parent_event_id')
+                LEFT JOIN results b ON b.event_id=p.event_id LEFT JOIN results s ON s.event_id=c.event_id
+                WHERE json_extract(c.request, '$.kind')='cli_python' AND json_extract(p.request, '$.kind')='bash'
+                    AND s.event_id IS NULL AND (? IS NULL OR p.event_id=?)
+                    AND (? IS NULL OR json_extract(c.request, '$.role')=?)''',
+                (parent, parent, self.identity.get('role'), self.identity.get('role'))).fetchall()
+            for child, enclosing, record in rows:
+                ended = facts if parent else json.loads(record) if record else {}
+                if not closed_execution(ended):
+                    continue
+                self._visible(conn, child)
+                self.complete(child, 'timed_out' if ended.get('timed_out') else 'failed',
+                    completion='unfinished', error='execution_boundary_closed', exit_code=None,
+                    interrupted_by=enclosing,
+                    partial_output=dict(scope='enclosing_bash',
+                        stdout=enclosing + ':stdout_bytes', stderr=enclosing + ':stderr_bytes'))
+                children.append(child)
+        return children
 
     def actor_fields(self):
         fields = {k: self.identity[k] for k in ('run_id', 'world_id', 'role', 'agent_id', 'session_id') if k in self.identity}

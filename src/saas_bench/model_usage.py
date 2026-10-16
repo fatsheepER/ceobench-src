@@ -503,7 +503,7 @@ class ModelUsage:
                     raise RunCancelled('sql_evidence_pending') from exc
                 except Exception as exc:
                     recorder.evidence_store.fail(exc)
-                    raise
+                    raise RunCancelled('run_evidence_fault', exception_details(exc)) from exc
             body = raw_body.decode('utf-8')
             try:
                 body = json.loads(body)

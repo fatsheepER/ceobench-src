@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Supervise independent groups once; failures HOLD for manual checkpoint resume.
 
-Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 controller/resource failure.
+Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 supervision/resource-closure failure.
 """
 
 import argparse

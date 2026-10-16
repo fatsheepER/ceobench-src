@@ -197,13 +197,27 @@ class PFQueries:
                 SELECT v.version_id,r.query_id FROM versions v JOIN requests r USING(event_id)
                 WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
                 ORDER BY r.rowid''', (capture.event,)).fetchall()
-            scripts = conn.execute('''SELECT r.event_id || ':stdout' FROM requests r
+            scripts = conn.execute('''SELECT r.event_id, v.version_id FROM requests r
+                LEFT JOIN versions v ON v.version_id=r.event_id || ':stdout'
                 WHERE json_extract(r.request, '$.parent_event_id')=? AND json_extract(r.request, '$.kind')='cli_python'
                 AND json_extract(r.request, '$.request.script') IS NOT NULL ORDER BY r.rowid''',
                 (capture.event,)).fetchall()
         body = str(text)
         printed = []
-        for (version,) in scripts:
+        for child, version in scripts:
+            if version is None:
+                event = self.store.read_event(child)
+                if (event['result'].get('completion') == 'unfinished'
+                        and not {child + ':python_end', child + ':stdout_bytes'} & set(event['outputs'])):
+                    continue
+                if child + ':stdout_bytes' in event['outputs']:
+                    from .execution_capture import decoded
+                    raw = self.resolver.content(child + ':stdout_bytes')[1]
+                    try:
+                        decoded(raw)
+                    except UnicodeError:
+                        continue
+                version = child + ':stdout'
             try:
                 output = self.resolver.content(version)[1].decode('utf-8')
             except (RuntimeError, UnicodeDecodeError):

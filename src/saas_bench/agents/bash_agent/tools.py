@@ -559,8 +559,13 @@ class BashAgentToolExecutor:
                       self._bash_facts.get('boundary_closed') is True else 'result_unknown')
             raise
         finally:
-            body = result
             read_key = None
+            if (capture and tool_name == 'bash' and capture.safe(capture.store.settle_interrupted_scripts,
+                    capture.event, self._bash_facts) and result is not None):
+                from saas_bench.execution_capture import join_text
+                result = join_text(result, '\n', '[Script execution unfinished. The enclosing command ended '
+                    'before the Python wrapper reported completion. Any output above is partial.]')
+            body = result
             if capture:
                 after = None
                 if before is not None:

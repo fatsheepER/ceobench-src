@@ -463,6 +463,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
               "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
     runner._execute_tool('bash', {'command': script})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
+    assert not runner.evidence_store.fault_path.exists(), runner.evidence_store.fault_path.read_text()
     footer = re.search(r'\n\[pf: (calc\.py\.out@v1) \| query\d+@v1\]$', output)
     assert footer and 'ledger rows:' in output, output
     store = runner.evidence_store

@@ -48,6 +48,7 @@ _ENGINE_MODULES = [
     "public_sql",
     "sql_evidence",
     "execution_capture",
+    "registration_evidence",
     "evidence_handles",
     "pf_refresh",
     "pf_deadline",

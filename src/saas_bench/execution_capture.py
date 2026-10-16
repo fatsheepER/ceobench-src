@@ -21,6 +21,14 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
                         'get_market_overview', 'get_group_insights'})
 
 
+def closed_execution(facts):
+    boundary = facts.get('process_boundary') or {}
+    return (facts.get('process_started') is True and facts.get('boundary_closed') is True
+            and boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait'
+            and boundary.get('descendants_closed') is True and boundary.get('children') == []
+            and boundary.get('unknown') is None)
+
+
 def sql_client_interruption(conn, event):
     row = conn.execute('''SELECT q.request, qr.record, d.record,
             p.request, pr.record, b.request, br.record
@@ -38,10 +46,18 @@ def sql_client_interruption(conn, event):
         if not (outer['status'] == 'timed_out' or outer.get('exit_code') in (124, 137)):
             return None
         proof = dict(reason='bash_client_timeout')
-    elif (parent['kind'] == 'cli_python' and bash and ended['status'] == 'failed'
-          and ended.get('error') == 'timeout' and ended.get('exit_code') == -9
+    elif (parent['kind'] == 'cli_python' and bash
           and ended.get('capture_status') == 'complete' and ended.get('completed_at')):
-        proof = dict(reason='python_timeout_kill', python_event_id=parent['event_id'])
+        if (ended['status'] == 'failed' and ended.get('error') == 'timeout'
+                and ended.get('exit_code') == -9):
+            reason = 'python_timeout_kill'
+        elif (ended.get('completion') == 'unfinished'
+                and ended.get('interrupted_by') == bash['event_id']
+                and ended.get('error') == 'execution_boundary_closed'):
+            reason = 'python_boundary_interruption'
+        else:
+            return None
+        proof = dict(reason=reason, python_event_id=parent['event_id'])
     else:
         return None
     if (query['kind'] != 'sql_query' or bash['kind'] != 'bash' or not outer
@@ -428,23 +444,47 @@ def receive_client(handler):
             handler._send_json({'accepted': True})
             return
         if record.get('kind') == 'python_end':
+            from .registration_evidence import EvidenceResolver
             if set(record) != {'kind', 'stdout', 'stderr', 'exit_code', 'error'}:
                 raise ValueError('Invalid Python end record')
-            child = store.parent(body['call'])
+            child = store.parent(body['call'], active=False)
             if store.read_event(child)['request']['parent_event_id'] != parent:
                 raise ValueError('Python execution parent mismatch')
-            for name in ('stdout', 'stderr'):
-                raw = bytes.fromhex(record[name])
-                store.version(child, name + '_bytes', raw, layer=name + '_bytes')
-                try:
-                    store.version(child, name, decoded(raw), layer=name, derived_from=child + ':' + name + '_bytes')
-                except UnicodeError:
-                    pass  # Raw bytes survive a client-visible decode failure.
-            status = ('result_unknown' if record['exit_code'] is None else
-                      'failed' if record['exit_code'] or record['error'] else 'succeeded')
-            store.complete(child, status, exit_code=record['exit_code'], error=record['error'])
-            if status == 'result_unknown':
-                store.fail('Python child outcome unknown')
+            with store.batch(), store._writer() as conn:
+                resolver = EvidenceResolver(store)
+                received = conn.execute('SELECT version_id FROM versions WHERE version_id=?',
+                                        (child + ':python_end',)).fetchone()
+                if received:
+                    if resolver.content(received[0], connection=conn)[1] != encoded(record):
+                        raise RuntimeError('Conflicting Python end receipt')
+                    if any(resolver.content(child + ':' + name + '_bytes', connection=conn)[1]
+                           != bytes.fromhex(record[name]) for name in ('stdout', 'stderr')):
+                        raise RuntimeError('Conflicting Python end streams')
+                else:
+                    ended = conn.execute('SELECT record FROM results WHERE event_id=?', (child,)).fetchone()
+                    if ended and json.loads(ended[0]).get('completion') != 'unfinished':
+                        previous = json.loads(ended[0])
+                        previous = dict(kind='python_end', exit_code=previous.get('exit_code'),
+                            error=previous.get('error'), **{name: resolver.content(
+                                child + ':' + name + '_bytes', connection=conn)[1].hex()
+                                for name in ('stdout', 'stderr')})
+                        if previous != record:
+                            raise RuntimeError('Conflicting Python execution result')
+                    else:
+                        for name in ('stdout', 'stderr'):
+                            raw = bytes.fromhex(record[name])
+                            store.version(child, name + '_bytes', raw, layer=name + '_bytes')
+                            try:
+                                store.version(child, name, decoded(raw), layer=name, derived_from=child + ':' + name + '_bytes')
+                            except UnicodeError:
+                                pass  # Raw bytes survive a client-visible decode failure.
+                        status = ('result_unknown' if record['exit_code'] is None else
+                                  'failed' if record['exit_code'] or record['error'] else 'succeeded')
+                        if not ended:
+                            store.complete(child, status, exit_code=record['exit_code'], error=record['error'])
+                        if status == 'result_unknown':
+                            store.fail('Python child outcome unknown')
+                    store.version(child, 'python_end', encoded(record), layer='program_python_end')
             handler._send_json({'accepted': True})
             return
         if not set(body['record']) <= {'body', 'parsed', 'returned', 'error', 'state', 'projection', 'transformations'}:
