@@ -88,12 +88,6 @@ def _stream_chat_completion(client, request, check=lambda: None):
                             or tool.function is None or not isinstance(tool.function.name, str)
                             or not tool.function.name.strip()):
                         raise ValueError('Chat completion stream ended with incomplete tool metadata')
-                    try:
-                        arguments = json.loads(tool.function.arguments)
-                    except (TypeError, json.JSONDecodeError) as exc:
-                        raise ValueError('Chat completion stream ended with invalid tool arguments') from exc
-                    if not isinstance(arguments, dict):
-                        raise ValueError('Chat completion tool arguments must be a JSON object')
         except (httpx.TransportError, json.JSONDecodeError, ValidationError) as exc:
             raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
         try:
@@ -803,7 +797,7 @@ class BashAgent(BaseAgent):
                 json_validation_error = None
                 if assistant_msg.tool_calls:
                     for tc in assistant_msg.tool_calls:
-                        if tc.function.arguments:
+                        if tc.function.arguments or api_kwargs.get('stream'):
                             try:
                                 if not isinstance(json.loads(tc.function.arguments), dict):
                                     raise ValueError('Tool arguments must be a JSON object')
@@ -811,7 +805,7 @@ class BashAgent(BaseAgent):
                                 json_validation_error = (
                                     tc.function.name,
                                     str(je),
-                                    tc.function.arguments[:300],
+                                    str(tc.function.arguments)[:300],
                                 )
                                 break
 

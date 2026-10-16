@@ -256,8 +256,7 @@ def test_go_stream_preserves_reasoning_tools_usage_and_terminal_receipt(tmp_path
 
 
 @pytest.mark.parametrize('fault', ['missing_done', 'missing_finish', 'missing_both', 'missing_id',
-                                  'missing_type', 'missing_name', 'missing_function', 'invalid_json',
-                                  'non_object_arguments', 'empty_arguments', 'sse_json', 'null_choice',
+                                  'missing_type', 'missing_name', 'missing_function', 'sse_json', 'null_choice',
                                   'null_delta', 'null_choices', 'null_tool'])
 def test_go_malformed_stream_preserves_partial_tools_and_retries_transport_truncation(tmp_path, monkeypatch, fault):
     from saas_bench.agents.bash_agent.agent import BashAgent
@@ -276,9 +275,6 @@ def test_go_malformed_stream_preserves_partial_tools_and_retries_transport_trunc
                 tool[fault.removeprefix('missing_')] = None
             elif fault == 'missing_name':
                 tool['function']['name'] = None
-            elif fault in ('invalid_json', 'non_object_arguments', 'empty_arguments'):
-                tool['function']['arguments'] = {'invalid_json': '{', 'non_object_arguments': '[]',
-                                                 'empty_arguments': ''}[fault]
         frames = [dict(base, choices=[dict(index=0, delta=dict(role='assistant', tool_calls=[
             tool]), finish_reason=None)]),
             dict(base, choices=[dict(index=0, delta={}, finish_reason='tool_calls' if finished else None)]),

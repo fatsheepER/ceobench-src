@@ -67,7 +67,7 @@ def test_failed_group_holds_once_and_only_manual_invocation_restarts(observer, c
         assert any('week' in row['message'].lower() for row in saved['validation_warnings'])
 
 
-@pytest.mark.parametrize('failure,requests', [('network', 5), ('invalid_reply', 4)])
+@pytest.mark.parametrize('failure,requests', [('network', 5), ('invalid_reply', 4), ('invalid_arguments', 4)])
 def test_real_model_failure_writes_hold_without_creating_another_attempt(frozen, tmp_path, monkeypatch, failure, requests):
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
     entry = next(row for row in batch.read(path)['runs'] if row['group'] == 'git')
@@ -79,6 +79,11 @@ def test_real_model_failure_writes_hold_without_creating_another_attempt(frozen,
                 sent.append(request)
                 if failure == 'network':
                     raise httpx.ConnectError('offline connection refused', request=request)
+                if failure == 'invalid_arguments':
+                    fixture = batch.read(Path(__file__).parent / 'fixtures/s1045_r1_d70_invalid_arguments.json')
+                    message = dict(role='assistant', content=None, tool_calls=[dict(id='d70', type='function',
+                        function=dict(name=fixture['tool'], arguments=fixture['arguments']))])
+                    return completion(message, json.loads(request.content).get('stream', False))
             return completion(final('No tool action.'), json.loads(request.content).get('stream', False))
         return batch.checked_client(role, 'offline-hold', transport=httpx.MockTransport(respond))
     record = batch.prepare(path, entry['run_id'], live=True, client_factory=client,
@@ -91,6 +96,8 @@ def test_real_model_failure_writes_hold_without_creating_another_attempt(frozen,
         assert delays == [10, 20, 40, 80] and 'offline connection refused' in hold['detail']
     else:
         assert hold['reason'] == 'model_attempt_limit' and '4' in hold['detail']
+        if failure == 'invalid_arguments':
+            assert 'Extra data: line 1 column 2528 (char 2527)' in hold['detail']
 
 
 def test_unknown_public_business_result_holds_for_manual_resume(frozen, tmp_path, monkeypatch):

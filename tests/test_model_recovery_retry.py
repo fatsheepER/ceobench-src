@@ -1,5 +1,7 @@
 import errno
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import socket
 import ssl
 import threading
@@ -19,6 +21,107 @@ from saas_bench.model_usage import (ModelUsage, _ATTEMPT, _Stream, check_model_c
                                    physical_usage_summary, summarize_usage_log, usage_delta)
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
+
+
+@pytest.mark.parametrize('mode', ['corrected', 'exhausted', 'interrupted'])
+@pytest.mark.parametrize('arguments_key', ['extra_data', 'invalid_json', 'non_object', 'empty'])
+def test_completed_stream_invalid_arguments_use_generation_correction(tmp_path, monkeypatch, mode, arguments_key):
+    fixture = json.loads((Path(__file__).parent / 'fixtures/s1045_r1_d70_invalid_arguments.json').read_text())
+    arguments = dict(extra_data=fixture['arguments'], invalid_json='{', non_object='[]', empty='')[arguments_key]
+    error = ('Tool arguments must be a JSON object' if arguments_key == 'non_object' else
+             {'extra_data': 'Extra data: line 1 column 2528 (char 2527)',
+              'invalid_json': 'Expecting property name enclosed in double quotes: line 1 column 2 (char 1)',
+              'empty': 'Expecting value: line 1 column 1 (char 0)'}[arguments_key])
+    requests, payloads, waits, responses = [], [], [], []
+    monkeypatch.setenv('CEOBENCH_INVALID_GENERATION_ATTEMPTS', '4')
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            invalid = len(requests) <= (4 if mode == 'exhausted' else 1 + int(mode == 'interrupted'))
+            name = fixture['tool'] if invalid else 'read_file'
+            value = arguments if invalid else '{"path":"MEMORY.md"}'
+            base = dict(id='d70', object='chat.completion.chunk', created=1, model='test-model')
+            frames = [dict(base, choices=[dict(index=0, finish_reason=None, delta=dict(role='assistant',
+                tool_calls=[dict(index=0, id='call1', type='function',
+                    function=dict(name=name, arguments=value[:len(value) // 2]))]))]),
+                dict(base, choices=[dict(index=0, finish_reason=None, delta=dict(tool_calls=[dict(index=0,
+                    function=dict(arguments=value[len(value) // 2:]))]))]),
+                dict(base, choices=[dict(index=0, finish_reason='tool_calls', delta={})])]
+            interrupted = mode == 'interrupted' and len(requests) == 1
+            if interrupted:
+                frames = frames[:1]
+            payload = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames)
+            if not interrupted:
+                payload += 'data: [DONE]\n\n'
+            payloads.append(payload)
+            body = payload.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    serving = threading.Thread(target=server.serve_forever)
+    client, started = None, False
+    try:
+        serving.start()
+        started = True
+        client = OpenAI(api_key='offline', max_retries=0,
+            base_url=f'http://127.0.0.1:{server.server_port}/opencode.ai/v1/',
+            http_client=httpx.Client(timeout=3, trust_env=False))
+        recorder = ModelUsage(tmp_path / 'usage.jsonl', 'ceo')
+        monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
+        agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=True), client,
+            model='test-model', workspace_path=tmp_path,
+            text_registration=True, pf=True, usage_recorder=recorder,
+            response_callback=lambda **kwargs: responses.append(kwargs))
+        if mode == 'exhausted':
+            with pytest.raises(RunCancelled, match='model_attempt_limit') as failure:
+                agent.act('dashboard', 0, False, {'day': 70})
+            assert 'No valid reply after 4 model requests' in failure.value.detail
+            assert error in failure.value.detail
+            assert len(requests) == 4 and not agent._pending_tool_calls
+        else:
+            action = agent.act('dashboard', 0, False, {'day': 70})
+            assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+            assert len(requests) == (3 if mode == 'interrupted' else 2)
+        invalid = [json.loads(line) for line in (tmp_path / 'invalid-generations.jsonl').read_text().splitlines()]
+        assert len(invalid) == (4 if mode == 'exhausted' else 1)
+        for record in invalid:
+            assert record['reason'] == 'arguments' and error in record['feedback']
+            assert record['output']['choices'][0]['message']['tool_calls'][0]['function']['arguments'] == arguments
+        regenerated = requests[2 if mode == 'interrupted' else 1]['messages']
+        assert error in regenerated[-1]['content']
+        assert not any(message.get('tool_calls') for message in regenerated)
+        assert waits == ([10] if mode == 'interrupted' else [])
+        if mode == 'interrupted':
+            assert requests[0] == requests[1]
+        entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+        logical = [row for row in entries if row['event'] == 'response']
+        assert all(row['error'] is None for row in logical)
+        assert [row['model_attempts'] for row in logical] == (
+            [1] * 4 if mode == 'exhausted' else ([2, 1] if mode == 'interrupted' else [1, 1]))
+        assert [row['body'] for row in entries if row['event'] == 'http_response'] == payloads
+        assert all(value is None for value in recorder.summary['known'].values())
+        assert recorder.summary['known_cost_usd'] is None
+        assert len(responses) == len(logical)
+        if mode == 'exhausted':
+            action = agent.act('dashboard', 0, False, {'day': 70})
+            assert len(requests) == 5 and action.tool == 'read_file'
+    finally:
+        if client:
+            client.close()
+        if started:
+            server.shutdown()
+        server.server_close()
+        if started:
+            serving.join(3)
+    assert not serving.is_alive()
 
 
 @pytest.mark.parametrize('attempt_limit', [2, 7, 0, None])
