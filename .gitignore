@@ -30,6 +30,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -65,7 +66,6 @@ workspaces/
 test_workspace/
 test_10day/
 .oracle_workspace/
-simulation.db
 *.db
 *.db-shm
 *.db-wal
@@ -82,8 +82,6 @@ simulation.db
 
 # Reports and viz (generated, not source)
 reports/
-viz/data/
-monitor/data.json
 wiki_pages/
 wiki_diagrams/
 
@@ -98,15 +96,12 @@ oracle_sweep/
 replay_runs/
 modal_glm5/
 modal_kimi_k25/
-modal_deploy/state/
 
 # Backups (local mirrors of remote run state, not source)
 backups/
 
 # Aux dirs (internal-only, not part of public package)
 analysis/
-build/
-dist/
 # Generated docs are in public/docs. Track only the user-facing guide here.
 docs/*
 !docs/analyze_trajectory.md
@@ -119,50 +114,6 @@ plots/
 prompts/
 presentation/
 sequence-diagram/
-# tests/ is internal-only, except selected source-level regression tests that
-# must ship so a fresh clone can rebuild and verify public/.
-tests/*
-!tests/test_resume_advisories.py
-!tests/test_manual_hold.py
-!tests/conftest.py
-!tests/test_docs_coverage.py
-!tests/test_ceobench_customer_choice.py
-!tests/test_ceobench_group_research_and_insights.py
-!tests/test_ceobench_initial_conditions.py
-!tests/test_ceobench_rnd_projects.py
-!tests/test_ceobench_segment_discovery.py
-!tests/test_public_sql.py
-!tests/test_sql_evidence.py
-!tests/test_team_sql_monitor.py
-!tests/test_execution_capture.py
-!tests/test_pending_business_requests.py
-!tests/test_client_admission_race.py
-!tests/test_manual_continuation.py
-!tests/test_text_registry.py
-!tests/test_pf_queries.py
-!tests/test_pf_stale.py
-!tests/test_pf_weekly_ledger.py
-!tests/test_pf_read.py
-!tests/test_pf_acceptance.py
-!tests/test_pf_cli.py
-!tests/test_pf_registration_scope.py
-!tests/test_pf_text_search.py
-!tests/test_pf_review_changes.py
-!tests/test_pf_pipeline_receipts.py
-!tests/test_prefix_week_binding.py
-!tests/test_simulator_service_failures.py
-!tests/test_model_recovery_retry.py
-!tests/test_recovery_waste.py
-!tests/test_round4.py
-!tests/test_public_result_contracts.py
-!tests/test_stage5_prep.py
-!tests/test_preflight_*.py
-!tests/preflight_*.py
-!tests/fixtures/
-tests/fixtures/*
-!tests/fixtures/original_bash_agent.json
-!tests/fixtures/round4_pf_commands.json
-!tests/fixtures/pf_pipeline_d63_growth.json
 tools/
 variants/
 viz/
@@ -187,8 +138,6 @@ audit_pages.py
 cleanup_wiki_layout.py
 rename_to_bossbench.py
 upload_diagrams_to_notion.py
-core.*
 
 # Agent sandbox Python runtime (scripts/build_agent_runtime.py)
 agent-runtime/
-
