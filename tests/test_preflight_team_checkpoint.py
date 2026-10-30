@@ -105,7 +105,7 @@ def behavior(runtime):
     root = str(runtime.root)
     state = {}
     worlds = list(dict.fromkeys(message.world_state_id for message in runtime.messages))
-    header = re.compile(r'Analyst handoff \| role=(\w+) \| day=(\d+) \| world_state_id=(\w+) \| request_id=(\w+)\n'
+    header = re.compile(r'Analyst handoff \| role=(\w+) \| day=(\d+) \| request_world_state_id=(\w+) \| request_id=(\w+)\n'
                         r'Workspace: ([^\n]+)\nSnapshot commit: ([0-9a-f]+)\n')
 
     def normalize_handoff(match):
@@ -114,7 +114,7 @@ def behavior(runtime):
         assert (role, int(day), world, commit) == (request.receiver, request.day, request.world_state_id, request.handoff_commit)
         assert workspace == '<ROOT>/roles/' + role
         tree = runtime._git(runtime.roles[role], 'rev-parse', commit + '^{tree}')
-        return (f'Analyst handoff | role={role} | day={day} | world_state_id=state-{worlds.index(world)} | request_id=request-{index}\n'
+        return (f'Analyst handoff | role={role} | day={day} | request_world_state_id=state-{worlds.index(world)} | request_id=request-{index}\n'
                 f'Workspace: {workspace}\nSnapshot commit: tree-{tree}\n')
 
     for role, item in runtime.roles.items():

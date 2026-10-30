@@ -651,6 +651,9 @@ class BashAgentToolExecutor:
     def _file_name(self, path):
         return str(path.relative_to(self._read_root(path)))
 
+    def _display_path(self, path):
+        return self._file_name(path) if self._read_root(path) == self.workspace_path else str(path)
+
     def _file_owner(self, path):
         return self._read_root(path).name if self.identity else self.role
 
@@ -1315,7 +1318,7 @@ class BashAgentToolExecutor:
             source_start = 0
             for i, line in enumerate(content.split('\n'), 1):
                 if regex.search(line):
-                    rel = self._file_name(fpath)
+                    rel = self._display_path(checked)
                     prefix = f"{rel}:{i}: "
                     self._source(version, content, source_start, source_start + len(line), target + len(prefix))
                     matches.append(prefix + line)
@@ -1368,8 +1371,8 @@ class BashAgentToolExecutor:
         result = []
         for m in matches:
             try:
-                self._contained(m, str(m))
-                rel = self._file_name(m)
+                checked = self._contained(m, str(m))
+                rel = self._display_path(checked)
                 result.append(str(rel))
             except ValueError:
                 result.append('[Skipped out-of-workspace path]')

@@ -794,7 +794,7 @@ def hold_attempt(team, entry, directory, record, reason):
     elif team.failure == 'model_request_failed':
         detail = 'Model request failed; manual checkpoint resume required. ' + detail
     elif team.failure == 'world_operation_failed':
-        detail = 'World advancement failed or timed out; progress is recorded in the operation receipts. ' + detail
+        detail = 'Business operation failed or outcome remains unknown; progress is recorded in the operation receipts. ' + detail
     elif team.failure == 'business_operation_pending':
         detail = 'Business operation is still running; waiting for its terminal receipt. ' + detail
     elif team.failure == 'business_operation_unknown':

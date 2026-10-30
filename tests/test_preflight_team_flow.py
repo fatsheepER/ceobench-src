@@ -225,7 +225,9 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
             if n == 1:
                 assert 'REQUIRED' not in system or 'advance to the next week' not in system.lower()
                 assert "Each week resets your conversation" in system
-                assert "Only the CEO can change the business" in system
+                assert 'All roles can set model tiers' in system
+                assert 'Only CEO can' in system
+                assert 'same permissions as their owner' in system
                 assert '## Weekly Workflow' not in system
                 if role == 'growth':
                     assert 'by customer group and channel' in system

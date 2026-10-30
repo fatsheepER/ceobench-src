@@ -600,8 +600,10 @@ def test_http_business_failure_and_unknown_bare_client(captured):
     api, store, executor = captured
     req = urllib.request.Request(f'http://127.0.0.1:{api.port}/call',
                                  data=b'{"tool":"does_not_exist"}')
-    with urllib.request.urlopen(req) as response:
-        raw = response.read()
+    with pytest.raises(urllib.error.HTTPError) as rejected:
+        urllib.request.urlopen(req)
+    assert rejected.value.code == 403
+    raw = rejected.value.read()
     settled(api)
     row, = records(store)
     assert json.loads(raw)['success'] is False

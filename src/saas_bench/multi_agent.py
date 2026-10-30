@@ -17,7 +17,7 @@ from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_
 from .api_server import NovaMindAPIServer
 from .execution_capture import join_text
 from .model_usage import ModelUsage
-from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit
+from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit, require_call
 from .run_state import tree_hash, write_json
 from .run_lifecycle import BusinessOutcomeUnknown, RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
@@ -264,9 +264,9 @@ class MultiAgentRuntime:
         finally:
             self._safe_point = False
 
-    def _begin_operation(self, kind):
+    def _begin_operation(self, kind, *, role='ceo'):
         path = self.root / 'private' / 'operations' / (uuid.uuid4().hex + '.json')
-        state = dict(kind=kind, day=self.server.tools.current_day, status='running')
+        state = dict(kind=kind, role=role, day=self.server.tools.current_day, status='running')
         if kind == 'ceo_scripts' or kind.startswith('ceo_tool:'):
             from .team_checkpoint import business_operations
             with self.server._request_lock:
@@ -388,11 +388,12 @@ class MultiAgentRuntime:
         server = self.server
         execute, advance = server.execute_tool, server.advance_week
         def guarded_execute(tool, args, *, role='ceo'):
-            if role != 'ceo' or CALL_POLICY.get(tool) == 'read':
+            require_call(role, tool)
+            if CALL_POLICY[tool] == 'read':
                 return execute(tool, args, role=role)
             with server._lock:
-                server.authorize_team(role, CALL_POLICY.get(tool, 'write'))
-                operation = self._begin_operation('api:' + tool)
+                server.authorize_team(role, CALL_POLICY[tool])
+                operation = self._begin_operation('api:' + tool, role=role)
                 try:
                     result = execute(tool, args, role=role)
                 except BaseException:
@@ -593,7 +594,7 @@ class MultiAgentRuntime:
 
     def _handoff(self, request):
         header = (f'Analyst handoff | role={request.receiver} | day={request.day} | '
-                  f'world_state_id={request.world_state_id} | request_id={request.request_id}\n'
+                  f'request_world_state_id={request.world_state_id} | request_id={request.request_id}\n'
                   f'Workspace: {self.roles[request.receiver].workspace}\n'
                   f'Snapshot commit: {request.handoff_commit}\n')
         return join_text(header, '\n', request.reply)

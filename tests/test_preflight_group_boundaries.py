@@ -28,6 +28,30 @@ def original_prompt(days):
                       'lead generation from all ad spend',
                       '- `ads_strength` (0–1, default 0) controls in-app ads only; it does not change how many '
                       'leads ad spend generates')
+    sim = sim.replace('''- You MUST respond with `send_enterprise_deal` using compact tuple format: `deals=[[customer_id, [["plan", price_per_seat], ...]]]` — all contracts are month-to-month (1 month)
+- Grace period: 1 day to reply with no penalty
+- Late reply: -0.02 relationship/day after grace period
+- 7-day timeout (1 week): if YOU (the agent) do not reply within 7 days (1 week), the lead is PERMANENTLY LOST (or existing customer cancels). The clock starts when the customer message arrives — you must call `send_enterprise_deal` within 1 simulation week.
+''', '''- Before timeout, send offerings with `send_enterprise_deal` using `deals=[[customer_id, [["plan", price_per_seat], ...]]]` or close the negotiation with `reject_enterprise_deal(deals=[{"customer_id": customer_id}])`. All offerings are month-to-month (1 month).
+- Offers sent with `send_enterprise_deal` have a 1-day reply grace period. Later offers reduce relationship by 0.02 per extra day.
+- Explicit rejection closes the negotiation, marks pending new leads lost, and preserves an existing subscription.
+- At 7 days after a customer message without an offer or explicit rejection, the lead is lost or an existing subscriber cancels. Send offerings or explicitly reject before this timeout.
+''')
+    sim = sim.replace('''- `send_enterprise_deal` auto-detects: if a customer has an open thread, it replies; if no open thread, it initiates a renegotiation
+''', '''- `send_enterprise_deal` auto-detects: if a customer has an open thread, it replies; if no open thread, it requires an active enterprise subscription to start renegotiation
+''')
+    sim = sim.replace('''- Use `reject_enterprise_deal` to explicitly reject threads — WARNING: rejecting renegotiation/renewal/churn_prevention threads causes the customer to CHURN
+''', '''- Use `reject_enterprise_deal` with customer_id to close negotiations. Pending new leads become lost; existing subscriptions remain unchanged.
+''')
+    sim = sim.replace('''- `send_enterprise_deal(deals=[[cid1, [["plan", price]], [cid2, [["plan", price]]]])` — send offerings to multiple enterprise customers in one call
+''', '''- `send_enterprise_deal(deals=[[cid1, [["plan", price]]], [cid2, [["plan", price]]]])` — send offerings to multiple enterprise customers in one call
+''')
+    sim = sim.replace('''- Per-group targeting via `set_targeted_ops_spend`
+''', '''- `set_targeted_ops_spend` targets groups, plans, group-plan pairs, or customer IDs. Each supplied scope replaces its mapping; {} clears that scope. Omitted or None scopes stay unchanged.
+''')
+    sim = sim.replace('''- Per-group targeting via `set_targeted_dev_spend`: ACCUMULATES a group-specific quality bonus that persists after spending stops
+''', '''- `set_targeted_dev_spend` replaces the whole group mapping; {} clears it. Per-group spend ACCUMULATES a group-specific quality bonus that persists after spending stops
+''')
     template = ORIGINAL['system_template'].replace('''# Daily script management
 novamind register-daily-script setup.py  # Register a script to run automatically at start of each week
 novamind list-daily-scripts              # List all registered weekly scripts
@@ -371,7 +395,7 @@ print(json.dumps(results))'''
         assert not probes['http']['token_present']
         for path in ('/pf/query', '/evidence', '/sql-evidence'):
             assert probes['http'][path]['status'] == 404
-        assert probes['http']['/call']['status'] == 200
+        assert probes['http']['/call']['status'] == 403
         assert probes['http']['/call']['body']['success'] is False
         assert 'Unknown tool: pf_read' in json.dumps(probes['http']['/call']['body'])
         history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})

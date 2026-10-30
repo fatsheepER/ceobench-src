@@ -118,7 +118,7 @@ def test_generated_clients_share_one_world_and_ceo_can_write(team):
 
 @pytest.mark.parametrize('role', ROLES[1:])
 @pytest.mark.parametrize('gateway', ('raw', 'sdk', 'cli'))
-def test_analyst_writes_research_advance_denied_without_changes(team, role, gateway):
+def test_analyst_ceo_actions_research_advance_denied_without_changes(team, role, gateway):
     before = snapshot(team)
     code = '''import json, os, http.client, socket
 from novamind_api import _client
@@ -157,7 +157,6 @@ print('ALL-DENIED')
 @pytest.mark.parametrize('owner', ROLES)
 def test_full_file_matrix(team, actor, owner):
     r, target = team.roles[actor], team.roles[owner].workspace
-    allowed = owner in READABLE_ROLES[actor]
     marker = owner + '-data'
     variants = [str(target / 'data.txt'), os.path.relpath(target / 'data.txt', r.workspace)]
     for kind in ('absolute', 'relative'):
@@ -170,10 +169,10 @@ def test_full_file_matrix(team, actor, owner):
         search = r.executor.execute('search_files', {'path': path, 'pattern': marker})
         glob = r.executor.execute('glob_files', {'pattern': path})
         bash = r.executor.execute('bash', {'command': 'cat ' + shlex.quote(path)})
-        assert (marker in read) == allowed, read
-        assert (marker in search) == allowed, search
-        assert (marker in bash) == allowed, bash
-        assert (not glob.startswith('Error:') and 'Skipped' not in glob) == allowed, glob
+        assert marker in read, read
+        assert marker in search, search
+        assert marker in bash, bash
+        assert not glob.startswith('Error:') and 'Skipped' not in glob, glob
         original = (target / 'data.txt').read_text()
         write = r.executor.execute('write_file', {'path': path, 'content': marker + '-changed'})
         assert (target / 'data.txt').read_text() == (marker + '-changed' if actor == owner else original)
@@ -340,7 +339,7 @@ def test_git_history_and_registration_inspection_obey_mounts(team):
         for owner in ROLES:
             command = 'git -c safe.directory=* -C ' + shlex.quote(str(team.roles[owner].workspace)) + ' log -1 --format=%B'
             output = team.roles[actor].executor.execute('bash', {'command': command})
-            assert ((owner + '-history-secret') in output) == (owner in READABLE_ROLES[actor]), output
+            assert owner + '-history-secret' in output, output
     growth, peer = team.roles['growth'], team.roles['ops_finance']
     full = peer.executor.run_private(['git', '-C', str(peer.workspace), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
     alternate = growth.workspace / '.git/objects/info/alternates'

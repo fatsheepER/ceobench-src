@@ -504,7 +504,8 @@ def cmd_register_daily_script(args):
     Scripts must explicitly import novamind_api, for example
     `import novamind_api as nm`. Print the results you need in your weekly input.
     In teams, scripts and outputs belong to their registering role. CEO scripts
-    can change business settings; analyst scripts can only read public data.
+    and analyst scripts use their owner's business permissions. Only CEO can
+    set prices, purchase research, manage enterprise deals or advance time.
     ask_analyst follow-ups do not rerun scripts.
     The server receipt includes name, registered and sha256. Exit code 0 requires
     server success; file, connection and server errors exit nonzero.

@@ -139,16 +139,10 @@ def test_weekly_observations_allow_public_registration_without_exposing_private_
             runtime = team.roles[reader]
             output = runtime.executor.execute('pf_read', dict(target={'path': owner + ':same.txt'}))
             send(team, reader, [observations[reader], output])
-            saved = runtime.registry.path.read_bytes()
             result = runtime.executor.execute('text_create', dict(text='Peer decision',
                 objects=[dict(kind='metric', id='cash')], references=[dict(cite=owner + ':same.txt@v1')],
                 applies='0-', reason='decision'))
-            if owner in READABLE_ROLES[reader]:
-                assert not output.startswith('Error:') and result.startswith('Registered'), (output, result)
-            else:
-                assert 'inaccessible' in output.lower() and result.startswith('Error:'), (output, result)
-                assert owner + '-FILE-EVIDENCE' not in output + result
-                assert runtime.registry.path.read_bytes() == saved
+            assert not output.startswith('Error:') and result.startswith('Registered'), (output, result)
         for runtime in team.roles.values():
             runtime.store.assert_healthy()
 
@@ -263,16 +257,6 @@ def test_independent_detached_history_handoffs_weeks_and_git_authority(mode):
                 assert (peer in READABLE_ROLES[role]) == (peer + '-' in output), output
                 own_db = runtime.executor.run_private(['git', '-C', str(runtime.workspace), 'cat-file', '-t', hashes[peer]], capture_output=True)
                 assert (own_db.returncode == 0) == (role == peer)
-            sibling = next((p for p in ROLES if p not in READABLE_ROLES[role]), None)
-            if sibling:
-                link = runtime.workspace / 'peer-escape'
-                link.symlink_to(team.roles[sibling].workspace / 'same.txt')
-                assert runtime.executor.run_private(['cat', str(link)], capture_output=True).returncode != 0
-                git_path = runtime.workspace / '.git/objects/info/alternates'
-                git_path.write_text(str(team.roles[sibling].workspace / '.git/objects') + '\n')
-                result = runtime.executor.run_private(['git', '-C', str(runtime.workspace), 'cat-file', '-t', hashes[sibling]], capture_output=True)
-                assert result.returncode != 0
-                git_path.unlink()
 
 
 def test_pf_owner_every_reader_equal_bytes_private_layers_and_cursor_reopen():
@@ -285,7 +269,6 @@ def test_pf_owner_every_reader_equal_bytes_private_layers_and_cursor_reopen():
         for role, runtime in team.roles.items():
             q = runtime.executor.pf_queries
             for owner in ROLES:
-                accessible = owner in READABLE_ROLES[role]
                 for operation, args in [('pf_read', dict(target={'path': owner + ':private.txt'})),
                                         ('pf_log', dict(target={'path': owner + ':private.txt'})),
                                         ('pf_blame', dict(target={'path': owner + ':private.txt'})),
@@ -294,11 +277,9 @@ def test_pf_owner_every_reader_equal_bytes_private_layers_and_cursor_reopen():
                                         ('pf_read', dict(target={'version': version(team, owner, 'private.txt')})),
                                         ('pf_read', dict(target={'version': owner + ':private.txt@v1'}))]:
                     result = runtime.executor.execute(operation, args)
-                    assert (not result.startswith('Error:')) == accessible, (role, owner, operation, result)
-                    if not accessible:
-                        assert owner + '-EXCLUSIVE-SECRET' not in result
+                    assert not result.startswith('Error:'), (role, owner, operation, result)
                 matches = q.answer('pf_search', dict(text=owner + '-EXCLUSIVE-SECRET'))
-                assert bool(matches['items']) == accessible
+                assert matches['items']
             event = runtime.store.begin_event('model_request', dict(context_id='context'))
             wire = runtime.store.version(event, 'wire', 'RAW-REQUEST-SECRET', layer='model_request_wire')
             runtime.store.complete(event)
@@ -328,15 +309,15 @@ def test_pf_owner_every_reader_equal_bytes_private_layers_and_cursor_reopen():
         assert team.roles['ops_finance'].executor.execute('pf_more', dict(cursor=page['next_cursor'])).startswith('Error:')
 
 
-def test_ceo_copy_traversal_stops_without_ops_body_summary_or_snippet():
+def test_ceo_copy_traversal_exposes_both_business_sources_to_every_reader():
     with make_team('pf', lambda *args: final('done'), 'stage3-trace') as team:
         for role in ROLES[1:]:
             write(team, role, role + '-ORIGINAL-SOURCE')
             declare(team, role, role + '-ORIGINAL-CLAIM', [role + ':same.txt@v1'])
         declare(team, 'ceo', 'CEO composite decision', ['growth:r1.1', 'ops_finance:r1.1'])
         result = pf(team, 'growth', 'pf depend ceo:r1 --history --detail')
-        assert 'inaccessible' in result.lower(), result
-        assert 'ops_finance-ORIGINAL-SOURCE' not in result and 'ops_finance-ORIGINAL-CLAIM' not in result
+        assert 'inaccessible' not in result.lower(), result
+        assert 'ops_finance-ORIGINAL-CLAIM' in result
         assert 'growth' in result and 'CEO composite decision' in result
         result = pf(team, 'ceo', 'pf depend ceo:r1 --history --detail')
         assert 'growth-ORIGINAL-CLAIM' in result and 'ops_finance-ORIGINAL-CLAIM' in result
@@ -368,8 +349,8 @@ def test_source_navigation_and_lists_keep_role_identity():
         assert 'checks' not in listed
         for command in ('pf depend ceo:r1', 'pf depend ceo:r2'):
             assert pf(team, 'ceo', command).startswith(command.split()[-1] + '.1 ·')
-        denied = pf(team, 'growth', 'pf depend ops_finance:r1 --detail')
-        assert 'inaccessible' in denied.lower() and 'ops_finance-before' not in denied
+        peer = pf(team, 'growth', 'pf depend ops_finance:r1 --detail')
+        assert 'inaccessible' not in peer.lower() and 'ops_finance:same.txt@v1' in peer
         for runtime in team.roles.values():
             runtime.store.assert_healthy()
 
@@ -505,13 +486,17 @@ def test_public_observations_canonical_numbered_nested_handles_and_late_capture(
         assert evidence_handles.index(reopened).lookup(ha)[-1] == growth_a
         assert 'public_a' in pf(team, 'ceo', 'pf show ' + ha)
         assert 'public_b' in pf(team, 'ceo', 'pf log ' + hb.split('@')[0])
-        ops_public = query('ops_finance', 'SELECT 3 AS SHARED_PUBLIC', note='OPS-NOTE-PRIVATE')
+        ops_public = query('ops_finance', 'SELECT 3 AS SHARED_PUBLIC', note='OPS-BUSINESS-NOTE')
         assert 'SHARED_PUBLIC' in pf(team, 'growth', 'pf show ' + ops_public)
         growth.executor.execute('write_file', dict(path='reports/marker.txt', content='directory'))
         public_from_cwd = pf(team, 'growth', 'cd reports && pf show ' + ops_public)
-        assert 'SHARED_PUBLIC' in public_from_cwd and 'OPS-NOTE-PRIVATE' not in public_from_cwd
-        assert growth.executor.pf_queries.answer('pf_search', dict(text='OPS-NOTE-PRIVATE'))['total'] == 0
-        assert ceo.executor.pf_queries.answer('pf_search', dict(text='OPS-NOTE-PRIVATE'))['total'] > 0
+        assert 'SHARED_PUBLIC' in public_from_cwd and 'OPS-BUSINESS-NOTE' not in public_from_cwd
+        note_hits = growth.executor.pf_queries.answer('pf_search', dict(text='OPS-BUSINESS-NOTE'))
+        assert note_hits['total'] > 0
+        note_sources = [growth.store.get_content(item['source_version'])[0] for item in note_hits['items']]
+        assert any(meta['layer'] == 'file_bytes' and meta['object_id'] == '.tool-notes.jsonl' and
+                   meta['owner_role'] == 'ops_finance' for meta in note_sources)
+        assert ceo.executor.pf_queries.answer('pf_search', dict(text='OPS-BUSINESS-NOTE'))['total'] > 0
         shared_name = evidence_handles.index(team.roles['ops_finance'].store).name(ops_public)
         assert 'SHARED_PUBLIC' in pf(team, 'growth', 'pf show ' + shared_name.split('@')[0])
         event = team.roles['ops_finance'].store.begin_event('dashboard_generation', dict(day=0))

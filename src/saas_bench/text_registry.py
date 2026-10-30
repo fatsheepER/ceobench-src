@@ -54,6 +54,19 @@ class TextRegistry:
     def _git_output(self, argv, **kwargs):
         return self.git_run(argv, capture_output=True, check=True, timeout=10, **kwargs).stdout
 
+    def _git_reference(self, workspace, evidence):
+        if self.identity:
+            git_dir = workspace / '.git'
+            objects = git_dir / 'objects'
+            aliases = (git_dir / 'commondir', objects / 'info/alternates')
+            if (workspace.resolve() != workspace or git_dir.is_symlink() or objects.is_symlink() or
+                    not git_dir.is_dir() or not objects.is_dir() or
+                    any(path.exists() or path.is_symlink() for path in aliases) or
+                    any(path.is_symlink() for path in objects.rglob('*'))):
+                raise ValueError("Git citations need the named role's native repository. "
+                                 'Remove Git aliases or cite the peer as ROLE:path@commit.')
+        return git_reference(workspace, evidence, run=self.git_run)
+
     def execute(self, operation, args):
         with self.resolver.binding_scope() if self.resolver else nullcontext():
             return self._execute(operation, args)
@@ -206,7 +219,7 @@ class TextRegistry:
     def _closing_binding(self, ref, provisional):
         binding = dict(git_week=provisional['awaiting_week'])
         try:
-            evidence, full = git_reference(self.workspace, ref['evidence'], run=self.git_run)
+            evidence, full = self._git_reference(self.workspace, ref['evidence'])
             binding['git_commit'] = full
             raw = self._git_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
             handles = evidence_handles.index(self.store)
@@ -368,7 +381,7 @@ class TextRegistry:
             # PF keeps the Git group's committed-file references (design 4.1).
             if 'path' not in evidence:
                 raise ValueError('Evidence must be a workspace file path or a registered text rN.M; otherwise use unknown with a reason')
-            ref['evidence'], full = git_reference(workspace, evidence, run=self.git_run)
+            ref['evidence'], full = self._git_reference(workspace, evidence)
             if self.identity:
                 ref['evidence']['owner'] = owner
             if (ref.get('select') or ref.get('predicate')) and not ref['evidence']['path'].endswith(('.json', '.csv')):

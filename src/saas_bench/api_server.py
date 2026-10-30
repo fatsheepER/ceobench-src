@@ -1166,10 +1166,8 @@ class NovaMindAPIServer:
         """Execute a tool call with thread safety."""
         require_call(role, tool_name)
         with self._lock:
-            self.authorize_team(role, CALL_POLICY.get(tool_name, 'write'))
-            dispatch_fn = _TOOL_DISPATCH.get(tool_name)
-            if dispatch_fn is None:
-                return ToolResult(False, f"Unknown tool: {tool_name}")
+            self.authorize_team(role, CALL_POLICY[tool_name])
+            dispatch_fn = _TOOL_DISPATCH[tool_name]
             if CALL_POLICY[tool_name] != 'read':
                 with self._request_lock:
                     self._request_mutations += 1

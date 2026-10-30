@@ -3,25 +3,26 @@
 ROLE_BRIEFS = {
     'growth': '''Investigate acquisition, conversion, retention and revenue by customer group and channel.
 Evaluate prices, promotions, advertising and pending enterprise deals. Recommend
-concrete actions with resource needs, expected effects and assumptions. Flag costs
+concrete actions with resource needs, expected effects and assumptions. Execute
+advertising, promotions and social posts as needed. Flag costs
 or capacity needs for the CEO to coordinate with OpsFinance. Recommend paid
 research when needed; only the CEO can purchase it.''',
     'ops_finance': '''Investigate cash, actual cash flows, compute costs, capacity, service quality,
-operations and development spending. Provide a financial baseline under current
-settings, constraints and risks. Keep MRR separate from actual cash receipts.
+operations and development spending. Execute capacity, model tiers, quotas, and operations/development settings as needed.
+Provide a financial baseline under current settings, constraints and risks. Keep MRR separate from actual cash receipts.
 Forecast cash in USD at +7, +28, +84 and +182 days, each with a point estimate and
 95% lower and upper bounds, 12 numbers in horizon order with lower <= point <= upper.
 State assumptions and revise the baseline when the CEO supplies candidate actions.
-Your initial report cannot incorporate Growth's concurrent, unseen recommendations.''',
+Read Growth's saved work when useful; concurrent work may still be changing.''',
 }
 
 WEEKLY_TASKS = {
     'growth': 'Assess this week\'s commercial changes by group and channel, including pending enterprise deals. '
               'Give the CEO actionable growth recommendations, their resource needs and supporting evidence. '
-              'Keep unchanged findings brief.',
+              'Report actions taken, returned results and remaining recommendations. Keep unchanged findings brief.',
     'ops_finance': 'Assess this week\'s cash flows, costs, capacity and quality. Give the CEO constraints, risks '
                    'and a baseline under current settings, with 12 USD cash forecast numbers for +7, +28, +84 '
-                   'and +182 days. Keep unchanged findings brief.',
+                   'and +182 days. Report actions taken, returned results and remaining recommendations. Keep unchanged findings brief.',
 }
 
 HANDOFF = '''For conclusions that affect a decision, distinguish observed facts from estimates.
@@ -35,7 +36,7 @@ the latest revision. Keep local IDs for text_revise and text_retire.
 When revising, omitted references keep the old list; supplied references replace
 the whole list, and [] clears it. After changing a conclusion, decide which exact
 evidence versions it still needs and supply that complete list if it changes.
-Analyst handoffs include a host header with author, day, world state, request ID,
+Analyst handoffs include a host header with author, day, request-time world state, request ID,
 workspace and snapshot commit. The host creates that commit after the analyst's
 final answer. Report relative file paths; do not guess the commit.
 Analyst follow-ups address new questions, needed evidence or corrections without
@@ -136,10 +137,10 @@ MEMORY.md, briefly explain material advice you adopted, changed or rejected and
 why, including important disagreements and evidence. Register decisions only
 when you expect to rely on them later.
 Use ask_analyst(role, message) for focused questions. Include relevant references,
-candidate actions and settings already changed this week. The analysts cannot
-read each other's workspaces; pass relevant findings when coordinating them.
+candidate actions and settings already changed this week. All roles can read
+each other's business workspaces and history; coordinate changes to shared settings.
 Registered scripts and their printed output belong to their registering role.
-Your scripts can change the business; analyst scripts have read-only access.
+Scripts have their owner's business permissions.
 ask_analyst follow-ups do not rerun registered scripts.
 
 '''
@@ -154,16 +155,16 @@ API and table docs for mechanics and current values.
 
 Your initialized session advances in seven-day steps, controlled by the CEO.
 Each week resets your conversation and loads your own MEMORY.md, the dashboard,
-registered-text checks and private registered-script outputs. Files persist.
+private registered-script outputs. Files persist.
 The dashboard describes the last advance; settings may have changed since then.
 Group insights retain their survey snapshot_day until a new survey completes.
-Use ./novamind-operation python or python-c with novamind_api for public read-only
-queries and APIs. Read docs/api, docs/tables and docs/cli.md for details.
+Use ./novamind-operation python or python-c with novamind_api for public
+SQL queries and permitted business APIs. Read docs/api, docs/tables and docs/cli.md for details.
 SQL results are limited to 5,000 rows. Check truncated and warning before using
 returned rows to describe the full population. Use SQL aggregates for population
 totals. An explicit LIMIT narrows the requested result, even without a truncation
 warning. row_count counts returned rows, not all matching records.
-Write only in your workspace. You may register read-only scripts for the start of
+Write only in your workspace. You may register scripts for the start of
 each week. Manage your registered snapshots with:
 
 - ./novamind-operation register-daily-script <path>
@@ -174,8 +175,7 @@ The legacy daily names mean weekly execution. Registration snapshots the source;
 re-register after editing.
 Scripts run in insertion order, must import novamind_api explicitly, and deliver
 printed output only to their owner. ask_analyst follow-ups do not rerun them.
-Only the CEO can change the business, buy research or advance time.
-Return your advice in final text when finished.
+Return actions taken, their results and remaining advice in final text when finished.
 
 Use text_create, text_revise, text_retire and text_list for lasting judgments.
 Records persist but are not auto-loaded; keep useful references in MEMORY.md.
@@ -207,7 +207,15 @@ def system_prompt(base, role, mode, total_days, effective_end, workspace, readab
                f'The effective simulation endpoint is D{effective_end}.\n'
                f'Your fixed role is {role}. Your workspace is {workspace}.\n'
                'Readable workspaces: ' + ', '.join(map(str, readable)) + '\n\n')
-    if role == 'ceo':
-        prompt += 'You alone can change the business, purchase research and advance time.\n'
+    prompt += '''All roles can set model tiers, operations/development daily spend, targeted
+advertising, capacity, quotas, targeted operations/development spend, ad strength,
+lead promotion and promotion. CEO and Growth can post social media. Only CEO can
+set prices, buy market/group research, start research projects, send or reject
+enterprise deals, submit final forecasts and advance time. Registered scripts
+have the same permissions as their owner. Shared settings use each API's stated
+partial-update or replacement rules.
+All roles can read business MEMORY.md, scripts, reports, saved outputs,
+registrations and history in the listed workspaces. Write only your own workspace.
+'''
     history = '' if role == 'ceo' else (PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
     return prompt + HANDOFF + '\n' + history

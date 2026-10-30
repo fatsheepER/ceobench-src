@@ -300,17 +300,27 @@ def test_plan_setting_changes_survive_public_sdk(server, make_agent_tools, monke
     assert _client.call(name, args)['changes'] == {}
 
 
-def test_capture_cursor_rechecks_role_visibility():
+def test_capture_cursors_are_local_and_recheck_public_event_visibility():
     from test_preflight_team_flow import final, make_team
     with make_team('pf', lambda *args: final('done'), 'capture-cursor-access') as team:
-        private = team.roles['ops_finance']
-        output = private.executor.execute('bash', {'command': 'echo secret > private.txt; echo done'})
+        producer = team.roles['ops_finance']
+        output = producer.executor.execute('bash', {'command': 'echo business > saved.txt; echo done'})
         cursor = re.search(r'captures: pf more (c\d+)', output)[1]
-        saved = private.store.load_state('pf_cursors')[cursor]
+        saved = producer.store.load_state('pf_cursors')[cursor]
         growth = team.roles['growth']
+        foreign = growth.executor.execute('bash', {'command': 'pf more ' + cursor})
+        assert 'unknown cursor' in foreign.lower() and '[exit code: 1]' in foreign
+        assert 'Captured in ops_finance:' in producer.executor.execute('bash', {'command': 'pf more ' + cursor})
         growth.store.save_state('pf_cursors', {'c1': saved})
-        denied = growth.executor.execute('bash', {'command': 'pf more c1'})
-        assert 'inaccessible' in denied.lower() and 'private.txt' not in denied
+        shared = growth.executor.execute('bash', {'command': 'pf more c1'})
+        assert 'Captured in ops_finance:' in shared and '[exit code:' not in shared
+        event = producer.store.begin_event('model_request')
+        producer.store.version(event, 'wire', 'PRIVATE-MODEL-RECORD', layer='model_request_wire')
+        producer.store.complete(event)
+        copied_private = dict(saved, values=dict(saved['values'], capture_event=event), cutoff=None)
+        growth.store.save_state('pf_cursors', {'c2': copied_private})
+        denied = growth.executor.execute('bash', {'command': 'pf more c2'})
+        assert 'inaccessible' in denied.lower() and 'PRIVATE-MODEL-RECORD' not in denied
 
 
 def test_business_batch_partial_failure_reaches_model_with_actual_changes(http_captured, make_agent_tools):
