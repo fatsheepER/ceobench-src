@@ -102,7 +102,23 @@ def behavior(runtime):
         selected = ','.join(f'"{name}"' for name in columns)
         tables[table] = dict(columns=columns, rows=[tuple(row) for row in
             runtime.server.conn.execute(f'SELECT {selected} FROM "{table}"')])
+    references = dict(runtime.server.conn.execute(
+        'SELECT operation_ref,operation_seq FROM business_operations'))
+    effect_table = tables['business_effects']
+    projected = []
+    for record in effect_table['rows']:
+        row = dict(zip(effect_table['columns'], record))
+        if json.loads(row['target_json']).get('table') == 'predictions':
+            for field in ('before_json', 'after_json', 'applied_parameters_json'):
+                value = json.loads(row[field])
+                if isinstance(value, dict):
+                    value.pop('submitted_at', None)
+                    row[field] = json.dumps(value, sort_keys=True)
+        projected.append(tuple(row[name] for name in effect_table['columns']))
+    effect_table['rows'] = projected
     business = json.dumps(tables, sort_keys=True)
+    for reference, sequence in references.items():
+        business = business.replace(reference, 'operation-' + str(sequence))
     (runtime.root / 'private' / 'final-world.json').write_text(business)
     root = str(runtime.root)
     state = {}
@@ -175,13 +191,16 @@ def behavior(runtime):
 @pytest.mark.parametrize('boundary', ['answers_ready', 'ask_completed', 'week_boundary'])
 def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boundary):
     continuous = make_team(tmp_path / 'continuous', mode)
-    snapshots, forks = [], []
+    snapshots, forks, ledger_prefixes = [], [], []
     def save(runtime, current):
         if current == boundary and not snapshots:
             snapshots.append(runtime.checkpoint())
             # Fork while the source is still at this handoff, before it advances.
             forks.append(MultiAgentRuntime.restore(snapshots[0], tmp_path / 'restored',
                 client_factory=clients(), simulator_factory=fast_simulator))
+            prefix = list(runtime.server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq'))
+            assert [tuple(r) for r in forks[-1].server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq')] == [tuple(r) for r in prefix]
+            ledger_prefixes.append([r[0] for r in prefix])
     continuous.checkpoint_callback = save
     try:
         outcome = continuous.run(stop_after_day=14)
@@ -217,6 +236,11 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
                 assert any(s.get('pf_read_spans') for s in saved['sources'])
             assert restored.run(stop_after_day=14).reason == 'observation_end', restored.failure
             actual = behavior(restored)
+            original_refs = [r[0] for r in continuous.server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq')]
+            resumed_refs = [r[0] for r in restored.server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq')]
+            prefix = ledger_prefixes[0]
+            assert original_refs[:len(prefix)] == resumed_refs[:len(prefix)] == prefix
+            assert set(original_refs[len(prefix):]).isdisjoint(resumed_refs[len(prefix):])
             write_json(tmp_path / 'comparison.json', dict(mode=mode, boundary=boundary,
                 continuous=expected, recovered=actual, equal=actual == expected))
             assert actual == expected

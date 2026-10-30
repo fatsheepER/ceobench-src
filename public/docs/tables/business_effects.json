@@ -1,0 +1,17 @@
+{
+  "table": "business_effects",
+  "description": "Actual committed effects. Effects in one transaction share effect_seq. Advance effects are commit progress summaries, not simulator row audits.",
+  "columns": {
+    "effect_ref": "TEXT PRIMARY KEY. Stable operation reference plus local effect index.",
+    "operation_ref": "TEXT. Operation that produced this effect.",
+    "effect_seq": "INTEGER. Actual committed transaction segment order on the retained route.",
+    "item_index": "INTEGER. Zero-based effect order inside this segment.",
+    "day": "INTEGER. Simulation day at the commit.",
+    "kind": "TEXT. Public row insert/update/delete, runtime_config, or advance_progress.",
+    "target_json": "TEXT. Public target identity as JSON.",
+    "before_json": "TEXT. Public values before this effect, or JSON null.",
+    "after_json": "TEXT. Public values after this effect, or JSON null.",
+    "applied_parameters_json": "TEXT. Normalized applied public values as JSON.",
+    "result_json": "TEXT. Effect-specific public result as JSON."
+  }
+}

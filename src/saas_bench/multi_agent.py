@@ -155,6 +155,7 @@ class MultiAgentRuntime:
         self._public_dir = public
         workspaces = {role: self.root / 'roles' / role for role in ROLES}
         sockets = {role: Path(self._sockets.name) / role / 'api.sock' for role in ROLES}
+        script_sockets = {role: Path(self._sockets.name) / role / 'script.sock' for role in ROLES}
         stores, runtimes, script_executors, audits = {}, {}, {}, {}
         for role in ROLES:
             workspace = workspaces[role]
@@ -185,7 +186,7 @@ class MultiAgentRuntime:
                 settings = _restored_state['roles'][role]['executor']
                 script_settings = _restored_state['roles'][role]['script_executor']
             executor = BashAgentToolExecutor(**executor_options, text_registry=registry, **settings)
-            script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env)), **script_settings)
+            script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env), api_socket=script_sockets[role]), **script_settings)
             executor.lifecycle = script_executors[role].lifecycle = self._lifecycle
             executor.temp_root = script_executors[role].temp_root = self._temp_root
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
@@ -218,7 +219,7 @@ class MultiAgentRuntime:
         self.roles = MappingProxyType(runtimes)
         self.server = NovaMindAPIServer(tools, simulator=simulator, conn=conn,
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
-            role_sockets=sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
+            role_sockets=sockets, script_role_sockets=script_sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
         self.server.team_permission = self._team_permission
         self.server.script_check = self._check
         for role, runtime in self.roles.items():
@@ -426,15 +427,15 @@ class MultiAgentRuntime:
     def _guard_business_operations(self):
         server = self.server
         execute, advance = server.execute_tool, server.advance_week
-        def guarded_execute(tool, args, *, role='ceo'):
+        def guarded_execute(tool, args, *, role='ceo', initiator='host'):
             require_call(role, tool)
             if CALL_POLICY[tool] == 'read':
-                return execute(tool, args, role=role)
+                return execute(tool, args, role=role, initiator=initiator)
             with server._lock:
                 server.authorize_team(role, CALL_POLICY[tool])
                 operation = self._begin_operation('api:' + tool, role=role)
                 try:
-                    result = execute(tool, args, role=role)
+                    result = execute(tool, args, role=role, initiator=initiator)
                 except BaseException:
                     server._operation_failed = True
                     server._advance_outcome = None

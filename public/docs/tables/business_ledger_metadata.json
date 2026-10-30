@@ -1,0 +1,8 @@
+{
+  "table": "business_ledger_metadata",
+  "description": "Ledger inception on this world. Older history is not reconstructed.",
+  "columns": {
+    "singleton": "INTEGER PRIMARY KEY. Always 1.",
+    "inception_day": "INTEGER. Day the ledger schema was first installed."
+  }
+}

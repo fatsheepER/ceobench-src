@@ -24,7 +24,6 @@ from .database import (
     # Table documentation registry
     TABLE_DOCS,
     # Config override recording
-    record_config_override,
     # Notifications
     add_notification,
     # Agent social media
@@ -1934,13 +1933,9 @@ class AgentTools:
         """Update the current day."""
         self.current_day = day
 
-    def _record_config_override(self, tool_name, setting_type, settings):
-        try:
-            record_config_override(self.conn, self.current_day, tool_name, setting_type, settings)
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+    def _record_config_override(self, tool_name, setting_type, settings, replacements):
+        from .business_ledger import publish_runtime_config
+        publish_runtime_config(self, tool_name, setting_type, settings, replacements)
 
     def set_prices(self, prices: Dict[str, float]) -> ToolResult:
         """Set prices for plans A, B, C. Only provided keys are changed.
@@ -2222,10 +2217,10 @@ class AgentTools:
         else:
             result_msg = "Ad spend cleared. No advertising spend."
 
-        self._record_config_override('set_targeted_ad_spend', 'targeted_ad_spend',
-                                     {'targeted_spend': targeted_spend})
         changes = _setting_changes(self.config.targeted_ad_spend, targeted_spend)
-        self.config.targeted_ad_spend = targeted_spend
+        self._record_config_override('set_targeted_ad_spend', 'targeted_ad_spend',
+                                     {'targeted_spend': targeted_spend},
+                                     {'targeted_ad_spend': targeted_spend})
         return ToolResult(True, result_msg, {
             'changes': changes,
             'targeted_spend': targeted_spend,
@@ -2375,11 +2370,9 @@ class AgentTools:
                 'by_group_plan': gp,
                 'by_customer': {str(k): v for k, v in c.items()},
             },
+            {'targeted_ops_spend': g, 'targeted_ops_spend_by_plan': p,
+             'targeted_ops_spend_by_group_plan': gp, 'targeted_ops_spend_by_customer': c},
         )
-        self.config.targeted_ops_spend = g
-        self.config.targeted_ops_spend_by_plan = p
-        self.config.targeted_ops_spend_by_group_plan = gp
-        self.config.targeted_ops_spend_by_customer = c
         return ToolResult(True, result_msg, {
             'changes': changes,
             'by_group': g,
@@ -2429,10 +2422,10 @@ class AgentTools:
         else:
             result_msg += "  (no targeted dev spend — all dev spend is global)"
 
-        self._record_config_override('set_targeted_dev_spend', 'targeted_dev_spend',
-                                     {'targeted_spend': targeted_spend})
         changes = _setting_changes(self.config.targeted_dev_spend, targeted_spend)
-        self.config.targeted_dev_spend = targeted_spend
+        self._record_config_override('set_targeted_dev_spend', 'targeted_dev_spend',
+                                     {'targeted_spend': targeted_spend},
+                                     {'targeted_dev_spend': targeted_spend})
         return ToolResult(True, result_msg, {
             'changes': changes,
             'targeted_spend': targeted_spend,
@@ -2492,10 +2485,7 @@ class AgentTools:
             'global': strength,
             'by_group': groups,
             'by_customer': {str(k): v for k, v in customers.items()},
-        })
-        self.config.ads_strength_global = strength
-        self.config.ads_strength_by_group = groups
-        self.config.ads_strength_by_customer = customers
+        }, {'ads_strength_global': strength, 'ads_strength_by_group': groups, 'ads_strength_by_customer': customers})
         return ToolResult(True, "Ads strength updated.", {
             'changes': changes,
             'global': self.config.ads_strength_global,
@@ -2575,11 +2565,7 @@ class AgentTools:
             'by_group': groups,
             'by_channel': channels,
             'by_channel_group': channel_groups,
-        })
-        self.config.lead_promotion_global = promotion
-        self.config.lead_promotion_by_group = groups
-        self.config.lead_promotion_by_channel = channels
-        self.config.lead_promotion_by_channel_group = channel_groups
+        }, {'lead_promotion_global': promotion, 'lead_promotion_by_group': groups, 'lead_promotion_by_channel': channels, 'lead_promotion_by_channel_group': channel_groups})
         return ToolResult(True, "Lead promotion updated.", {
             'changes': changes,
             'global': self.config.lead_promotion_global,
@@ -2666,11 +2652,7 @@ class AgentTools:
             'by_group': groups,
             'by_customer': {str(k): v for k, v in customers.items()},
             'by_group_plan': group_plans,
-        })
-        self.config.promotion_global = promotion
-        self.config.promotion_by_group = groups
-        self.config.promotion_by_customer = customers
-        self.config.promotion_by_group_plan = group_plans
+        }, {'promotion_global': promotion, 'promotion_by_group': groups, 'promotion_by_customer': customers, 'promotion_by_group_plan': group_plans})
         return ToolResult(True, "Promotion updated.", {
             'changes': changes,
             'global': self.config.promotion_global,

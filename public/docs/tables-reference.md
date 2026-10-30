@@ -57,6 +57,55 @@ Social media posts and replies authored by the agent (CEO). Use post_social_medi
 
 ---
 
+## `business_effects`
+
+Actual committed effects. Effects in one transaction share effect_seq. Advance effects are commit progress summaries, not simulator row audits.
+
+| Column | Description |
+|--------|-------------|
+| `effect_ref` | TEXT PRIMARY KEY. Stable operation reference plus local effect index. |
+| `operation_ref` | TEXT. Operation that produced this effect. |
+| `effect_seq` | INTEGER. Actual committed transaction segment order on the retained route. |
+| `item_index` | INTEGER. Zero-based effect order inside this segment. |
+| `day` | INTEGER. Simulation day at the commit. |
+| `kind` | TEXT. Public row insert/update/delete, runtime_config, or advance_progress. |
+| `target_json` | TEXT. Public target identity as JSON. |
+| `before_json` | TEXT. Public values before this effect, or JSON null. |
+| `after_json` | TEXT. Public values after this effect, or JSON null. |
+| `applied_parameters_json` | TEXT. Normalized applied public values as JSON. |
+| `result_json` | TEXT. Effect-specific public result as JSON. |
+
+---
+
+## `business_ledger_metadata`
+
+Ledger inception on this world. Older history is not reconstructed.
+
+| Column | Description |
+|--------|-------------|
+| `singleton` | INTEGER PRIMARY KEY. Always 1. |
+| `inception_day` | INTEGER. Day the ledger schema was first installed. |
+
+---
+
+## `business_operations`
+
+Authorized business calls shared by Git and PF. Query deliberately; default receipts remain concise. See docs/business-ledger.md.
+
+| Column | Description |
+|--------|-------------|
+| `operation_ref` | TEXT PRIMARY KEY. Stable random reference across restored routes. |
+| `operation_seq` | INTEGER. Operation admission order on the retained route. |
+| `actor` | TEXT. Role bound by the host listener. |
+| `initiator` | TEXT. model, registered_script, or host; bound by the host. |
+| `tool` | TEXT. Authorized business tool or next_week. |
+| `day` | INTEGER. Simulation day at admission. |
+| `parameters_json` | TEXT. Complete public request parameters as JSON. |
+| `outcome` | TEXT. unfinished, succeeded, rejected, partial, or unknown. Unfinished does not imply zero effects or a live worker. |
+| `result_json` | TEXT. Complete tool result including per-item failures, or canonical next_week terminal outcome; NULL until confirmed. |
+
+---
+
 ## `config_history`
 
 Daily snapshot of all agent-configurable settings

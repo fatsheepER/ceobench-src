@@ -318,6 +318,10 @@ TABLE_DOCS = {
 }
 
 
+from .business_ledger import TABLE_DOCS as BUSINESS_TABLE_DOCS
+TABLE_DOCS.update(BUSINESS_TABLE_DOCS)
+
+
 class SharedMemoryConnection(sqlite3.Connection):
     query_uri: str
 
@@ -1141,6 +1145,8 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     conn.execute("ANALYZE")
 
     conn.commit()
+    from .business_ledger import ensure_schema
+    ensure_schema(conn, 0)
     return conn
 
 

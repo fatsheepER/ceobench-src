@@ -5,6 +5,10 @@ Complete reference for all available tools. Call them via the Python API
 and run scripts with `./novamind-operation python <script.py>` or
 `./novamind-operation python-c "<inline code>"`.
 
+Business changes are shared through `business_operations` and `business_effects`.
+Default receipts stay concise. Query the ledger for actor, source, before/after values and complete per-item results.
+See [business ledger](business-ledger.md) for stable query examples and commit semantics.
+
 ## Tool Summary
 
 | Tool | Description |

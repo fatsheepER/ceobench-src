@@ -43,6 +43,7 @@ _ENGINE_MODULES = [
     "_embedded_key",
     "_sql_chunk",
     "api_server",
+    "business_ledger",
     "role_policy",
     "workspace_io",
     "public_sql",
@@ -120,7 +121,7 @@ def build():
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
     from saas_bench.docs_generator import render_api_docs, render_table_docs, render_cli_docs
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-    from generate_public_docs import render_tools_reference
+    from generate_public_docs import render_tools_reference, render_tables_reference
 
     docs_dir = PUBLIC_DIR / "docs"
     api_dir = docs_dir / "api"
@@ -137,6 +138,7 @@ def build():
     render_table_docs(tables_dir)
     render_cli_docs(docs_dir)
     render_tools_reference(docs_dir / "tools-reference.md")
+    render_tables_reference(docs_dir / "tables-reference.md")
 
     # Drop any stale empty JSON
     import json as _json

@@ -114,11 +114,11 @@ def test_denies_entire_query_without_world_changes(server, sql):
 
 
 def test_policy_and_every_public_projection(server):
-    assert PUBLIC_POLICY_VERSION == 'public-sql-v1'
-    assert len(PUBLIC_COLUMNS) == 19
-    assert sum(map(len, PUBLIC_COLUMNS.values())) == 145
+    assert PUBLIC_POLICY_VERSION == 'public-sql-v2'
+    assert len(PUBLIC_COLUMNS) == 22
+    assert sum(map(len, PUBLIC_COLUMNS.values())) == 167
     # Any membership/order change requires an explicit policy review and fixture update.
-    assert hashlib.sha256(json.dumps(PUBLIC_COLUMNS, sort_keys=True).encode()).hexdigest() == 'e845b1e89b2793c55cc7003adc26bdc6c28478cd241a9d1f6bed6f304352fb93'
+    assert hashlib.sha256(json.dumps(PUBLIC_COLUMNS, sort_keys=True).encode()).hexdigest() == 'cbdf053c6a3ee4fe16f53412d5fc863ccf5c23b020f4cf24a828f45b96f28eb8'
     for table, columns in PUBLIC_COLUMNS.items():
         result = execute_query(server, f'SELECT * FROM "{table}" LIMIT 0')
         original_order = [row[1] for row in server.conn.execute(f'PRAGMA table_info("{table}")') if row[1] in columns]

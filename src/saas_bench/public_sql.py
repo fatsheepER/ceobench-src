@@ -10,7 +10,7 @@ from .database import TABLE_DOCS, SharedMemoryConnection
 from .runtime_options import runtime_value
 
 
-PUBLIC_POLICY_VERSION = 'public-sql-v1'
+PUBLIC_POLICY_VERSION = 'public-sql-v2'
 PUBLIC_COLUMNS = {table: tuple(doc['columns']) for table, doc in TABLE_DOCS.items()}
 ROW_LIMIT = 20000
 CELL_LIMIT_BYTES = 8 * 1024 * 1024

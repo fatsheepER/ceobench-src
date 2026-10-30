@@ -1,5 +1,8 @@
 # CEOBench CLI Reference
 
+Business calls are recorded in `business_operations` and `business_effects` for every role in Git and PF.
+Use `novamind_api.query` or `./novamind-operation query` to inspect them. See [business ledger](business-ledger.md) for full results and stable paging.
+
 ## novamind-operation
 
 Entry point for novamind-operation CLI.

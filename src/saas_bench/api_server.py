@@ -541,7 +541,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             if server.read_only_task and tool_name not in READ_ONLY_TASK_TOOLS:
                 self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
                 return
-            result = server.execute_tool(tool_name, args, role=self.role)
+            result = server.execute_tool(tool_name, args, role=self.role, initiator=self.server._initiator)
 
             if isinstance(result, ToolResult):
                 self._send_json(result.to_json())
@@ -646,7 +646,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                     return
                 parsed[horizon] = {"cash": {"point": point, "lower": lower, "upper": upper}}
 
-            result = server.advance_week(predictions=parsed, rationale=rationale, role=self.role)
+            result = server.advance_week(predictions=parsed, rationale=rationale, role=self.role, initiator=self.server._initiator)
             self._send_json(result)
         except (RequestRejected, RequestDeadlineExceeded):
             raise
@@ -993,7 +993,8 @@ class NovaMindAPIServer:
                  day_callback=None, dashboard_callback=None,
                  shock_manager=None, event_logger=None, script_workspace=None,
                  require_sandbox=False, sql_evidence=None, checkpoint_token=None,
-                 role_sockets=None, role_stores=None, role_executors=None, role_audits=None):
+                 role_sockets=None, role_stores=None, role_executors=None, role_audits=None,
+                 script_role_sockets=None):
         """Initialize the API server.
 
         Args:
@@ -1008,11 +1009,14 @@ class NovaMindAPIServer:
         self.oracle_mode = _ORACLE_MODE
         self.read_only_task = os.environ.get('CEOBENCH_READ_ONLY_TASK') == '1'
         self.role_sockets = dict(role_sockets or {})
+        self.script_role_sockets = dict(script_role_sockets or {})
         self.team_mode = bool(self.role_sockets)
         self.team_phase = None
         self.script_check = None
         if self.team_mode and set(self.role_sockets) != set(ROLES):
             raise ValueError('Team requires exactly three role listeners')
+        if self.script_role_sockets and set(self.script_role_sockets) != set(self.role_sockets):
+            raise ValueError('Registered script listeners require the same owner roles')
         self.role_stores = role_stores or {}
         self.role_audits = role_audits or {}
         self.role_executors = role_executors or {}
@@ -1031,6 +1035,9 @@ class NovaMindAPIServer:
         self.tools = tools
         self.simulator = simulator
         self.conn = conn
+        if conn is not None:
+            from .business_ledger import ensure_schema
+            ensure_schema(conn, tools.current_day)
         self.day_callback = day_callback
         self.dashboard_callback = dashboard_callback
         self.shock_manager = shock_manager
@@ -1088,6 +1095,7 @@ class NovaMindAPIServer:
         httpd = _TrackedHTTPServer(('127.0.0.1', 0), _APIHandler)
         httpd._api_server = self
         httpd._role = None if self.team_mode else "ceo"
+        httpd._initiator = "model"
         self.port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         try:
@@ -1097,11 +1105,14 @@ class NovaMindAPIServer:
             raise
         self._httpd, self._thread = httpd, thread
         try:
-            for role, path in self.role_sockets.items():
+            listeners = [(role, path, "model") for role, path in self.role_sockets.items()]
+            listeners += [(role, path, "registered_script") for role, path in self.script_role_sockets.items()]
+            for role, path, initiator in listeners:
                 from pathlib import Path
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
                 httpd = _UnixHTTPServer(str(path), _APIHandler)
                 httpd._api_server, httpd._role = self, role
+                httpd._initiator = initiator
                 try:
                     threading.Thread(target=httpd.serve_forever, daemon=True).start()
                 except BaseException:
@@ -1165,7 +1176,7 @@ class NovaMindAPIServer:
             self._last_dashboard = dashboard_version(self, dashboard, day)
             return self._last_dashboard
 
-    def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo') -> Any:
+    def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo', initiator='host') -> Any:
         """Execute a tool call with thread safety."""
         require_call(role, tool_name)
         with self._lock:
@@ -1174,7 +1185,25 @@ class NovaMindAPIServer:
             if CALL_POLICY[tool_name] != 'read':
                 with self._request_lock:
                     self._request_mutations += 1
-            result = dispatch_fn(self.tools, args)
+            if CALL_POLICY[tool_name] == 'read':
+                result = dispatch_fn(self.tools, args)
+            else:
+                from .business_ledger import BusinessOperation
+                operation = None
+                try:
+                    operation = BusinessOperation(self.conn or self.tools.conn, actor=role,
+                        initiator=initiator, tool=tool_name, day=self.tools.current_day, parameters=args)
+                    with operation.bind(self.tools):
+                        result = dispatch_fn(self.tools, args)
+                    operation.finish(result)
+                except BaseException:
+                    self._operation_failed = True
+                    if operation is not None:
+                        try:
+                            operation.finish(unknown=True)
+                        except BaseException:
+                            logging.exception('Could not persist unknown business outcome')
+                    raise
             if CALL_POLICY[tool_name] != 'read' and result.success:
                 self.world_state_id = uuid.uuid4().hex
                 if self.team_mode and self.team_phase is not None and self.conn is not None:
@@ -1242,7 +1271,7 @@ class NovaMindAPIServer:
         finally:
             self._advance_lock.release()
 
-    def advance_week(self, predictions=None, rationale=None, *, role="ceo", on_settled=None):
+    def advance_week(self, predictions=None, rationale=None, *, role="ceo", on_settled=None, initiator="host"):
         require_advance(role)
         with self._lock:
             self.authorize_team(role, 'advance')
@@ -1252,28 +1281,36 @@ class NovaMindAPIServer:
         if not self._advance_lock.acquire(blocking=False):
             raise RuntimeError('Week advancement already in progress')
 
+        business_operation = None
+
         def settle(*, result=None, error=None):
-            reached = getattr(self.simulator, 'current_day', self.tools.current_day)
-            completed = result.day if result is not None else old_day
-            evidence_error = None
-            if result is None and self.conn is not None:
-                try:
-                    row = self.conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()
-                    if row:
-                        completed = json.loads(row[0])['_sim_state']['current_day']
-                except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
-                    completed, evidence_error = None, type(exc).__name__ + ': ' + str(exc)
-            outcome = dict(status='failed' if error is not None else 'completed',
-                old_day=old_day, target_day=old_day + 7, reached_day=reached,
-                last_completed_day=completed,
-                progression='not_advanced' if reached <= old_day else
-                    'complete' if completed is not None and completed >= old_day + 7 else 'partial',
-                error=type(error).__name__ + ': ' + str(error) if error is not None else None)
-            if evidence_error:
-                outcome['progress_evidence_error'] = evidence_error
-            if on_settled:
-                on_settled(outcome)
-            self._advance_outcome = outcome
+            with self._lock:
+                reached = getattr(self.simulator, 'current_day', self.tools.current_day)
+                completed = result.day if result is not None else old_day
+                evidence_error = None
+                if result is None and self.conn is not None:
+                    try:
+                        row = self.conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()
+                        if row:
+                            completed = json.loads(row[0])['_sim_state']['current_day']
+                    except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+                        completed, evidence_error = None, type(exc).__name__ + ': ' + str(exc)
+                outcome = dict(status='failed' if error is not None else 'completed',
+                    old_day=old_day, target_day=old_day + 7, reached_day=reached,
+                    last_completed_day=completed,
+                    progression='not_advanced' if reached <= old_day else
+                        'complete' if completed is not None and completed >= old_day + 7 else 'partial',
+                    error=type(error).__name__ + ': ' + str(error) if error is not None else None)
+                if evidence_error:
+                    outcome['progress_evidence_error'] = evidence_error
+                if business_operation is not None:
+                    if error is not None:
+                        business_operation.finish(unknown=True)
+                    else:
+                        business_operation.finish(dict(success=True, day=reached, advance=outcome))
+                if on_settled:
+                    on_settled(outcome)
+                self._advance_outcome = outcome
 
         try:
             if self._operation_failed or self._step_day_timed_out:
@@ -1282,8 +1319,21 @@ class NovaMindAPIServer:
                 return dict(success=False, error='previous_operation_failed', message=message,
                     day=self.tools.current_day, advance=self._advance_outcome, manual_resume_required=True)
             self._advance_outcome = None
-            result = self._advance_week(predictions, rationale, on_settled=settle)
+            if self.conn is not None:
+                from .business_ledger import BusinessOperation
+                with self._lock:
+                    business_operation = BusinessOperation(self.conn, actor=role, initiator=initiator,
+                        tool='next_week', day=old_day, parameters=dict(predictions=predictions, rationale=rationale))
+            result = self._advance_week(predictions, rationale, on_settled=settle,
+                                        business_operation=business_operation)
             if result.get('error') == 'prediction_save_failed':
+                with self._lock:
+                    if business_operation is not None:
+                        if business_operation.commit_failed:
+                            self._operation_failed = True
+                            business_operation.finish(unknown=True)
+                        else:
+                            business_operation.finish(result)
                 return result
             if self._advance_outcome is None and result.get('error') != 'step_week_timeout':
                 self._operation_failed = True
@@ -1303,7 +1353,7 @@ class NovaMindAPIServer:
             self._advance_lock.release()
 
     def _advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
-                     rationale: Optional[str] = None, *, on_settled=None) -> Dict[str, Any]:
+                     rationale: Optional[str] = None, *, on_settled=None, business_operation=None) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
         Waits for step_week with slow-operation warnings and an optional deadline.
@@ -1353,15 +1403,19 @@ class NovaMindAPIServer:
             _pred_exc_tb = None
             try:
                 with self._lock:
-                    self.conn.execute('SAVEPOINT week_predictions')
-                    try:
-                        _save_predictions(self.conn, old_day, predictions, _time.time())
-                        self.conn.execute('RELEASE week_predictions')
-                        self.conn.commit()
-                    except Exception:
-                        if self.conn.in_transaction:
-                            self.conn.rollback()
-                        raise
+                    from contextlib import nullcontext
+                    context = business_operation.bind(self.tools, tables=('predictions',)) if business_operation else nullcontext(self.conn)
+                    with context as connection:
+                        connection.execute('BEGIN')
+                        try:
+                            _save_predictions(connection, old_day, predictions, _time.time())
+                            connection.commit()
+                        except Exception:
+                            if connection.in_transaction:
+                                connection.rollback()
+                                if business_operation is not None:
+                                    business_operation.commit_failed = False
+                            raise
             except Exception:
                 import traceback
                 _pred_exc_tb = traceback.format_exc()
@@ -1378,14 +1432,19 @@ class NovaMindAPIServer:
             with self._lock:
                 result, error = None, None
                 try:
-                    # Publish the new world and day together, including shocks.
-                    if self.shock_manager:
-                        for d in range(old_day + 1, old_day + 8):
-                            new_shocks = self.shock_manager.check_and_generate_shocks(d)
-                            if self.event_logger:
-                                for shock in new_shocks:
-                                    self.event_logger.log_shock(shock.shock_type, shock.details)
-                    result = self.simulator.step_week()
+                    from contextlib import nullcontext
+                    context = (business_operation.bind(self.tools, self.simulator, tables=(), advance=True,
+                                                       extra_owners=(self.shock_manager,
+                                                           getattr(self.simulator, 'customer_simulator', None)))
+                               if business_operation else nullcontext())
+                    with context:
+                        if self.shock_manager:
+                            for d in range(old_day + 1, old_day + 8):
+                                new_shocks = self.shock_manager.check_and_generate_shocks(d)
+                                if self.event_logger:
+                                    for shock in new_shocks:
+                                        self.event_logger.log_shock(shock.shock_type, shock.details)
+                        result = self.simulator.step_week()
                     self._last_day_result = result
                     self.tools.set_current_day(result.day)
                     self.world_state_id = uuid.uuid4().hex
