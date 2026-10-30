@@ -14,7 +14,7 @@ import pytest
 
 from saas_bench.api_server import NovaMindAPIServer
 from saas_bench.public_sql import PUBLIC_POLICY_VERSION
-from saas_bench.sql_evidence import FORMAT, SQLEvidenceStore, whole_rows
+from saas_bench.sql_evidence import EvidencePending, FORMAT, SQLEvidenceStore, whole_rows
 from test_public_sql import server
 
 
@@ -126,6 +126,52 @@ def test_repeat_change_identity_and_restart(captured):
     assert event_ids(reopened)[-1].endswith('/5')
 
 
+@pytest.mark.parametrize('status,body', [
+    (200, b'{"success":true,"columns":["x"],"rows":[{"x":1}]}'),
+    (504, b'{"success":false,"error":"query timeout"}'),
+])
+def test_finish_identical_replay_preserves_committed_evidence(tmp_path, status, body):
+    from concurrent.futures import ThreadPoolExecutor
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', identity())
+    event = store.begin(b'{"sql":"SELECT 1 AS x"}', PUBLIC_POLICY_VERSION)
+    args = event, status, 'HTTP response headers', body, dict(day=105)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: store.finish(*args), range(2)))
+    before = store.read_event(event)
+    with closing(store.connect()) as conn:
+        versions = [tuple(row) for row in conn.execute('SELECT * FROM versions')]
+    reopened = SQLEvidenceStore(store.path, identity())
+    reopened.finish(*args)
+    assert reopened.read_event(event) == before
+    assert reopened.get_content(event + ':public_response')[1] == body
+    with closing(reopened.connect()) as conn:
+        assert [tuple(row) for row in conn.execute('SELECT * FROM versions')] == versions
+        assert conn.execute('SELECT count(*) FROM results').fetchone()[0] == 1
+    assert len(versions) == (2 if status == 200 else 1)
+    assert not reopened.fault_path.exists()
+
+
+@pytest.mark.parametrize('changed', ['status', 'headers', 'body', 'execution'])
+def test_finish_conflicting_replay_rejects_without_overwriting(tmp_path, changed):
+    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', identity())
+    event = store.begin(b'{"sql":"SELECT 1 AS x"}', PUBLIC_POLICY_VERSION)
+    args = dict(status=200, headers='original headers',
+        body=b'{"success":true,"columns":["x"],"rows":[{"x":1}]}', execution=dict(day=105))
+    store.finish(event, **args)
+    record = store.read_event(event)
+    with closing(store.connect()) as conn:
+        before = {table: [tuple(row) for row in conn.execute('SELECT * FROM ' + table)]
+                  for table in ('versions', 'blobs', 'results')}
+    args[changed] = dict(status=504, headers='different headers',
+        body=b'{"success":true,"columns":["x"],"rows":[{"x":2}]}', execution=dict(day=112))[changed]
+    with pytest.raises(ValueError, match='Conflicting SQL evidence finish: ' + event):
+        store.finish(event, **args)
+    assert store.read_event(event) == record
+    with closing(store.connect()) as conn:
+        assert {table: [tuple(row) for row in conn.execute('SELECT * FROM ' + table)]
+                for table in before} == before
+
+
 def test_comparison_preserves_rows_types_and_order():
     def compare(rows, columns=['x'], **kwargs):
         return whole_rows(json.dumps(dict(success=True, columns=columns, rows=rows, **kwargs)).encode())[1]
@@ -191,8 +237,10 @@ def test_begin_failure_and_send_failure_preserve_observed_facts(captured, monkey
     from saas_bench.api_server import _APIHandler
     from types import SimpleNamespace
     handler = _APIHandler.__new__(_APIHandler)
-    handler.server = SimpleNamespace(_api_server=api)
+    handler.server = SimpleNamespace(_api_server=api, _role="ceo")
     handler.connection = SimpleNamespace(settimeout=lambda _: None)
+    with api._request_lock:
+        api._active_requests[id(handler.connection)] = dict(read_only=True, method='POST', path='/query')
     handler.request_version = 'HTTP/1.1'
     handler._sql_event = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION)
     handler._sql_execution = {}
@@ -205,6 +253,8 @@ def test_begin_failure_and_send_failure_preserve_observed_facts(captured, monkey
     handler.wfile = SimpleNamespace(write=broken)
     with pytest.raises(BrokenPipeError):
         handler._send_query_json(dict(success=True, columns=['x'], rows=[dict(x=1)]))
+    with api._request_lock:
+        assert api._active_requests.pop(id(handler.connection))['outcome_known'] is True
     assert statuses == [200]
     event = handler._sql_event
     assert store.read_event(event)['result']['status'] == 'succeeded'
@@ -255,11 +305,11 @@ os._exit(0)
             store.assert_healthy()
 
 
-def test_settle_waits_only_for_late_send_records(tmp_path):
+def test_settle_waits_for_pending_results_and_send_records(tmp_path):
     store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
     event = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     store.complete(event)
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome'):
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome'):
         store.assert_healthy()
     late = threading.Timer(.2, store.delivered, (event, 'sent'))
     late.start()
@@ -268,15 +318,50 @@ def test_settle_waits_only_for_late_send_records(tmp_path):
     lost = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     store.complete(lost)
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + lost):
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome: ' + lost):
         store.assert_healthy(settle=.3)
     assert time.monotonic() - started >= .3
     store.delivered(lost, 'sent')
     running = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + running):
-        store.assert_healthy(settle=5)
-    assert time.monotonic() - started < 1
+    with pytest.raises(EvidencePending, match='Unconfirmed SQL evidence outcome: ' + running):
+        store.assert_healthy(settle=.3)
+    assert time.monotonic() - started >= .3
+
+
+def test_unknown_execution_wins_over_pending_evidence(tmp_path):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
+    unknown = store.begin_event('bash')
+    store.complete(unknown, 'result_unknown')
+    with pytest.raises(RuntimeError, match='Unconfirmed execution outcome: ' + unknown) as raised:
+        store.assert_healthy(settle=.3)
+    assert not isinstance(raised.value, EvidencePending)
+
+
+@pytest.mark.parametrize('parent_pending', [False, True])
+@pytest.mark.parametrize('python_parent', [False, True])
+def test_missing_receive_distinguishes_pending_ancestors(tmp_path, parent_pending, python_parent):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    bash = store.begin_event('bash')
+    parent = store.begin_event('cli_python', parent=bash) if python_parent else bash
+    if python_parent:
+        store.complete(parent)
+    query = store.begin(b'{"sql":"SELECT 1"}', PUBLIC_POLICY_VERSION, parent=parent)
+    token = 'a' * 32
+    store.bind_client(query, token)
+    store.finish(query, 200, [], b'{"success":true,"columns":[],"rows":[]}', {})
+    store.delivered(query, 'sent')
+    if not parent_pending:
+        store.complete(bash)
+        store.begin_event('bash')
+    if parent_pending:
+        with pytest.raises(EvidencePending):
+            store.assert_healthy()
+    else:
+        with pytest.raises(RuntimeError, match='Unconfirmed client receive outcome: ' + token) as raised:
+            store.assert_healthy(settle=.3)
+        assert not isinstance(raised.value, EvidencePending)
 
 
 def test_snapshot_branch_visibility_and_tampering(captured, tmp_path):
@@ -313,3 +398,97 @@ def test_private_store_is_inaccessible(captured):
     executor = BashAgentToolExecutor(api.script_workspace, require_sandbox=True)
     executor.verify_sandbox()
     assert executor.execute('bash', {'command': 'test ! -r ' + shlex.quote(str(store.path)) + ' && echo private'}).strip() == 'private'
+
+
+def test_shared_writer_wait_keeps_http_archive(captured, monkeypatch):
+    api, store = captured
+    other = SQLEvidenceStore(store.path, identity('growth'))
+    locked = threading.Event()
+    threads = []
+    finish = store.finish
+
+    def writer():
+        with other.batch():
+            other.save_state('competing_capture', True)
+            locked.set()
+            time.sleep(1.3)
+
+    def contested_finish(*args):
+        thread = threading.Thread(target=writer)
+        threads.append(thread)
+        thread.start()
+        assert locked.wait(5)
+        return finish(*args)
+
+    monkeypatch.setattr(store, 'finish', contested_finish)
+    try:
+        status, body = request(api, 'SELECT amount FROM ledger WHERE 0')
+        settled(api)
+        assert status == 200 and json.loads(body)['rows'] == []
+        event, = event_ids(store)
+        assert store.read_event(event)['result']['capture_status'] == 'complete'
+        assert store.read_event(event)['delivery']['send_state'] == 'sent'
+        store.assert_healthy()
+    finally:
+        for thread in threads:
+            thread.join(5)
+
+
+def test_client_receipt_is_atomic_and_rejects_duplicates(tmp_path):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    event = store.begin_event('bash')
+    token = 'a' * 32
+    store.bind_client(event, token)
+    with pytest.raises(ValueError):
+        store.received(token, {'state': 'received', 'body': 'not hexadecimal'})
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT count(*) FROM versions').fetchone()[0] == 0
+        assert conn.execute('SELECT received FROM client_calls').fetchone()[0] is None
+    store.received(token, {'state': 'received', 'body': b'{}'.hex(), 'parsed': {}})
+    assert store.get_content(event + ':client_body')[1] == b'{}'
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT count(*) FROM versions').fetchone()[0] == 3
+        assert json.loads(conn.execute('SELECT received FROM client_calls').fetchone()[0])['receive_state'] == 'received'
+    with pytest.raises(ValueError, match='already recorded'):
+        store.received(token, {'state': 'received'})
+
+
+def test_fault_keeps_first_cause_across_stores_and_preservation(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    other = SQLEvidenceStore(store.path, identity('growth'))
+    try:
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('SELECT * FROM missing')
+    except sqlite3.OperationalError as exc:
+        store.fail(exc)
+    original = json.loads(store.fault_path.read_text())
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(lambda s: s.fail(RuntimeError('collection stopped')), (store, other)))
+    executor = SimpleNamespace(capture=SimpleNamespace(store=other, facts={}), _bash_facts={})
+    BashAgentToolExecutor._preserve_process(executor, SimpleNamespace(pid=123), {'unknown': 'still running'})
+    saved = json.loads(store.fault_path.read_text())
+    assert all(saved[key] == value for key, value in original.items())
+    assert saved['exception_type'] == 'OperationalError'
+    assert saved['sqlite_errorcode'] == sqlite3.SQLITE_ERROR
+    assert saved['sqlite_errorname'] == 'SQLITE_ERROR'
+    assert saved['traceback'] and all(set(frame) == {'filename', 'function', 'line'} for frame in saved['traceback'])
+    assert saved['preserve_scene'] and saved['supervisor_pid'] == 123
+
+
+def test_fault_keeps_in_memory_cause_when_disk_write_fails(tmp_path, monkeypatch):
+    from saas_bench import run_state
+
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    def full_disk(*args):
+        raise OSError('disk full')
+    monkeypatch.setattr(run_state, 'write_json', full_disk)
+    store.fail('original archive failure')
+    first = dict(store.fault)
+    store.fail(RuntimeError('collection stopped'))
+    assert store.fault == first
+    with pytest.raises(RuntimeError, match='collection stopped'):
+        store.assert_healthy()

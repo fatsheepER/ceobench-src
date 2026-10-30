@@ -8,6 +8,7 @@ import re
 import pytest
 
 from saas_bench.pf_queries import MODELS, PFQueries
+from saas_bench.execution_capture import finish_http
 from saas_bench.registration_evidence import HANDLES
 from saas_bench.sql_evidence import SQLEvidenceStore, encoded
 from test_sql_evidence import identity, request, settled
@@ -30,6 +31,19 @@ def read(executor, **args):
     assert not text.startswith('Error:'), text
     head, body = text.split('\n', 1)
     return json.loads(head), body, text
+
+
+def test_public_read_versions_support_the_recommended_diff(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    handles = []
+    for value in (1, 2):
+        event = store.begin_event('public_http', dict(method='POST', path='/call',
+            parsed=dict(tool='list_research_projects', args={})))
+        finish_http(store, event, 200, '', encoded(dict(success=True, data={'count': value})), {})
+        handles.append(registry.resolver.handle(event + ':public_response'))
+    diff = executor.execute('bash', {'command': f'pf diff {handles[0]} {handles[1]}'})
+    assert '"count":1' in diff and '"count":2' in diff
+    assert f'Before changing this source: pf rdepend {handles[0]} --detail.' in diff
 
 
 def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_path):
@@ -207,8 +221,9 @@ def test_sql_diff_preserves_duplicates_types_order_and_cross_branch_identity(wor
         store.finish(event, 200, '', encoded(dict(success=True, columns=['x'], rows=rows, row_count=len(rows))), {})
         store.delivered(event, 'sent')
     hist = query(executor, 'pf_read', mode='history', target={'sql': 'SELECT x'})['items'][::-1]
-    # Reordered but equal rows are the same content: one handle, marked as acquired again.
-    assert hist[0]['version'] == hist[1]['version'] and hist[1]['unchanged_since_day'] == 0
+    # Reordered but equal rows share one handle; undated captures do not invent a day.
+    assert hist[0]['version'] == hist[1]['version']
+    assert 'unchanged_since_day' not in hist[1]
     assert hist[2]['version'].endswith('@v2') and hist[2]['previous_version'] == hist[0]['version']
     head, _, _ = read(executor, mode='diff', baseline={'version': hist[0]['version']}, target={'version': hist[2]['version']})
     assert head['raw_equal'] is False and head['rows_equal'] is False
@@ -350,11 +365,10 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert not any(t['name'].startswith('pf_') for t in child.agent.tool_descriptions)
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        # The return and the written file are named; the queries behind them are traced, not listed.
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| wrote query\.json@v1\]$', output), output
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote query\.json@v1\]$', output), output
         # A non-zero exit still delivered the SQL result and wrote the file.
         failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| wrote failed\.json@v1\]$', failed), failed
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote failed\.json@v1\]$', failed), failed
         assert 'SELECT' not in output.rsplit('\n', 1)[1]
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
@@ -383,7 +397,7 @@ def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspac
     assert again.endswith('[pf: cmd3@v1 | wrote one.txt@v2]'), again
     (workspace / 'one.txt').write_text('1')
     assert executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'}).endswith(
-        '[pf: cmd3@v1 (same as day 0) | wrote one.txt@v4]')
+        '[pf: cmd3@v1 | wrote one.txt@v4]')
     history = query(executor, 'pf_read', mode='history', target={'path': 'one.txt'})['items']
     assert history[0]['same_content_as'] == 'one.txt@v2'
 
@@ -443,11 +457,14 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     """Agents run SDK scripts and read printed summaries, never the raw query response."""
     runner = offline_runner(text_registration='pf')
     runner.agent.current_day = 0
+    stamp = runner.evidence_store.begin_event('dashboard_generation', {'day': 0})
+    runner.evidence_store.complete(stamp)
     script = ("cat > calc.py <<'EOF'\nimport novamind_api as nm\n"
               "r = nm.query('SELECT COUNT(*) AS n FROM ledger')\nprint('ledger rows:', r['rows'][0]['n'])\nEOF")
     runner._execute_tool('bash', {'command': script})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
-    footer = re.search(r'\n\[pf: (calc\.py\.out@v1)\]$', output)
+    assert not runner.evidence_store.fault_path.exists(), runner.evidence_store.fault_path.read_text()
+    footer = re.search(r'\n\[pf: (calc\.py\.out@v1) \| query\d+@v1\]$', output)
     assert footer and 'ledger rows:' in output, output
     store = runner.evidence_store
     settled_request = send(store, output)
@@ -455,6 +472,11 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     # The raw query result never reached the model, so SQL alone is still refused, with a pointer.
     refused = runner._execute_tool('text_create', declaration({'sql': 'SELECT COUNT(*) AS n FROM ledger'}))
     assert refused.startswith('Error:') and 'first handle in its [pf: ...] line' in refused, refused
+    refused_condition = runner._execute_tool('text_create', declaration(references=[dict(
+        evidence={'version': footer.group(1)}, select={'col': 'n'},
+        predicate=dict(type='threshold', op='>=', value=0))]))
+    assert 'For a condition, cite query' in refused_condition, refused_condition
+    assert re.search(r'pf show query\d+@v1 --full', refused_condition), refused_condition
     created = runner._execute_tool('text_create', declaration({'version': footer.group(1)}))
     assert created.startswith('Registered r1.1 (active).\nCited: calc.py.out@v1 (day 0)'), created
     assert runner.tool_executor.text_registry.last_result['evidence'][0]['version'] == footer.group(1)
@@ -471,7 +493,7 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     # Running the same script again with the same printed output keeps the handle; a
     # different output is its next version, whatever the surrounding command looks like.
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py 2>&1 | head -5'})
-    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\)\]$', output), output
+    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\) \| query\d+@v1\]$', output), output
     runner._execute_tool('bash', {'command': "printf 'print(2)\\nprint(3)\\n' > calc.py"})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py | head -1'})
     assert re.search(r'\[pf: cmd\d+@v1, with part of calc\.py\.out@v2\]$', output), output

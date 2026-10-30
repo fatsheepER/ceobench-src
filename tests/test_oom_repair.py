@@ -1,0 +1,186 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
+import uuid
+
+import httpx
+import pytest
+
+from saas_bench import team_batch as batch
+from saas_bench.model_usage import ModelUsage
+from saas_bench.run_lifecycle import RunCancelled
+from saas_bench.run_state import write_json
+from test_preflight_team_controller import controller
+from test_preflight_team_flow import completion, final
+from test_preflight_team_observer import observer
+
+def test_worker_warns_about_scope_identity_without_stopping_peer(observer, controller, monkeypatch, tmp_path):
+    observer.poll()
+    monkeypatch.setenv('OPENCODE_API_KEY', 'offline')
+    monkeypatch.setenv('CEOBENCH_WORKER_SCOPE_POLICY', '{}')
+    wires = []
+    def respond(request):
+        wires.append(request)
+        return completion(final('unsafe request'), stream=True)
+    def prepare(manifest, run_id, **options):
+        client = batch.checked_client('ceo', 'offline', transport=httpx.MockTransport(respond),
+            request_guard=options['request_guard'])
+        usage = ModelUsage(tmp_path / 'usage.jsonl', 'ceo', {})
+        usage.attach(client)
+        try:
+            params = dict(model=batch.MODEL, messages=[dict(role='user', content='offline')],
+                reasoning_effort='high', extra_body={'thinking': {'type': 'enabled'}},
+                temperature=1., max_tokens=16384, stream=True, stream_options={'include_usage': True})
+            def invoke():
+                with client.chat.completions.create(**params) as stream:
+                    list(stream)
+                return completion(final('unsafe request'), stream=False).json()
+            usage.call('chat', params, invoke, day=0)
+        finally:
+            client.close()
+        return dict(status='finished')
+    monkeypatch.setattr(batch, 'prepare', prepare)
+    failure = None
+    try:
+        controller.module.worker(controller.policy, observer.manifest['runs'][0]['run_id'],
+            resume=False, parent_pid=None)
+    except RunCancelled as exc:
+        failure = str(exc)
+    assert len(wires) == 1 and failure is None
+    assert not observer.hold.exists()
+    assert (tmp_path / 'usage.jsonl').exists()
+
+@pytest.mark.parametrize('fault', ['slice', 'invocation', 'omit', 'limit', 'user-ancestor', 'system-ancestor'])
+def test_scope_startup_records_policy_drift_and_requires_resource_identity(monkeypatch, fault):
+    from saas_bench import systemd_guard
+    policy = dict(unit='test.scope', memory_high=2 * 1024**3, memory_max=3 * 1024**3, memory_swap_max=0)
+    observed = dict(Id='test.scope', InvocationID='scope-invocation', Slice='ceobench.slice',
+        ControlGroup=f'/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/ceobench.slice/test.scope',
+        OOMPolicy='kill', ManagedOOMPreference='omit', ManagedOOMMemoryPressure='auto', ManagedOOMSwap='auto',
+        MemoryHigh=str(policy['memory_high']), MemoryMax=str(policy['memory_max']), MemorySwapMax='0')
+    if fault in ('slice', 'invocation', 'omit', 'limit'):
+        key, value = {'slice': ('Slice', 'app.slice'), 'invocation': ('InvocationID', ''),
+            'omit': ('ManagedOOMPreference', 'none'), 'limit': ('MemoryMax', '1')}[fault]
+        observed[key] = value
+    calls = []
+    def show(command, **options):
+        calls.append(options['timeout'])
+        rows = []
+        for name in command[command.index('--') + 1:]:
+            row = dict(observed) if name == 'test.scope' else dict(Id=name,
+                ManagedOOMMemoryPressure='auto', ManagedOOMSwap='auto')
+            if name == '-.slice' and ((fault == 'user-ancestor' and '--user' in command) or
+                                      (fault == 'system-ancestor' and '--user' not in command)):
+                row['ManagedOOMMemoryPressure'] = 'kill'
+            rows.append('\n'.join(f'{key}={value}' for key, value in row.items()))
+        return SimpleNamespace(stdout='\n\n'.join(rows))
+    monkeypatch.setattr(systemd_guard.subprocess, 'run', show)
+    monkeypatch.setattr(systemd_guard, 'check_worker_cgroup', lambda proof: [])
+    if fault == 'invocation':
+        with pytest.raises(RuntimeError, match='invocation/cgroup binding'):
+            systemd_guard.verify_worker_scope(policy)
+    else:
+        proof = systemd_guard.verify_worker_scope(policy)
+        assert proof['observations'] and proof['invocation_id'] == 'scope-invocation'
+    assert calls and all(0 < value <= 5 for value in calls)
+
+@pytest.mark.parametrize('omit', [False, True])
+@pytest.mark.parametrize('unlimited', [False, True])
+def test_real_worker_scope_proof_precedes_model_usage(observer, controller, tmp_path, omit, unlimited):
+    from saas_bench.systemd_guard import scope_command
+    observer.expected['source_root'] = observer.manifest['source_root'] = str(batch.ROOT)
+    write_json(controller.policy, dict(identity=observer.expected))
+    observer.poll()
+    unit = 'ceobench-134-model-proof-' + uuid.uuid4().hex + '.scope'
+    scope_policy = dict(unit=unit, memory_high='max' if unlimited else 2 * 1024**3,
+        memory_max='max' if unlimited else 3 * 1024**3, memory_swap_max=0)
+    manifest_file = tmp_path / 'offline-manifest.json'
+    write_json(manifest_file, observer.manifest)
+    usage_path = tmp_path / 'worker-model.jsonl'
+    code = '''import json,os,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1]+'/scripts');sys.path.insert(0,sys.argv[1]+'/tests')
+import team_controller,httpx
+from saas_bench import team_batch as batch
+from saas_bench.model_usage import ModelUsage
+from saas_bench.run_lifecycle import RunCancelled
+from saas_bench.agents.bash_agent import run_test
+from test_preflight_team_flow import completion,final
+manifest=json.loads(Path(sys.argv[3]).read_text());wires=[]
+team_controller.identity=lambda *args:manifest
+def forbidden(*args):raise AssertionError('Scope proof must not read .env')
+run_test.load_env_file=forbidden
+def respond(request):wires.append(request);return completion(final('offline'),stream=True)
+def prepare(path,run_id,**options):
+ client=batch.checked_client('ceo','offline',transport=httpx.MockTransport(respond),request_guard=options['request_guard'])
+ usage=ModelUsage(sys.argv[4],'ceo',{});usage.attach(client)
+ params=dict(model=batch.MODEL,messages=[dict(role='user',content='offline')],reasoning_effort='high',extra_body={'thinking':{'type':'enabled'}},temperature=1.,max_tokens=16384,stream=True,stream_options={'include_usage':True})
+ def invoke():
+  with client.chat.completions.create(**params) as stream:list(stream)
+  return completion(final('offline'),stream=False).json()
+ try:usage.call('chat',params,invoke,day=0)
+ finally:client.close()
+ return dict(status='finished',run_id=run_id)
+batch.prepare=prepare
+try:team_controller.worker(sys.argv[2],manifest['runs'][0]['run_id'],resume=False,parent_pid=None)
+except RunCancelled as exc:print(json.dumps(dict(failure=str(exc),wires=len(wires))))
+else:print(json.dumps(dict(wires=len(wires))))
+'''
+    env = dict(os.environ, OPENCODE_API_KEY='offline', CEOBENCH_WORKER_SCOPE_POLICY=json.dumps(scope_policy),
+        CEOBENCH_WORKER_LAUNCH_ID='offline-proof')
+    command = scope_command([sys.executable, '-c', code, str(batch.ROOT), str(controller.policy),
+        str(manifest_file), str(usage_path)], unit, **{key: scope_policy[key]
+            for key in ('memory_high', 'memory_max', 'memory_swap_max')})
+    if not omit:
+        command.remove('--property=ManagedOOMPreference=omit')
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout.splitlines()[-1])
+        assert output['wires'] == 1 and usage_path.exists()
+        proof = batch.read(observer.host_logs / 'worker-scope-git-offline-proof.json')
+        assert proof['verified'] is True
+        if omit:
+            assert proof['slice'] == 'ceobench.slice' and '/app.slice/' not in proof['control_group']
+            assert proof['memory_high'] == scope_policy['memory_high'] and proof['memory_max'] == scope_policy['memory_max']
+            assert proof['memory_swap_max'] == 0
+            assert not any('MemoryHigh' in row or 'MemoryMax' in row or 'memory.high' in row or 'memory.max' in row
+                for row in proof['observations'])
+        else:
+            assert any('ManagedOOMPreference' in item for item in proof['observations'])
+            assert not observer.hold.exists()
+    finally:
+        subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, timeout=5)
+        subprocess.run(['systemctl', '--user', 'reset-failed', unit], capture_output=True, timeout=5)
+
+@pytest.mark.parametrize('fault', ['dead', 'stale', 'forced'])
+def test_controller_records_sampler_finalization_without_global_hold(observer, controller, monkeypatch, fault):
+    for entry in observer.manifest['runs']:
+        write_json(Path(entry['output_dir']) / 'attempt-001/attempt.json', dict(status='finished'))
+    polls = []
+    def poll(*args):
+        polls.append(None)
+        return dict(status='healthy', quota_error=None, coverage={}, units={})
+    class Sampler:
+        def __init__(self, path):
+            pass
+        def start(self):
+            return dict(sequence=1)
+        def check(self):
+            if len(polls) == 2 and fault != 'forced':
+                raise RuntimeError('Memory sampler ' + fault)
+        def stop(self):
+            return dict(closed=True, exit_code=1 if fault == 'dead' else 0,
+                forced=fault == 'forced', unexpected_exit=fault == 'dead')
+    monkeypatch.setattr(controller.module, 'poll', poll)
+    monkeypatch.setattr(controller.module, 'MemorySampler', Sampler)
+    controller.module.supervise(controller.policy, resume=True)
+    assert not observer.hold.exists()
+    receipt = batch.read(controller.policy.parent / 'controller-exit.json')
+    assert not receipt['failed'] and not receipt['hold'] and receipt['memory_sampler']['closed']
+    assert receipt['memory_sampler']['forced'] is (fault == 'forced')

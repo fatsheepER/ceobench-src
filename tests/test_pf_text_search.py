@@ -41,6 +41,10 @@ def test_literal_search_pages_do_not_expand_to_future_or_private_evidence(worksp
     assert executor.pf_queries.answer('pf_search', {'object': {'id': 'q_min.*'}})['total'] == 0
 
 
+def test_text_search_parser_preserves_empty_literal():
+    assert parse_argv(['search', '--text', '']) == ('pf_search', {'text': ''})
+
+
 def test_empty_object_search_suggests_a_shell_quoted_literal_search(workspace, tmp_path):
     import shlex
     _, _, executor = captured(workspace, tmp_path)

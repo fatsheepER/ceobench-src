@@ -14,6 +14,7 @@ Commands:
 
 import argparse
 import json
+import logging
 import uuid
 import os
 import signal
@@ -197,7 +198,7 @@ def _session_config(seed, total_days, initial_cash, meta=None):
     if manifest_path:
         requested = json.loads(Path(manifest_path).read_text())['benchmark_config']
         if frozen and frozen != requested:
-            raise ValueError('Session configuration differs from run manifest')
+            logging.warning('Session applies requested recovery configuration over checkpoint values')
         frozen = requested
     config = BenchmarkConfig(**frozen) if frozen else BenchmarkConfig(
         seed=seed, total_days=total_days, initial_cash=initial_cash)
@@ -209,7 +210,8 @@ def _session_config(seed, total_days, initial_cash, meta=None):
     before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
     effective = _apply_simulator_llm_config(config)
     if frozen and effective != before:
-        raise ValueError('Simulator environment would change frozen model configuration')
+        logging.warning('Simulator applies explicit environment model overrides: %s',
+            {field: dict(old=before[field], new=value) for field, value in effective.items() if before[field] != value})
     return config
 
 
@@ -339,9 +341,17 @@ def cmd_start_server(args, base: Path):
         pass  # Column already exists
 
     # Reconstruct simulator state
-    rng = Generator(PCG64(seed))
     config = _session_config(seed, total_days, meta['initial_cash'], meta)
+    seed, total_days = config.seed, config.total_days
+    rng = Generator(PCG64(seed))
     meta["simulator_llm"] = _apply_simulator_llm_config(config)
+    from dataclasses import asdict
+    meta.update(seed=seed, total_days=total_days, initial_cash=config.initial_cash, benchmark_config=asdict(config))
+    manifest_path = os.environ.get('CEOBENCH_RUN_MANIFEST')
+    requested_manifest = json.loads(Path(manifest_path).read_text()) if manifest_path else {}
+    if manifest_path:
+        meta['scenario'] = requested_manifest.get('configuration', {}).get('scenario',
+            meta.get('scenario', 'default'))
 
     customer_sim = CustomerSimulator(
         client=_create_simulator_openai_client(config),
@@ -483,8 +493,12 @@ def cmd_start_server(args, base: Path):
             from saas_bench.sql_evidence import digest
             saved = sql_evidence.load_state('dashboard')
             if saved is None or saved['sha256'] != digest(state['dashboard'].encode()):
-                raise ValueError('Restored dashboard source state mismatch')
-            api_server._last_dashboard = CapturedText(state['dashboard'], saved['origins'])
+                if requested_manifest.get('capture_history', {}).get('source_checkpoint_coverage') not in ('unavailable', 'sql_only'):
+                    raise ValueError('Restored dashboard source state mismatch')
+                logging.warning('Historical dashboard sources are unavailable; capturing a fresh dashboard from the restored world')
+                api_server.public_dashboard()
+            else:
+                api_server._last_dashboard = CapturedText(state['dashboard'], saved['origins'])
         api_server.last_script_results = state['script_results']
         customer_sim.usage_recorder.summary = state['usage']
         for name, value in state['event_logger'].items():

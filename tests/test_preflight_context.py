@@ -11,6 +11,7 @@ from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
 def agent(tmp_path, anthropic=False):
     value = BashAgent.__new__(BashAgent)
+    value.identity = None
     value.conversation = []
     value._pending_tool_calls = []
     value.current_day = 7
@@ -23,6 +24,7 @@ def agent(tmp_path, anthropic=False):
     value.use_anthropic = anthropic
     value._skip_next_refresh = False
     value.max_turns_per_day = 0
+    value.memory_max_chars = 40000
     value._call_llm = lambda: 'action'
     return value
 

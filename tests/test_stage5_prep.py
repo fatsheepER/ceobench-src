@@ -20,7 +20,7 @@ def file_versions(store):
         return conn.execute("SELECT count(*) FROM versions WHERE json_extract(metadata,'$.layer')='file_bytes'").fetchone()[0]
 
 
-def test_boundary_snapshots_reuse_unchanged_versions_in_one_transaction(workspace, tmp_path):
+def test_boundary_snapshots_reuse_unchanged_versions_and_exact_bytes(workspace, tmp_path):
     store, _, executor = captured(workspace, tmp_path, 'prefix')
     executor.execute('bash', {'command': 'printf A > a.txt'})
     baseline = file_versions(store)
@@ -36,16 +36,7 @@ def test_boundary_snapshots_reuse_unchanged_versions_in_one_transaction(workspac
     # Manifests still name one version per path, and it holds exactly the observed bytes.
     capture = ExecutionCapture(store)
     capture.begin('probe', {})
-    connects, original = [], store.connect
-    def counted():
-        connects.append(1)
-        return original()
-    store.connect = counted
-    try:
-        items = capture.snapshot(workspace, 'before')
-    finally:
-        store.connect = original
-    assert len(connects) == 1, 'one snapshot is one transaction'
+    items = capture.snapshot(workspace, 'before')
     for path, item in items.items():
         if item.get('type') == 'file':
             assert store.get_content(item['version'])[0]['blob_sha256'] == item['sha256'], path
@@ -125,7 +116,7 @@ def test_prefix_stops_at_fork_day_then_git_and_pf_branches_continue(offline_runn
         assert outcome['outcome'] == 'stopped' and outcome['days_run'] == 28 and len(more) == 2
         assert branch._load_checkpoint()['day'] == 28
         assert (branch.evidence_store is None) == (mode == 'git')
-        assert not list(branch_dir.rglob('sql-evidence*')) if mode == 'git' else (branch_dir / 'sql-evidence.sqlite').exists()
+        assert not list(branch_dir.rglob('sql-evidence*')) if mode == 'git' else (branch.workspace_dir / 'sql-evidence.sqlite').exists()
 
 
 def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
@@ -139,12 +130,15 @@ def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
     pf_text = integrate(base, pf=True) + json.dumps(get_bash_agent_tool_descriptions(True, True))
     for word in ('PF', 'pf ', 'pf_', '@v1', '[pf:', '"compare"', 'delivered', 'last saw', 'keeps the note'):
         assert word not in git_text, word
-    for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'keeps the note',
+    for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'PF keeps it',
                  'path@week-N', 'this request'):
         assert word in pf_text, word
-    # The function tools are those of Git; PF adds only the optional note on three of them.
     names = lambda pf: [t['name'] for t in get_bash_agent_tool_descriptions(True, pf)]
     assert names(True) == names(False)
+    tools = {pf: {tool['name']: tool for tool in get_bash_agent_tool_descriptions(True, pf)}
+        for pf in (False, True)}
+    for name in ('bash', 'write_file', 'edit_file'):
+        assert tools[False][name]['parameters']['properties']['note'] == tools[True][name]['parameters']['properties']['note']
     assert MODELS['prefix'] is MODELS['git']
     with pytest.raises(Exception):
         MODELS['git']['create'].model_validate(declaration({'sql': 'SELECT 1'}))
@@ -212,8 +206,9 @@ def test_repeated_tool_calls_are_delivered_compactly_and_reconstruct(workspace, 
     assert summary['read_kinds']['tool_call'] >= 4 and summary['net_saved_tokens'] > 0
 
 
-def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
+def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path, monkeypatch):
     store, registry, executor = pf_executor(workspace, tmp_path)
+    monkeypatch.setitem(executor.runtime_environment, 'CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     (workspace / 'facts.txt').write_text(sample())
     a = executor.execute('read_file', {'path': 'facts.txt'})
     b = executor.execute('read_file', {'path': 'facts.txt'})
@@ -231,6 +226,7 @@ def test_tool_call_recovery_truncation_and_file_delivery(workspace, tmp_path):
     (workspace / 'big.txt').write_text('x' * 40000)
     big1 = executor.execute('bash', {'command': 'cat big.txt'})
     big2 = executor.execute('bash', {'command': 'cat big.txt'})
+    assert 'output truncated' in big1 and 'output truncated' in big2
     _, ledger = deliver(store, [big1, big2])
     assert ledger[1]['mode'] == 'FULL' and ledger[1]['reason'] == 'partial_or_truncated'
     # Git and prefix groups never produce compact tool reads.

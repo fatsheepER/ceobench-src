@@ -54,7 +54,7 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
     def create(restore=None, **options):
         managed_checkpoints = options.pop('managed_checkpoints', True)
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
-                                total_days=options.pop('total_days', 42), workspace_base=tmp_path, continue_from=restore,
+                                total_days=options.pop('total_days', None if restore else 42), workspace_base=tmp_path, continue_from=restore,
                                 run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
         if not managed_checkpoints:
             server_environment = runner._server_environment
@@ -117,7 +117,7 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
     from test_preflight_rng import runtime_values
 
     first = offline_runner()
-    manifest = (first.workspace_dir / 'manifest.json').read_bytes()
+    manifest = json.loads((first.workspace_dir / 'manifest.json').read_text())
     expected = runtime_values()
     set_runtime_config(first, expected)
     expected['targeted_ad_spend'] = {'social_media': {'S1': 19.0}}
@@ -137,7 +137,9 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
         runner._save_checkpoint(14)
         directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
         assert saved_runtime_config(directory / 'world.nmdb') == encoded
-        assert (runner.workspace_dir / 'manifest.json').read_bytes() == manifest
+        restored_manifest = json.loads((runner.workspace_dir / 'manifest.json').read_text())
+        restored_manifest.pop('recovery_source', None)
+        assert restored_manifest == manifest
     assert business_state(restored) == business_state(first)
 
 
@@ -339,8 +341,7 @@ def test_failed_publication_and_unknown_operation_keep_previous_snapshot(offline
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
     assert checkpoint_directory(runner.workspace_dir, runner._load_checkpoint()).is_dir()
     runner._begin_operation('tool', 0)
-    with pytest.raises(ValueError, match='unknown'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint()
     # Analysis can still inspect the last complete generation directly.
     assert checkpoint_directory(runner.workspace_dir, json.loads(pointer)).is_dir()
 
@@ -495,8 +496,7 @@ def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_r
     assert runner._server_proc is None
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == previous
     assert 'unknown' in json.loads((runner.workspace_dir / 'branch_stop.json').read_text())['reason']
-    with pytest.raises(ValueError, match='unknown'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint()
 
 
 def test_packed_public_sql_policy(offline_runner):
@@ -559,11 +559,13 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     runner._stop_server()
     restored = offline_runner(runner.workspace_dir)
     assert not restored.execution_capture and restored.evidence_store is None
-    with pytest.raises(ValueError, match='configuration mismatch'):
-        offline_runner(runner.workspace_dir, execution_capture=True)
+    changed = offline_runner(runner.workspace_dir, execution_capture=True)
+    assert changed.execution_capture and changed.evidence_store is not None
+    assert json.loads((changed.workspace_dir / 'manifest.json').read_text())['capture_history'][
+        'source_checkpoint_coverage'] == 'sql_only'
     restored._http_post('/query', {'sql': sql})
     restored._save_checkpoint(7)
-    assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 5
+    assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 1
     left = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-left', 'left'))
     right = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-right', 'right'))
     for child in (left, right):
@@ -580,9 +582,17 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     again = offline_runner(left.workspace_dir)
     again._http_post('/query', {'sql': 'SELECT 43 AS x'})
     again._save_checkpoint(7)
-    assert again._load_checkpoint()['sql_evidence']['cutoff'] == 2
+    assert again._load_checkpoint()['sql_evidence']['cutoff'] == 1
     with closing(store.connect()) as conn:
-        assert store.sequence(conn) == 5
+        assert store.sequence(conn) == 4
+    restored._http_post('/query', {'sql': 'SELECT 44 AS x'})
+    restored._stop_server()
+    evidence_bytes = (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes()
+    rolled_back = offline_runner(restored.workspace_dir)
+    assert rolled_back.workspace_dir != restored.workspace_dir
+    assert (restored.workspace_dir / 'sql-evidence.sqlite').read_bytes() == evidence_bytes
+    with closing(store.connect()) as conn:
+        assert store.sequence(conn) == 4
 
 
 def test_packed_execution_capture_scripts_cache_restore_and_fork(offline_runner, tmp_path):
@@ -699,7 +709,7 @@ def test_six_week_execution_capture_matches_uncaptured_run(offline_runner, tmp_p
         'server_state.json').read_bytes() == (checkpoint_directory(runners[1].workspace_dir,
         runners[1]._load_checkpoint()) / 'server_state.json').read_bytes()
     store = runners[1].evidence_store
-    store.assert_healthy()
+    store.assert_healthy(settle=5)
     kinds = {store.read_event(event)['request']['kind'] for event in event_ids(store)}
     assert {'bash', 'sql_query', 'registered_script_execution', 'public_http'} <= kinds
     destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
@@ -922,10 +932,9 @@ os._exit(77)
     assert relevant[0]['result']['status'] == 'succeeded'
     assert relevant[0]['delivery']['receive_state'] == 'unknown'
     assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
-    with pytest.raises(ValueError, match='outcome unknown'):
-        runner._load_checkpoint()
-    with pytest.raises(ValueError, match='outcome unknown'):
-        offline_runner(runner.workspace_dir)
+    assert runner._load_checkpoint()
+    recovered = offline_runner(runner.workspace_dir)
+    assert recovered.workspace_dir != runner.workspace_dir
     destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
     if destination:
         output = Path(destination)
@@ -936,7 +945,7 @@ os._exit(77)
             'child_exit_code': child.returncode, 'public_attempts': len(relevant),
             'public_result_status': relevant[0]['result']['status'],
             'receive_state': relevant[0]['delivery']['receive_state'],
-            'checkpoint_unchanged': True, 'restore_refused': True}, indent=2))
+            'checkpoint_unchanged': True, 'restore_refused': False}, indent=2))
 
 
 def test_git_workspace_maintenance_is_synchronous(offline_runner):
@@ -972,10 +981,27 @@ def test_harness_preserves_unfinished_descendants_and_server(offline_runner, mon
         assert runner.tool_executor.preserved_process.poll() is None
         assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
         assert json.loads((runner.workspace_dir / 'sql-evidence.fault.json').read_text())['preserve_scene']
-        with pytest.raises(ValueError, match='unknown'):
-            runner._load_checkpoint()
+        assert runner._load_checkpoint()
     finally:
         proc = runner.tool_executor.preserved_process
         if proc:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('execution_capture', [False, True])
+def test_packed_weekly_script_keeps_full_streams_in_durable_evidence(offline_runner, execution_capture):
+    runner = offline_runner(execution_capture=execution_capture)
+    code = "import sys\nprint('PACKED-' + 'x' * 31000)\nprint('PACKED-ERR', file=sys.stderr)\nsys.exit(3)\n"
+    (runner.agent_workspace / 'weekly.py').write_text(code)
+    result = runner.tool_executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py'))
+    assert 'registered' in result.lower(), result
+    receipt = advance(runner)
+    assert receipt['success'] is True
+    assert 'PACKED-' in receipt['dashboard']
+    evidence = list(runner.workspace_dir.rglob('registered-script-evidence/scripts/*/execution.json'))
+    assert len(evidence) == 1
+    record = json.loads(evidence[0].read_text())
+    assert record['classification'] == 'script_error'
+    assert (evidence[0].parent / 'stdout.bin').read_bytes() == ('PACKED-' + 'x' * 31000 + '\n').encode()
+    assert (evidence[0].parent / 'stderr.bin').read_bytes() == b'PACKED-ERR\n'

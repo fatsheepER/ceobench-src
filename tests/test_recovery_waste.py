@@ -1,0 +1,216 @@
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytest
+
+from saas_bench import team_batch as batch
+from saas_bench.run_state import write_json
+from saas_bench.team_results import summarize_pairs
+from test_preflight_team_usage import PRICES, body, log, receipts
+from test_preflight_team_batch import frozen, managed_team
+
+
+def test_retained_calls_and_discarded_calls_are_separate_by_role(tmp_path):
+    entry = dict(output_dir=str(tmp_path), category='formal')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    for directory in (first, second):
+        (directory / 'runtime/private/ceo').mkdir(parents=True)
+        (directory / 'runtime/private/growth').mkdir()
+        write_json(directory / 'attempt.json', dict(status='finished'))
+    kept = receipts('kept', 'ceo', body(10, 2), cost=.1)
+    abandoned = receipts('discarded', 'growth', body(30, 4), cost=.2)
+    resumed = receipts('resumed', 'ceo', body(20, 3), cost=.1)
+    abandoned[-1]['timestamp'] = '2026-10-07T00:00:04+00:00'
+    log(first / 'runtime/private/ceo/model-usage.jsonl', kept)
+    log(first / 'runtime/private/growth/model-usage.jsonl', abandoned)
+    log(second / 'runtime/private/ceo/model-usage.jsonl', kept + resumed)
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['team']['complete']['total_tokens'] == 35
+    assert waste['team']['complete']['total_tokens'] == 34
+    assert waste['roles']['growth']['complete']['total_tokens'] == 34
+    assert waste['roles']['growth']['wall_seconds'] == 4
+    assert {row['call_id'] for row in waste['records']} == {'discarded'}
+
+
+def test_repeated_rollback_excludes_abandoned_attempts_and_downtime(tmp_path):
+    stamp = datetime(2026, 10, 15, tzinfo=timezone.utc)
+    history = [tmp_path / f'attempt-{number:03}' for number in (1, 2, 3)]
+    source = history[0] / 'runtime/checkpoints/first'
+    write_json(source / 'team.json', dict(source_root=str(history[0] / 'runtime'),
+        saved_at=(stamp + timedelta(seconds=80)).isoformat()))
+    for directory, seconds, start in zip(history, (100, 50, 30), (0, 1000, 2000)):
+        write_json(directory / 'attempt.json', dict(wall_seconds=seconds,
+            execution_started_at=(stamp + timedelta(seconds=start)).isoformat(),
+            source_checkpoint=str(source) if directory != history[0] else None))
+    result = batch.wall_time(history)
+    assert result['wall_seconds'] == 110
+    assert result['waste_wall_seconds'] == 70
+    assert result['wall_seconds'] + result['waste_wall_seconds'] == 180
+
+
+def test_pair_comparison_uses_valid_time_and_exposes_waste_separately():
+    rows = [dict(seed=42, repeat=1, group=group, run_id=group, status='running',
+                 wall_seconds=duration, waste_wall_seconds=waste)
+            for group, duration, waste in [('git', 10, 90), ('pf', 20, 1)]]
+    pair = summarize_pairs(rows)['pairs'][0]
+    assert pair['comparison']['wall_seconds']['pf_over_git'] == 2
+    assert pair['waste']['git']['wall_seconds'] == 90
+
+
+def test_tail_remains_pending_until_a_new_attempt_selects_checkpoint(tmp_path):
+    entry = dict(output_dir=str(tmp_path), category='formal', run_id='git')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    private = first / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    kept = receipts('kept', 'ceo', body(10, 2), cost=.1)
+    log(private / 'model-usage.jsonl', kept + receipts('discarded', 'ceo', body(30, 4), cost=.2))
+    checkpoint = first / 'runtime/checkpoints/complete'
+    (checkpoint / 'private/ceo').mkdir(parents=True)
+    (checkpoint / 'roles').mkdir()
+    log(checkpoint / 'private/ceo/model-usage.jsonl', kept)
+    (checkpoint / 'world.nmdb').write_bytes(b'complete world')
+    write_json(checkpoint / 'team.json', dict(day=21, stage='boundary',
+        saved_at='2026-10-15T01:00:00+00:00', source_root=str(first / 'runtime'),
+        roles={name: dict(identity=dict(run_id='git')) for name in ('ceo', 'growth', 'ops_finance')}))
+    from saas_bench.run_state import file_hash, tree_hash
+    write_json(checkpoint / 'checkpoint.json', dict(version=1,
+        files={name: file_hash(checkpoint / name) for name in ('team.json', 'world.nmdb')},
+        roles_sha256=tree_hash(checkpoint / 'roles', exact=True),
+        private_sha256=tree_hash(checkpoint / 'private')))
+    write_json(first / 'attempt.json', dict(status='failed', checkpoint=str(checkpoint)))
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['team']['complete']['total_tokens'] == 12
+    assert valid['pending']['team']['complete']['total_tokens'] == 34
+    assert valid['pending']['status'] == 'awaiting_operator_selection'
+    assert not waste['records']
+    write_json(second / 'attempt.json', dict(status='failed', attempt=2, source_checkpoint=str(checkpoint)))
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['team']['complete']['total_tokens'] == 12
+    assert waste['team']['complete']['total_tokens'] == 34
+    from unittest.mock import patch
+    manifest = dict(category='formal', runs=[dict(entry, seed=42, repeat=1, group='git')],
+                    d0={}, pricing=PRICES)
+    with patch.object(batch, 'validate_manifest', return_value=manifest):
+        report = batch.summarize(tmp_path / 'manifest.json')
+    assert report['resources']['team']['complete']['total_tokens'] == 12
+    assert report['runs'][0]['waste']['team']['complete']['total_tokens'] == 34
+
+
+def test_unreadable_historical_time_metadata_remains_unknown(tmp_path):
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    first.mkdir()
+    (first / 'attempt.json').write_text('{unfinished')
+    write_json(second / 'attempt.json', dict(wall_seconds=3))
+    report = batch.wall_time([first, second])
+    assert report['wall_seconds'] is None
+    assert report['wall_seconds_known'] == 3
+    assert report['time_metadata_errors'][0]['attempt'] == 'attempt-001'
+
+
+def test_paused_time_is_pending_until_operator_selects_a_checkpoint(tmp_path):
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    source = first / 'runtime/checkpoints/complete'
+    write_json(source / 'team.json', dict(source_root=str(first / 'runtime'),
+        saved_at='2026-10-15T00:01:20+00:00'))
+    write_json(first / 'attempt.json', dict(status='paused', wall_seconds=100,
+        execution_started_at='2026-10-15T00:00:00+00:00', checkpoint=str(source)))
+    before = batch.wall_time([first])
+    assert before['wall_seconds'] == 80 and before['pending_wall_seconds'] == 20
+    assert before['waste_wall_seconds'] == 0
+    write_json(second / 'attempt.json', dict(status='finished', source_checkpoint=str(source), wall_seconds=30))
+    after = batch.wall_time([first, second])
+    assert after['wall_seconds'] == 110 and after['pending_wall_seconds'] == 0
+    assert after['waste_wall_seconds'] == 20
+
+
+def test_failed_model_request_does_not_publish_a_new_checkpoint(managed_team, monkeypatch):
+    from saas_bench.multi_agent import RunOutcome
+    from saas_bench.run_lifecycle import RunCancelled
+    team, directory, record, manifest, entry = managed_team
+    original = record['checkpoint']
+    before = set((team.root / 'checkpoints').iterdir())
+    def fail_model(**kwargs):
+        usage = team.roles['ceo'].usage
+        monkeypatch.setattr(usage.lifecycle, 'sleep', lambda seconds: None)
+        try:
+            usage.call('chat', dict(model=team.roles['ceo'].agent.model),
+                       lambda: (_ for _ in ()).throw(ValueError('offline failed request')), day=0)
+        except RunCancelled:
+            pass
+        team.failure = 'model_request_failed'
+        return RunOutcome(day=0, reason='failed')
+    monkeypatch.setattr(team, 'run', fail_model)
+    result = batch.execute(team, manifest, entry, directory, record, directory / 'STOP')
+    assert result['checkpoint'] == original
+    assert set((team.root / 'checkpoints').iterdir()) == before
+    assert result['result']['usage']['team']['billed_units'] == 0
+    assert result['result']['waste']['roles']['ceo']['billed_units'] == 0
+    assert result['result']['pending']['roles']['ceo']['billed_units'] == 1
+
+
+def test_missing_recovery_selection_keeps_previous_tail_pending(tmp_path):
+    entry = dict(output_dir=str(tmp_path), category='formal', run_id='git')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    private = first / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    log(private / 'model-usage.jsonl', receipts('pending', 'ceo', body(30, 4), cost=.2))
+    write_json(first / 'attempt.json', dict(status='paused', wall_seconds=10))
+    before, waste = batch.run_usage(entry, PRICES)
+    assert before['pending']['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    write_json(second / 'attempt.json', dict(status='paused', reason='missing_checkpoint',
+        execution_started=False, source_checkpoint=None))
+    after, waste = batch.run_usage(entry, PRICES)
+    assert after['pending']['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    timing = batch.wall_time([first, second])
+    assert timing['pending_wall_seconds'] == 10 and timing['waste_wall_seconds'] == 0
+
+
+def test_unreadable_old_attempt_metadata_does_not_block_usage_accounting(tmp_path, caplog):
+    entry = dict(output_dir=str(tmp_path), category='formal')
+    first, second = tmp_path / 'attempt-001', tmp_path / 'attempt-002'
+    write_json(first / 'attempt.json', None)
+    write_json(second / 'attempt.json', dict(status='finished'))
+    private = second / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    log(private / 'model-usage.jsonl', receipts('kept', 'ceo', body(10, 2), cost=.1))
+    valid, waste = batch.run_usage(entry, PRICES)
+    assert valid['roles']['ceo']['billed_units'] == 1 and not waste['records']
+    assert 'accounting metadata is not an object' in caplog.text
+
+
+@pytest.mark.parametrize('broken', ['{unfinished', 'null', '[]', None, '{}', '{"status":"finished","result":[]}'])
+def test_unreadable_latest_metadata_preserves_retained_and_pending_usage(tmp_path, caplog, monkeypatch, broken):
+    entry = dict(output_dir=str(tmp_path), category='formal', run_id='git', seed=42, repeat=1, group='git')
+    first, second, third = [tmp_path / f'attempt-{n:03}' for n in (1, 2, 3)]
+    private = first / 'runtime/private/ceo'
+    private.mkdir(parents=True)
+    log(private / 'model-usage.jsonl', receipts('kept', 'ceo', body(10, 2), cost=.1) +
+        receipts('unselected', 'ceo', body(20, 3), cost=.1))
+    checkpoint = first / 'runtime/checkpoints/complete'
+    (checkpoint / 'private/ceo').mkdir(parents=True)
+    log(checkpoint / 'private/ceo/model-usage.jsonl', receipts('kept', 'ceo', body(10, 2), cost=.1))
+    write_json(first / 'attempt.json', dict(status='paused', attempt=1, checkpoint=str(checkpoint), wall_seconds=1))
+    second_private = second / 'runtime/private/ceo'
+    second_private.mkdir(parents=True)
+    log(second_private / 'model-usage.jsonl', receipts('unknown', 'ceo', body(30, 4), cost=.1))
+    broken_path = second / 'attempt.json'
+    if broken is not None:
+        broken_path.write_text(broken)
+    original = broken_path.read_bytes() if broken_path.exists() else None
+    manifest = dict(category='formal', runs=[entry], d0={}, pricing=PRICES)
+    monkeypatch.setattr(batch, 'validate_manifest', lambda path: manifest)
+    for missing_selection in (False, True):
+        if missing_selection:
+            write_json(third / 'attempt.json', dict(status='paused', attempt=3, reason='missing_checkpoint',
+                execution_started=False))
+        valid, waste = batch.run_usage(entry, PRICES)
+        assert {row['call_id'] for row in valid['records']} == {'kept'}
+        assert {row['call_id'] for row in valid['pending']['records']} == {'unselected', 'unknown'}
+        assert not waste['records']
+        report = batch.summarize(tmp_path / 'manifest.json')
+        row, = report['runs']
+        assert row['status'] == ('paused' if missing_selection else 'unknown')
+        assert row['reason'] == ('missing_checkpoint' if missing_selection else 'unreadable_attempt_metadata')
+        assert row['usage'] == valid and row['pending'] == valid['pending'] and row['waste'] == waste
+        assert row['wall_seconds'] is None
+        assert (broken_path.read_bytes() if broken_path.exists() else None) == original
+    assert str(broken_path) in caplog.text

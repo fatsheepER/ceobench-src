@@ -84,13 +84,23 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
         executor.execute('bash', {'command': 'true'})
     full = executor.execute('bash', {'command': command})
     result = executor.execute('bash', {'command': f'{command} | {view[0]} -{view[1]}'})
-    assert result == apply_view(str(full), view)
+    notice, shell_output = result.split('\n', 1)
+    assert 'PF final delivery' in notice and 'partial' in notice and 'source ranges unknown' in notice
+    assert 'before shell processing' in notice
+    assert shell_output == apply_view(str(full), view)
     if command == 'pf show facts.txt' and view[0] == 'tail':
-        assert result == 'B\nC\n'
+        assert shell_output == 'B\nC\n'
     event, reads = deliver(store, [result])
     assert len(reads) == 1 and reads[0]['complete'] is False
     assert reads[0]['mode'] == ('DIFF' if 'diff' in command else 'FULL')
     assert reads[0]['actual_tokens'] == Counter().count(result)
+    assert json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content'] == result
+    meta, saved = store.get_content(result.pf_read['id'])
+    assert saved.decode() == result and meta['view'] == 'shell_source_ranges_unknown'
+    assert meta['read_range'] is None and reads[0]['range'] is None
+    original_meta, _ = store.get_content(meta['original_read'])
+    assert original_meta['target'] == meta['target']
+    assert store.get_content(meta['created_by_event'] + ':stdout')[1].decode() == shell_output
     for item in result.origins:
         meta, raw = store.get_content(item['version_id'])
         a, b = item['source_range']
@@ -100,6 +110,45 @@ def test_pf_pipes_filter_delivery_and_preserve_read_accounting(workspace, tmp_pa
             assert not item['full_source']
     with pytest.raises(ValueError, match='delivered|neither read nor wrote'):
         call(registry, 'create', **declaration({'path': 'facts.txt'}))
+
+
+@pytest.mark.parametrize('command, partial', [
+    ('pf show facts.txt', False),
+    ('pf show facts.txt | cat', False),
+    ('pf show facts.txt; pf show facts.txt', False),
+    ('pf show facts.txt; pf show facts.txt | tail -1', True),
+    ('pf show facts.txt | cat; pf show facts.txt | tail -1', True),
+    ('pf show facts.txt | head -2; pf show facts.txt | tail -1', True),
+    ("pf show facts.txt | grep observation", True),
+    ("printf '%20000s' x; pf show facts.txt; printf '%20000s' y", True),
+])
+def test_pf_final_shell_delivery_scope_on_model_wire(workspace, tmp_path, command, partial, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
+    store, _, executor = captured(workspace, tmp_path)
+    (workspace / 'facts.txt').write_text(sample().replace('\r\n', '\n'))
+    executor.execute('bash', {'command': 'true'})
+    result = executor.execute('bash', {'command': command})
+    assert ('PF final delivery' in result) is partial
+    event, reads = deliver(store, [result])
+    wire = json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content']
+    assert wire == result
+    assert result.count('PF final delivery') == int(partial)
+    tool_event = next(item['version_id'].split(':')[0] for item in result.origins
+                      if item['version_id'].endswith(':tool_return'))
+    facts = store.read_event(tool_event)['result']
+    raw = store.get_content(tool_event + ':stdout')[1].decode()
+    assert 'PF final delivery' not in raw
+    if partial:
+        assert facts['pf_delivery']['complete'] is False
+        assert facts['pf_delivery']['source_range'] is None
+        assert all(not item['complete'] for item in reads)
+    if '20000' in command:
+        assert facts['output_truncated'] is True
+        assert 'output truncated' in wire
+        assert len(raw) > 30000
+    assert all(item['actual_tokens'] == Counter().count(
+        store.get_content(item['actual_version'])[1].decode()) for item in reads)
+    store.assert_healthy()
 
 
 def test_official_model_tokenizer_is_pinned_and_validated(tmp_path, monkeypatch):
@@ -313,6 +362,9 @@ def test_final_wire_validation_and_private_snapshot_sources(workspace, tmp_path)
     bad_sources = text_sources(bad)
     with pytest.raises(ValueError, match='cannot be reconstructed'):
         model_request(store, encoded(bad), bad_sources, 'call', 'bad', 'week')
+    with closing(store.connect()) as conn:
+        failed = conn.execute("SELECT event_id FROM requests WHERE json_extract(request, '$.kind')='model_request' ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    store.complete(failed, 'failed', error='wire validation rejected before transport')
     # Serialized mutation is rejected before it can be sent to a provider.
     restored['messages'][1]['content'] += 'corrupt'
     with pytest.raises(ValueError, match='serialization changed'):
@@ -412,3 +464,37 @@ def test_agent_snapshot_restore_pruning_and_new_week(workspace, tmp_path):
     assert accounting(store)['materialized_full_tokens'] > 0
     store.assert_healthy()
     client.close()
+
+
+@pytest.mark.parametrize('command', ['cat facts.txt', 'pf show facts.txt'])
+def test_repeated_slow_bash_keeps_each_notice_in_actual_request(workspace, tmp_path, monkeypatch, command):
+    from saas_bench.process_boundary import Boundary
+    store, _, executor = captured(workspace, tmp_path)
+    (workspace / 'facts.txt').write_text(sample())
+    executor.bash_timeout, executor.bash_warn_after = 480, 120
+    elapsed = iter([120, 121])
+    communicate = Boundary.communicate
+    def timed(boundary, *args, **kwargs):
+        result = communicate(boundary, *args, **kwargs)
+        boundary.record['elapsed_seconds'] = next(elapsed)
+        return result
+    monkeypatch.setattr(Boundary, 'communicate', timed)
+    first = executor.execute('bash', dict(command=command))
+    deliver(store, [first])
+    second = executor.execute('bash', dict(command=command))
+    event, ledger = deliver(store, [first, second])
+    wire = json.loads(store.get_content(event + ':wire')[1])
+    assert wire['messages'][1]['content'] == second
+    assert '120.000 seconds' in first and '121.000 seconds' in second
+    assert ledger[-1]['mode'] == 'FULL'
+    if command.startswith('pf '):
+        span, = second.pf_read_spans
+        a, b = span['request_range']
+        assert second[a:b] == store.get_content(span['id'])[1].decode()
+        assert '[Framework timing notice]' not in second[a:b]
+    else:
+        assert ledger[-1]['reason'] == 'requested_full'
+        first_meta = store.get_content(first.origins[0]['version_id'])[0]
+        second_meta = store.get_content(second.origins[0]['version_id'])[0]
+        assert first_meta['body_sha256'] == second_meta['body_sha256']
+    store.assert_healthy()

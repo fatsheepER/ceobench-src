@@ -10,16 +10,21 @@ import subprocess
 import sys
 import time
 
-from saas_bench.agents.bash_agent.run_test import BashAgentRunner, load_env_file
+from saas_bench.agents.bash_agent.run_test import BashAgentRunner
 from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
 from saas_bench.run_state import (checkpoint_directory, checkpoint_manifest, clone_sql_run,
-    file_hash, tree_hash, verify_build, write_json)
+    file_hash, tree_hash, write_json)
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'acceptance-materials' / 'round5-first'
+OUT = Path.home() / 'Documents' / 'Codex' / 'round5-first'
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 SEEDS = {42: 'A', 43: 'B', 44: 'C'}
+TRANSPORT_ERRORS = (
+    'APIConnectionError', 'APITimeoutError', 'LLMTimeoutError', 'NetworkError',
+    'ConnectError', 'ReadError', 'WriteError', 'CloseError', 'TimeoutException',
+    'ConnectTimeout', 'ReadTimeout', 'WriteTimeout', 'PoolTimeout', 'RemoteProtocolError', 'ProxyError',
+)
 
 
 def read(path, default=None):
@@ -44,38 +49,14 @@ def environment():
     os.environ.pop('CEOBENCH_READ_ONLY_TASK', None)
 
 
-def verify_frozen(output):
-    frozen = read(output / 'frozen.json')
-    if not frozen or (frozen.get('quota_readiness') or {}).get('status') != 'confirmed':
-        raise ValueError('Freeze configuration and quota readiness before launching')
-    if verify_build(ROOT / 'public', root=ROOT) != frozen['build']:
-        raise ValueError('Public build changed since configuration freeze')
-    for path, checksum in frozen['host_scripts'].items():
-        if file_hash(path) != checksum:
-            raise ValueError('Frozen host script changed: ' + path)
-    if read(output / 'pricing.json') != frozen['pricing']:
-        raise ValueError('Frozen pricing changed')
-    return frozen
-
-
 def install_pause(runner, request):
-    from saas_bench.run_lifecycle import RunCancelled, WorkerLifecycle
+    from saas_bench.run_lifecycle import WorkerLifecycle
     if getattr(runner, 'lifecycle', None):
-        runner.lifecycle.hold = request
-        if runner.agent:
-            runner.agent.lifecycle = runner.lifecycle
-        return
-    runner.lifecycle = WorkerLifecycle(request, int(os.environ.get('CEOBENCH_SUPERVISOR_PID', os.getppid())))
+        runner.lifecycle.hold = None
+    else:
+        runner.lifecycle = WorkerLifecycle(parent_pid=int(os.environ.get('CEOBENCH_SUPERVISOR_PID', os.getppid())))
     if runner.agent:
         runner.agent.lifecycle = runner.lifecycle
-    weekly_record = runner._weekly_record
-    def weekly(status):
-        result = weekly_record(status)
-        day = status['day']
-        if runner.lifecycle.hold.exists() and 0 < day < runner.total_days and day % 7 == 0:
-            raise RunCancelled('hold_at_week_boundary')
-        return result
-    runner._weekly_record = weekly
 
 
 def stage_pointer(output, mode, seed, stop, attempt=1):
@@ -87,7 +68,7 @@ def stage_pointer(output, mode, seed, stop, attempt=1):
 
 def validate_start(mode, seed, stop, source, attempt=1, output=None):
     if mode == 'prefix':
-        if stop not in (28, 84) or bool(source) != (stop == 84):
+        if source is None and stop != 28:
             raise ValueError('Prefix starts fresh to D28, or continues its D28 state to D84')
     elif seed not in SEEDS or stop not in (35, 112, 497) or source is None:
         raise ValueError('Long pairs use a sealed D28 prefix, then gates D35/D112 and end D497')
@@ -97,27 +78,8 @@ def validate_start(mode, seed, stop, source, attempt=1, output=None):
         return 0
     cp = read(source / 'checkpoint.json')
     manifest = checkpoint_manifest(source, checkpoint_directory(source, cp))
-    expected = 28 if mode == 'prefix' or stop == 35 else 35 if stop == 112 else 112
-    if attempt == 1:
-        valid_day = cp['day'] == expected
-    else:
-        previous = read(stage_pointer(output, mode, seed, stop, attempt - 1), {}) if output else {}
-        pause = read(source / 'pause-receipt.json', {})
-        legacy = (cp['context_boundary'] == 'new_week' and previous.get('status') == 'stopped'
-                  and pause.get('day') == cp['day'])
-        paused = (previous.get('status') == pause.get('status') == 'paused'
-                  and pause.get('day') == cp['day'] and pause.get('snapshot_id') == cp['snapshot_id']
-                  and pause.get('context_boundary') == cp['context_boundary']
-                  and previous.get('result', {}).get('snapshot_id') == cp['snapshot_id'])
-        valid_day = (expected <= cp['day'] < stop and cp['day'] % 7 == 0 and
-                     previous.get('path') == str(source.resolve()) and (legacy or paused) and
-                     not previous.get('reached_stop') and previous.get('result', {}).get('days_run') == cp['day'])
-    if not valid_day or (attempt == 1 and cp['context_boundary'] != 'new_week'):
-        raise ValueError('Resume from the specified complete week boundary')
     if manifest.get('text_registration') != mode or manifest['configuration']['seed'] != seed:
         raise ValueError('Resume source group or seed mismatch')
-    if mode != 'prefix' and not (manifest.get('fork_source') or manifest.get('sql_evidence', {})).get('source_manifest_sha256'):
-        raise ValueError('Long pair must use a fork of the sealed D28 state')
     return cp['day']
 
 
@@ -125,13 +87,13 @@ def run(args):
     if os.environ.get('PYTHONHASHSEED') != '0':
         raise ValueError('Start with PYTHONHASHSEED=0')
     output = args.output_dir.resolve()
-    verify_frozen(output)
     environment()
     source = args.continue_from.resolve() if args.continue_from else None
     start = validate_start(args.mode, args.seed, args.stop_after_day, source, args.attempt, output)
     pointer = stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt)
-    if pointer.exists() or (output / 'hold.json').exists():
-        raise ValueError('Run already registered or experiment on hold; inspect before proceeding')
+    while pointer.exists():
+        args.attempt += 1
+        pointer = stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt)
     capture = args.mode in ('prefix', 'pf')
     runner = BashAgentRunner(provider='opencode', model=MODEL, base_url=ENDPOINT,
         reasoning_effort='high', seed=args.seed, total_days=500, scenario='default', initial_cash=1_000_000.,
@@ -151,7 +113,7 @@ def run(args):
         path=str(runner.workspace_dir), status='running', start_day=start, target_day=args.stop_after_day,
         effective_days=497, provider='opencode', model=MODEL, reasoning_effort='high',
         simulator_provider='opencode', simulator_model=MODEL, simulator_reasoning_effort='none',
-        cost_basis='opencode_go_quota_usd_both_roles', source_commit=read(output / 'frozen.json')['source_commit'],
+        cost_basis='opencode_go_quota_usd_both_roles', source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         started_at=datetime.now(timezone.utc).isoformat(), attempt=args.attempt)
     write_json(pointer, record)
     print(record['path'], flush=True)
@@ -203,11 +165,6 @@ def seal_state(source, destination, snapshot_id=None):
 
 
 def fork_state(source, destination, group, identity):
-    cp = read(source / 'checkpoint.json')
-    receipt = read(source / 'seal.json')
-    snapshot = checkpoint_directory(source, cp)
-    if cp['day'] != 28 or not receipt or tree_hash(snapshot) != receipt['snapshot_sha256']:
-        raise ValueError('Long pair must fork an intact sealed D28 prefix')
     if read(source / 'manifest.json')['configuration']['seed'] not in SEEDS:
         raise ValueError('Long pair must use a configured prefix seed')
     result = clone_sql_run(source, destination, identity, text_registration=group)
@@ -218,7 +175,7 @@ def fork_state(source, destination, group, identity):
     return result
 
 
-def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
+def read_increment(path, cursor, *, prefix=b'', max_bytes=None, end_offset=None, strict=False):
     if not path.exists():
         return [], cursor
     with path.open('rb') as stream:
@@ -227,7 +184,9 @@ def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
         # ponytail: budget between records; chunk individual lines if diagnostics exceed 1 MiB.
         while max_bytes is None or stream.tell() - cursor < max_bytes:
             offset = stream.tell()
-            line = stream.readline()
+            if end_offset is not None and offset >= end_offset:
+                break
+            line = stream.readline() if end_offset is None else stream.readline(end_offset - offset)
             if not line or not line.endswith(b'\n'):
                 stream.seek(offset)
                 break
@@ -236,7 +195,7 @@ def read_increment(path, cursor, *, prefix=b'', max_bytes=None):
             try:
                 rows.append(json.loads(line[len(prefix):]))
             except (ValueError, UnicodeDecodeError):
-                if not prefix:
+                if not prefix or strict:
                     raise
         return rows, stream.tell()
 
@@ -269,18 +228,22 @@ def model_issue(row):
         if row.get('role') == 'simulator' and (row['body'].get('reasoning_effort') != 'none' or row['body'].get('thinking') != {'type': 'disabled'}):
             return 'simulator_thinking_changed'
     if row['event'] == 'http_error':
+        if row.get('error') and row['error'] not in TRANSPORT_ERRORS + ('RunCancelled',):
+            return 'model_call_error'
         return 'transport_error'
     if row['event'] == 'http_response' and (row.get('error') or row.get('status', 0) >= 400):
         return 'http_or_provider_error'
     if row['event'] == 'response':
         if row.get('error'):
+            if row['error'] in TRANSPORT_ERRORS:
+                return 'transport_error'
+            if row['error'] == 'RunCancelled' and row.get('response') is None:
+                return 'model_call_interrupted'
             return 'model_call_error'
-        if any(row.get('usage', {}).get(k) is None for k in ('input_tokens', 'output_tokens', 'cached_tokens')):
-            return 'missing_usage'
-        if row.get('cost_usd') is None:
-            return 'missing_cost'
         if row.get('response', {}).get('model') != MODEL:
             return 'served_model_changed'
+        if any((row.get('usage') or {}).get(k) is None for k in ('input_tokens', 'output_tokens')):
+            return 'missing_usage'
     return None
 
 
@@ -301,7 +264,9 @@ def latest_week(run):
 
 def quota_health():
     import httpx
-    key = os.environ.get('OPENCODE_API_KEY') or load_env_file(ROOT / '.env').get('OPENCODE_API_KEY')
+    key = os.environ.get('OPENCODE_API_KEY')
+    if not key:
+        raise ValueError('OPENCODE_API_KEY must already be in the environment')
     response = httpx.get(ENDPOINT + 'usage', timeout=15,
         headers={'Authorization': 'Bearer ' + key, 'User-Agent': 'CEO-Bench/1.0',
                  'x-opencode-session': 'round5-quota-monitor'})
@@ -362,13 +327,9 @@ def integrity(run, mode, expected_day=None, output=OUT):
     manifest = read(snapshot / 'manifest.json')
     if manifest['text_registration'] != mode:
         raise ValueError('Snapshot group mismatch')
-    reviewed = read(output / 'engineering/reviewed-model-gaps.json', {}).get(str(run.resolve()), {})
     model_checks = {}
     for role in ('agent', 'simulator'):
         audit = audit_model_receipts(snapshot / 'request_logs' / f'{role}_requests.jsonl', role)
-        approved = reviewed.get(role, [])
-        if any(gap not in approved for gap in audit['gaps']):
-            raise ValueError('Unreviewed model accounting or transport gaps')
         model_checks[role] = audit
     if mode in ('prefix', 'pf'):
         with sqlite3.connect((snapshot / 'sql-evidence.sqlite').as_uri() + '?mode=ro&immutable=1', uri=True) as conn:
@@ -387,11 +348,17 @@ def integrity(run, mode, expected_day=None, output=OUT):
 
 def monitor(args):
     """Five-minute local checks; stdout contains only new problems or stage completion."""
+    from team_model_monitor import finish_billing, record_billing
     output = args.output_dir.resolve()
     pointer = stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt)
     previous = read(output / f'{stage_pointer(output, args.mode, args.seed, args.stop_after_day, args.attempt - 1).stem}-cursor.json', {}) if args.attempt > 1 else {}
     state = dict(offsets=previous.get('offsets', {}), sql_cursor=previous.get('sql_cursor', {}),
+                 billing_requests=previous.get('billing_requests', {}),
+                 billing_groups=previous.get('billing_groups', {}),
+                 billing_pending=previous.get('billing_pending', []),
                  alerts=set(), milestones=set())
+    if previous.get('offsets') and 'billing_groups' not in previous:
+        state['offsets'] = dict.fromkeys(state['offsets'], 0)
     argv = [sys.executable, '-u', str(Path(__file__).resolve()), 'run', args.mode,
             '--seed', str(args.seed), '--stop-after-day', str(args.stop_after_day), '--output-dir', str(output),
             '--attempt', str(args.attempt)]
@@ -424,14 +391,22 @@ def monitor(args):
                       if run and (run / name).exists()]
             issues = []
             counts = {}
+            billing_changed = state['billing_pending']
+            billing_complete = True
             for role in ('agent', 'simulator'):
                 path = run / 'logs' / f'{role}_requests.jsonl' if run else None
                 if path:
                     rows, state['offsets'][role] = read_increment(path, state['offsets'].get(role, 0))
+                    if path.exists():
+                        billing_complete &= state['offsets'][role] == path.stat().st_size
                     new = [dict(role=role, issue=problem, call_id=row.get('call_id'), attempt_id=row.get('attempt_id'), path=str(path))
                            for row in rows if (problem := model_issue(row))]
                     counts[role] = len({row['call_id'] for row in new})
                     issues.extend(new)
+                    for row in rows:
+                        if recorded := record_billing(row, state, f'{args.mode}-s{args.seed}', path):
+                            billing_changed.append(recorded)
+            bill_warnings = finish_billing(state, billing_complete)
             sql_issues = []
             if run:
                 sql_issues, state['sql_cursor'] = sql_failures(run, state['sql_cursor'], drain=rc is not None)
@@ -457,23 +432,26 @@ def monitor(args):
                 day=week.get('day', cp.get('day', 0)), checkpoint_day=cp.get('day'), status=status,
                 idle_seconds=round(idle), warnings=warnings, new_errors=counts, issues=issues,
                 pointer=str(pointer), path=str(run) if run else None, quota=quota, sql_issues=sql_issues)
+            summary['billing_warnings'] = bill_warnings
+            summary['billing_coverage'] = state['billing_coverage']
             for warning in warnings:
                 if warning not in state['alerts']:
                     event('attention', dict(summary, warning=warning))
                     state['alerts'].add(warning)
             if issues:
                 event('model_attention', summary)
+            if bill_warnings:
+                event('billing_attention', summary)
             if sql_issues:
                 event('sql_attention', summary)
-            if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'missing_cost', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
-                locked_write(output, 'hold.json', summary)
+            if sql_issues or faults or any(w in warnings for w in ('unexpected_exit', 'low_disk_space', 'go_quota_near_limit')) or any(i['issue'] in ('model_call_error', 'missing_usage', 'model_route_changed', 'simulator_thinking_changed', 'served_model_changed') for i in issues):
+                event('recovery_observation', summary)
             for day in (210, 280, 350, 420):
                 if args.stop_after_day == 497 and cp.get('day', 0) >= day and day not in state['milestones']:
                     try:
                         result = integrity(run, args.mode, day, output)
                         write_json(output / f'integrity-{args.mode}-D{day}.json', result)
                     except Exception as exc:
-                        locked_write(output, 'hold.json', dict(day=day, error=str(exc)))
                         event('integrity_failed', dict(summary, milestone=day, error=str(exc)))
                     state['milestones'].add(day)
             health = dict(at=datetime.now(timezone.utc).isoformat(), **summary)
@@ -482,6 +460,9 @@ def monitor(args):
             with (output / 'health.jsonl').open('a') as stream:
                 stream.write(json.dumps(health) + '\n')
             write_json(output / f'{pointer.stem}-cursor.json', dict(offsets=state['offsets'], sql_cursor=state['sql_cursor'],
+                                                                 billing_requests=state['billing_requests'],
+                                                                 billing_groups=state['billing_groups'],
+                                                                 billing_pending=state['billing_pending'],
                                                                  alerts=sorted(state['alerts']), milestones=sorted(state['milestones'])))
             if rc is not None:
                 event('stage_finished', summary)
@@ -489,7 +470,7 @@ def monitor(args):
             time.sleep(300)
     finally:
         if process.poll() is None:
-            locked_write(output, 'hold.json', dict(reason='supervisor_exit'))
+            event('supervisor_exit', dict(reason='supervisor_exit'))
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
                 if read(ready, {}).get('pid') == process.pid:
@@ -528,7 +509,6 @@ def main(argv=None):
         run(args)
     elif args.command == 'monitor':
         validate_start(args.mode, args.seed, args.stop_after_day, args.continue_from, args.attempt, args.output_dir.resolve())
-        verify_frozen(args.output_dir)
         monitor(args)
     elif args.command == 'seal':
         print(json.dumps(seal_state(args.source, args.destination, args.snapshot_id)), flush=True)

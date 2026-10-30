@@ -1,26 +1,82 @@
 """Private SDK call and HTTP attempt receipts; unknown usage stays unknown."""
 
 from contextvars import ContextVar
+import copy
 from datetime import datetime, timezone
 import base64
+import errno
 import functools
 import json
+import logging
 import math
 import os
+import socket
+import ssl
 from pathlib import Path
 import threading
+import time
 import uuid
+import weakref
 
 import httpx
 
+from .run_lifecycle import RunCancelled, WorkerLifecycle
+from .runtime_options import nonnegative_integer, nonnegative_number, runtime_value
+
 
 _CALL = ContextVar('model_call', default=None)
+_ATTEMPT = ContextVar('model_request_attempt', default=None)
+MODEL_REQUEST_ATTEMPTS = 5
+MODEL_RETRY_DELAYS = (10, 20, 40, 80)
+MODEL_ATTEMPT_SECONDS = 600
+_DEFAULT = object()
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
 
 
+def check_model_call():
+    if current := _CALL.get():
+        current[0]._check_deadline()
+
+
+def exception_details(exc):
+    details, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        details.append(type(exc).__name__ + ': ' + str(exc))
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return '; '.join(details)
+
+
+def is_network_error(exc):
+    from openai import APIConnectionError as OpenAIConnectionError
+    from anthropic import APIConnectionError as AnthropicConnectionError
+    chain, seen = [], set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    for error in chain:
+        status = getattr(error, 'status_code', 0) or (
+            error.response.status_code if isinstance(error, httpx.HTTPStatusError) else 0)
+        if status:
+            return status in (408, 409, 429) or 500 <= status < 600
+    if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol,
+                             httpx.PoolTimeout)) for error in chain):
+        return False
+    network_errno = {errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+                     errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}
+    return any(isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException,
+                                  ssl.SSLError, socket.gaierror, ConnectionError, TimeoutError)) or
+               isinstance(error, OSError) and error.errno in network_errno for error in chain) or (
+        len(chain) == 1 and isinstance(exc, (OpenAIConnectionError, AnthropicConnectionError)))
+
+
 def plain(value):
+    if isinstance(value, httpx.Timeout):
+        return value.as_dict()
     if hasattr(value, 'model_dump'):
         value = value.model_dump(mode='json', exclude_unset=True)
     if isinstance(value, dict):
@@ -71,11 +127,31 @@ def usage_values(response, api):
 
 def usage_delta(previous, current):
     """Known subtotals and missing counts for calls made since a summary snapshot."""
+    previous, current = physical_usage_summary(previous), physical_usage_summary(current)
     calls = current['calls'] - previous['calls']
     missing = {field: current['missing'][field] - previous['missing'][field] for field in FIELDS}
     known = {field: None if calls and missing[field] == calls else
              (current['known'][field] or 0) - (previous['known'][field] or 0) for field in FIELDS}
     return dict(calls=calls, known=known, missing=missing)
+
+
+def physical_usage_summary(summary):
+    """Include every failed HTTP retry, retaining reported or unknown usage."""
+    result = copy.deepcopy(summary)
+    if 'retry_usage' in result:
+        merge_usage_totals(result, result['retry_usage'])
+        return result
+    retries = result.get('retried_http_attempts', 0)
+    for field in ('calls', 'errors', 'missing_cost'):
+        result[field] += retries
+    for field in FIELDS:
+        result['missing'][field] += retries
+    if 'costs' in result:
+        for field in ('unknown_calls', 'missing_field_calls'):
+            result['costs'][field] += retries
+        for field in result['costs']['missing_fields']:
+            result['costs']['missing_fields'][field] += retries
+    return result
 
 
 def summarize_usage_log(path, start_day=0, end_day=None):
@@ -85,19 +161,22 @@ def summarize_usage_log(path, start_day=0, end_day=None):
     Missing usage remains separate from the known subtotals.
     """
     summary = dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
-                   known_cost_usd=None, missing_cost=0, unreturned_requests=0)
-    pending = set()
+                   known_cost_usd=None, missing_cost=0, unreturned_requests=0, costs=billing_totals())
+    pending = {}
     with Path(path).open() as stream:
         for line in stream:
             row = json.loads(line)
             call_id = row.get('call_id')
             if row['event'] == 'request':
                 if row['day'] >= start_day and (end_day is None or row['day'] < end_day):
-                    pending.add(call_id)
+                    pending[call_id] = row.get('timestamp')
             elif row['event'] == 'response' and call_id in pending:
-                pending.remove(call_id)
+                timestamp = pending.pop(call_id)
                 summary['calls'] += 1
                 summary['errors'] += row.get('error') is not None
+                summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + row.get('retried_http_attempts', 0)
+                if 'retry_usage' in row:
+                    merge_usage_totals(summary.setdefault('retry_usage', empty_usage_totals()), row['retry_usage'])
                 usage = row.get('usage') or {}
                 for field in FIELDS:
                     value = usage.get(field)
@@ -110,8 +189,10 @@ def summarize_usage_log(path, start_day=0, end_day=None):
                     summary['missing_cost'] += 1
                 else:
                     summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+                add_billing(summary['costs'], billing_assessment(usage, row.get('api'), row.get('pricing'),
+                    at=datetime.fromisoformat(timestamp) if timestamp else None, recorded_cost=cost))
     summary['unreturned_requests'] = len(pending)
-    return summary
+    return physical_usage_summary(summary)
 
 
 def load_pricing(path):
@@ -162,9 +243,97 @@ def cost_usd(usage, api, rates, at=None):
     return multiplier * sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
 
 
+def billing_assessment(usage, api, rates, *, at=None, recorded_cost=None):
+    """Frozen uniform fees; raw billing fields remain unchanged."""
+    usage = {field: usage.get(field) for field in FIELDS}
+    complete = all(usage[field] is not None for field in ('input_tokens', 'output_tokens'))
+    missing = ([field for field in ('cached_tokens', 'cache_creation_tokens') if usage[field] is None] +
+               (['cost_usd'] if recorded_cost is None else [])) if complete else []
+    result = dict(kind='unknown', usd=None, lower_usd=None, upper_usd=None, missing_fields=missing)
+    timed = rates and any(key in rates for key in ('valid_from', 'valid_until', 'peak_schedule'))
+    if not complete or not rates or api not in ('chat', 'responses', 'messages') or timed and at is None:
+        return result
+    at = at or datetime.min.replace(tzinfo=timezone.utc)
+    if at.tzinfo is None:
+        raise ValueError('Receipt timestamp requires a timezone')
+    uncertain_read = usage['cached_tokens'] is None
+    uncertain_write = api == 'messages' and usage['cache_creation_tokens'] is None
+    if not uncertain_read and not uncertain_write:
+        fee = cost_usd(usage, api, rates, at=at)
+        if fee is not None:
+            result.update(kind='exact' if recorded_cost is not None else 'recomputed', usd=fee)
+        return result
+    read = usage['cached_tokens']
+    write = usage['cache_creation_tokens'] if api == 'messages' else 0
+    if uncertain_read and uncertain_write:
+        endpoints = [(0, 0), (usage['input_tokens'], 0), (0, usage['input_tokens'])]
+    elif uncertain_read:
+        endpoints = [(0, write), (usage['input_tokens'] - write, write)]
+    else:
+        endpoints = [(read, 0), (read, usage['input_tokens'] - read)]
+    amounts = [cost_usd(dict(usage, cached_tokens=cached, cache_creation_tokens=created), api, rates, at=at)
+               for cached, created in endpoints]
+    if all(amount is not None for amount in amounts):
+        result.update(kind='interval', lower_usd=min(amounts), upper_usd=max(amounts))
+    return result
+
+
+def billing_totals():
+    return dict(exact=dict(calls=0, subtotal_usd=None), recomputed=dict(calls=0, subtotal_usd=None),
+                interval=dict(calls=0, lower_usd=None, upper_usd=None), unknown_calls=0,
+                missing_field_calls=0, unclassified_prior_calls=0,
+                missing_fields=dict.fromkeys(('cached_tokens', 'cache_creation_tokens', 'cost_usd'), 0))
+
+
+def add_billing(totals, cost):
+    totals['missing_field_calls'] += bool(cost['missing_fields'])
+    for field in cost['missing_fields']:
+        totals['missing_fields'][field] += 1
+    if cost['kind'] == 'unknown':
+        totals['unknown_calls'] += 1
+        return
+    category = totals[cost['kind']]
+    category['calls'] += 1
+    if cost['kind'] == 'interval':
+        for field in ('lower_usd', 'upper_usd'):
+            category[field] = (category[field] or 0) + cost[field]
+    else:
+        category['subtotal_usd'] = (category['subtotal_usd'] or 0) + cost['usd']
+
+
+def empty_usage_totals():
+    return dict(calls=0, errors=0, known=dict.fromkeys(FIELDS), missing=dict.fromkeys(FIELDS, 0),
+                known_cost_usd=None, missing_cost=0, costs=billing_totals())
+
+
+def merge_usage_totals(target, source):
+    for field, value in source.items():
+        if isinstance(value, dict):
+            merge_usage_totals(target[field], value)
+        elif value is not None:
+            target[field] = (target[field] or 0) + value
+
+
+def add_usage(total, usage, cost, billing, *, failed):
+    totals = total.setdefault('costs', dict(billing_totals(), unclassified_prior_calls=total['calls']))
+    total['calls'] += 1
+    total['errors'] += failed
+    for field, value in usage.items():
+        if value is None:
+            total['missing'][field] += 1
+        else:
+            total['known'][field] = (total['known'][field] or 0) + value
+    if cost is None:
+        total['missing_cost'] += 1
+    else:
+        total['known_cost_usd'] = (total['known_cost_usd'] or 0) + cost
+    add_billing(totals, billing)
+
+
 class _Stream(httpx.SyncByteStream):
-    def __init__(self, source, finish, require_done=False):
+    def __init__(self, source, finish, require_done=False, check=lambda: None):
         self.source, self.finish = source, finish
+        self.check = check
         self.chunks = []
         self.finished = False
         self.require_done = require_done
@@ -178,6 +347,9 @@ class _Stream(httpx.SyncByteStream):
         try:
             for chunk in self.source:
                 self.chunks.append(chunk)
+                if chunk and (attempt := _ATTEMPT.get()):
+                    attempt.reply_started()
+                self.check()
                 yield chunk
         except BaseException as exc:
             self._finish(type(exc).__name__)
@@ -185,7 +357,7 @@ class _Stream(httpx.SyncByteStream):
         else:
             if self.require_done and b'data: [DONE]' not in b''.join(self.chunks).splitlines():
                 self._finish('stream_closed_before_completion')
-                raise httpx.ReadError('Chat completion stream ended before [DONE]')
+                raise httpx.RemoteProtocolError('Chat completion stream ended before [DONE]')
             self._finish()
 
     def close(self):
@@ -197,24 +369,88 @@ class _Stream(httpx.SyncByteStream):
             self._finish(None if completed else 'stream_closed_before_completion')
 
 
+class _ModelAttempt(WorkerLifecycle):
+    def __init__(self, lifecycle, deadline, timeout_seconds):
+        super().__init__()
+        self.lifecycle, self.deadline = lifecycle, deadline
+        self.timeout_seconds = timeout_seconds
+        self.received_reply = False
+        self.timer = None
+
+    def watch_socket(self, channel):
+        for owner in (self.lifecycle, self):
+            with owner._socket_lock:
+                owner._sockets.add(channel)
+                if owner.reason:
+                    try:
+                        channel.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        self.check()
+
+    def reply_started(self):
+        with self._socket_lock:
+            self.check()
+            self.received_reply = True
+            if self.timer:
+                self.timer.cancel()
+
+    def expire(self):
+        with self._socket_lock:
+            if not self.received_reply:
+                self.cancel('model_attempt_timeout')
+
+    def check(self, *, retry=False):
+        self.lifecycle.check(retry=retry)
+        if self.reason or (self.deadline is not None and not self.received_reply
+                           and time.monotonic() >= self.deadline):
+            self.expire()
+            raise TimeoutError(f'Model request received no response bytes within {self.timeout_seconds:g} seconds')
+
+
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None, identity=None, expected_model=None,
+                 *, model_request_attempts=_DEFAULT, model_retry_delays=None, model_attempt_seconds=_DEFAULT):
+        self.model_request_attempts = (runtime_value('model_request_attempts', MODEL_REQUEST_ATTEMPTS)
+            if model_request_attempts is _DEFAULT else nonnegative_integer(model_request_attempts))
+        self.model_attempt_seconds = (runtime_value('model_attempt_seconds', MODEL_ATTEMPT_SECONDS)
+            if model_attempt_seconds is _DEFAULT else nonnegative_number(model_attempt_seconds))
+        delays = model_retry_delays if model_retry_delays is not None else runtime_value(
+            'model_retry_delays', ','.join(map(str, MODEL_RETRY_DELAYS)))
+        self.model_retry_delays = tuple(nonnegative_number(value) for value in (
+            delays.split(',') if isinstance(delays, str) else delays))
+        if not self.model_retry_delays:
+            raise ValueError('Model retry intervals must contain at least one delay')
+        self.identity = identity
+        self.expected_model = expected_model
+        self.message_ids = []
+        self.world_state = lambda: None
+        self.request_check = lambda: None
+        self.call_world_state = None
         self.evidence_store = evidence_store
         self.token_counter = token_counter
         self.source_records = []
-        self.context_id = uuid.uuid4().hex if evidence_store else None
+        self.weekly_check = None
+        self.context_id = uuid.uuid4().hex if evidence_store or identity else None
         self.last_request_event = None
         self.path = Path(path) if path else None
         self.role = role
         self.pricing = pricing or {}
         self.lock = threading.RLock()
+        self.call_lock = threading.RLock()
+        self.lifecycle = WorkerLifecycle()
+        self._clients = []
         self.summary = {'calls': 0, 'errors': 0, 'known': {k: None for k in FIELDS},
                         'missing': {k: 0 for k in FIELDS}, 'known_cost_usd': None, 'missing_cost': 0,
+                        'costs': billing_totals(),
                         'http_attempts': 0, 'failed_http_attempts': 0, 'failed_attempts_without_usage': 0}
 
     def write(self, event, **values):
         if self.path:
             entry = dict(event=event, role=self.role, timestamp=datetime.now(timezone.utc).isoformat(), **values)
+            if self.identity:
+                entry.update(self.identity.fields(), context_id=self.context_id, message_ids=list(self.message_ids),
+                             world_state_id=self.call_world_state)
             with self.lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open('a') as stream:
@@ -227,13 +463,27 @@ class ModelUsage:
         http_client = getattr(client, '_client', None)
         if not isinstance(http_client, httpx.Client):
             return client
+        if client not in self._clients:
+            self._clients.append(client)
         if getattr(http_client, '_ceobench_recorded', False):
             return client
         send = http_client.send
+        http_client._ceobench_model_sockets = weakref.WeakSet()
 
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
-            recorder, call_id = _CALL.get() or (self, None)
+            current = _CALL.get()
+            recorder, call_id = current[:2] if current else (self, None)
+            http_state = current[2] if current else None
+            recorder._check_deadline()
+            recorder.request_check()
+            timeouts = dict(request.extensions.get('timeout', {}))
+            if not recorder.model_attempt_seconds:
+                timeouts['read'] = None
+                request.extensions['timeout'] = timeouts
+            elif timeouts.get('read') is not None and timeouts['read'] < recorder.model_attempt_seconds:
+                timeouts['read'] = recorder.model_attempt_seconds
+                request.extensions['timeout'] = timeouts
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
             with recorder.lock:
@@ -243,26 +493,48 @@ class ModelUsage:
             capture_done = False
             if recorder.evidence_store:
                 from .execution_capture import model_request
+                from .run_lifecycle import RunCancelled
+                from .sql_evidence import EvidencePending
                 # Required evidence is durable before sending a model request.
                 try:
                     capture_event = model_request(recorder.evidence_store, raw_body, recorder.source_records,
-                                                  call_id, attempt_id, recorder.context_id)
+                                                  call_id, attempt_id, recorder.context_id, recorder.message_ids)
+                except EvidencePending as exc:
+                    raise RunCancelled('sql_evidence_pending') from exc
                 except Exception as exc:
                     recorder.evidence_store.fail(exc)
-                    raise
+                    raise RunCancelled('run_evidence_fault', exception_details(exc)) from exc
             body = raw_body.decode('utf-8')
             try:
                 body = json.loads(body)
             except ValueError:
                 pass
+            weekly = recorder.weekly_check
+            included = bool(weekly and weekly['summary'] and isinstance(body, dict) and any(
+                isinstance(message, dict) and isinstance(message.get('content'), str) and
+                weekly['summary'] in message['content'] for message in body.get('messages', [])))
+
+            def weekly_delivery(state):
+                if weekly is None:
+                    return {}
+                return dict(weekly_check=dict(weekly['receipt'], delivery_state=(
+                    state if included else 'not_in_request') if weekly['summary'] else 'not_applicable'))
+
             recorder.write('http_request', call_id=call_id, attempt_id=attempt_id,
                        method=request.method, endpoint=str(request.url.copy_with(query=None, username='', password='')),
                        client_headers={k: request.headers[k] for k in ('user-agent', 'x-opencode-session') if k in request.headers},
-                       sdk_retry=request.headers.get('x-stainless-retry-count'), body=body)
+                       sdk_retry=request.headers.get('x-stainless-retry-count'), body=body,
+                       **weekly_delivery('send_attempted'))
             try:
                 # Read through our stream wrapper, so interrupted SSE bodies are retained too.
                 streaming = kwargs.get('stream', False)
                 response = send(request, *args, **dict(kwargs, stream=True))
+                network_stream = response.extensions.get('network_stream')
+                channel = network_stream.get_extra_info('socket') if network_stream else None
+                if channel is not None:
+                    http_client._ceobench_model_sockets.add(channel)
+                    if attempt := _ATTEMPT.get():
+                        attempt.watch_socket(channel)
                 def finish(content, error):
                     nonlocal failure_recorded, capture_done
                     try:
@@ -284,6 +556,8 @@ class ModelUsage:
                     except UnicodeDecodeError:
                         body = {'base64': base64.b64encode(content).decode('ascii')}
                     if response.status_code >= 400 or error:
+                        if http_state is not None:
+                            http_state['failed_response'] = reported
                         with recorder.lock:
                             recorder.summary['failed_http_attempts'] += 1
                             recorder.summary['failed_attempts_without_usage'] += not bool(
@@ -291,13 +565,16 @@ class ModelUsage:
                         failure_recorded = True
                     recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
-                               body=body, error=error)
+                               body=body, error=error, **weekly_delivery('response_received'))
                 if response.is_stream_consumed:
+                    if response.content and (attempt := _ATTEMPT.get()):
+                        attempt.reply_started()
                     finish(response.content, None)
                 else:
                     require_done = (streaming and request.url.path.endswith('/chat/completions')
                                     and response.headers.get('content-type', '').startswith('text/event-stream'))
-                    response.stream = _Stream(response.stream, finish, require_done=require_done)
+                    response.stream = _Stream(response.stream, finish, require_done=require_done,
+                                              check=recorder._check_deadline)
                     if not streaming:
                         response.read()
                 return response
@@ -311,7 +588,8 @@ class ModelUsage:
                     with recorder.lock:
                         recorder.summary['failed_http_attempts'] += 1
                         recorder.summary['failed_attempts_without_usage'] += 1
-                recorder.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__)
+                recorder.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__,
+                               **weekly_delivery('send_unknown'))
                 raise
 
         http_client.send = recorded_send
@@ -319,7 +597,63 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        acquired = False
+        policies = []
+        try:
+            while not acquired:
+                self.lifecycle.check()
+                acquired = self.call_lock.acquire(timeout=.1)
+            self._check_deadline()
+            for client in self._clients:
+                policies.append((client, client.max_retries))
+                client.max_retries = 0
+                self.lifecycle.watch_client(client)
+            with self.lifecycle.model_call():
+                return self._call(api, request, invoke, **context)
+        except Exception as exc:
+            raise RunCancelled('model_request_failed', exception_details(exc)) from exc
+        finally:
+            for client, retries in policies:
+                client.max_retries = retries
+            if acquired:
+                self.call_lock.release()
+
+    def _check_deadline(self):
+        self.lifecycle.check()
+        if attempt := _ATTEMPT.get():
+            attempt.check()
+
+    def _invoke_attempt(self, invoke):
+        remaining = self.model_attempt_seconds
+        attempt = _ModelAttempt(self.lifecycle, time.monotonic() + remaining if remaining else None, remaining)
+        token = _ATTEMPT.set(attempt)
+        timer = threading.Timer(remaining, attempt.expire) if remaining else None
+        attempt.timer = timer
+        if timer:
+            timer.daemon = True
+        previous = getattr(self.lifecycle._model, 'attempt', None)
+        self.lifecycle._model.attempt = attempt
+        try:
+            for client in self._clients:
+                http = client._client
+                for channel in list(http._ceobench_model_sockets):
+                    attempt.watch_socket(channel)
+            if timer:
+                timer.start()
+            with attempt.model_call():
+                return invoke()
+        finally:
+            if timer:
+                timer.cancel()
+                if timer.ident is not None:
+                    timer.join(timeout=1)
+            self.lifecycle._model.attempt = previous
+            _ATTEMPT.reset(token)
+
+    def _call(self, api, request, invoke, **context):
+        self.request_check()
         self.last_request_event = None
+        self.call_world_state = self.world_state()
         replacements = []
         if self.evidence_store:
             from .execution_capture import text_sources
@@ -332,38 +666,75 @@ class ModelUsage:
             self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
-        token = _CALL.set((self, call_id))
-        response, error = None, None
-        self.write('request', call_id=call_id, api=api, request=request, **context)
+        http_state = dict(failed_response=None)
+        token = _CALL.set((self, call_id, http_state))
+        response, error, model_attempts, last_model_error = None, None, 0, None
+        retried_http_attempts = pending_retry_http_attempts = 0
+        retry_usage, pending_retry_usage = empty_usage_totals(), None
+        retry_policy = dict(attempts=self.model_request_attempts, delays=self.model_retry_delays,
+                            first_byte_seconds=self.model_attempt_seconds)
+        self.write('request', call_id=call_id, api=api, request=request, retry_policy=retry_policy, **context)
         try:
-            response = invoke()
-            if message := response_error(plain(response), api):
-                raise ValueError(message)
-            return response
+            while not self.model_request_attempts or model_attempts < self.model_request_attempts:
+                self._check_deadline()
+                model_attempts += 1
+                retried_http_attempts += pending_retry_http_attempts
+                pending_retry_http_attempts = 0
+                if pending_retry_usage is not None:
+                    add_usage(retry_usage, *pending_retry_usage, failed=True)
+                    pending_retry_usage = None
+                response = None
+                http_state['failed_response'] = None
+                failures_before = self.summary['failed_http_attempts']
+                try:
+                    response = self._invoke_attempt(invoke)
+                    self._check_deadline()
+                    raw = plain(response)
+                    if message := response_error(raw, api):
+                        raise ValueError(message)
+                    if self.expected_model is not None and raw.get('model') != self.expected_model:
+                        logging.warning('Returned model differs from frozen configuration')
+                    return response
+                except Exception as exc:
+                    last_model_error = exception_details(exc)
+                    self.lifecycle.check()
+                    if not is_network_error(exc) or model_attempts == self.model_request_attempts:
+                        detail = (f'Model request stopped after {model_attempts} attempts. Last error {last_model_error}. '
+                            'Continue with scripts/team_driver.py --policy <policy.json> --live --resume '
+                            '--week <existing-week>.')
+                        raise RunCancelled('model_request_failed', detail) from exc
+                    pending_retry_http_attempts = self.summary['failed_http_attempts'] - failures_before
+                    if pending_retry_http_attempts:
+                        failed = http_state['failed_response']
+                        failed_usage = usage_values(failed, api)
+                        rates = self.pricing.get(failed.get('model')) if isinstance(failed, dict) else None
+                        failed_cost = cost_usd(failed_usage, api, rates, at=started)
+                        pending_retry_usage = (failed_usage, failed_cost, billing_assessment(
+                            failed_usage, api, rates, at=started, recorded_cost=failed_cost))
+                    delay = self.model_retry_delays[min(model_attempts - 1, len(self.model_retry_delays) - 1)]
+                    self.lifecycle.sleep(delay)
         except BaseException as exc:
             error = type(exc).__name__
             raise
         finally:
             try:
                 raw = plain(response)
-                usage = usage_values(raw, api)
-                served_model = raw.get('model') if isinstance(raw, dict) else None
+                accounting = raw if raw is not None else http_state['failed_response']
+                usage = usage_values(accounting, api)
+                served_model = accounting.get('model') if isinstance(accounting, dict) else None
                 cost = cost_usd(usage, api, self.pricing.get(served_model), at=started)
+                billing = billing_assessment(usage, api, self.pricing.get(served_model),
+                                             at=started, recorded_cost=cost)
                 with self.lock:
                     summary = self.summary
-                    summary['calls'] += 1
-                    summary['errors'] += error is not None
-                    for field, value in usage.items():
-                        if value is None:
-                            summary['missing'][field] += 1
-                        else:
-                            summary['known'][field] = (summary['known'][field] or 0) + value
-                    if cost is None:
-                        summary['missing_cost'] += 1
-                    else:
-                        summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+                    add_usage(summary, usage, cost, billing, failed=error is not None)
+                    summary['retried_http_attempts'] = summary.get('retried_http_attempts', 0) + retried_http_attempts
+                    merge_usage_totals(summary.setdefault('retry_usage', empty_usage_totals()), retry_usage)
                     self.write('response', call_id=call_id, api=api, response=raw, usage=usage,
-                               error=error, cost_usd=cost, pricing=self.pricing.get(served_model))
+                               error=error, cost_usd=cost, pricing=self.pricing.get(served_model),
+                               cost=billing, request_timestamp=started.isoformat(),
+                               model_attempts=model_attempts, last_model_error=last_model_error,
+                               retried_http_attempts=retried_http_attempts, retry_usage=retry_usage)
             finally:
                 _CALL.reset(token)
                 if replacements:

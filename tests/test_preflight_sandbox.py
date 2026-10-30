@@ -73,7 +73,7 @@ def test_sandbox_requires_built_agent_runtime(tmp_path, monkeypatch):
     if sys.platform != 'linux' or not __import__('shutil').which('bwrap'):
         pytest.skip('Linux bubblewrap only')
     monkeypatch.setenv('CEOBENCH_AGENT_RUNTIME', str(tmp_path / 'missing'))
-    with pytest.raises(RuntimeError, match='build_agent_runtime'):
+    with pytest.raises(RuntimeError, match="Bubblewrap startup failed:.*Can't find source path"):
         BashAgentToolExecutor(tmp_path, require_sandbox=True).verify_sandbox()
 
 

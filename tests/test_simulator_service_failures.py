@@ -15,7 +15,7 @@ def unavailable(*args, **kwargs):
 
 
 @pytest.mark.parametrize('kind', ['regular', 'macro', 'judge'])
-def test_live_service_failure_stops_week_and_refuses_continuation(server, kind):
+def test_live_service_failure_holds_week_for_manual_resume(server, kind, caplog):
     customer = SimpleNamespace(generate_social_post=unavailable, complete_text=unavailable)
     sim = Simulator(server.conn, BenchmarkConfig(), default_rng(123), customer_simulator=customer)
     if kind == 'judge':
@@ -30,16 +30,21 @@ def test_live_service_failure_stops_week_and_refuses_continuation(server, kind):
     server.conn.commit()
     sim.step_week = step
     server.simulator = sim
-    with pytest.raises(RuntimeError, match='provider exhausted retries'):
-        server.advance_week()
+    result = server.advance_week()
+    assert result['success'] is False and result['error'] == 'step_week_failed'
+    assert result['day'] == 0 and 'provider exhausted retries' in result['message']
     assert server._operation_failed
     assert server.tools.current_day == 0
     assert server.conn.execute('SELECT count(*) FROM social_media_posts').fetchone()[0] == 0
     if kind == 'judge':
         row = server.conn.execute('SELECT effect_by_group,views FROM agent_social_media_posts WHERE agent_post_id=?', (post,)).fetchone()
         assert row['effect_by_group'] == '{}' and row['views'] == 0
-    with pytest.raises(RuntimeError, match='continuation refused'):
-        server.advance_week()
+    result = server.advance_week()
+    assert result['success'] is False and result['manual_resume_required'] is True
+    assert result['error'] == 'previous_operation_failed' and result['day'] == 0
+    assert 'HOLD for manual checkpoint resume' in caplog.text
+    assert server.tools.current_day == 0
+    assert server.conn.execute('SELECT count(*) FROM social_media_posts').fetchone()[0] == 0
 
 
 def test_explicit_offline_template_mode_still_generates_posts(server):

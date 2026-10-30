@@ -54,6 +54,14 @@ class Compare(Input):
     op: Literal['>', '>=', '<', '<=']
     right: Selector
 
+    @model_validator(mode='before')
+    @classmethod
+    def table_cells(cls, data):
+        if isinstance(data, dict) and any(isinstance(data.get(side), dict) and
+                                         'path' in data[side] for side in ('left', 'right')):
+            raise ValueError('compare requires row/col on both left and right; JSON paths are not supported')
+        return data
+
 
 CITE_FORMS = dict(
     git='a workspace file path (the version this week\'s closing commit week-N will store), path@week-N or '
@@ -61,7 +69,7 @@ CITE_FORMS = dict(
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
        'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
        'or "unknown: <reason>"')
-_RECORD = re.compile(r'r[1-9][0-9]*(\.[1-9][0-9]*)?')
+_RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 _SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')
 _COMMIT = re.compile(r'week-[1-9][0-9]*|[0-9a-fA-F]{1,40}')
 _UNKNOWN = re.compile(r'unknown(?:(?:\s*:|\s)(.*))?', re.I | re.S)
@@ -76,7 +84,7 @@ def parse_cite(cite, pf):
         return dict(unknown=m.group(1).strip())
     if _RECORD.fullmatch(cite):
         return dict(record=cite)
-    if pf and (VERSIONED.fullmatch(cite) or ('/' not in cite and '.' not in cite and _SINGLE.fullmatch(cite))):
+    if pf and (VERSIONED.fullmatch(cite) or ('/' not in cite and '.' not in cite and _SINGLE.fullmatch(cite.split(':')[-1]))):
         return dict(version=cite)
     if '@' in cite:
         path, commit = cite.rsplit('@', 1)
@@ -111,7 +119,7 @@ def cite_text(evidence):
     if 'sql' in evidence:
         return 'SQL: ' + evidence['sql']
     if 'path' in evidence:
-        return evidence['path'] + ('@' + evidence['commit'] if evidence.get('commit') else '')
+        return (evidence['owner'] + ':' if evidence.get('owner') else '') + evidence['path'] + ('@' + evidence['commit'] if evidence.get('commit') else '')
     return evidence.get('record') or evidence.get('version')
 
 
@@ -160,7 +168,7 @@ def _declaration_models(pf):
             if isinstance(data, dict) and isinstance(data.get('evidence'), dict):
                 given = [k for k in ('path', 'sql', 'record', 'version', 'unknown') if data['evidence'].get(k) is not None]
                 if len(given) != 1 or ('sql' in given and not pf) or ('version' in given and not pf) or \
-                        set(data['evidence']) - {'path', 'commit', 'sql', 'record', 'version', 'unknown'} or \
+                        set(data['evidence']) - {'path', 'commit', 'sql', 'record', 'version', 'unknown', 'owner'} or \
                         ('commit' in data['evidence'] and 'path' not in given) or \
                         not all(isinstance(v, str) and v for v in data['evidence'].values()):
                     raise ValueError('Specify exactly one of ' + ('path, sql, record, version, unknown' if pf
@@ -173,8 +181,6 @@ def _declaration_models(pf):
             if self.predicate is not None and self.predicate.type == 'compare':
                 if self.select is not None:
                     raise ValueError('compare uses left/right selectors, not select')
-                if self.predicate.left.path is not None or self.predicate.right.path is not None:
-                    raise ValueError('compare requires two cells of one query result')
                 if 'path' in evidence or 'record' in evidence:
                     raise ValueError('compare requires a query view')
             elif self.predicate is not None and self.select is None:
@@ -288,10 +294,12 @@ def compact_schema(node):
     return result
 
 
-def tool_definitions(pf=False):
+def tool_definitions(pf=False, team=False):
     group = 'pf' if pf else 'git'
     checks = ('Optional select and predicate on a reference make the weekly check test a condition instead '
-              'of reporting any change. select picks one cell: {"row": {"group_id": "S1"}, "col": "conv"} in a '
+              'of reporting any change. Without select or predicate, the check compares whole content; '
+              'select alone compares the selected value for equality. select picks one cell: '
+              '{"row": {"group_id": "EXAMPLE_GROUP"}, "col": "metric"} in a '
               'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
               'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}, '
               'or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
@@ -306,7 +314,8 @@ def tool_definitions(pf=False):
                   '"49-" (until revised or retired) or "unknown: <reason>". ' + checks +
                   ' Notes over 200 characters are truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
-                  'supplied references replace the whole list. Earlier revisions remain in registrations.json.',
+                  'supplied references replace the whole list, and [] clears it. '
+                  'Earlier revisions remain in registrations.json.',
         'retire': 'Stop using a registered text. Appends a retired revision with a reason and keeps all history.',
         'list': 'Page through your active registered texts in creation order, with their references and notes. '
                 'Does not check them. Pass next_after as after for the next page.',
@@ -315,7 +324,78 @@ def tool_definitions(pf=False):
     if pf:
         descriptions['create'] += (' An explicit whole-version citation binds that captured version even when its body '
                                    'is absent from this request; reading scope is recorded separately. '
-                                   'Selected fields require coverage in this request or your own current-context file write.')
+                                   'Selected fields require coverage in this request or your own current-context file write. '
+                                   'Copy the actual returned handle and choose the selector, threshold and applies days '
+                                   'from the evidence and intended claim. The following identifiers and values are synthetic.\n'
+                                   'Example request:\n```json\n'
+                                   '{\n'
+                                   '  "text": "The selected metric remains at least 0.5.",\n'
+                                   '  "objects": [{"kind": "customer_group", "id": "EXAMPLE_GROUP"}],\n'
+                                   '  "references": [{\n'
+                                   '    "cite": "query1@v1",\n'
+                                   '    "purpose": "current",\n'
+                                   '    "select": {"row": {"group_id": "EXAMPLE_GROUP"}, "col": "metric"},\n'
+                                   '    "predicate": {"type": "threshold", "op": ">=", "value": 0.5},\n'
+                                   '    "note": "Only this selected condition supports the claim."\n'
+                                   '  }],\n'
+                                   '  "applies": "7-13",\n'
+                                   '  "reason": "Track this condition over the stated days."\n'
+                                   '}\n```\n')
         descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
+    if team:
+        descriptions = {
+            'create': (
+                'Register a reusable hypothesis, forecast, plan, conclusion, or counterevidence. Set text, objects '
+                '[{kind,id}], references, applies, and reason. Each reference has cite, optional purpose current '
+                '(default) or historical_only, and optional note (max 200 characters retained). applies uses '
+                'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Cite actual [pf: ...] handles, file paths '
+                'read in this request or written in this context, committed path@week-N or path@COMMIT, registered '
+                'texts, or "unknown: <reason>". Whole-version citations bind saved evidence; coverage is recorded '
+                'separately. Selected fields require a read in this request or your current-context write. Without '
+                'select/predicate, checks compare whole content; select alone checks equality. Use table row/col '
+                'selectors or JSON Pointer path. Threshold/tolerance require select; compare uses left/right table '
+                'selectors within one query. To find query handles behind a receipt, run '
+                '`pf depend <receipt-handle> --detail`, then cite a listed query handle with row/col. '
+                'Read that query with `pf show <query-handle> --full` alone before registering selected fields. '
+                'Script stdout and plain text support whole-content equality only. '
+                'Format-only example; use observed evidence and intended days.\n'
+                'Example request:\n```json\n{"text":"The selected metric is at least '
+                '0.5.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"query1@v1","select":{"row":{"group_id":"EXAMPLE_GROUP"},"col":"metric"},"predicate":{"type":"threshold","op":">=","value":0.5}}],"applies":"7-13","reason":"Track'
+                ' this condition."}\n```'
+            ) if pf else (
+                'Register a reusable hypothesis, forecast, plan, conclusion, or counterevidence. Set text, objects '
+                '[{kind,id}], references, applies, and reason. Each reference has cite, optional purpose current '
+                '(default) or historical_only, and optional note (max 200 characters retained). applies uses '
+                'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Choose dates to cover the intended '
+                'review. Omitted revision references retain the list; supplied references replace it. Share the '
+                'returned exact ROLE:rN.M, not a guessed peer version. Cite a workspace path, committed path@week-N'
+                ' or path@COMMIT, registered text rN.M, or "unknown: <reason>". A bare path binds this week\'s '
+                'closing commit, including later edits. Cite readable peer handoff files as ROLE:PATH@COMMIT with '
+                'the actual host snapshot. Save command output to a file before citing it. Weekly checks compare '
+                'whole cited files and registered texts. select/predicate are stored without condition evaluation; '
+                'check selected values and conditions yourself using current read-only evidence. Example below is '
+                'format-only: the saved path and object must exist, and dates must fit the judgment.\nExample '
+                'request:\n```json\n{"text":"Review this group before changing its '
+                'price.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"notes.md","purpose":"current","note":"Observed'
+                ' pricing evidence."}],"applies":"7-13","reason":"Keep the rationale for review."}\n```'
+            ),
+            'revise': (
+                'Append a revision with a reason. Omitted fields retain their values; supplied references replace '
+                'the complete list, and [] clears it. Preserve the complete intended evidence set. Use local rN; '
+                'share the returned role-qualified revision. Earlier revisions remain in registrations.json.'
+            ),
+            'retire': (
+                'Retire your judgment with a reason while preserving history. Use local rN; the receipt includes '
+                'its role-qualified retired revision.'
+            ),
+            'list': (
+                'List your active texts, references, and notes without checking them. Continue with next_after as '
+                'after. shareable_references gives exact role-qualified citations.'
+            ) + (
+                ' Use review="pending" to filter pending source checks; their original verification days are '
+                'retained.'
+                if pf else ''
+            ),
+        }
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
             for name, model in models.items()]

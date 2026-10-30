@@ -105,11 +105,15 @@ All interaction goes through the `./novamind-operation` CLI:
 ./novamind-operation python my_script.py   # Run a script with novamind_api available
 ./novamind-operation python-c "import novamind_api as nm; print(nm.vars.current_day)"
 
-# Daily script management
-novamind register-daily-script setup.py  # Register a script to run automatically at start of each week
-novamind list-daily-scripts              # List all registered weekly scripts
-novamind remove-daily-script setup.py    # Remove a registered weekly script
+# Weekly script management (legacy command names)
+./novamind-operation register-daily-script setup.py  # Register a script to run automatically at start of each week
+./novamind-operation list-daily-scripts              # List all registered weekly scripts
+./novamind-operation remove-daily-script setup.py    # Remove a registered weekly script
 ```
+
+Registration snapshots the source file under its filename. Re-register after edits.
+Scripts run in insertion order at the start of each week and must explicitly
+`import novamind_api as nm`. Print results for your weekly input.
 
 ### API Documentation
 
@@ -178,7 +182,7 @@ Queries are read-only — **use the `novamind_api` functions for all actions** (
 **The ONLY things that persist across weeks:**
 1. **`MEMORY.md`** — automatically loaded into your system prompt every week
 2. **Your working directory** — all files, scripts, and data you created
-3. **Weekly scripts** — registered via `novamind register-daily-script`
+3. **Weekly scripts** — registered via `./novamind-operation register-daily-script`
 
 **`MEMORY.md` is your brain across weeks.** Since your conversation context resets, MEMORY.md is the ONLY way to carry knowledge forward. At the start of every week, its contents are injected into your system prompt. Write anything you need to remember:
 - Current strategy and rationale for decisions
@@ -196,7 +200,7 @@ When you encounter errors or unexpected behavior, record what you learned in MEM
 **Your full working directory also persists.** Beyond MEMORY.md, create any files you need:
 - Reusable Python scripts for common analysis
 - Detailed notes or experiment results (reference from MEMORY.md)
-- Weekly scripts that auto-run at the start of each week (via `novamind register-daily-script`)
+- Weekly scripts that auto-run at the start of each week (via `./novamind-operation register-daily-script`)
 
 ## Weekly Workflow
 

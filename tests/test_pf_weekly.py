@@ -68,7 +68,7 @@ def test_compact_lines_carry_day_what_and_value_without_clock_time(workspace, tm
     # One line per declared reference; the failed threshold shows the value then and now.
     assert len([l for l in lines if re.match(r'\d+\. ', l)]) == 1
     assert 'cites' in lines[2] and 'text r1.1' in lines[2]
-    assert '1 of 1 underlying sources PREDICATE FAILS on SQL: SELECT amount FROM ledger: >= 40: now 39 (was 42)' in lines[2]
+    assert '1 underlying source PREDICATE FAILS on SQL: SELECT amount FROM ledger: >= 40: now 39 (was 42)' in lines[2]
     detail = executor.execute('pf_dependencies', {'target': {'record': 'r2'}, 'detail': True})
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39', detail) and 'note: Keep at least forty' in detail
     assert 'SQL (1 rows): SELECT amount FROM ledger' in detail
@@ -79,7 +79,8 @@ def test_compact_lines_carry_day_what_and_value_without_clock_time(workspace, tm
         assert not CLOCK.search(text), text
     header = json.loads(executor.execute('pf_read', {'target': {'record': 'r1'}}).split('\n', 1)[0])
     assert set(header) == {'delivery', 'next_cursor', 'range', 'target', 'total_chars'}
-    assert set(header['target']) == {'version', 'day', 'what'}
+    assert set(header['target']) == {'version', 'day', 'what', 'owner'}
+    assert header['target']['owner'] == 'ceo'
 
 
 def test_search_and_history_are_newest_first_with_one_optional_detail_line(workspace, tmp_path):
@@ -111,6 +112,43 @@ def test_query_changes_name_the_rows_that_differ(workspace, tmp_path, server):
     assert history.startswith('Versions of SQL: ') and ': 1 saved' in history and 'rerun' not in history
 
 
+def test_contextual_next_steps_follow_changed_underlying_sources(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    server.conn.execute('UPDATE ledger SET amount=amount+1')
+    server.conn.commit()
+    weekly = executor.weekly_check(14)
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in weekly
+    assert 'Details: pf depend r2.' in weekly
+    compact = executor.execute('bash', {'command': 'pf depend r2'})
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in compact
+    assert 'pf depend r2.1 --detail' in compact
+    diff = executor.execute('bash', {'command': 'pf diff query1@v1 query1@v2'})
+    assert 'Before changing this source: pf rdepend query1@v1 --detail.' in diff
+    referrers = executor.execute('bash', {'command': 'pf rdepend query1@v1 --detail'})
+    assert 'r1.1' in referrers and 'r2.1' in referrers
+    log = executor.execute('bash', {'command': 'pf log query1@v1'})
+    assert 'Before changing this source: pf rdepend query1@v1 --detail.' in log
+
+
+def test_unchanged_dependency_keeps_depend_hint_without_a_change_hint(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    result = executor.execute('bash', {'command': 'pf depend r2'})
+    assert 'pf depend r2.1 --detail' in result
+    assert 'See what changed' not in result
+    assert 'Before changing this source' not in executor.weekly_check(14)
+
+
+def test_append_only_source_change_also_recommends_diff(workspace, tmp_path, server):
+    _, _, executor = chain(workspace, tmp_path, server)
+    server.conn.execute("INSERT INTO ledger(day, category, amount) VALUES(1, 'operations', 43)")
+    server.conn.commit()
+    weekly = executor.weekly_check(14)
+    assert 'Only added rows' in weekly and 'pf depend r2' in weekly
+    assert 'See what changed: pf diff query1@v1 query1@v2.' in weekly
+    diff = executor.execute('bash', {'command': 'pf diff query1@v1 query1@v2'})
+    assert '--- query1@v1\n+++ query1@v2' in diff and '"amount": 43.0' in diff
+
+
 def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server, select={'col': 'amount'},
         predicate={'type': 'threshold', 'op': '>=', 'value': 40})
@@ -129,7 +167,7 @@ def test_weekly_check_reruns_citations_and_lists_only_changed_texts(workspace, t
     assert 'Checked this week: 2 texts; 2 with changed evidence:' in loud and 'r1.1 (day 7): "Keep the plan"' in loud
     assert re.search(r'PREDICATE FAILS \(now query\d+@v\d+\): >= 40: now 39 \(was 42\)', loud), loud
     # r2 cites r1, whose predicate failed: the failure reaches it through the declared chain.
-    assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend rN.')
+    assert 'r2.1 (day 7)' in loud and loud.endswith('Details: pf depend r2.')
     assert not CLOCK.search(loud)
     # The digest is saved with its own origin so request source mappings stay complete.
     assert loud.origins and store.get_content(loud.origins[0]['version_id'])[1].decode() == str(loud)
@@ -188,3 +226,31 @@ def test_runner_puts_the_weekly_check_after_the_new_week_dashboard(offline_runne
     assert 'revised to r1.2' in check
     if mode == 'pf':  # r3's cited query output is unchanged, so it is not listed.
         assert 'r3.1' not in check and 'refresh' not in check, check
+
+
+@pytest.mark.parametrize('fields', [{}, {'select': {'col': 'amount'}}])
+def test_weekly_without_structured_predicates_does_not_claim_they_passed(workspace, tmp_path, server, fields):
+    store, _, executor = chain(workspace, tmp_path, server, **fields)
+    weekly = executor.weekly_check(14)
+    assert 'No structured predicates were checked.' in weekly
+    delivered = send(store, weekly)
+    assert json.loads(store.get_content(delivered + ':wire')[1])['messages'][0]['content'] == weekly
+    assert 'no predicate fails' not in weekly
+
+
+@pytest.mark.parametrize('mode', ['git', 'prefix', 'pf'])
+def test_weekly_zero_checked_has_no_freshness_conclusion(workspace, tmp_path, mode):
+    if mode == 'git':
+        registry = TextRegistry(workspace, mode, sim_day=lambda: 7)
+        weekly_check = registry.weekly_check
+    else:
+        _, registry, executor = captured(workspace, tmp_path, mode)
+        weekly_check = executor.weekly_check
+    registry.execute('create', declaration({'path': 'evidence.json'}, applies_at={'start_day': 7, 'end_day': 13})
+                     if mode != 'pf' else declaration(applies_at={'start_day': 7, 'end_day': 13}))
+    if mode == 'pf':
+        registry.execute('create', declaration({'record': 'r1'}, applies_at={'start_day': 21}))
+    weekly = weekly_check(14)
+    assert 'Checked this week: 0 texts; no new freshness conclusion.' in weekly
+    assert 'unchanged' not in weekly and 'no predicate fails' not in weekly
+    assert 'Not checked: 1 text past the applies window.' in weekly

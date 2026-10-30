@@ -29,16 +29,31 @@ def test_pf_command_parsing_views_and_refusals():
     assert pf_cli.parse('pf search S1 --kind customer_group', ROOTS)[1] == dict(
         object={'id': 'S1', 'kind': 'customer_group'}, all=False)
     assert pf_cli.parse('pf more c3 | tail -n 5', ROOTS) == ('pf_more', {'cursor': 'c3'}, ('tail', 5))
-    for command in ('pf', 'pf help', 'pf frobnicate x', 'pf log', 'pf log a b', 'pf depend r1 --bogus',
-                    'pf log MEMORY.md && ls', 'ls && pf log MEMORY.md', 'pf log MEMORY.md > out.txt',
-                    'pf log MEMORY.md | grep x', 'pf more 3'):
+    for command in ('pf', 'pf help', 'pf --help', 'pf -h'):
         with pytest.raises(pf_cli.Usage) as error:
             pf_cli.parse(command, ROOTS)
-        assert 'usage: pf <command>' in str(error.value), command
+        assert str(error.value) == pf_cli.USAGE
+    refusals = {
+        'pf frobnicate x': 'pf: unknown command frobnicate',
+        'pf log': 'pf log: wrong number of arguments',
+        'pf log a b': 'pf log: wrong number of arguments',
+        'pf depend r1 --bogus': 'pf: unknown option --bogus',
+        'pf log MEMORY.md && ls': 'pf: run pf on its own in a bash call, not together with other commands',
+        'ls && pf log MEMORY.md': 'pf: run pf on its own in a bash call, not together with other commands',
+        'pf log MEMORY.md > out.txt': 'pf: run pf on its own in a bash call, not together with other commands',
+        'pf log MEMORY.md | grep x': 'pf: only | head -N and | tail -N can follow pf',
+        'pf more 3': 'pf more: give the cursor from a previous result, e.g. pf more c2',
+    }
+    for command, message in refusals.items():
+        with pytest.raises(pf_cli.Usage) as error:
+            pf_cli.parse(command, ROOTS)
+        assert str(error.value) == message + '\nRun pf help for usage and complete examples.'
 
 
 def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
+    dashboard = store.begin_event('dashboard_generation', {'day': 0})
+    store.complete(dashboard)
     first = executor.execute('write_file', {'path': 'MEMORY.md', 'content': 'a\nb\n', 'note': 'first notes'})
     assert first.endswith('\n[pf: wrote MEMORY.md@v1 | note saved]'), first
     # The note is not part of the call: repeating the command keeps its handle.
@@ -53,7 +68,8 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     assert lines[0] == 'file MEMORY.md: 2 versions, newest first'
     assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
     assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
-    assert lines[3] == 'pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md'
+    assert lines[3] == ('pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md '
+                        'Before changing this source: pf rdepend MEMORY.md@v2 --detail.')
     assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
     diff = executor.execute('bash', {'command': 'pf diff MEMORY.md'})
     assert '--- MEMORY.md@v1\n+++ MEMORY.md@v2' in diff and '-b\n+B\n+c' in diff
@@ -82,6 +98,41 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
                                               '" | 2 versions: pf log MEMORY.md]')
 
 
+@pytest.mark.parametrize('sandboxed', [False, True])
+def test_pf_shell_uses_and_cleans_long_owned_tmpdir(workspace, tmp_path, monkeypatch, sandboxed):
+    from test_execution_capture import records
+    store, _, executor = captured(workspace, tmp_path)
+    if sandboxed:
+        assert executor._bwrap(), 'The sandboxed PF wrapper requires bubblewrap'
+    else:
+        monkeypatch.setattr(executor, '_bwrap', lambda: None)
+    root = tmp_path / ('run-' + 'x' * 120) / 'tmp'
+    root.mkdir(parents=True)
+    executor.temp_root = root
+    executor.execute('write_file', {'path': 'owned.txt', 'content': 'owned temporary storage\n'})
+    execute = executor.pf_queries.execute
+    sockets = []
+
+    def observed(operation, arguments):
+        socket = executor._pf_service.root / 'socket'
+        assert socket.parent.parent == root
+        assert socket.is_socket()
+        sockets.append(socket)
+        return execute(operation, arguments)
+
+    monkeypatch.setattr(executor.pf_queries, 'execute', observed)
+    result = executor.execute('bash', {'command': 'pf log owned.txt'})
+    assert result.splitlines()[:2] == [
+        'file owned.txt: 1 version, newest first', 'owned.txt@v1 · day unknown · 1 line']
+    assert len(sockets) == 1
+    assert executor.last_status == 'succeeded'
+    bash = next(row['result'] for row in records(store) if row['request']['kind'] == 'bash')
+    assert bash['process_boundary']['target_started'] is True
+    assert bash['pf_cleanup'] == dict(closed=True, unfinished_event_ids=[])
+    assert list(root.iterdir()) == []
+    store.assert_healthy()
+
+
 def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(workspace):
     from saas_bench.agents.bash_agent.agent import BashAgent
     agent = BashAgent.__new__(BashAgent)
@@ -92,7 +143,7 @@ def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(wor
         assert 'You have 10 tools:' in prompt and 'MEMORY.md is the ONLY way' not in prompt
         assert prompt.index('## Registered Texts') < prompt.index('## Weekly Workflow')
         assert ('## File and Output History (pf)' in prompt) == pf and ('## File History (git)' in prompt) != pf
-        assert ('pf search --text "market cap"' in prompt) == pf
+        assert ('pf search --text "KEYWORD"' in prompt) == pf
     with pytest.raises(ValueError, match='exactly once'):
         integrate(original.replace('You have 6 tools:', ''), False)
     assert git_memory_line(workspace) is None
@@ -108,7 +159,8 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
     text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
                                            reason='r', references=[dict(cite='evidence.json', note='why')]))
     assert text == "Registered r1.1 (active).\nCited: evidence.json@week-2 (this week's closing commit)"
-    assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == 'Revised r1.2 (active).'
+    assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == (
+        "Revised r1.2 (active).\nRetained references: evidence.json@week-2 (this week's closing commit)")
     stored = json.loads(registry.path.read_text())['records']['r1'][-1]
     assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
     assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
@@ -124,6 +176,8 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
 def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
     runner = offline_runner(text_registration='pf')
     runner.agent.current_day = 0
+    stamp = runner.evidence_store.begin_event('dashboard_generation', {'day': 0})
+    runner.evidence_store.complete(stamp)
     output = runner._execute_tool('bash', {'command': './novamind-operation python-c "import novamind_api as nm; '
                                            "nm.analytics.set_targeted_dev_spend(targeted_spend={'S1': 500})\""})
     assert '[pf: cmd' in output, output
@@ -139,7 +193,8 @@ def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
     assert lines[2].startswith('Business writes this week touching S1: day 0 set_targeted_dev_spend(') and '500' in lines[2]
     other = runner._execute_tool('text_create', dict(text='About S2', objects=[dict(kind='customer_group', id='S2')],
                                                      applies='0-', reason='plan', references=[]))
-    assert other == 'Registered r2.1 (active).'
+    assert other == ('Registered r2.1 (active).\n'
+                     'Next weekly check if the run continues: day 7; applies: yes.')
 
 
 @pytest.mark.parametrize('mode', ['prefix', 'pf'])
@@ -157,7 +212,7 @@ def test_next_weeks_memory_names_its_history(offline_runner, monkeypatch, mode):
     system = requests[-1]['messages'][0]['content']
     assert 'loaded into your context at the start of every week.\n' in system
     if mode == 'pf':
-        assert '[pf: MEMORY.md@v1, written day 0, note: "cap table kept here" | 1 version: pf log MEMORY.md]' in system
+        assert '[pf: MEMORY.md@v1, written day unknown, note: "cap table kept here" | 1 version: pf log MEMORY.md]' in system
     else:
         assert re.search(r'\[git: MEMORY\.md last committed in week-1 \([0-9a-f]{7}\) \| git log -p -- MEMORY\.md\]', system)
     assert system.endswith('\n\ncap 272812')
@@ -189,7 +244,7 @@ def test_single_diff_continues_the_same_pair_after_new_writes(workspace, tmp_pat
     assert tail['baseline']['version'] == header['baseline']['version'] == 'long.txt@v1'
     assert tail['target']['version'] == header['target']['version'] == 'long.txt@v2'
     assert tail['range'] == [24000, header['total_chars']] and tail['next_cursor'] is None
-    complete = body.rsplit('\n[', 1)[0] + rest
+    complete = body.rsplit('\n[', 1)[0] + rest.split('\n[Before changing this source:', 1)[0]
     assert len(complete) == header['total_chars'] and 'newer' not in complete
 
 
@@ -287,3 +342,34 @@ def test_bash_pf_audit_joins_tool_logs_to_private_events(workspace, tmp_path):
     logfile.write_text(''.join(json.dumps(e) + '\n' for e in entries))
     recovered = analyze(pointer)['weeks'][0]['pf_calls']
     assert len(recovered) == 5 and all(c['capture_match'] is None for c in recovered)
+
+
+def test_reverse_detail_hint_matches_declared_reference_traversal(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    executor.execute('write_file', {'path': 'source.json', 'content': '{"n": 1}'})
+    call(registry, 'create', **declaration({'path': 'source.json'}))
+    call(registry, 'create', **declaration({'record': 'r1'}))
+    compact = executor.execute('bash', {'command': 'pf rdepend source.json'})
+    detail = executor.execute('bash', {'command': 'pf rdepend source.json --detail'})
+    assert '--detail lists expanded declared-reference paths.' in compact
+    assert 'scripts, files and outputs derived from it' not in compact
+    assert 'text r1.1' in detail and 'text r2.1' in detail and 'via r1.1' in detail
+
+
+def test_reverse_detail_does_not_follow_automatic_query_output_edges(workspace, tmp_path):
+    from test_pf_stale import record_sql, cite
+    store, registry, executor = captured(workspace, tmp_path)
+    event = store.begin_event('bash', {'command': 'python report.py'})
+    source = record_sql(store, 'SELECT n FROM sample',
+                        dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1), parent=event)
+    output = store.version(event, 'output', 'Stored report', layer='tool_return')
+    store.complete(event)
+    cite(store, registry, executor, output)
+    handle = registry.resolver.handle(source)
+    for flags in ('', ' --detail', ' --detail --all'):
+        result = executor.execute('bash', {'command': f'pf rdepend {handle}{flags}'})
+        assert 'No active registered text cites it.' in result
+        assert 'text r1.1' not in result
+    cite(store, registry, executor, source)
+    result = executor.execute('bash', {'command': f'pf rdepend {handle} --detail'})
+    assert 'text r2.1' in result and 'text r1.1' not in result

@@ -22,15 +22,6 @@ simulated days the text is about: "49", "49-55", "49-" (from day 49 until
 revised or retired) or "unknown: <reason>". Each week starts with a check of
 your active texts, shown after the dashboard.
 
-Example, shortened from an actual week-7 finding:
-
-```
-text_create {{"text": "S1 leads are linear in ad spend: ~165 leads per $1000/day from $2.9K to $8K/day, no saturation yet.",
-             "objects": [{{"kind": "customer_group", "id": "S1"}}],
-             "references": [{{"cite": "{cite}", "note": "daily leads & subs by start_day d29-49"}}],
-             "applies": "49-", "reason": "ad spend test result"}}
-```
-
 The dashboard reflects the last weekly advance; after changing settings within
 a week, query the current settings instead.
 
@@ -62,6 +53,9 @@ changes. In `text_create`, cite such a handle, a file path (the version you last
 saw or wrote), a committed file (`MEMORY.md@week-6`), another text (`r4.2`) or
 `unknown: <reason>`. The weekly check reports cited files and texts that changed
 and predicates that no longer hold.
+Register selected conditions for reusable judgments; weekly checks keep testing them
+within their applies window and flag failures or unavailable evidence.
+Run `pf show HANDLE --full` alone, without a pipe, before registering selected fields.
 
 After an ordinary reference needs review, the weekly check retains its first
 finding and last verification day instead of rerunning it each week. Revise the
@@ -77,12 +71,15 @@ retrieve them. Only a completed `research_group` survey updates that date.
 command or what the change is for. PF keeps it with the outputs and files of
 that call and shows it when you see them again, e.g. above MEMORY.md next week.
 
-Run `pf` in bash; commands, loops, pipes and redirects follow normal Bash rules.
+Run `pf` directly in Bash, for example `pf`. It is a separate command;
+never use `novamind-operation pf`. `pf help` has complete examples.
+Loops, pipes and redirects follow normal Bash rules.
 Citing a whole captured object does not require reading all of it. PF records
 what you actually read separately; selected fields must have reached you.
 Compact DELTA/UNCHANGED returns name the exact baseline and a `pf show ... --full`
 command. Use that command if you need the saved full output.
 
+Replace the synthetic names below with handles from actual receipts.
 Commands:
 
 ```
@@ -92,8 +89,8 @@ pf diff MEMORY.md          what the latest version changed; or pf diff MEMORY.md
 pf blame MEMORY.md         the version and day each line was written
 pf depend r4               what r4 cites; reruns the queries behind it and reports changes
 pf rdepend scripts/an_w7d.py.out@v1   registered texts that cite it
-pf search S1               your texts, business writes and latest outputs about S1 (or t10_2, ...)
-pf search --text "market cap"   literal text search across captured history
+pf search ACTUAL_ID        your texts, business writes and latest outputs about that object
+pf search --text "KEYWORD" literal text search across captured history
 ```
 
 Example: MEMORY.md is rewritten almost every week. Before relying on something
@@ -103,13 +100,12 @@ removed.
 '''
 
 GLOB_ROW = '| `glob_files` | Find files by pattern (like `*.py`, `docs/**/*.json`) |'
-WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `novamind register-daily-script`'
+WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `./novamind-operation register-daily-script`'
 
 
 def edits(pf):
     """(original, replacement) pairs; every original must occur exactly once."""
     history = PF_HISTORY if pf else GIT_HISTORY
-    cite = 'scripts/an_w7d.py.out@v1' if pf else 'notes/observations.md'
     return [
         ('You have 6 tools:', 'You have 10 tools:'),
         (GLOB_ROW, GLOB_ROW + '\n| `text_create`, `text_revise`, `text_retire`, `text_list` | Register, revise, '
@@ -124,7 +120,7 @@ def edits(pf):
                           'every week (use `git log`)')),
         ('MEMORY.md is the ONLY way to carry knowledge forward.',
          'MEMORY.md is the only file loaded into your context automatically.'),
-        ('## Weekly Workflow', REGISTERED_TEXTS.format(cite=cite) + history + '## Weekly Workflow'),
+        ('## Weekly Workflow', REGISTERED_TEXTS + history + '## Weekly Workflow'),
         ('1. **Read the dashboard** (automatically shown at start of week)',
          '1. **Read the dashboard** (automatically shown at start of week, followed by the check of your '
          'registered texts)'),
@@ -153,12 +149,12 @@ MEMORY_HEADER = ('\n\n## Your MEMORY.md (auto-loaded)\n\n'
                  'This is automatically loaded into your context at the start of every week.\n')
 
 
-def git_memory_line(workspace):
+def git_memory_line(workspace, run=None):
     """[git: MEMORY.md last committed in week-7 (3f9a2c1) | ...], or None before any commit."""
     import re
     import subprocess
     try:
-        result = subprocess.run(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', 'MEMORY.md'],
+        result = (run or subprocess.run)(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', 'MEMORY.md'],
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -178,7 +174,7 @@ def pf_memory_line(store, version):
     group = handles.group(version)
     if group is None:
         return None
-    head = f"{handles.name(version)}, written day {group['day']}"
+    head = f"{handles.name(version)}, written day {group['day'] if group['day'] is not None else 'unknown'}"
     if note := handles.note(version):
         head += f', note: "{short(note[1], 200)}"'
     count = len(handles.groups[group['key']])

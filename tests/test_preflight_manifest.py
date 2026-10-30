@@ -4,10 +4,11 @@ import platform
 import pytest
 
 from saas_bench.run_state import artifact_hashes, verify_build, write_json, runtime_versions, tree_hash, file_hash
+from test_preflight_integration import offline_runner, packed_public
 
 
 @pytest.mark.parametrize('changed', ['docs/novamind_api/client.py', 'novamind-client'])
-def test_artifact_drift_and_atomic_manifest(tmp_path, changed):
+def test_artifact_drift_is_recorded_and_manifest_writes_are_atomic(tmp_path, changed, caplog):
     (tmp_path / 'docs' / 'novamind_api').mkdir(parents=True)
     (tmp_path / 'novamind-operation').write_text('bundle')
     (tmp_path / 'novamind-client').write_text('client')
@@ -20,11 +21,11 @@ def test_artifact_drift_and_atomic_manifest(tmp_path, changed):
         write_json(tmp_path / 'build.json', {'bad': float('nan')})
     assert json.loads((tmp_path / 'build.json').read_text()) == original
     (tmp_path / changed).write_text('changed')
-    with pytest.raises(ValueError, match='artifacts'):
-        verify_build(tmp_path)
+    assert verify_build(tmp_path) == original
+    assert 'artifacts' in caplog.text
 
 
-def test_build_rejects_python_sdk_and_source_drift(tmp_path):
+def test_build_records_python_sdk_and_source_drift(tmp_path, caplog):
     public = tmp_path / 'public'
     (public / 'docs' / 'novamind_api').mkdir(parents=True)
     (public / 'novamind-operation').write_text('bundle')
@@ -40,18 +41,18 @@ def test_build_rejects_python_sdk_and_source_drift(tmp_path):
     write_json(public / 'build.json', baseline)
     assert verify_build(public, tmp_path) == baseline
     write_json(public / 'build.json', dict(baseline, python='0.0.0'))
-    with pytest.raises(ValueError, match='Python'):
-        verify_build(public, tmp_path)
+    assert verify_build(public, tmp_path)['python'] == '0.0.0'
+    assert 'Python' in caplog.text
     write_json(public / 'build.json', dict(baseline, runtime={}))
-    with pytest.raises(ValueError, match='SDK'):
-        verify_build(public, tmp_path)
+    assert verify_build(public, tmp_path)['runtime'] == {}
+    assert 'SDK' in caplog.text
     write_json(public / 'build.json', baseline)
     source.write_text('changed')
-    with pytest.raises(ValueError, match='source'):
-        verify_build(public, tmp_path)
+    assert verify_build(public, tmp_path) == baseline
+    assert 'source' in caplog.text
 
 
-def test_frozen_simulator_configuration_rejects_environment_drift(tmp_path, monkeypatch):
+def test_simulator_inherits_saved_configuration_and_honors_explicit_environment(tmp_path, monkeypatch):
     from dataclasses import asdict
     from saas_bench.config import BenchmarkConfig
     from saas_bench.server_entry import _session_config
@@ -66,8 +67,101 @@ def test_frozen_simulator_configuration_rejects_environment_drift(tmp_path, monk
     monkeypatch.delenv('CEOBENCH_SIMULATOR_LLM_MODEL', raising=False)
     assert json.loads(json.dumps(asdict(_session_config(42, 7, 100)))) == json.loads(json.dumps(asdict(config)))
     monkeypatch.setenv('CEOBENCH_SIMULATOR_LLM_MODEL', 'different-model')
-    with pytest.raises(ValueError, match='frozen'):
-        _session_config(42, 7, 100)
+    restored = _session_config(42, 7, 100)
+    assert restored.social_post_llm_model == restored.enterprise_llm_model == 'different-model'
+
+
+def test_single_agent_resume_applies_explicit_configuration_to_requests_and_simulator(
+        offline_runner, tmp_path, monkeypatch):
+    import httpx
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from saas_bench.run_state import checkpoint_directory
+    source = offline_runner()
+    source._save_checkpoint(0)
+    original = (source.workspace_dir / 'manifest.json').read_bytes()
+    monkeypatch.setenv('CEOBENCH_SIMULATOR_LLM_MODEL', 'changed-simulator')
+    resumed = BashAgentRunner(continue_from=source.workspace_dir, workspace_base=tmp_path,
+        api_key='offline', model='changed-agent', provider='openai', base_url='http://127.0.0.1:9/v1',
+        seed=12345, scenario='unrecognized-scenario', total_days=56, initial_cash=250000., reasoning_effort='low')
+    try:
+        resumed.setup()
+        resumed._restore_from_checkpoint(resumed._load_checkpoint())
+        resumed._save_checkpoint(0)
+        snapshot = checkpoint_directory(resumed.workspace_dir, resumed._load_checkpoint())
+        session = json.loads((snapshot / 'session.json').read_text())
+        assert session['seed'] == 12345 and session['total_days'] == 56
+        assert session['initial_cash'] == 250000. and session['scenario'] == 'unrecognized-scenario'
+        assert session['benchmark_config']['total_days'] == 56
+        assert session['simulator_llm']['social_post_llm_model'] == 'changed-simulator'
+        sent = []
+        def respond(_, request):
+            sent.append(json.loads(request.read()))
+            return httpx.Response(200, json=dict(id='changed', object='response', status='completed',
+                model='changed-agent', output=[dict(type='function_call', id='fc1', call_id='call1',
+                    name='bash', arguments=json.dumps(dict(command='echo changed')))],
+                usage=dict(input_tokens=20, output_tokens=10, input_tokens_details=dict(cached_tokens=0))))
+        monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', respond)
+        resumed.agent.act('Current day is zero.', 0, False, info={'day': 0})
+        assert sent[-1]['model'] == 'changed-agent' and sent[-1]['reasoning']['effort'] == 'low'
+        assert '56' in sent[-1]['instructions']
+        assert str(resumed.client.base_url) == 'http://127.0.0.1:9/v1/'
+        assert resumed.provider == 'openai'
+        assert (resumed.seed, resumed.scenario, resumed.total_days, resumed.initial_cash) == (
+            12345, 'unrecognized-scenario', 56, 250000.)
+        manifest = json.loads((resumed.workspace_dir / 'manifest.json').read_text())
+        overrides = {row['field']: row for row in manifest['configuration_overrides']}
+        assert overrides['model']['old'] == 'test-model' and overrides['model']['new'] == 'changed-agent'
+        assert overrides['social_post_llm_model']['new'] == 'changed-simulator'
+        assert overrides['social_post_llm_model']['effective_at'] == 'simulator_start_in_new_recovery_attempt'
+        assert (source.workspace_dir / 'manifest.json').read_bytes() == original
+    finally:
+        resumed._stop_server()
+        resumed.client.close()
+
+
+@pytest.mark.parametrize('source_capture', ['off', 'sql', 'execution'])
+def test_single_agent_resume_can_change_capture_without_claiming_historical_coverage(
+        offline_runner, tmp_path, source_capture):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    enable = source_capture != 'execution'
+    source = offline_runner(sql_capture=source_capture != 'off', execution_capture=source_capture == 'execution',
+        text_registration='prefix' if source_capture == 'execution' else 'off')
+    source.agent.current_day = 0
+    source._save_checkpoint(0)
+    resumed = BashAgentRunner(continue_from=source.workspace_dir, workspace_base=tmp_path, api_key='offline',
+        execution_capture=enable, sql_capture=enable, text_registration='prefix' if enable else 'off', pf_stale_checks=False)
+    try:
+        resumed.setup()
+        resumed._restore_from_checkpoint(resumed._load_checkpoint())
+        assert resumed.execution_capture is enable
+        assert (resumed.evidence_store is not None) is enable
+        manifest = json.loads((resumed.workspace_dir / 'manifest.json').read_text())
+        assert bool(manifest.get('sql_evidence')) is enable
+        if enable:
+            assert manifest['capture_history']['source_checkpoint_coverage'] == (
+                'sql_only' if source_capture == 'sql' else 'unavailable')
+            assert resumed.agent.current_day == -1 and resumed.agent.conversation == []
+    finally:
+        resumed._stop_server()
+        resumed.client.close()
+
+
+def test_recovery_weekly_usage_does_not_recount_old_physical_retries(tmp_path):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from saas_bench.model_usage import ModelUsage
+    summary = ModelUsage(tmp_path / 'requests.jsonl', 'agent', {}).summary
+    summary['retried_http_attempts'] = 2
+    runner = object.__new__(BashAgentRunner)
+    runner.workspace_dir = tmp_path
+    runner.agent = SimpleNamespace(usage_recorder=SimpleNamespace(summary=deepcopy(summary)), total_turns=0)
+    runner.recovery_source = dict(usage=dict(agent=deepcopy(summary), simulator=deepcopy(summary)), attempt_id='new')
+    runner._http_post = lambda *_: dict(day=7, usage=deepcopy(summary))
+    runner._weekly_record(dict(day=7))
+    current = json.loads((tmp_path / 'usage_summary.json').read_text())['attempt_usage']['agent']
+    assert current['calls'] == 0 and current['errors'] == 0 and current['missing_cost'] == 0
+    assert set(current['missing'].values()) == {0}
 
 
 def test_opencode_routes_both_roles_without_deepseek_credentials(tmp_path, monkeypatch):
@@ -100,24 +194,19 @@ def test_opencode_routes_both_roles_without_deepseek_credentials(tmp_path, monke
     client.close()
 
 
-def test_registered_pricing_is_frozen_and_survives_source_file_removal(tmp_path, monkeypatch):
-    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
-    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', lambda _: {})
-    monkeypatch.setattr('saas_bench.run_state.verify_build', lambda *a, **k: {})
-    monkeypatch.setenv('OPENCODE_API_KEY', 'offline-only')
+def test_checkpoint_pricing_survives_removed_or_changed_source_file(offline_runner, tmp_path):
     path = tmp_path / 'price.json'
     data = dict(source='https://opencode.ai/docs/go/', basis='USD/1k quota', rates={'test-model': {'input': .001}})
     path.write_text(json.dumps(data))
-    first = BashAgentRunner(provider='opencode', model='test-model', workspace_base=tmp_path, pricing_file=path)
-    first._prepare_manifest()
-    assert json.loads((first.workspace_dir / 'manifest.json').read_text())['pricing'] == data
+    first = offline_runner(pricing_file=path)
+    first._save_checkpoint(0)
+    original = (first.workspace_dir / 'manifest.json').read_bytes()
     path.unlink()
-    restored = BashAgentRunner(continue_from=first.workspace_dir)
-    restored._prepare_manifest()
+    restored = offline_runner(first.workspace_dir)
     assert restored._pricing == data['rates']
     data['rates']['test-model']['input'] = 9
     path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match='pricing configuration mismatch'):
-        BashAgentRunner(continue_from=first.workspace_dir, pricing_file=path)
-    first.client.close()
-    restored.client.close()
+    changed = offline_runner(first.workspace_dir, pricing_file=path)
+    assert changed._pricing == {'test-model': {'input': 9}}
+    assert changed.workspace_dir != first.workspace_dir
+    assert (first.workspace_dir / 'manifest.json').read_bytes() == original

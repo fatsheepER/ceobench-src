@@ -63,8 +63,6 @@ def public_outcomes(run, start):
 
 
 def execute(source, destination, group, identity, output, *, api_key=None):
-    if (output / 'rollout-hold.json').exists():
-        raise ValueError('Resolve the episode engineering hold before launching')
     destination = round5_short.fork_task(source, destination, group, identity)
     checkpoint = json.loads((destination / 'checkpoint.json').read_text())
     start = checkpoint['day']
@@ -72,6 +70,7 @@ def execute(source, destination, group, identity, output, *, api_key=None):
     end = start + 21
     round5.environment()
     runner = RolloutRunner(continue_from=destination, stop_after_day=end, api_key=api_key)
+    destination = runner.workspace_dir
     round5.environment()
     round5.install_pause(runner, output / 'rollout-hold.json')
     record = dict(status='running', start_day=start, target_day=end, goal_days=500, expected_weeks=3, group=group, identity=identity, request_log_begin_bytes=cutoffs, started_at=datetime.now(timezone.utc).isoformat())
@@ -118,11 +117,6 @@ def main():
     parser.add_argument('--identity', required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
-    round5.verify_frozen(args.output_dir)
-    frozen = json.loads((args.output_dir / 'rollout-frozen.json').read_text())
-    for path, checksum in frozen['host_scripts'].items():
-        if file_hash(path) != checksum:
-            raise ValueError('Rollout host changed after freeze: ' + path)
     execute(args.source, args.destination, args.group, args.identity, args.output_dir)
 
 

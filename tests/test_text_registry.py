@@ -180,10 +180,13 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     assert store.get_content(binding['latest_version_id'])[1] == b'{"n":8}'
     newest = executor.execute('read_file', {'path': 'evidence.json'})
     send(store, newest)
-    call(registry, 'revise', record='r1', reason='Text only', text='Clarified')
+    revised = executor.execute('text_revise', dict(record='r1', reason='Text only', text='Clarified'))
+    assert 'Retained references: evidence.json@v1' in revised
     assert store.load_state('declaration:r1.2')['references'] == [binding]
     call(registry, 'revise', record='r1', reason='New evidence', references=declaration({'path': 'evidence.json'})['references'])
     assert store.load_state('declaration:r1.3')['references'][0]['version_id'] != binding['version_id']
+    delivered = send(store, revised)
+    assert json.loads(store.get_content(delivered + ':wire')[1])['messages'][0]['content'] == revised
     with pytest.raises(ValueError, match='or a file path'):
         call(registry, 'create', **declaration({'version': 'v999'}))
 
@@ -365,6 +368,13 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     ref = dict(evidence={'sql': sql}, purpose='current', predicate=dict(type='compare',
                left={'row': {'channel': 'search'}, 'col': 'cost'}, op='<',
                right={'row': {'channel': 'social'}, 'col': 'cost'}))
+    footer = re.search(r'\[pf: (cmd\d+@v1) \| (query\d+@v1)\]', result)
+    assert footer, result
+    refused = executor.execute('text_create', declaration(references=[dict(ref, evidence={'version': footer[1]})]))
+    assert 'For a condition, cite ' + footer[2] + ' with row/col' in refused, refused
+    recovery = re.search(r'```bash\n(.*?)\n```', refused, re.S)[1]
+    assert recovery == f'pf show {footer[2]} --full'
+    send(store, executor.execute('bash', dict(command=recovery)))
     registered = call(registry, 'create', **declaration(references=[ref]))
     assert re.fullmatch(r'query\d+@v1', registered['evidence'][0]['version'])
     binding = store.load_state('declaration:r1.1')['references'][0]
@@ -373,7 +383,7 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     # Equal text from another command cannot stand in for a redirected query.
     redirected_sql = 'SELECT 456 AS n'
     cli_code = 'from cli_fixture import cmd_query; from argparse import Namespace; cmd_query(Namespace(session=None, sql=' + repr(redirected_sql) + '))'
-    echo_code = 'print(' + repr(json.dumps({'columns': ['n'], 'rows': [{'n': 456}], 'row_count': 1}, indent=2)) + ')'
+    echo_code = 'print(' + repr(json.dumps({'success': True, 'columns': ['n'], 'rows': [{'n': 456}], 'row_count': 1}, indent=2)) + ')'
     output = executor.execute('bash', {'command': 'python -c ' + shlex.quote(cli_code) + ' > /dev/null; python -c ' + shlex.quote(echo_code)})
     send(store, output)
     with pytest.raises(ValueError, match='not been delivered'):
@@ -385,6 +395,62 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     send(store, output)
     with pytest.raises(ValueError, match='not been delivered'):
         call(registry, 'create', **declaration({'sql': hidden_sql}))
+    multi = executor.execute('bash', {'command': 'python -c ' + shlex.quote(
+        "import novamind_api as n; n.query('SELECT 11 AS n'); n.query('SELECT 22 AS n'); print('summary')")})
+    assert not re.search(r'\[pf: .*\| query\d+', multi), multi
+    command_handle = re.search(r'\[pf: (cmd\d+@v1)', multi)[1]
+    ref = dict(evidence={'version': command_handle}, select={'col': 'n'},
+               predicate=dict(type='threshold', op='>', value=0))
+    rejected = executor.execute('text_create', declaration(references=[ref]))
+    recovery = re.search(r'```bash\n(.*?)\n```', rejected, re.S)[1].splitlines()
+    assert len(recovery) == 2, rejected
+    assert all(re.fullmatch(r'pf show query\d+@v1 --full', command) for command in recovery)
+    shown = executor.execute('bash', dict(command=recovery[-1]))
+    assert json.loads(shown.split('\n', 1)[1])['rows'] == [{'n': 22}]
+    send(store, shown)
+    ref['evidence'] = {'version': recovery[-1].split()[2]}
+    assert call(registry, 'create', **declaration(references=[ref]))['id'] == 'r2'
+
+
+def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, server, packed_public, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_ROW_LIMIT', '5000')
+    monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
+    import shlex
+    from test_sql_evidence import settled
+    from saas_bench.pf_stale import compare
+    store, registry, executor = captured(workspace, tmp_path)
+    server.sql_evidence = store
+    server.start()
+    shutil.copy(packed_public / 'novamind-client', workspace / 'novamind-operation')
+    executor.extra_env = {'NOVAMIND_API_PORT': str(server.port)}
+    sql = 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<5001) SELECT n FROM x'
+    command = './novamind-operation query ' + shlex.quote(sql)
+    result = executor.execute('bash', {'command': command})
+    settled(server)
+    event = send(store, result)
+    wire = json.loads(store.get_content(event + ':wire')[1])
+    delivered = wire['messages'][0]['content']
+    assert 'Result exceeded 5000 rows and was truncated.' in delivered
+    assert 'output truncated' in delivered
+    with store.connect() as conn:
+        versions = conn.execute("SELECT version_id FROM versions WHERE json_extract(metadata, '$.layer') = 'query_model_projection'").fetchall()
+    assert len(versions) == 1
+    meta, raw = store.get_content(versions[0][0])
+    body = json.loads(raw)
+    assert body['success'] and body['truncated'] and body['row_count'] == 5000
+    assert meta['source_truncated']
+    assert body == json.loads(store.get_content(meta['derived_from'])[1])
+    with pytest.raises(ValueError, match='source_truncated'):
+        compare(registry.resolver, meta['derived_from'], meta['derived_from'], {}, 'query')
+    nested = 'import json, subprocess; r=json.loads(subprocess.check_output(' + repr(shlex.split(command)) + ')); print(len(r["rows"]))'
+    result = executor.execute('bash', {'command': 'python -c ' + shlex.quote(nested)})
+    event = send(store, result)
+    delivered = json.loads(store.get_content(event + ':wire')[1])['messages'][0]['content']
+    assert '5000' in delivered
+    assert 'Result exceeded 5000 rows and was truncated.' in delivered
+    limited = executor.execute('bash', {'command': './novamind-operation query ' + shlex.quote(sql + ' LIMIT 1')})
+    body = json.loads(limited.rsplit('\n[', 1)[0])
+    assert body['row_count'] == 1 and 'truncated' not in body and 'warning' not in body
 
 
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
@@ -426,23 +492,16 @@ def test_all_model_apis_receive_shared_tools_and_original_prompt_is_unchanged(wo
         assert [t['name'] for t in tools][-4:] == ['text_create', 'text_revise', 'text_retire', 'text_list']
 
 
-def test_runner_registration_mode_is_frozen_on_resume(tmp_path, monkeypatch):
+def test_runner_applies_explicit_registration_change_after_checkpoint_restore(offline_runner, tmp_path):
     from saas_bench.agents.bash_agent.run_test import BashAgentRunner
-    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', lambda _: {})
-    monkeypatch.setattr('saas_bench.run_state.verify_build', lambda *a, **k: {})
-    monkeypatch.setenv('OPENCODE_API_KEY', 'offline-only')
-    first = BashAgentRunner(provider='opencode', model='test-model', workspace_base=tmp_path, text_registration='prefix')
-    first._prepare_manifest()
+    first = offline_runner(text_registration='prefix')
+    first._save_checkpoint(0)
     assert first.execution_capture
-    restored = BashAgentRunner(continue_from=first.workspace_dir)
-    assert restored.text_registration == 'prefix'
-    restored._prepare_manifest()
-    with pytest.raises(ValueError, match='registration configuration mismatch'):
-        BashAgentRunner(continue_from=first.workspace_dir, text_registration='pf')
+    restored = offline_runner(first.workspace_dir, text_registration='pf')
+    assert restored.text_registration == 'pf'
+    assert restored.workspace_dir != first.workspace_dir
     with pytest.raises(ValueError, match='requires execution capture'):
         BashAgentRunner(workspace_base=tmp_path, text_registration='prefix', execution_capture=False)
-    first.client.close()
-    restored.client.close()
 
 
 def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp_path):
@@ -566,3 +625,29 @@ def test_applicability_accepts_open_ended_start_and_explains_shapes(workspace):
         with pytest.raises(ValueError, match='until revised or retired') as error:
             call(registry, 'create', **declaration(applies_at=bad))
         assert '"21-27"' in str(error.value) and '"unknown: <reason>"' in str(error.value)
+
+
+@pytest.mark.parametrize('mode', ['git', 'prefix', 'pf'])
+def test_changed_body_receipt_discloses_retained_references_and_replacement(workspace, tmp_path, mode):
+    if mode == 'git':
+        registry = TextRegistry(workspace, mode, sim_day=lambda: 7)
+        execute = lambda name, args: registry.execute(name.removeprefix('text_'), args)
+    else:
+        store, registry, executor = captured(workspace, tmp_path, mode)
+        execute = executor.execute
+        send(store, executor.execute('read_file', {'path': 'evidence.json'}))
+    created = execute('text_create', declaration({'path': 'evidence.json'}))
+    cited = created.split('Cited: ', 1)[1]
+    refs = json.loads(registry.path.read_text())['records']['r1'][0]['references']
+    changed = execute('text_revise', dict(record='r1', text='New wording', reason='Clarify'))
+    assert 'Retained references: ' + cited in changed
+    assert json.loads(registry.path.read_text())['records']['r1'][-1]['references'] == refs
+    unchanged = execute('text_revise', dict(record='r1', text='New wording', reason='Reaffirm'))
+    assert 'Retained references:' not in unchanged
+    replaced = execute('text_revise', dict(record='r1', reason='Replace all', references=[dict(cite='r1.1')]))
+    assert 'Cited: r1.1' in replaced and 'evidence.json' not in replaced
+    cleared = execute('text_revise', dict(record='r1', reason='Clear all', references=[]))
+    assert 'Retained references:' not in cleared
+    empty = execute('text_revise', dict(record='r1', text='Independent note', reason='Clarify'))
+    assert 'Retained references: none' in empty
+    assert json.loads(registry.path.read_text())['records']['r1'][-1]['references'] == []

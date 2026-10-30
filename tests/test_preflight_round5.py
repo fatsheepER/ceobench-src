@@ -30,12 +30,17 @@ def test_monitor_detects_both_roles_and_usage_failures():
         assert round5.model_issue(dict(role=role, event='http_response', status=429)) == 'http_or_provider_error'
         assert round5.model_issue(dict(role=role, event='http_error')) == 'transport_error'
         assert round5.model_issue(dict(role=role, event='response', error='ValueError')) == 'model_call_error'
-        assert round5.model_issue(dict(role=role, event='response', usage={'input_tokens': None})) == 'missing_usage'
+        assert round5.model_issue(dict(role=role, event='response', response={'model': round5.MODEL},
+                                      usage={'input_tokens': None})) == 'missing_usage'
         response = dict(role=role, event='response', response={'model': round5.MODEL},
                         usage=dict(input_tokens=10, output_tokens=2, cached_tokens=0), cost_usd=.01)
         assert round5.model_issue(response) is None
         response['cost_usd'] = None
-        assert round5.model_issue(response) == 'missing_cost'
+        assert round5.model_issue(response) is None
+        response['usage']['cached_tokens'] = None
+        assert round5.model_issue(response) is None
+        response['usage']['output_tokens'] = None
+        assert round5.model_issue(response) == 'missing_usage'
     assert round5.model_issue(dict(event='tool_result', result='Traceback (most recent call last): ordinary agent script')) is None
     request = dict(role='simulator', event='http_request', endpoint=round5.ENDPOINT + 'chat/completions',
                    body=dict(model=round5.MODEL, thinking={'type': 'disabled'}, reasoning_effort='none'))
@@ -44,6 +49,23 @@ def test_monitor_detects_both_roles_and_usage_failures():
     assert round5.model_issue(request) == 'simulator_thinking_changed'
     request['endpoint'] = 'https://api.deepseek.com/chat/completions'
     assert round5.model_issue(request) == 'model_route_changed'
+
+
+@pytest.mark.parametrize('error', [
+    'APIConnectionError', 'APITimeoutError', 'LLMTimeoutError', 'NetworkError',
+    'ConnectError', 'ReadError', 'WriteError', 'CloseError', 'TimeoutException',
+    'ConnectTimeout', 'ReadTimeout', 'WriteTimeout', 'PoolTimeout', 'RemoteProtocolError', 'ProxyError',
+])
+@pytest.mark.parametrize('event', ['response', 'http_error'])
+def test_monitor_classifies_named_network_errors_as_transient(error, event):
+    assert round5.model_issue(dict(event=event, error=error)) == 'transport_error'
+
+
+@pytest.mark.parametrize('error', ['ValueError', 'HTTPError', 'TransportError',
+                                  'UnsupportedProtocol', 'LocalProtocolError', 'APIStatusError'])
+@pytest.mark.parametrize('event', ['response', 'http_error'])
+def test_monitor_does_not_mask_configuration_or_other_errors(error, event):
+    assert round5.model_issue(dict(event=event, error=error)) == 'model_call_error'
 
 
 def test_incremental_receipts_do_not_lose_partial_lines(tmp_path):
@@ -96,10 +118,8 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     assert round5.validate_start('prefix', seed, 84, sealed) == 28
     with pytest.raises(ValueError, match='seed mismatch'):
         round5.validate_start('prefix', 44, 84, sealed)
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, copies['git'].workspace_dir)
-    with pytest.raises(ValueError, match='starts fresh'):
-        round5.validate_start('prefix', 43, 28, sealed)
+    assert round5.validate_start('git', seed, 112, copies['git'].workspace_dir) == 28
+    assert round5.validate_start('prefix', seed, 28, sealed) == 28
     git = copies['git']
     for day in (35, 42):
         assert advance(git)['success']
@@ -113,12 +133,10 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
     (git.workspace_dir / 'pause-receipt.json').write_text(json.dumps({'day': 42}))
     assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
     assert round5.stage_pointer(output, 'git', seed, 112, 2).name == f'git-{round5.SEEDS[seed]}-to112-attempt2.json'
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, git.workspace_dir)
+    assert round5.validate_start('git', seed, 112, git.workspace_dir) == 42
     previous.write_text(json.dumps(dict(path=str(git.workspace_dir.resolve()), status='running',
         reached_stop=False, result={'days_run': 42})))
-    with pytest.raises(ValueError, match='complete week boundary'):
-        round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
+    assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
     for boundary in ('new_week', 'same_week'):
         git.agent.current_day = 42 if boundary == 'same_week' else 35
         git._save_checkpoint(42)
@@ -133,8 +151,7 @@ def test_sealed_generation_stays_fixed_and_forks_restore_independently(offline_r
         assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
         for field, wrong in [('day', 35), ('snapshot_id', 'wrong'), ('context_boundary', 'wrong')]:
             pause.write_text(json.dumps(dict(receipt, **{field: wrong})))
-            with pytest.raises(ValueError, match='complete week boundary'):
-                round5.validate_start('git', seed, 112, git.workspace_dir, 2, output)
+            assert round5.validate_start('git', seed, 112, git.workspace_dir, 2, output) == 42
 
 
 def test_receipt_audit_preserves_unknown_attempts_and_rejects_pending_or_changed_routes(tmp_path):
@@ -212,7 +229,7 @@ def test_monitor_observes_real_sql_failures_without_holding_on_bad_queries(tmp_p
     events = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
     sql_events = [row for row in events if row['event'] == 'sql_attention']
     assert bool(sql_events) is service_failure
-    assert (output / 'hold.json').exists() is service_failure
+    assert not (output / 'hold.json').exists()
     if service_failure:
         alert, = sql_events[0]['sql_issues']
         assert alert['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE

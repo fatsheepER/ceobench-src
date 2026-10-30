@@ -229,7 +229,7 @@ def test_runner_cancels_after_week_advance_only(offline_runner, monkeypatch):
     assert all(f['model_context_id'] == request['request']['request']['context_id'] for f in facts)
 
 
-def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_runner, monkeypatch, tmp_path):
+def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_runner, monkeypatch, tmp_path, caplog):
     import threading
     from saas_bench import db_protection
     from saas_bench.run_state import recover_run, checkpoint_directory, tree_hash
@@ -256,8 +256,8 @@ def test_checkpoint_freeze_is_immutable_and_recovery_preserves_original(offline_
     checkpoint = json.loads((runner.workspace_dir / 'checkpoint.json').read_text())
     directory = checkpoint_directory(runner.workspace_dir, checkpoint)
     assert (directory / 'agent_workspace/MEMORY.md').read_text() == 'frozen'
-    with pytest.raises(ValueError, match='recover_run.py'):
-        runner._load_checkpoint()
+    assert runner._load_checkpoint() == checkpoint
+    assert 'Discarding post-checkpoint operation outcomes' in caplog.text
     runner._stop_server()
     before = tree_hash(runner.workspace_dir)
     with pytest.raises(ValueError, match='outside the original run'):
@@ -326,7 +326,7 @@ def test_pending_review_keeps_conditions_live_and_manual_scope_matters(workspace
     assert {v: list(e) for v, e in cold.outgoing.items() if e} == warm
 
 
-def test_each_refresh_source_gets_its_own_timeout(workspace, tmp_path, server, monkeypatch):
+def test_refresh_sources_share_deadline_and_next_call_can_continue(workspace, tmp_path, server, monkeypatch):
     from saas_bench.pf_refresh import refresh
     from saas_bench.public_sql import execute_query
     from test_pf_stale import record_sql
@@ -336,11 +336,15 @@ def test_each_refresh_source_gets_its_own_timeout(workspace, tmp_path, server, m
     slow = record_sql(store, slow_sql, {'success': True, 'columns': ['n'], 'rows': [{'n': 0}], 'row_count': 1})
     fast = record_sql(store, 'SELECT amount FROM ledger', execute_query(server, 'SELECT amount FROM ledger'))
     parent = store.begin_event('pf_weekly_check', {'day': 0})
-    monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', .025)
+    monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', 2)
     result = refresh(server, [slow, fast], parent)
     receipts = [store.read_event(store.get_content(result[v])[0]['created_by_event'])['result'] for v in (slow, fast)]
-    assert [r['http_status'] for r in receipts] == [504, 200]
-    assert all(r['attempted'] for r in receipts)
+    assert [r['http_status'] for r in receipts] == [504, 504]
+    assert [r['attempted'] for r in receipts] == [True, False]
+    assert receipts[0]['attempted_sql'] == slow_sql
+    resumed = refresh(server, [fast], parent)
+    receipt = store.read_event(store.get_content(resumed[fast])[0]['created_by_event'])['result']
+    assert receipt['http_status'] == 200 and receipt['attempted'] is True
     store.complete(parent)
 
 
@@ -409,8 +413,8 @@ def test_recovery_before_first_fork_checkpoint_preserves_group(offline_runner, t
         manifest = json.loads((source / 'manifest.json').read_text())
         manifest['configuration']['seed'] += 1
         write_json(source / 'manifest.json', manifest)
-        with pytest.raises(ValueError, match='configuration differs'):
-            recover_run(source, tmp_path / (name + '-invalid'))
+        revised = recover_run(source, tmp_path / (name + '-revised'))
+        assert (revised / 'checkpoint.json').exists()
 
 
 def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_path):

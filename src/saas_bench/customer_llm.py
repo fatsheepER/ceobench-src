@@ -21,6 +21,7 @@ from openai import OpenAI
 
 from .config import BenchmarkConfig, CUSTOMER_GROUPS, ChurnReason
 from .model_usage import ModelUsage, usage_values
+from .runtime_options import runtime_value
 from .database import (
     get_customer_persona, get_group_characteristics, get_world_context,
     add_social_media_post, add_notification
@@ -156,6 +157,7 @@ class CustomerSimulator:
     """
 
     def __init__(self, client: OpenAI, conn: sqlite3.Connection, config: BenchmarkConfig):
+        self.max_output_tokens = runtime_value('model_max_output_tokens', None)
         self.usage_recorder = ModelUsage(os.environ.get('CEOBENCH_SIMULATOR_USAGE_LOG'), 'simulator', config.model_pricing)
         self.client = self.usage_recorder.attach(client)
         self.conn = conn
@@ -214,6 +216,8 @@ class CustomerSimulator:
         reasoning_effort: Optional[str] = None,
     ) -> tuple:
         """Single-turn completion. Returns (text, input_tokens, output_tokens)."""
+        if self.max_output_tokens is not None:
+            max_tokens = self.max_output_tokens
         if provider in ("bedrock", "anthropic"):
             client = self.bedrock_client if provider == "bedrock" else self.anthropic_client
             api = 'messages'

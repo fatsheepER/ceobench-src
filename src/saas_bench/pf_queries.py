@@ -4,6 +4,7 @@ from contextlib import closing
 import difflib
 import json
 import re
+import shlex
 import time
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -11,17 +12,19 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError, model_validator
 
 from .execution_capture import CapturedText, CURRENT_EVENT, OBJECT_FIELDS, origin
+from .pf_deadline import budget_scope, check
+from .run_lifecycle import RunCancelled
 from . import evidence_handles, pf_render
 from .registration_evidence import covered
 from .registration_schema import Input, Text
 from .text_registry import applies_ended
-from .sql_evidence import encoded
+from .sql_evidence import PUBLIC_LAYERS, encoded
 
 
 class Target(Input):
     path: Text | None = None
     sql: Text | None = None
-    record: Annotated[str, Field(pattern=r'^r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
+    record: Annotated[str, Field(pattern=r'^(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
     version: Annotated[str, Field(pattern=evidence_handles.HANDLE_PATTERN)] | None = None
 
     @model_validator(mode='after')
@@ -127,13 +130,6 @@ def _about(content_time):
     return f'day {low}' if low == high else f'days {low}-{high}'
 
 
-# Private request wires, declarations, comparison blobs and workspace manifests
-# are never addressable through the agent's historical reader.
-PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registered_text',
-                 'registered_script', 'executed_code', 'stdout', 'stderr', 'dashboard',
-                 'query_model_projection', 'tool_return'}
-
-
 def evidence_key(version, meta, query, result, request, record=None):
     """The object whose versions are listed, diffed and checked together."""
     record = record or {}
@@ -155,11 +151,13 @@ def evidence_key(version, meta, query, result, request, record=None):
 def noise(path):
     """Interpreter caches and CLI session logs are captured but never shown as handles."""
     parts = path.split('/')
-    return '__pycache__' in parts or parts[0] == 'sessions'
+    return '__pycache__' in parts or parts[0] in ('sessions', '.tool-notes.jsonl')
 
 
 class PFQueries:
-    def __init__(self, registry, *, stale_checks=True, refresh=None):
+    def __init__(self, registry, *, stale_checks=True, refresh=None, call_timeout=None):
+        from .runtime_options import runtime_value
+        self.call_timeout = runtime_value('pf_timeout', 600) if call_timeout is None else call_timeout
         if registry.mode != 'pf':
             raise ValueError('PF queries require PF mode')
         self.store, self.resolver = registry.store, registry.resolver
@@ -196,16 +194,30 @@ class PFQueries:
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
                 ON json_extract(r.request, '$.parent_event_id')=c.event_id
                 WHERE json_extract(r.request, '$.kind') NOT GLOB 'pf_*')
-                SELECT count(*) FROM versions v JOIN requests r USING(event_id)
+                SELECT v.version_id,r.query_id FROM versions v JOIN requests r USING(event_id)
                 WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
-                ''', (capture.event,)).fetchone()[0]
-            scripts = conn.execute('''SELECT r.event_id || ':stdout' FROM requests r
+                ORDER BY r.rowid''', (capture.event,)).fetchall()
+            scripts = conn.execute('''SELECT r.event_id, v.version_id FROM requests r
+                LEFT JOIN versions v ON v.version_id=r.event_id || ':stdout'
                 WHERE json_extract(r.request, '$.parent_event_id')=? AND json_extract(r.request, '$.kind')='cli_python'
                 AND json_extract(r.request, '$.request.script') IS NOT NULL ORDER BY r.rowid''',
                 (capture.event,)).fetchall()
         body = str(text)
         printed = []
-        for (version,) in scripts:
+        for child, version in scripts:
+            if version is None:
+                event = self.store.read_event(child)
+                if (event['result'].get('completion') == 'unfinished'
+                        and not {child + ':python_end', child + ':stdout_bytes'} & set(event['outputs'])):
+                    continue
+                if child + ':stdout_bytes' in event['outputs']:
+                    from .execution_capture import decoded
+                    raw = self.resolver.content(child + ':stdout_bytes')[1]
+                    try:
+                        decoded(raw)
+                    except UnicodeError:
+                        continue
+                version = child + ':stdout'
             try:
                 output = self.resolver.content(version)[1].decode('utf-8')
             except (RuntimeError, UnicodeDecodeError):
@@ -234,12 +246,14 @@ class PFQueries:
             if printed:
                 output += ', with ' + ' and '.join(('' if full else 'part of ') + self.resolver.handle(v)
                                                    for v, full, _ in printed)
-        line = '[pf: ' + ' | '.join([output] + wrote + noted) + ']'
+        queries = [row['version_id'] for row in observed if row['query_id']]
+        query = [self.resolver.handle(queries[0])] if len(queries) == 1 else []
+        line = '[pf: ' + ' | '.join([output] + query + wrote + noted) + ']'
         return body + '\n' + line + ''.join('\n' + line for line in shown_files)
 
     def _noted(self, version):
         note = evidence_handles.index(self.store).note(version)
-        return f' note (day {note[0]}): "{pf_render.short(note[1], 200)}"' if note else ''
+        return f' note (day {note[0] if note[0] is not None else "unknown"}): "{pf_render.short(note[1], 200)}"' if note else ''
 
     def _shown_notes(self, after, written, body):
         """Notes on workspace files whose whole content this output shows, e.g. after cat."""
@@ -257,35 +271,41 @@ class PFQueries:
 
     def execute(self, operation, args):
         """Agent-facing result: compact text, one line per item."""
-        if operation == 'pf_more':
-            saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
-            if not saved:
-                raise ValueError('Unknown cursor; run the pf command again')
-            operation = saved['operation']
-        page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
-        if isinstance(page, str):
-            return page  # pf_read content and diff keep their header line and exact body
-        if operation == 'pf_search':
-            if 'text' in self.values:
-                return self._render_text_search(page)
-            if 'sections' in page:
-                return pf_render.render_search(page)
-            wanted = self.values['object']
-            return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
-        if operation == 'pf_log':
-            return pf_render.render_log(page)
-        if operation == 'pf_read':
-            return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
-        if operation == 'pf_dependents':
-            return pf_render.render_dependents(page)
-        return pf_render.render_dependencies(page)
+        with budget_scope():
+            if operation == 'pf_more':
+                saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
+                if not saved:
+                    raise ValueError('Unknown cursor; run the pf command again')
+                operation = saved['operation']
+            page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
+            if isinstance(page, str):
+                return page  # pf_read content and diff keep their header line and exact body
+            if operation == 'pf_search':
+                if 'text' in self.values:
+                    return self._render_text_search(page)
+                if 'sections' in page:
+                    return pf_render.render_search(page)
+                wanted = self.values['object']
+                return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
+            if operation == 'pf_log':
+                return pf_render.render_log(page)
+            if operation == 'pf_read':
+                return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
+            if operation == 'pf_dependents':
+                return pf_render.render_dependents(page)
+            return pf_render.render_dependencies(page)
 
     def answer(self, operation, args):
         """Structured page for one query; pf_read content and diff return their delivered text."""
-        with self.resolver.cached():
-            return self._answer(operation, args)
+        try:
+            with budget_scope(timeout=self.call_timeout or float('inf')), self.resolver.cached():
+                return self._answer(operation, args)
+        except TimeoutError:
+            self.__dict__.pop('_indexed', None)
+            raise
 
     def _answer(self, operation, args):
+        check()
         try:
             values = MODELS[operation].model_validate(args).model_dump(exclude_none=True)
         except ValidationError as exc:
@@ -360,13 +380,20 @@ class PFQueries:
                 token = CURRENT_EVENT.set(event)
                 try:
                     self._check(rows)
+                    check()
                     self._review_after_manual(target, rows)
                     self.check_state = 'pf_check:' + event
                     self.store.save_state(self.check_state, rows)
                     if own_event:
                         self.store.complete(event)
+                except TimeoutError as exc:
+                    if own_event:
+                        self.store.complete(event, 'timed_out', error=str(exc))
+                    raise
                 finally:
                     CURRENT_EVENT.reset(token)
+        checked_days = {r['check'].get('checked_day') for r in rows if 'check' in r}
+        checked_day = next(iter(checked_days)) if len(checked_days) == 1 else None
         unexpanded = list(dict.fromkeys(self.resolver.handle(r['edge']['target']) for r in rows
                                        if r['stop'] == 'depth_limit'))
         describe = lambda r, all_rows=rows: self._top(r, all_rows) if _depth(r) == 1 else self._describe_edge(r)
@@ -384,7 +411,7 @@ class PFQueries:
                 rows = endpoints
         return self._page(rows, offset, describe, root=self._describe(target),
                           stale_check='performed' if checking else 'not_performed', unexpanded=unexpanded,
-                          checked_day=self._check_day if checking else None)
+                          checked_day=checked_day if checking else None)
 
     def _review_after_manual(self, target, rows):
         state = self.store.load_state('pf_review')
@@ -407,63 +434,93 @@ class PFQueries:
         self.store.save_state('pf_review', state)
 
     def weekly_check(self, day):
-        with self.resolver.cached():
-            return self._weekly_check(day)
+        try:
+            with budget_scope(), self.resolver.cached():
+                return self._weekly_check(day)
+        except (TimeoutError, RunCancelled):
+            self.__dict__.pop('_indexed', None)
+            raise
 
     def _weekly_check(self, day):
         """Week-start digest of new issues, pending review and continuing conditions."""
         if not self.stale_checks:
             return None
-        self._index(None)
-        tracing = time.monotonic()
-        self.operation = 'pf_dependencies'
-        # The digest covers every reachable dependency; explicit queries remain depth-limited.
-        self.values = dict(depth=len(self.nodes), purpose='current', include_execution=False, detail=False, limit=100)
-        self.follow_execution = True
-        state = self.store.load_state('pf_review') or {'pending': {}, 'ended': []}
-        self.review_pending = state['pending']
-        active = sorted((v for v, record in self.records.items()
-                         if record['status'] == 'active' and self.latest[self._key(v)] == v),
-                        key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
-        traced, ended, continuing = {}, [], set()
-        eligible = set()
-        for version in active:
-            record = self.records[version]
-            if applies_ended(record, day):
-                ended.append(record['version'])
-                continue
-            if record.get('applies_at', {}).get('start_day', 0) > day:
-                continue
-            eligible.add(version)
-            if version in self.review_pending:
-                # Keep ordinary findings dated, but retry transient source failures
-                # alongside explicit conditions and their propagation paths.
-                rows = self.review_pending[version]['conditions']
-                if rows:
-                    traced[version] = rows
-                    continuing.add(version)
-                continue
-            rows = self._cached_trace(version)
-            if any(_weekly(r) for r in rows):
-                traced[version] = rows
-        self.review_pending = {v: p for v, p in self.review_pending.items() if v in eligible}
-        new_ended = [v for v in ended if v not in state['ended']]
-        if not traced and not new_ended and not self.review_pending:
-            if state != {'pending': {}, 'ended': ended}:
-                self.store.save_state('pf_review', dict(pending={}, ended=ended))
-            return None
-        traced_at = time.monotonic()
-        skipped_pending = len(self.review_pending) - len(continuing)
+        latest_records = None
+        traced, ended, continuing, previous_checks = {}, [], set(), {}
+        self.review_pending = {}
         event = self.store.begin_event('pf_weekly_check', {'day': day})
         token = CURRENT_EVENT.set(event)
         try:
+            self._index(None)
+            tracing = time.monotonic()
+            self.operation = 'pf_dependencies'
+            # The digest covers every reachable dependency; explicit queries remain depth-limited.
+            self.values = dict(depth=len(self.nodes), purpose='current', include_execution=False, detail=False, limit=100)
+            self.follow_execution = True
+            state = self.store.load_state('pf_review') or {'pending': {}, 'ended': []}
+            self.review_pending = state['pending']
+            owner = self.store.identity.get('role')
+            active = sorted((v for v, record in self.records.items()
+                             if (not owner or self.nodes[v]['meta'].get('owner_role') == owner)
+                             and record['status'] == 'active' and self.latest[self._key(v)] == v),
+                            key=lambda v: int(self.records[v]['id'][1:]), reverse=True)
+            latest_records = [v for v in self.records if self.latest[self._key(v)] == v
+                              and (not owner or self.nodes[v]['meta'].get('owner_role') == owner)]
+            if not latest_records:
+                self.store.complete(event, check_complete=True, inventory_complete=True,
+                                    conditions=[], digest_version=None, checked_texts=0, pending_texts=0)
+                return None
+            eligible = set()
+            for version in active:
+                check()
+                record = self.records[version]
+                if applies_ended(record, day):
+                    ended.append(record['version'])
+                    continue
+                if record.get('applies_at', {}).get('start_day', 0) > day:
+                    continue
+                eligible.add(version)
+                if version in self.review_pending:
+                    # Keep ordinary findings dated, but retry transient source failures
+                    # alongside explicit conditions and their propagation paths.
+                    rows = [dict(r) for r in self._indexed_references(self.review_pending[version]['conditions'])]
+                    for row in rows:
+                        if 'cached_check' not in row and 'check' in row:
+                            previous_checks[id(row)] = row.pop('check')
+                    if rows:
+                        traced[version] = rows
+                        continuing.add(version)
+                    continue
+                rows = self._cached_trace(version)
+                if any(_weekly(r) for r in rows):
+                    traced[version] = rows
+            self.review_pending = {v: p for v, p in self.review_pending.items() if v in eligible}
+            new_ended = [v for v in ended if v not in state['ended']]
+            if not traced and not new_ended and not self.review_pending:
+                if state != {'pending': {}, 'ended': ended}:
+                    self.store.save_state('pf_review', dict(pending={}, ended=ended))
+                self.store.complete(event, check_complete=True, inventory_complete=True, conditions=self._weekly_conditions(latest_records, {}, day),
+                                    checked_texts=0, pending_texts=0, digest_version=None)
+                return None
+            traced_at = time.monotonic()
+            skipped_pending = len(self.review_pending) - len(continuing)
             self._check([row for rows in traced.values() for row in rows], day=day)
+            check()
             rendering = time.monotonic()
             entries, underlying = [], []
+            predicates_checked = False
             for version, rows in traced.items():
-                tops = ([self._describe_edge(r) for r in rows
-                         if (self._conditional(r) or r.get('retry_refresh')) and not r['historical_only']]
-                        if version in continuing else [self._top(r, rows) for r in rows if _weekly(r)])
+                check()
+                tops = []
+                for row in rows:
+                    if (row['edge'].get('reference', {}).get('predicate')
+                            and row['check']['predicate_result'] in ('holds', 'fails', 'cannot_check')):
+                        predicates_checked = True
+                    if version in continuing:
+                        if (self._conditional(row) or row.get('retry_refresh')) and not row['historical_only']:
+                            tops.append(self._top(row, rows))
+                    elif _weekly(row):
+                        tops.append(self._top(row, rows))
                 # Old data changing deserves an example even behind an immutable
                 # output. Only verified row additions are folded into a count.
                 direct = [t for t in tops if t['check'].get('below_failed')
@@ -471,10 +528,13 @@ class PFQueries:
                           or t['check']['predicate_result'] in ('fails', 'cannot_check')
                           or (t['check']['version_changed'] and t['check']['predicate_result'] != 'holds'
                               and t['check'].get('change_kind') != 'append_only')]
-                entries.append(dict(text=self._describe(version), total=len(tops), changed=direct))
+                entries.append(dict(text=self._describe(version), total=len(tops), changed=direct,
+                                    diff_pair=next((t['diff_pair'] for t in tops if t.get('diff_pair')), None),
+                                    stored_conditions=[self._describe_edge(r) for r in rows if not r['historical_only']
+                                        and r['check'].get('evaluation_scope') == 'stored_artifact' and self._conditional(r)]))
                 if not direct and any(t['check'].get('below_changed') or
                                       t['check'].get('change_kind') == 'append_only' for t in tops):
-                    underlying.append(self.records[version]['version'])
+                    underlying.append(self.resolver.handle(version))
                 if version not in continuing:
                     ordinary = self._ordinary_changes(rows)
                     if ordinary:
@@ -484,27 +544,117 @@ class PFQueries:
                 else:
                     # Do not advance the ordinary problem's last verification date.
                     self.review_pending[version]['conditions'] = self._continuing_rows(rows)
-            text = pf_render.render_weekly(entries, day, pf=True, ended=new_ended, underlying=underlying,
+            rendered = {}
+            text = pf_render.render_weekly(entries, day, pf=True, rendered=rendered, ended=new_ended, underlying=underlying,
                                           condition_only=len(continuing), pending=len(self.review_pending),
-                                          active=len(active), eligible=len(eligible))
+                                          active=len(active), eligible=len(eligible), predicates_checked=predicates_checked)
             if self.review_pending:
+                example = self.resolver.handle(next(iter(self.review_pending))).split('.')[0]
                 text += (f'\nPending review: {pf_render.plural(len(self.review_pending), "active text")}; '
                          f'{pf_render.plural(skipped_pending, "earlier finding")} '
                          f'{"was" if skipped_pending == 1 else "were"} not rechecked this week. '
                          'Use text_list with review="pending" for dated findings; '
-                         'pf depend rN rechecks one text. Pending does not retire a text.')
+                         f'pf depend {example} rechecks one text. Pending does not retire a text.')
                 text += pf_render.render_pending([
-                    dict(record=self.records[v]['version'], **p) for v, p in self.review_pending.items()], day)
+                    dict(record=self.resolver.handle(v), **p) for v, p in self.review_pending.items()], day)
             self.store.save_state('pf_review', dict(pending=self.review_pending, ended=ended))
             version = self.store.version(event, 'weekly_check', text, layer='weekly_check')
-            self.store.complete(event, index=self.index_stats, check=self.check_stats,
+            self.store.complete(event, check_complete=True, inventory_complete=True, index=self.index_stats, check=self.check_stats,
                                 trace_seconds=traced_at-tracing, render_seconds=time.monotonic()-rendering,
                                 skipped_pending_texts=skipped_pending,
                                 content_reads=self.resolver.read_stats,
-                                checked_texts=len(traced), pending_texts=len(self.review_pending))
+                                checked_texts=len(traced), pending_texts=len(self.review_pending),
+                                digest_version=version, conditions=self._weekly_conditions(latest_records, traced, day, rendered))
+        except TimeoutError as exc:
+            self.store.complete(event, 'timed_out', error=str(exc), check_complete=False,
+                                pending_texts=len(self.review_pending),
+                                digest_version=None, inventory_complete=latest_records is not None,
+                                coverage='complete' if latest_records is not None else 'unavailable',
+                                conditions=self._weekly_conditions(latest_records, traced, day, interrupted=True, previous_checks=previous_checks) if latest_records is not None else [])
+            raise
+        except (Exception, RunCancelled) as exc:
+            self.store.complete(event, 'cancelled' if isinstance(exc, RunCancelled) else 'failed', error=str(exc), check_complete=False,
+                                digest_version=None, inventory_complete=latest_records is not None,
+                                coverage='complete' if latest_records is not None else 'unavailable',
+                                conditions=self._weekly_conditions(latest_records, traced, day, interrupted=True, previous_checks=previous_checks) if latest_records is not None else [])
+            raise
         finally:
             CURRENT_EVENT.reset(token)
         return CapturedText(text, [origin(version, text)])
+
+    def _indexed_references(self, rows):
+        result = []
+        for row in rows:
+            edge = row['edge']
+            if edge['origin'] == 'agent_declaration' and 'reference_index' not in edge:
+                matches = [e for e in self.outgoing[edge['source']]
+                           if {k: v for k, v in e.items() if k != 'reference_index'} == edge]
+                result.extend(dict(row, edge=e) for e in matches)
+                if matches:
+                    continue
+            result.append(row)
+        return result
+
+    def _weekly_conditions(self, versions, traced, day, rendered=None, interrupted=False, previous_checks=None):
+        conditions = []
+        for version in versions:
+            record = self.records[version]
+            rows = traced.get(version, [])
+            binding = self.store.load_state('declaration:' + record['version']) or {}
+            bindings = binding.get('references', [])
+            for index, reference in enumerate(record['references']):
+                identity = self._condition_id(version, index)
+                direct = next((r for r in rows if r['edge']['source'] == version
+                               and r['edge'].get('reference_index') == index), None)
+                previous_check = dict(direct.get('check') or {}) if direct else {}
+                pending_rows = self.review_pending.get(version, {}).get('conditions', [])
+                pending_recheck = any(r['edge']['source'] == version and
+                    (r['edge'].get('reference_index') == index or
+                     'reference_index' not in r['edge'] and r['edge'].get('reference') == reference)
+                    for r in pending_rows)
+                completed = (direct is not None and 'cached_check' not in direct and
+                             previous_check.get('predicate_result') in ('holds', 'fails', 'cannot_check', 'not_declared'))
+                reason = ('retired' if record['status'] == 'retired' else
+                          'applies_ended' if applies_ended(record, day) else
+                          'not_yet_applicable' if record.get('applies_at', {}).get('start_day', 0) > day else
+                          'historical_only' if reference.get('purpose') == 'historical_only' else
+                          'explicit_unknown' if direct is None and 'unknown' in reference.get('evidence', {}) else
+                          'pending_not_rechecked' if (direct is not None and 'cached_check' in direct) or
+                          (direct is None and version in self.review_pending and not pending_recheck) else
+                          'check_interrupted' if interrupted and not completed else
+                          'pending_not_rechecked' if version in self.review_pending and direct is None else
+                          'not_selected' if direct is None else None)
+                outcome = previous_check
+                last_verification = (previous_checks or {}).get(id(direct)) if direct else None
+                if reason == 'pending_not_rechecked':
+                    pending = self.review_pending[version]
+                    last_verification = previous_check or dict(checked_day=pending['last_day'], finding=pending['reason'])
+                if reason:
+                    outcome = dict(predicate_result='not_checked', reason=reason, evaluation_scope='not_checked', checked_day=None)
+                dependencies = []
+                if direct:
+                    target = direct['edge']['target']
+                    dependencies = [dict(edge=r['edge'], path=r['path'], historical_only=r['historical_only'],
+                                         check=r.get('check')) for r in rows if r is direct or
+                                    (target is not None and len(r['path']) > 2 and r['path'][1] == target)]
+                source = direct['edge']['target'] if direct else (bindings[index].get('version_id') if index < len(bindings) else None)
+                conditions.append(dict(condition_id=identity, declaration_version=version,
+                    record=record['version'], role=record.get('author'), reference_index=index,
+                    reference=reference, applies_at=record.get('applies_at'), weekly_day=day,
+                    checked_day=outcome.get('checked_day'), last_verification=last_verification,
+                    status='skipped' if reason else outcome.get('predicate_result', 'not_checked'),
+                    source_version=source,
+                    current_source_version=outcome.get('current_version'),
+                    cited_observation_day=outcome.get('cited_observed_day'),
+                    computation_day=outcome.get('checked_day') if outcome.get('evaluation_scope') == 'refreshed_read' else None,
+                    check=outcome, dependencies=dependencies,
+                    digest_ranges=(rendered or {}).get(identity, [])))
+        return conditions
+
+    def _condition_id(self, version, index):
+        owner = self.records[version].get('author', self.registry.role)
+        record = self.resolver.handle(version).split(':')[-1]
+        return f'{owner}:{record}:{index}'
 
     def _ordinary_changes(self, rows):
         paths = {tuple(p) for r in rows if _weekly(r) for p in r['check']['affected_paths']}
@@ -528,14 +678,40 @@ class PFQueries:
             target = row['edge']['target']
             failure = failures.get(encoded(self._key(target)).decode(), {}) if target else {}
             return bool(failure) and not failure.get('permanent') and not row['historical_only']
-        paths = [r['path'] for r in rows if not r['historical_only'] and (self._conditional(r) or needs_retry(r))]
+        active = [r for r in rows if not r['historical_only']]
+        selected = {encoded(r['edge']) for r in active if self._conditional(r) or needs_retry(r)}
+        descendants = {self._node(r['edge']['target']) for r in active if self._conditional(r)
+                       and r['edge']['target'] and r['check'].get('evaluation_scope') == 'stored_artifact'}
+        fresh = set()
+        while True:
+            check()
+            before = len(descendants)
+            for row in active:
+                check()
+                if self._node(row['edge']['source']) in descendants:
+                    fresh.add(encoded(row['edge']))
+                    if row['edge']['target']:
+                        descendants.add(self._node(row['edge']['target']))
+            if len(descendants) == before:
+                break
+        selected.update(fresh)
+        while True:
+            check()
+            before = len(selected)
+            sources = {self._node(r['edge']['source']) for r in active if encoded(r['edge']) in selected}
+            selected.update(encoded(r['edge']) for r in active
+                            if r['edge']['target'] and self._node(r['edge']['target']) in sources)
+            if len(selected) == before:
+                break
         result = []
-        for row in rows:
-            if not any(path[:len(row['path'])] == row['path'] for path in paths):
+        for row in active:
+            check()
+            key = encoded(row['edge'])
+            if key not in selected:
                 continue
             item = dict(row)
             item['retry_refresh'] = needs_retry(row)
-            if not self._conditional(row) and not item['retry_refresh']:
+            if not self._conditional(row) and not item['retry_refresh'] and key not in fresh:
                 item['cached_check'] = row['check']
             else:
                 item.pop('cached_check', None)
@@ -563,29 +739,27 @@ class PFQueries:
         check = row.get('check')
         if not check or row['historical_only']:
             return result
-        below = [r for r in rows if _depth(r) > 1 and r['path'][:2] == row['path'] and r.get('check')
-                 and not r['historical_only'] and (r['edge']['target'] is None or
-                 (self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
-                  and not self._clock(r['edge']['target'])))]
-        # Shared ancestors may have been expanded under another path. Use propagated
-        # causes, not just this branch's displayed traversal, for failed predicates.
-        causes = {tuple(path[-2:]) for path in check['affected_paths'] if len(path) > 2}
-        missing = {path[-1] for path in check['affected_paths'] if len(path) > 1}
-        problems = {encoded(r['edge']): r for r in rows if not r['historical_only']
-                    and r['check']['predicate_result'] in ('fails', 'cannot_check') and
-                    ((r['edge']['source'], r['edge']['target']) in causes or
-                     (r['edge']['target'] is None and r['edge']['source'] in missing))}
+        causes = {(self._node(path[-2]), self._node(path[-1]))
+                  for path in check['affected_paths'] if len(path) > 2}
+        missing = {self._node(path[-1]) for path in check['affected_paths'] if len(path) > 1}
+        below = {encoded(r['edge']): r for r in rows if r is not row and not r['historical_only']
+                 and ((r['edge']['target'] is not None
+                       and (self._node(r['edge']['source']), self._node(r['edge']['target'])) in causes)
+                      or (r['edge']['target'] is None and self._node(r['edge']['source']) in missing))}
+        problems = {key: r for key, r in below.items()
+                    if r['check']['predicate_result'] in ('fails', 'cannot_check')}
         failed = [r for r in problems.values() if r['check']['predicate_result'] == 'fails']
-        changed = [r for r in below if r['check']['version_changed'] and r['check']['predicate_result'] in
+        changed = [r for r in below.values() if r['edge']['target']
+                   and self.nodes[r['edge']['target']]['meta']['layer'] in SOURCE_LAYERS
+                   and not self._clock(r['edge']['target']) and r['check']['version_changed'] and r['check']['predicate_result'] in
                    ('not_declared', 'not_checked')]
         changed.sort(key=lambda r: r['check'].get('change_kind') == 'append_only')
         unknown = [r for r in problems.values() if r['check']['predicate_result'] == 'cannot_check']
-        source_count = len({encoded(r['edge']) for r in below} | problems.keys())
         parts = []
         for rows_, head in ((failed, 'PREDICATE FAILS on'), (changed, 'changed:')):
             if rows_:
                 example = self._describe_edge(rows_[0])
-                parts.append(f"{len(rows_)} of {source_count} underlying sources {head} "
+                parts.append(f"{pf_render.plural(len(rows_), 'underlying source')} {head} "
                              f"{example['target']['what']}: {example['check'].get('summary', 'changed')}")
         if unknown:
             reasons = ', '.join(sorted({str(r['check']['reason']) for r in unknown}))
@@ -594,6 +768,12 @@ class PFQueries:
             result['check']['sources'] = '; '.join(parts)
         result['check'].update(below_failed=len(failed) + len(unknown), below_changed=len(changed),
                               below_content_changed=sum(r['check'].get('change_kind') != 'append_only' for r in changed))
+        if not result.get('diff_pair'):
+            pair = next((self._describe_edge(r).get('diff_pair') for r in below.values()
+                         if r['edge']['target'] and r['check']['version_changed'] and r['check']['current_version']
+                         and not self._clock(r['edge']['target'])), None)
+            if pair:
+                result['diff_pair'] = pair
         return result
 
     def _clock(self, version):
@@ -602,6 +782,7 @@ class PFQueries:
         return request.get('path') == '/vars'
 
     def _index(self, cutoff):
+        check()
         started = time.monotonic()
         reset = not hasattr(self, '_indexed') or (cutoff is not None and cutoff < self._indexed)
         if reset:
@@ -614,7 +795,8 @@ class PFQueries:
             self._codes, self._private_pending = defaultdict(set), {}
             self._edge_keys, self._pending_events = set(), set()
             self._graph_versions, self._traces = defaultdict(int), {}
-            self._indexed = self._event_cutoff = self._last_day = 0
+            self._indexed = self._event_cutoff = 0
+            self._last_day = None
         day = self._last_day
         added_events = 0
         with closing(self.store.connect()) as conn:
@@ -626,15 +808,16 @@ class PFQueries:
                     LEFT JOIN results s USING(event_id) LEFT JOIN queries q ON r.query_id=q.id
                     WHERE r.rowid>? OR r.event_id IN ({placeholders}) ORDER BY r.rowid''',
                     [self._event_cutoff, *pending]):
+                check()
                 self._event_cutoff = max(self._event_cutoff, row['event_row'])
-                try:
-                    self.store._visible(conn, row['event_id'])
-                except KeyError:
-                    continue
+                if not self.store.identity.get('role'):
+                    try:
+                        self.store._visible(conn, row['event_id'])
+                    except KeyError:
+                        continue
                 request = json.loads(row['request'])
-                # The server records each weekly dashboard with its simulated day; later
-                # events happen on that day. Agents reason in simulated days, not clock time.
-                if row['event_id'] not in self.events and request['kind'] == 'dashboard_generation':
+                # Host day stamps provide context; file observation dates require stamped ancestry.
+                if row['event_id'] not in self.events and request['kind'] in evidence_handles.HOST_DAY_KINDS:
                     day = (request.get('request') or {}).get('day', day)
                 self.event_day.setdefault(row['event_id'], day)
                 self.events[row['event_id']] = dict(request=request,
@@ -648,12 +831,18 @@ class PFQueries:
             versions = conn.execute('SELECT rowid,* FROM versions WHERE rowid>? AND rowid<=? ORDER BY rowid',
                                     (self._indexed, self.cutoff)).fetchall()
         self._last_day = day
-        self._check_day = max(day, self.registry.sim_day() or 0)
+        self._check_day = self.registry.sim_day()
         new_nodes = {}
         for row in versions:
+            check()
             if row['event_id'] not in self.events:
                 continue
             meta = json.loads(row['metadata'])
+            try:
+                with closing(self.store.connect()) as conn:
+                    self.store.authorize_version(conn, row['event_id'], meta, public=meta['layer'] in PUBLIC_LAYERS, graph=True)
+            except PermissionError:
+                continue
             event = self.events[row['event_id']]
             retrieval = (meta['layer'] in ('stdout', 'stderr', 'tool_return')
                          and event['result'].get('pf_retrieval', bool(event['result'].get('pf_calls'))))
@@ -691,7 +880,7 @@ class PFQueries:
                     self._edge(version, segment['version_id'], 'public_field_range',
                                source_range=segment['source_range'], field=field['pointer'])
             if meta['layer'] == 'file_bytes':
-                key = meta['object_id']
+                key = (meta.get('owner_role'), meta['object_id'])
                 previous = files.get(key)
                 if previous and self.nodes[previous]['content_hash'] == row['content_hash']:
                     self._edge(version, previous, 'same_content_observation')
@@ -718,7 +907,7 @@ class PFQueries:
         for version, (event_id, layer) in list(self._private_pending.items()):
             if not self.events[event_id]['result']:
                 continue
-            value = json.loads(self.resolver.content(version)[1])
+            value = json.loads(self.resolver.content(version, graph=True)[1])
             if layer == 'agent_declaration' and value['version_id'] in self.records:
                 source = value['version_id']
                 refs = self.records[source]['references']
@@ -726,12 +915,15 @@ class PFQueries:
                     binding = value['references'][i] if i < len(value['references']) else {}
                     resolved = binding.get('status') == 'resolved' and binding.get('git_content_matches') is not False
                     target = binding.get('version_id') if resolved else None
-                    reason = (None if resolved else 'git_content_mismatch' if binding.get('git_content_matches') is False
+                    reason = ('inaccessible' if resolved and target not in self.nodes else None if resolved else 'git_content_mismatch' if binding.get('git_content_matches') is False
                               else binding.get('reason', 'not_captured_in_prefix'))
                     self._edge(source, target, 'reference', origin='agent_declaration',
-                               reference=ref, reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
+                               reference_index=i, reference=({k: v for k, v in ref.items() if k in ('purpose',)} if reason == 'inaccessible' else ref), reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
                                missing=target not in self.nodes)
             elif layer in ('model_source_occurrences', 'model_reconstructions'):
+                if self.store.identity.get('role') and (self.events[event_id]['request'].get('role') != self.store.identity['role'] or self.events[event_id]['request'].get('session_id') != self.store.identity['session_id']):
+                    del self._private_pending[version]
+                    continue
                 event = self.events[event_id]
                 if event['result'].get('send_state') == 'response_received' and event['result'].get('status') == 'succeeded':
                     for item in value:
@@ -765,8 +957,8 @@ class PFQueries:
     def _key(self, version):
         row = self.nodes[version]
         meta, event = row['meta'], self.events[row['event_id']]
-        return evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'),
-                            event['request'])
+        key = evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'), event['request'])
+        return (*key, meta.get('owner_role')) if self.store.identity.get('role') else key
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
         if target not in self.nodes and origin != 'agent_declaration':
@@ -791,17 +983,27 @@ class PFQueries:
                 for o in self.nodes[version]['meta'].get('objects', [])]
 
     def _target(self, target):
+        if 'version' in target and evidence_handles.RAW_VERSION.fullmatch(target['version']):
+            self.store.public_content(target['version'])
+            if target['version'] not in self.nodes:
+                raise ValueError('Captured version is unavailable in this cursor')
+            return target['version']
+        owner = self.store.identity.get('role')
+        target = dict(target)
+        if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
+            target = {'record': target['version']}
+        for field in ('path', 'record'):
+            if owner and field in target and target[field].split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in target[field]:
+                owner, target[field] = target[field].split(':', 1)
         if 'path' in target and evidence_handles.VERSIONED.fullmatch(target['path']) and not any(
                 row['meta'].get('object_id') == target['path'] for row in self.nodes.values()):
-            target = {'version': target['path']}  # forecast.json@v3 written as a path
+            target = {'version': (owner + ':' if owner else '') + target['path']}  # forecast.json@v3 written as a path
         if 'path' in target and not any(row['meta']['layer'] == 'file_bytes' and row['meta']['object_id'] == target['path']
                                         for row in self.nodes.values()):
             # An output or query named without its version, e.g. analyze.py.out or query7: the latest.
-            members = [v for v in evidence_handles.index(self.store).latest(target['path']) or [] if v in self.nodes]
+            members = [v for v in evidence_handles.index(self.store).latest((owner + ':' if owner else '') + target['path']) or [] if v in self.nodes]
             if members:
                 return members[-1]
-        if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
-            target = {'record': target['version']}
         if 'version' in target:
             members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
             if not members:
@@ -810,15 +1012,19 @@ class PFQueries:
         matches = []
         for version, row in self.nodes.items():
             meta, event = row['meta'], self.events[row['event_id']]
-            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path']:
+            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path'] and (not owner or meta.get('owner_role') == owner):
                 matches.append(version)
             elif 'sql' in target and meta['layer'] == 'server_public_response' and event['query'] and event['query'][5] == target['sql']:
                 matches.append(version)
             elif 'record' in target and version in self.records:
                 record = self.records[version]
-                if target['record'] in (record['id'], record['version']):
+                if target['record'] in (record['id'], record['version']) and (not owner or meta.get('owner_role') == owner):
                     matches.append(version)
         if not matches:
+            if owner and self.store.identity.get('role'):
+                from .role_policy import READABLE_ROLES
+                if owner not in READABLE_ROLES[self.store.identity['role']]:
+                    raise PermissionError('Evidence is inaccessible')
             raise ValueError('No captured version matches; use another path, SQL or registered text')
         return matches[-1]
 
@@ -835,7 +1041,7 @@ class PFQueries:
             day=record['sim_day'] if record and record.get('sim_day') is not None else self.event_day.get(row['event_id']),
             layer=meta['layer'], operation=event['request']['kind'],
             status=event['result'].get('status', 'result_unknown'), objects=self._objects(version),
-            relation_origin='agent_declaration' if record else 'automatic_capture')
+            relation_origin='agent_declaration' if record else 'automatic_capture', owner=meta.get('owner_role', 'ceo'))
         if meta['source_truncated']:
             result['truncated'] = True
         if meta['extent'] != 'full':
@@ -850,7 +1056,8 @@ class PFQueries:
             result['checked_day'] = self._check_day
             result['refresh_hint'] = 'research_group completes a new survey; calling get_group_insights again only retrieves it'
         if self._rerun(version):
-            result['what'] += ' [rerun by PF check]'
+            result['what'] += (' [reread by PF check]' if meta['layer'] == 'file_bytes'
+                               else ' [rerun by PF check]')
         if meta['layer'] == 'file_bytes':
             result['path'] = meta['object_id']
         if query:
@@ -863,7 +1070,8 @@ class PFQueries:
         if 'classification' in event['result']:
             result['classification'] = event['result']['classification']
         if record:
-            result.update(record=record['version'], text=record['text'], text_status=record['status'],
+            result.update(record=result['version'], what='text ' + result['version'],
+                          text=record['text'], text_status=record['status'],
                           reason=record['reason'], applies_at=record['applies_at'],
                           current_revision=self.latest[self._key(version)] == version)
         handles = evidence_handles.index(self.store)
@@ -885,7 +1093,7 @@ class PFQueries:
 
     def _brief(self, version):
         full = self._describe(version)
-        return {k: full[k] for k in ('version', 'day', 'what', 'truncated', 'extent',
+        return {k: full[k] for k in ('version', 'day', 'what', 'owner', 'truncated', 'extent',
                                     'snapshot_day', 'checked_day', 'refresh_hint') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
@@ -893,32 +1101,35 @@ class PFQueries:
         """How the current version of a dependency differs from the cited one."""
         if after in self.records:
             record = self.records[after]
-            return 'retired as ' + record['version'] if record['status'] == 'retired' else 'revised to ' + record['version']
+            return ('retired as ' if record['status'] == 'retired' else 'revised to ') + self.resolver.handle(after)
         meta = self.resolver.content(before)[0]
         kind = ('query' if meta['layer'] == 'server_public_response' and self.events[meta['created_by_event']]['query']
                 else 'public' if meta['layer'] == 'server_public_response'
                 else 'json' if (meta.get('object_id') or '').endswith('.json') else 'text')
         return pf_render.change(kind, self.resolver.content(before)[1], self.resolver.content(after)[1])
 
-    def _value(self, before, after, reference):
+    def _value(self, before, after, reference, check):
         """The cited cell(s) then and now, e.g. '>= 770: now 721 (was 812)'."""
         from .pf_stale import cell
         meta = self.resolver.content(before)[0]
         kind = 'csv' if (meta.get('object_id') or '').endswith('.csv') else 'json'
+        now = 'now' if check.get('evaluation_scope') == 'refreshed_read' else (
+            'stored bytes' if check.get('evaluation_scope') == 'stored_artifact' else 'captured value')
+        was = 'was' if now == 'now' else 'cited'
         try:
             predicate = reference.get('predicate') or {}
             if predicate.get('type') == 'compare':
                 left, right = (cell(self.resolver.content(after)[1], predicate[k], kind) for k in ('left', 'right'))
-                return f"{pf_render.number(left)} {predicate['op']} {pf_render.number(right)} now"
+                return f"{pf_render.number(left)} {predicate['op']} {pf_render.number(right)} {now}"
             old, new = (cell(self.resolver.content(v)[1], reference['select'], kind) for v in (before, after))
         except (ValueError, KeyError, TypeError, IndexError):
             return 'value unavailable'
         n = pf_render.number
         if predicate.get('type') == 'threshold':
-            return f"{predicate['op']} {n(predicate['value'])}: now {n(new)} (was {n(old)})"
+            return f"{predicate['op']} {n(predicate['value'])}: {now} {n(new)} ({was} {n(old)})"
         if predicate.get('type') == 'tolerance':
-            return f"within {n(predicate['amount'])} of {n(old)}: now {n(new)}"
-        return f'now {n(new)} (was {n(old)})'
+            return f"within {n(predicate['amount'])} of {n(old)}: {now} {n(new)}"
+        return f'{now} {n(new)} ({was} {n(old)})'
 
     def _node(self, version):
         return self.same_bytes.get(version, version)
@@ -940,6 +1151,7 @@ class PFQueries:
         follow = self.follow_execution
         queue, scheduled, rows = deque([(root, [root], False)]), {(self._node(root), False)}, []
         while queue:
+            check()
             node, path, historical = queue.popleft()
             for edge in self._edges(node, reverse):
                 if edge['origin'] != 'agent_declaration' and not follow:
@@ -974,18 +1186,22 @@ class PFQueries:
                       traversal_only=item['traversal_only'])
         if 'reference' in edge:
             result.update(edge['reference'])
+            result['condition_id'] = self._condition_id(edge['source'], edge.get('reference_index', 'legacy'))
+            result['reference_index'] = edge.get('reference_index')
         if 'check' in item:
             check = dict(item['check'])
             current = check['current_version']
             if edge['target'] and current:
                 if 'reference' in edge and (edge['reference'].get('select') or edge['reference'].get('predicate')) \
                         and check['predicate_result'] in ('holds', 'fails'):
-                    check['summary'] = self._value(edge['target'], current, edge['reference'])
+                    check['summary'] = self._value(edge['target'], current, edge['reference'], check)
                 elif check['version_changed']:
                     check['summary'] = self._change(edge['target'], current)
             check['current_version'] = self.resolver.handle(current) if current else None
             check['affected_paths'] = [[self.resolver.handle(v) for v in path] for path in check['affected_paths']]
             result['check'] = check
+            if edge['target'] and check['version_changed'] and check['current_version']:
+                result['diff_pair'] = [result['target']['version'], check['current_version']]
         return result
 
     # --- pf log / diff / blame / search ---------------------------------------------
@@ -1029,8 +1245,6 @@ class PFQueries:
                 item['note'] = note
             if same := handles.same_as(member):
                 item['same_content_as'] = same
-            if self._rerun(member):
-                item['what'] += ' [rerun by PF check]'
             return item
         return self._page(groups[::-1], offset, describe, root=self._describe(target))
 
@@ -1061,6 +1275,7 @@ class PFQueries:
         groups = [g for g in self._groups(target) if g['k'] <= group['k']]
         origins, lines = [], []
         for g in groups:
+            check()
             text = self._text(next(m for m in g['members'] if m in self.nodes))
             if text is None:
                 raise ValueError('blame needs a text version')
@@ -1072,14 +1287,14 @@ class PFQueries:
         name = handles.name(target)
         out = [f"{name}: the version and day that introduced each line"]
         previous = None
-        width = max((len(f"v{g['k']} d{g['day']}") for g in origins), default=0)
+        width = max((len(f"v{g['k']} d{g['day'] if g['day'] is not None else 'unknown'}") for g in origins), default=0)
         for origin_group, line in zip(origins, lines):
-            label = f"v{origin_group['k']} d{origin_group['day']}" if origin_group is not previous else ''
+            label = f"v{origin_group['k']} d{origin_group['day'] if origin_group['day'] is not None else 'unknown'}" if origin_group is not previous else ''
             out.append(f'{label:<{width}} | {line}')
             previous = origin_group
         notes = [g for g in {id(g): g for g in origins}.values() if g.get('note')]
         if notes:
-            out.append('Notes: ' + ' · '.join(f"v{g['k']} (day {g['note'][0]}): \"{pf_render.short(g['note'][1], 120)}\""
+            out.append('Notes: ' + ' · '.join(f"v{g['k']} (day {g['note'][0] if g['note'][0] is not None else 'unknown'}): \"{pf_render.short(g['note'][1], 120)}\""
                                               for g in sorted(notes, key=lambda g: g['k'])))
         text = '\n'.join(out)
         if len(text) > 30000:
@@ -1093,6 +1308,7 @@ class PFQueries:
         handles = evidence_handles.index(self.store)
         with closing(self.store.connect()) as conn:
             for version, row in reversed(self.nodes.items()):
+                check()
                 if self._rerun(version):
                     continue
                 key = (handles.key(version), row['content_hash'])
@@ -1126,7 +1342,7 @@ class PFQueries:
         text = f"pf search --text {self.values['text']!r}: {page['total']} matching objects/content versions, newest first."
         sources = []
         for item in page['items']:
-            text += f"\n{item['version']} · day {item['day']} · excerpt:\n"
+            text += f"\n{item['version']} · day {item['day'] if item['day'] is not None else 'unknown'} · excerpt:\n"
             sources.append(dict(version_id=item['source_version'], source_range=item['source_range'],
                                 request_range=[len(text), len(text) + len(item['snippet'])], full_source=False))
             text += item['snippet']
@@ -1181,7 +1397,7 @@ class PFQueries:
             remaining=len(rows) - end, total=len(rows), detail=self.values['detail'], **extra)
 
     def _read(self, target, offset, baseline=None):
-        meta, raw = self.resolver.content(target)
+        meta, raw = self.resolver.content(target, public=True)
         try:
             content = raw.decode('utf-8')
         except UnicodeDecodeError as exc:
@@ -1190,10 +1406,10 @@ class PFQueries:
         if self.values['mode'] == 'diff':
             baseline = baseline or self._target(self.values['baseline'])
             key = self._key(target)
-            if key != self._key(baseline) or not (key[0] in ('query', 'file_bytes', 'registered_text', 'registered_script',
+            if key != self._key(baseline) or not (key[0] in ('query', 'public_read', 'file_bytes', 'registered_text', 'registered_script',
                                                               'dashboard') or key[0].startswith(('script_', 'command_'))):
                 raise ValueError('Diff requires two versions of the same captured object')
-            old_meta, old = self.resolver.content(baseline)
+            old_meta, old = self.resolver.content(baseline, public=True)
             try:
                 before = old.decode('utf-8')
             except UnicodeDecodeError as exc:
@@ -1205,7 +1421,7 @@ class PFQueries:
                 # Rows compared after canonical sorting; null when either result lacks a comparison.
                 header['rows_equal'] = None
                 if all(c.get('status') == 'available' for c in comparison):
-                    contents = [self.resolver.content(self.nodes[v]['event_id'] + ':comparison')[1] for v in (baseline, target)]
+                    contents = [self.resolver.content(self.nodes[v]['event_id'] + ':comparison', graph=True)[1] for v in (baseline, target)]
                     header['rows_equal'] = contents[0] == contents[1]
                     if meta['source_truncated'] or old_meta['source_truncated']:
                         header['rows_scope'] = 'returned_subset'
@@ -1224,6 +1440,56 @@ class PFQueries:
         prefix = encoded(header).decode() + '\n'
         # The continuation command follows the body; the header keeps the delivery fields.
         more = f"\n[{len(content) - end:,} more characters: pf more {header['next_cursor']}]" if header['next_cursor'] else ''
+        if self.values['mode'] == 'diff' and content and end == len(content):
+            more += f"\n[Before changing this source: pf rdepend {shlex.quote(header['baseline']['version'])} --detail.]"
         from .pf_read import capture_read
         return capture_read(self, target, prefix + content[offset:end] + more,
                             offset, end, len(content))
+
+
+def weekly_condition_visibility(store, event_id):
+    """Private audit: exact digest ranges and successful model-request delivery.
+
+    Summary-only delivery has no condition ranges. A rendered condition counts as
+    delivered when a successful request includes one complete result line.
+    Each rendered range retains its own delivery facts.
+    """
+    event = store.read_event(event_id)
+    digest = event['result'].get('digest_version')
+    occurrences = []
+    if digest:
+        with closing(store.connect()) as conn:
+            versions = conn.execute("""SELECT v.version_id, v.event_id FROM versions v
+                JOIN results r USING(event_id)
+                WHERE json_extract(v.metadata, '$.layer')='model_source_occurrences'
+                AND json_extract(r.record, '$.status')='succeeded'
+                AND json_extract(r.record, '$.send_state')='response_received'""").fetchall()
+        for version in versions:
+            try:
+                store.read_event(version['event_id'])
+                _, raw = store.get_content(version['version_id'])
+            except (KeyError, PermissionError):
+                continue
+            occurrences.extend(dict(item, model_event=version['event_id']) for item in json.loads(raw)
+                               if item['version_id'] == digest)
+    results = []
+    for condition in event['result'].get('conditions', []):
+        ranges = condition.get('digest_ranges', [])
+        requests, range_deliveries = [], [dict(source_range=r, delivered_requests=[]) for r in ranges]
+        for request in dict.fromkeys(o['model_event'] for o in occurrences):
+            intervals = sorted(o['source_range'] for o in occurrences if o['model_event'] == request)
+            covered = []
+            for start, end in intervals:
+                if covered and start <= covered[-1][1]:
+                    covered[-1][1] = max(end, covered[-1][1])
+                else:
+                    covered.append([start, end])
+            for delivery in range_deliveries:
+                start, end = delivery['source_range']
+                if any(a <= start and end <= b for a, b in covered):
+                    delivery['delivered_requests'].append(request)
+                    if request not in requests:
+                        requests.append(request)
+        results.append(dict(condition_id=condition['condition_id'], digest_ranges=ranges,
+                            rendered=bool(ranges), range_deliveries=range_deliveries, delivered_requests=requests))
+    return results

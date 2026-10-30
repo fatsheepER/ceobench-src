@@ -98,7 +98,7 @@ def _get_latest_session() -> str:
 
 
 def _resolve_session(session_id: str = None) -> str:
-    if os.environ.get("NOVAMIND_API_PORT"):
+    if os.environ.get("NOVAMIND_API_PORT") or os.environ.get("NOVAMIND_API_SOCKET"):
         return "__env__"
     if session_id:
         return session_id
@@ -118,7 +118,7 @@ def _session_meta(session_id: str) -> dict:
 
 
 def _ensure_server_running(session_id: str) -> int:
-    env_port = os.environ.get("NOVAMIND_API_PORT")
+    env_port = os.environ.get("NOVAMIND_API_PORT") or ("1" if os.environ.get("NOVAMIND_API_SOCKET") else None)
     if env_port:
         return int(env_port)
 
@@ -176,7 +176,7 @@ def _ensure_server_running(session_id: str) -> int:
 @observed
 def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
     url = f"http://127.0.0.1:{port}{path}"
-    data = json.dumps(body or {}).encode() if method == "POST" else None
+    data = json.dumps(body or {}).encode() if method in ("POST", "DELETE") else None
     req = urllib.request.Request(
         url,
         data=data,
@@ -184,7 +184,16 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
         method=method,
     )
     try:
-        with urlopen(req, timeout=1800) as resp:
+        advance_timeout = float(os.environ.get('CEOBENCH_ADVANCE_TIMEOUT_SECONDS', '0'))
+        query_timeout = float(os.environ.get('CEOBENCH_SQL_TIMEOUT_SECONDS', '600'))
+        response_timeout = float(os.environ.get('CEOBENCH_SQL_RESPONSE_TIMEOUT_SECONDS', '120'))
+        completion_wait = float(os.environ.get('CEOBENCH_COMPLETION_WAIT_SECONDS', '30'))
+        timeout = 1800
+        if path == '/next-week':
+            timeout = advance_timeout + completion_wait if advance_timeout and completion_wait else None
+        elif path == '/query':
+            timeout = query_timeout + response_timeout + completion_wait if completion_wait else None
+        with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_bytes = e.read()
@@ -310,18 +319,32 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
     env.pop("NOVAMIND_SERVER_MODE", None)
 
     captured = script_start(code, source, env)
+    timeout_error = None
+    script_timeout = float(os.environ.get('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '1800')) or None
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, env=env,
-            cwd=str(_base_dir()), timeout=300,
-        )
-    except subprocess.TimeoutExpired as exc:
-        script_end(captured, exc.stdout or b'', exc.stderr or b'', None, 'timeout')
-        raise
+        with subprocess.Popen(
+            [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, cwd=str(_base_dir()),
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=script_timeout)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
+                # Descendants may still own the pipes; retain the bytes already collected.
+                stdout, stderr = exc.stdout or b'', exc.stderr or b''
+                timeout_error = exc
+            except BaseException:
+                process.kill()
+                raise
+            result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     except BaseException as exc:
         script_end(captured, b'', b'', None, type(exc).__name__)
         raise
-    script_end(captured, result.stdout, result.stderr, result.returncode)
+    script_end(captured, result.stdout, result.stderr, result.returncode,
+               'timeout' if timeout_error is not None else None)
+    if timeout_error is not None:
+        raise timeout_error
     result.stdout, result.stderr = decode_output(result.stdout), decode_output(result.stderr)
 
     if result.stdout:
@@ -353,12 +376,9 @@ def cmd_query(args):
         "timestamp": time.time(),
     })
     if result.get("success"):
-        rows = result.get("rows", [])
-        columns = result.get("columns", [])
-        if rows:
-            print(json.dumps({"columns": columns, "rows": rows, "row_count": len(rows)}, indent=2, default=str))
-        else:
-            print(json.dumps({"columns": columns, "rows": [], "row_count": 0}))
+        print(json.dumps(result, indent=2, default=str))
+        if result.get("warning"):
+            print(f"\n⚠️  {result['warning']}", file=sys.stderr)
     else:
         print(f"Error: {result.get('error', 'Unknown error')}", file=sys.stderr)
         sys.exit(1)
@@ -459,8 +479,82 @@ def cmd_stop(args):
         print(json.dumps({"success": True, "message": "Server was not running"}))
 
 
+def _script_request(args, method, body=None):
+    session_id = _resolve_session(getattr(args, "session", None))
+    port = _ensure_server_running(session_id)
+    try:
+        result = _api_call(port, method, "/daily-scripts", body)
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(result))
+    if result.get("success") is not True:
+        sys.exit(1)
+
+
+@observed
+def cmd_register_daily_script(args):
+    """Register a Python source snapshot for the start of each week.
+
+    Usage: ./novamind-operation register-daily-script <script_path> [--session ID]
+
+    The legacy command name says daily; execution is weekly, in insertion order.
+    Registration uses the source filename. Re-register that filename to replace
+    its snapshot; editing the local file alone does not update it.
+    Scripts must explicitly import novamind_api, for example
+    `import novamind_api as nm`. Print the results you need in your weekly input.
+    In teams, scripts and outputs belong to their registering role. CEO scripts
+    can change business settings; analyst scripts can only read public data.
+    ask_analyst follow-ups do not rerun scripts.
+    The server receipt includes name, registered and sha256. Exit code 0 requires
+    server success; file, connection and server errors exit nonzero.
+    """
+    source = Path(args.script_path)
+    try:
+        content = source.read_text()
+    except (OSError, UnicodeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    _script_request(args, "POST", {"name": source.name, "content": content})
+
+
+@observed
+def cmd_list_daily_scripts(args):
+    """List the current role's server snapshots in insertion order.
+
+    Usage: ./novamind-operation list-daily-scripts [--session ID]
+
+    Returns the server's scripts list with name, size and sha256 for each entry.
+    These snapshots run at the start of each week. Local files are not a registry.
+    Exit code 0 requires server success; connection and server errors exit nonzero.
+    """
+    _script_request(args, "GET")
+
+
+@observed
+def cmd_remove_daily_script(args):
+    """Remove a registered server snapshot by filename, preserving local files.
+
+    Usage: ./novamind-operation remove-daily-script <script_name> [--session ID]
+
+    Returns the server's removed filename. In teams, only your role's registry
+    is affected. Exit code 0 requires server success; missing registrations,
+    connection failures and rejected removals exit nonzero.
+    """
+    _script_request(args, "DELETE", {"name": args.script_name})
+
+
+def reject_pf_route():
+    if len(sys.argv) > 1 and sys.argv[1] == 'pf':
+        import shlex
+        print('Error: PF is a separate Bash command. Run: ' +
+              shlex.join(['pf', *sys.argv[2:]]), file=sys.stderr)
+        raise SystemExit(2)
+
 def main():
     import argparse
+    reject_pf_route()
+
 
     parser = argparse.ArgumentParser(
         prog="novamind-operation",
@@ -544,6 +638,17 @@ Examples:
     p = subparsers.add_parser("stop", help="Stop the simulation server")
     p.add_argument("--session", type=str, default=None, help="Session ID (default: latest)")
 
+    p = subparsers.add_parser("register-daily-script", help="Register a script snapshot for weekly execution")
+    p.add_argument("script_path", help="Path to the Python script")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
+    p = subparsers.add_parser("list-daily-scripts", help="List registered weekly script snapshots")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
+    p = subparsers.add_parser("remove-daily-script", help="Remove a registered weekly script snapshot")
+    p.add_argument("script_name", help="Registered filename")
+    p.add_argument("--session", default=None, help="Session ID (default: latest)")
+
     args = parser.parse_args()
 
     cmd_map = {
@@ -556,6 +661,9 @@ Examples:
         "history": cmd_history,
         "list-sessions": cmd_list_sessions,
         "stop": cmd_stop,
+        "register-daily-script": cmd_register_daily_script,
+        "list-daily-scripts": cmd_list_daily_scripts,
+        "remove-daily-script": cmd_remove_daily_script,
     }
 
     cmd_map[args.command](args)

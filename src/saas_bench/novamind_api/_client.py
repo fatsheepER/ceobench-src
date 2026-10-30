@@ -27,7 +27,7 @@ class _Vars:
 
 def _get_port() -> int:
     """Get the API server port from environment."""
-    port_str = os.environ.get('NOVAMIND_API_PORT', '')
+    port_str = os.environ.get('NOVAMIND_API_PORT') or ('1' if os.environ.get('NOVAMIND_API_SOCKET') else '')
     if not port_str:
         raise NovaMindAPIError(
             "NOVAMIND_API_PORT not set. Are you running inside a novamind-operation environment?"
@@ -170,7 +170,15 @@ def query(sql: str) -> Dict[str, Any]:
 
     Returns:
         Dict with 'columns' (list of column names), 'rows' (list of dicts),
-        and 'row_count' (int).
+        'row_count' (returned row count), and 'success'. Results are capped at
+        5,000 rows. If capped, 'truncated' is true and 'warning' describes the
+        returned subset. Warnings also print to stderr. Use SQL aggregates for
+        population calculations. An explicit LIMIT scopes the requested query;
+        absence of a truncation warning does not establish population coverage.
+        SQL values are limited to 1 MiB, accumulated rows to 8 MiB,
+        and the JSON response to 16 MiB. Oversized results fail with HTTP 413.
+        SQLite formatting can return NULL at its value limit; the response
+        warns when NULL also permits an invalid-format interpretation.
 
     Raises:
         NovaMindAPIError: On failure (blocked query, syntax error, etc.)

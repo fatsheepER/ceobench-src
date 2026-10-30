@@ -20,9 +20,9 @@ def test_explicit_citation_never_searches_old_requests_or_changes_requested_vers
     new = executor.execute('read_file', {'path': 'evidence.json'})
     current_request = request(store, new, 'new-week')
     read_event = store.read_event
-    def bounded(event):
+    def bounded(event, **kwargs):
         assert event != old_request, 'Registration searched a previous context'
-        return read_event(event)
+        return read_event(event, **kwargs)
     monkeypatch.setattr(store, 'read_event', bounded)
     receipt = executor.execute('text_create', declaration({'version': 'evidence.json@v1'}),
                                model_request_event=current_request, model_context_id='new-week')

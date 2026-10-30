@@ -76,57 +76,39 @@ counts. This is normal — just wait for the response.
 
 Exit code 0 on success, 1 on failure (including missing rationale or predictions).
 
-## novamind
+#### `./novamind-operation register-daily-script`
 
-Entry point for novamind CLI.
+Register a Python source snapshot for the start of each week.
 
-Commands:
-    register-daily-script   Register a script to run daily
-    list-daily-scripts      List all registered daily scripts
-    remove-daily-script     Remove a registered daily script
+Usage: ./novamind-operation register-daily-script <script_path> [--session ID]
 
-Examples:
-    novamind register-daily-script strategy.py
-    novamind list-daily-scripts
-    novamind remove-daily-script strategy.py
+The legacy command name says daily; execution is weekly, in insertion order.
+Registration uses the source filename. Re-register that filename to replace
+its snapshot; editing the local file alone does not update it.
+Scripts must explicitly import novamind_api, for example
+`import novamind_api as nm`. Print the results you need in your weekly input.
+In teams, scripts and outputs belong to their registering role. CEO scripts
+can change business settings; analyst scripts can only read public data.
+ask_analyst follow-ups do not rerun scripts.
+The server receipt includes name, registered and sha256. Exit code 0 requires
+server success; file, connection and server errors exit nonzero.
 
+#### `./novamind-operation list-daily-scripts`
 
-### Commands
+List the current role's server snapshots in insertion order.
 
-#### `novamind register-daily-script`
+Usage: ./novamind-operation list-daily-scripts [--session ID]
 
-Register a Python script to run automatically at the start of each day.
+Returns the server's scripts list with name, size and sha256 for each entry.
+These snapshots run at the start of each week. Local files are not a registry.
+Exit code 0 requires server success; connection and server errors exit nonzero.
 
-The script content is snapshotted at registration time. Subsequent edits
-to the source file will NOT affect the registered version. To update,
-re-register the script.
+#### `./novamind-operation remove-daily-script`
 
-If a script with the same filename already exists, it is overwritten.
-Scripts are executed in alphabetical order at the start of each day,
-with novamind_api pre-imported.
+Remove a registered server snapshot by filename, preserving local files.
 
-Args:
-    script_path: Path to the Python script to register.
+Usage: ./novamind-operation remove-daily-script <script_name> [--session ID]
 
-Example:
-    novamind register-daily-script my_strategy.py
-
-#### `novamind list-daily-scripts`
-
-List all registered daily scripts.
-
-Shows script names and sizes. Scripts run at the start of each day
-in alphabetical order.
-
-Example:
-    novamind list-daily-scripts
-
-#### `novamind remove-daily-script`
-
-Remove a registered daily script.
-
-Args:
-    script_name: Filename of the script to remove.
-
-Example:
-    novamind remove-daily-script my_strategy.py
+Returns the server's removed filename. In teams, only your role's registry
+is affected. Exit code 0 requires server success; missing registrations,
+connection failures and rejected removals exit nonzero.

@@ -137,11 +137,38 @@ def _literal_bases(store, source, available):
             meta, original = store.get_content(version)
             if original != raw:
                 continue  # Universal-newline projections cannot recover original bytes.
-        event = store.read_event(meta['created_by_event'])
+        event = store.read_event(meta['created_by_event'], evidence=True)
         key = evidence_key(version, meta, event['query_definition'], event['result'], event['request'].get('request'),
                            event['request'])
+        if store.identity.get('role'):
+            key = (*key, meta.get('owner_role'))
         available[version] = dict(text=text, key=list(key),
             chain=[dict(version=version, pointer=source['pointer'], range=[a, b])])
+
+
+def _embedded_reads(store, source, available, counter=None):
+    reads = []
+    for span in source.get('pf_read_spans', []):
+        read_id = span['id']
+        meta, raw = store.get_content(read_id)
+        full = raw.decode('utf-8')
+        a, b = span['request_range']
+        if not (0 <= a <= b <= len(source['text'])) or source['text'][a:b] != full:
+            raise ValueError('Embedded PF read differs from its saved full response')
+        delivery = span.get('delivery') or dict(
+            read_id=read_id, target=meta['target'], range=meta['read_range'], full_version=read_id,
+            mode='FULL' if meta['mode'] == 'content' else 'DIFF', reason='embedded_full',
+            actual_tokens=_count(counter, full), full_tokens=_count(counter, full),
+            tokenizer=counter.metadata if counter else None, recovery_of=None, materialization=False,
+            key=meta['key'], read_kind=meta.get('read_kind', 'pf_read'), chain=[])
+        reads.append(dict(span, delivery=delivery))
+        if meta['complete']:
+            target = meta['target']
+            text = store.get_content(target)[1].decode('utf-8')
+            data = available.setdefault(target, dict(text=text, key=meta['key'],
+                chain=[dict(version=target, pointer=source['pointer'], range=[a, b])]))
+            data['read_key'] = meta['key']
+    return reads
 
 
 def _recent(store, context_id):
@@ -149,9 +176,10 @@ def _recent(store, context_id):
         rows = conn.execute('''SELECT r.event_id,r.seq FROM requests r JOIN results s USING(event_id)
             WHERE r.branch=? AND json_extract(r.request,'$.kind')='model_request'
               AND json_extract(r.request,'$.request.context_id')=?
+              AND coalesce(json_extract(r.request,'$.session_id'),'')=?
               AND json_extract(s.record,'$.status')='succeeded'
               AND json_extract(s.record,'$.send_state')='response_received'
-            ORDER BY r.seq DESC LIMIT 2''', (store.identity['branch_id'], context_id)).fetchall()
+            ORDER BY r.seq DESC LIMIT 2''', (store.identity['branch_id'], context_id, store.identity.get('session_id', ''))).fetchall()
     if not rows:
         return [], 0, 0
     try:
@@ -169,7 +197,7 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
     if meta['mode'] == 'diff':
         return dict(choice, mode='DIFF', reason='active_diff')
     previous, last_seq, prior_seq = recent
-    spent_key = 'pf_read_recovered:' + store.identity['branch_id'] + ':' + context
+    spent_key = 'pf_read_recovered:' + store.identity['branch_id'] + ':' + store.identity.get('session_id', '') + ':' + context
     spent = store.load_state(spent_key) or []
     tool = meta.get('read_kind') == 'tool_call'
     # A tool call is identified by tool and arguments; a PF read by target and range.
@@ -200,7 +228,8 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         return dict(choice, reason='partial_or_truncated')
     if full_tokens is None:
         return dict(choice, reason='tokenizer_unavailable' if counter is None else 'token_count_failed')
-    candidates = [(v, data) for v, data in available.items() if data['key'] == meta['key']]
+    candidates = [(v, data) for v, data in available.items()
+                  if data['key'] == meta['key'] or data.get('read_key') == meta['key']]
     if not candidates:
         return choice
     base, data = candidates[-1]
@@ -253,20 +282,23 @@ def _replace(request, pointer, value):
 def prepare_request(store, request, context_id, counter):
     """Render a temporary request. The conversation keeps its exact full fallback."""
     sources = text_sources(request)
-    if not any(s.get('pf_read') for s in sources):
+    if not any(s.get('pf_read') or s.get('pf_read_spans') for s in sources):
         return []
     available, replacements = {}, []
     recent = _recent(store, context_id)
     for source in sources:
         if not source.get('pf_read'):
             _literal_bases(store, source, available)
+            if spans := _embedded_reads(store, source, available, counter):
+                value = CapturedText(source['text'], source['origins'], pf_read_spans=spans)
+                replacements.append((source['pointer'], at_pointer(request, source['pointer']), value))
             continue
         read_id = source['pf_read']['id']
         meta, raw = store.get_content(read_id)
         full = raw.decode('utf-8')
         if source['text'] != full:
             raise ValueError('PF read differs from its saved full response')
-        key = 'pf_read_choice:' + store.identity['branch_id'] + ':' + read_id
+        key = 'pf_read_choice:' + store.identity['branch_id'] + ':' + store.identity.get('session_id', '') + ':' + context_id + ':' + read_id
         choice = store.load_state(key)
         if choice is None:
             choice = _choose(store, read_id, meta, full, available, counter, context_id, recent)
@@ -342,6 +374,16 @@ def record_request(store, event, body, sources, context):
     for source in sources:
         if not source.get('pf_read'):
             _literal_bases(store, source, available)
+            for span in _embedded_reads(store, source, available):
+                a, b = span['request_range']
+                actual = at_pointer(body, source['pointer'])[a:b]
+                read = dict(span['delivery'], context_id=context, reader=store.identity.get('role', 'ceo'),
+                    agent_id=store.identity.get('agent_id'), session_id=store.identity.get('session_id'),
+                    json_pointer=source['pointer'], request_range=[a, b],
+                    message_id=_message_id(body, source['pointer'], event))
+                read['actual_version'] = store.version(event, 'pf_payload_' + str(len(reads)), actual,
+                                                       layer='pf_read_payload')
+                reads.append(read)
             continue
         read_id = source['pf_read']['id']
         meta, full = store.get_content(read_id)
@@ -364,7 +406,7 @@ def record_request(store, event, body, sources, context):
             chain = base['chain']
             common = dict(request_range=[0, len(actual)], reconstructible=True,
                 representation=delivery['mode'], reconstructed_from=chain, read_id=read_id,
-                reader='ceo', context_id=context, json_pointer=source['pointer'],
+                reader=store.identity.get('role', 'ceo'), agent_id=store.identity.get('agent_id'), session_id=store.identity.get('session_id'), context_id=context, json_pointer=source['pointer'],
                 send_state_event_id=event)
             if tool:
                 reconstructed.extend(dict(common, version_id=item['version_id'], source_range=item['source_range'],
@@ -377,7 +419,8 @@ def record_request(store, event, body, sources, context):
             raise ValueError('PF full response differs from saved evidence')
         elif tool:
             _literal_bases(store, source, available)
-        read = dict(delivery, context_id=context, json_pointer=source['pointer'],
+        read = dict(delivery, context_id=context, reader=store.identity.get('role', 'ceo'),
+                    agent_id=store.identity.get('agent_id'), session_id=store.identity.get('session_id'), json_pointer=source['pointer'],
                     message_id=_message_id(body, source['pointer'], event), chain=chain)
         read['actual_version'] = store.version(event, 'pf_payload_' + str(len(reads)), actual, layer='pf_read_payload')
         reads.append(read)

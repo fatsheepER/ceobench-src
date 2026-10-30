@@ -21,18 +21,97 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
                         'get_market_overview', 'get_group_insights'})
 
 
+def closed_execution(facts):
+    boundary = facts.get('process_boundary') or {}
+    return (facts.get('process_started') is True and facts.get('boundary_closed') is True
+            and boundary.get('phase') == 'closed' and boundary.get('coverage') == 'subreaper_wait'
+            and boundary.get('descendants_closed') is True and boundary.get('children') == []
+            and boundary.get('unknown') is None)
+
+
+def sql_client_interruption(conn, event):
+    row = conn.execute('''SELECT q.request, qr.record, d.record,
+            p.request, pr.record, b.request, br.record
+        FROM requests q JOIN results qr ON qr.event_id=q.event_id
+        JOIN deliveries d ON d.event_id=q.event_id
+        JOIN requests p ON p.event_id=json_extract(q.request, '$.parent_event_id')
+        JOIN results pr ON pr.event_id=p.event_id
+        LEFT JOIN requests b ON b.event_id=json_extract(p.request, '$.parent_event_id')
+        LEFT JOIN results br ON br.event_id=b.event_id WHERE q.event_id=?''', (event,)).fetchone()
+    if row is None:
+        return None
+    query, result, delivery, parent, ended, bash, outer = [json.loads(value) if value else None for value in row]
+    if parent['kind'] == 'bash':
+        bash, outer = parent, ended
+        if not (outer['status'] == 'timed_out' or outer.get('exit_code') in (124, 137)):
+            return None
+        proof = dict(reason='bash_client_timeout')
+    elif (parent['kind'] == 'cli_python' and bash
+          and ended.get('capture_status') == 'complete' and ended.get('completed_at')):
+        if (ended['status'] == 'failed' and ended.get('error') == 'timeout'
+                and ended.get('exit_code') == -9):
+            reason = 'python_timeout_kill'
+        elif (ended.get('completion') == 'unfinished'
+                and ended.get('interrupted_by') == bash['event_id']
+                and ended.get('error') == 'execution_boundary_closed'):
+            reason = 'python_boundary_interruption'
+        else:
+            return None
+        proof = dict(reason=reason, python_event_id=parent['event_id'])
+    else:
+        return None
+    if (query['kind'] != 'sql_query' or bash['kind'] != 'bash' or not outer
+            or result['status'] not in ('succeeded', 'failed', 'rejected', 'timed_out')
+            or delivery.get('send_state') not in ('sent', 'failed')
+            or outer['status'] not in ('succeeded', 'failed', 'timed_out')
+            or any(r.get('capture_status') != 'complete' or not r.get('completed_at')
+                   for r in (result, outer))):
+        return None
+    boundary = outer.get('process_boundary') or {}
+    boundary_exit = boundary.get('exit_code')
+    if boundary_exit != outer.get('exit_code') and boundary_exit is not None and boundary_exit < 0:
+        boundary_exit = 128 - boundary_exit
+    if (outer.get('process_started') is not True or outer.get('boundary_closed') is not True
+            or outer.get('exit_code') is None or boundary_exit != outer['exit_code']
+            or boundary.get('phase') != 'closed' or boundary.get('coverage') != 'subreaper_wait'
+            or boundary.get('descendants_closed', True) is not True
+            or boundary.get('children') != [] or boundary.get('unknown', 'missing') is not None):
+        return None
+    return dict(state='interrupted', receive_state='unknown', bash_event_id=bash['event_id'], **proof)
+
+
 def excluded(rel):
     """Only harness-owned paths at the workspace root; nested business names are legal."""
     from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
-    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS
+    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS or rel.split('/')[0] == '.git'
 
 
 class CapturedText(str):
-    def __new__(cls, text, origins=(), pf_read=None):
+    def __new__(cls, text, origins=(), pf_read=None, pf_read_spans=()):
         value = super().__new__(cls, text)
         value.origins = list(origins)
         value.pf_read = pf_read
+        value.pf_read_spans = list(pf_read_spans)
         return value
+
+
+def join_text(first, separator, second):
+    """Concatenate texts, retaining the evidence ranges of both parts."""
+    text = first + separator + second
+    origins = list(getattr(first, 'origins', []))
+    origins += slice_origins(getattr(second, 'origins', []), 0, len(second),
+                             target=len(first) + len(separator))
+    reads = []
+    for value, offset in ((first, 0), (second, len(first) + len(separator))):
+        reads.extend(slice_read_spans(getattr(value, 'pf_read_spans', []), 0, len(value), offset))
+        if read := getattr(value, 'pf_read', None):
+            reads.append(dict(id=read['id'], request_range=[offset, offset + len(value)]))
+    return CapturedText(text, origins, pf_read_spans=reads) if origins or reads else text
+
+
+def slice_read_spans(spans, start, end, target=0):
+    return [dict(item, request_range=[target + a - start, target + b - start])
+            for item in spans for a, b in [item['request_range']] if start <= a <= b <= end]
 
 
 def origin(version, text, start=0, end=None, target=0):
@@ -73,19 +152,18 @@ class ExecutionCapture:
             return None
         return self.safe(self.store.version, self.event, slot, value, layer=layer, **metadata)
 
-    def file(self, path, raw, text=None, phase='read'):
+    def file(self, path, raw, text=None, phase='read', owner=None):
         self.slots += 1
-        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path))
+        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **({'owner_role': owner} if owner else {}))
         if text is None:
             return raw_version
         version = self.blob(f'file_{self.slots}_text', text, 'file_text', derived_from=raw_version,
-                            transformation='decode_universal_newlines')
+                            transformation='decode_universal_newlines', **({'owner_role': owner} if owner else {}))
         return version
 
     def snapshot(self, workspace, phase):
         started = time.monotonic()
-        with self.store.batch():
-            items = self._snapshot(workspace, phase)
+        items = self._snapshot(workspace, phase)
         self.facts[phase + '_scan_seconds'] = time.monotonic() - started
         return items
 
@@ -110,13 +188,13 @@ class ExecutionCapture:
                     item.update(type='symlink', target=os.readlink(path))
                 elif stat.S_ISREG(info.st_mode):
                     # O_NOFOLLOW prevents a replacement symlink escaping the workspace.
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                    with os.fdopen(fd, 'rb') as stream:
+                    from .workspace_io import open_file
+                    with open_file(root, path) as stream:
                         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                             raise RuntimeError('File changed type during capture: ' + rel)
                         raw = stream.read()
                         after = os.fstat(stream.fileno())
-                    if (info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                    if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                         raise RuntimeError('File changed during boundary capture: ' + rel)
                     sha = digest(raw)
                     version, latest_sha = self.store.latest_version(rel, 'file_bytes') if self.event else (None, None)
@@ -140,6 +218,7 @@ class ExecutionCapture:
         return items
 
     def finish(self, text, status='succeeded', read_key=None, read_complete=True, body=None, **facts):
+        started = time.monotonic()
         # body is the return before PF appended handles; equal bodies keep one version number.
         from .evidence_handles import body_digest
         extra = dict(body_sha256=body_digest(body)) if body is not None else {}
@@ -151,20 +230,24 @@ class ExecutionCapture:
             # The exact tool return is the read target; repeated identical calls in one
             # request context can then be delivered as DELTA or UNCHANGED.
             read = self.blob('read_full', text, 'pf_read_full', target=version, key=read_key, mode='content',
-                             read_range=[0, len(text)], complete=read_complete, force_full=False,
+                             read_range=[0, len(text)], complete=read_complete,
+                             force_full=self.facts.get('warning_emitted', False),
                              read_kind='tool_call')
             pf_read = {'id': read} if read else pf_read
         self.facts.update(facts)
+        self.facts['capture_finish_seconds'] = time.monotonic() - started
         if self.event:
             self.safe(self.store.complete, self.event, status, **self.facts)
         origins = [origin(version, text)] if version else []
-        return CapturedText(text, origins + self.origins, pf_read) if text is not None else None
+        return CapturedText(text, origins + self.origins, pf_read,
+                            getattr(text, 'pf_read_spans', [])) if text is not None else None
 
 
-def capture_http(handler, raw):
-    store = handler.server._api_server.sql_evidence
+def capture_http(handler, raw, *, active_parent=True):
+    store = handler.evidence
     token = handler.headers.get('X-Capture-Context')
-    parent = store.parent(token) if token else None
+    parent = (handler._capture_parent if hasattr(handler, '_capture_parent') else
+              store.parent(token, active=active_parent) if token else None)
     try:
         request = json.loads(raw) if raw else {}
     except (ValueError, UnicodeError):
@@ -240,16 +323,39 @@ def public_handler(method):
     """Admit complete public operations, allowing active executions to finish callbacks."""
     from functools import wraps
     @wraps(method)
+    def audited(handler):
+        from .api_server import RequestRejected, RequestDeadlineExceeded
+        try:
+            handler._start_public_request()
+            try:
+                return observed(handler)
+            except (RequestRejected, RequestDeadlineExceeded) as exc:
+                return handler._reject_request(exc)
+        finally:
+            api = handler.server._api_server
+            if audit := api.role_audits.get(handler.role):
+                audit.record('public_http', method=handler.command, path=handler.path,
+                    tool=getattr(handler, '_audit_tool', None), http_status=getattr(handler, '_audit_status', None))
+
     def observed(handler):
+        from .api_server import RequestRejected, RequestDeadlineExceeded
         api = handler.server._api_server
-        store = api.sql_evidence
+        if not handler.admit():
+            return
+        store = handler.evidence
         if handler.path == '/_capture':
             return receive_client(handler)
-        if not store or not store.execution_capture:
+        status_only = (handler.command == 'GET' and handler.path == '/game-status'
+                       and handler.headers.get('X-Harness-Status') == 'flags')
+        if (not store or not store.execution_capture) and not status_only:
             return method(handler)
         if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh', '/run-metrics'):
-            handler._control_capture = True
+            handler._control_capture = bool(store and store.execution_capture)
             try:
+                if status_only:
+                    return handler._send_json(dict(timed_out=api._step_day_timed_out,
+                        operation_failed=api._operation_failed,
+                        operation_in_progress=api._advance_lock.locked()))
                 return method(handler)
             finally:
                 if hasattr(handler, '_control_record'):
@@ -262,30 +368,28 @@ def public_handler(method):
                                 os.fsync(stream.fileno())
                     except Exception as exc:
                         store.fail(exc)
+        if api.team_mode:
+            try:
+                handler._capture_parent = store.parent(handler.headers.get('X-Capture-Context'))
+            except (ValueError, KeyError):
+                return handler._reject_request(RequestRejected('Capture context belongs to a different execution'), 403)
         if store.fault or store.fault_path.exists():
             handler._send_json({'success': False, 'error': 'Execution capture failed; branch stopped'}, 503)
             return
-        with api._sql_lock:
-            while api._sql_paused:
-                try:
-                    if store.parent(handler.headers.get('X-Capture-Context')):
-                        break
-                except ValueError:
-                    pass
-                api._sql_lock.wait()
-            api._sql_active += 1
+        handler._admit_sql()
         handler._sql_event, handler._sql_response = None, None
         handler._sql_execution, handler._sql_capture_failed = {}, False
         handler._generic_capture = handler.path != '/query'
         token = None
         try:
-            raw = handler.rfile.read(int(handler.headers.get('Content-Length', 0)))
+            raw = handler._read_request_bytes()
             handler.rfile = io.BytesIO(raw)
             try:
                 if handler.path == '/query':
                     from .public_sql import PUBLIC_POLICY_VERSION
                     handler._sql_event = store.begin(raw, PUBLIC_POLICY_VERSION,
-                        parent=store.parent(handler.headers.get('X-Capture-Context')))
+                        parent=handler._capture_parent if api.team_mode else
+                            store.parent(handler.headers.get('X-Capture-Context')))
                 else:
                     handler._sql_event = capture_http(handler, raw)
                 client = handler.headers.get('X-Capture-Call')
@@ -296,36 +400,43 @@ def public_handler(method):
                 handler._sql_capture_failed = True
                 store.fail(exc)
             return method(handler)
+        except (RequestRejected, RequestDeadlineExceeded) as exc:
+            return handler._reject_request(exc)
         finally:
             if token is not None:
                 CURRENT_EVENT.reset(token)
             with api._sql_lock:
                 api._sql_active -= 1
                 api._sql_lock.notify_all()
-    return observed
+    return audited
 
 
 def receive_client(handler):
-    store = handler.server._api_server.sql_evidence
+    from .api_server import RequestRejected, RequestDeadlineExceeded
+    store = handler.evidence
     if not store or not store.execution_capture or handler.command != 'POST':
         handler._send_json({'error': 'Unknown endpoint'}, 404)
         return
     try:
-        length = int(handler.headers.get('Content-Length', 0))
-        if not 0 < length <= 64 * 1024 * 1024:
-            raise ValueError('Invalid capture payload length')
-        body = json.loads(handler.rfile.read(length))
+        raw = handler._read_request_bytes()
+        if not raw:
+            raise RequestRejected('Invalid capture payload length')
+        body = json.loads(raw)
         if set(body) != {'context', 'call', 'record'}:
             raise ValueError('Invalid capture record')
-        parent = store.parent(body['context'])
-        if parent is None or not isinstance(body['record'], dict):
+        if not isinstance(body['record'], dict):
+            raise ValueError('Capture requires an active execution')
+        parent = store.parent(body['context'], active=body['record'].get('kind') == 'python_start')
+        if parent is None:
             raise ValueError('Capture requires an active execution')
         record = body['record']
         if record.get('kind') == 'python_start':
             if set(record) != {'kind', 'code', 'source'} or not all(isinstance(record[k], str) for k in ('code', 'source')):
                 raise ValueError('Invalid Python start record')
             args = {'source': record['source']}
-            if script := script_name(record['source'], getattr(handler.server._api_server, 'script_workspace', None)):
+            api = handler.server._api_server
+            workspace = api.role_executors[store.identity['role']].workspace_path if api.team_mode else api.script_workspace
+            if script := script_name(record['source'], workspace):
                 args['script'] = script
             child = store.begin_event('cli_python', args, parent=parent)
             store.version(child, 'code', record['code'], layer='executed_code')
@@ -333,34 +444,62 @@ def receive_client(handler):
             handler._send_json({'accepted': True})
             return
         if record.get('kind') == 'python_end':
+            from .registration_evidence import EvidenceResolver
             if set(record) != {'kind', 'stdout', 'stderr', 'exit_code', 'error'}:
                 raise ValueError('Invalid Python end record')
-            child = store.parent(body['call'])
+            child = store.parent(body['call'], active=False)
             if store.read_event(child)['request']['parent_event_id'] != parent:
                 raise ValueError('Python execution parent mismatch')
-            for name in ('stdout', 'stderr'):
-                raw = bytes.fromhex(record[name])
-                store.version(child, name + '_bytes', raw, layer=name + '_bytes')
-                try:
-                    store.version(child, name, decoded(raw), layer=name, derived_from=child + ':' + name + '_bytes')
-                except UnicodeError:
-                    pass  # Raw bytes survive a client-visible decode failure.
-            status = 'result_unknown' if record['exit_code'] is None else 'failed' if record['exit_code'] else 'succeeded'
-            store.complete(child, status, exit_code=record['exit_code'], error=record['error'])
-            if status == 'result_unknown':
-                store.fail('Python child outcome unknown')
+            with store.batch(), store._writer() as conn:
+                resolver = EvidenceResolver(store)
+                received = conn.execute('SELECT version_id FROM versions WHERE version_id=?',
+                                        (child + ':python_end',)).fetchone()
+                if received:
+                    if resolver.content(received[0], connection=conn)[1] != encoded(record):
+                        raise RuntimeError('Conflicting Python end receipt')
+                    if any(resolver.content(child + ':' + name + '_bytes', connection=conn)[1]
+                           != bytes.fromhex(record[name]) for name in ('stdout', 'stderr')):
+                        raise RuntimeError('Conflicting Python end streams')
+                else:
+                    ended = conn.execute('SELECT record FROM results WHERE event_id=?', (child,)).fetchone()
+                    if ended and json.loads(ended[0]).get('completion') != 'unfinished':
+                        previous = json.loads(ended[0])
+                        previous = dict(kind='python_end', exit_code=previous.get('exit_code'),
+                            error=previous.get('error'), **{name: resolver.content(
+                                child + ':' + name + '_bytes', connection=conn)[1].hex()
+                                for name in ('stdout', 'stderr')})
+                        if previous != record:
+                            raise RuntimeError('Conflicting Python execution result')
+                    else:
+                        for name in ('stdout', 'stderr'):
+                            raw = bytes.fromhex(record[name])
+                            store.version(child, name + '_bytes', raw, layer=name + '_bytes')
+                            try:
+                                store.version(child, name, decoded(raw), layer=name, derived_from=child + ':' + name + '_bytes')
+                            except UnicodeError:
+                                pass  # Raw bytes survive a client-visible decode failure.
+                        status = ('result_unknown' if record['exit_code'] is None else
+                                  'failed' if record['exit_code'] or record['error'] else 'succeeded')
+                        if not ended:
+                            store.complete(child, status, exit_code=record['exit_code'], error=record['error'])
+                        if status == 'result_unknown':
+                            store.fail('Python child outcome unknown')
+                    store.version(child, 'python_end', encoded(record), layer='program_python_end')
             handler._send_json({'accepted': True})
             return
         if not set(body['record']) <= {'body', 'parsed', 'returned', 'error', 'state', 'projection', 'transformations'}:
             raise ValueError('Unsupported capture fields')
-        with closing(store.connect()) as conn:
-            row = conn.execute('SELECT r.request FROM client_calls c JOIN requests r USING(event_id) WHERE c.token=?', (body['call'],)).fetchone()
-            if not row or json.loads(row[0]).get('parent_event_id') != parent:
-                raise ValueError('Client call does not belong to this execution')
-        store.received(body['call'], body['record'])
+        api = handler.server._api_server
+        with api._request_lock:
+            pending = any(request.get('capture_context') == body['context'] and
+                request.get('capture_call') == body['call'] for request in api._active_requests.values())
+        store.received(body['call'], body['record'], parent=parent, allow_unbound=pending)
         handler._send_json({'accepted': True})
+    except (RequestRejected, RequestDeadlineExceeded):
+        raise
     except Exception as exc:
-        store.fail(exc)
+        if not handler.server._api_server.team_mode or not isinstance(exc, (ValueError, KeyError, TypeError)):
+            store.fail(exc)
         handler._send_json({'accepted': False}, 400)
 
 
@@ -406,15 +545,14 @@ def query_projection(capture, stdout):
             projected = json.loads(stdout)
         except ValueError:
             continue
-        expected = {k: body.get(k) for k in ('columns', 'rows', 'row_count')}
-        if body.get('success') and projected == expected:
+        if body.get('success') and projected == body:
             matches.append((public, meta))
     if len(matches) != 1:
         return []
     public, meta = matches[0]
     version = capture.blob('query_projection', stdout, 'query_model_projection',
                            object_id=meta['object_id'], derived_from=public,
-                           source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection')
+                           source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection', public_observation=True)
     return [origin(version, stdout)] if version else []
 
 
@@ -472,6 +610,8 @@ def text_sources(value, pointer=''):
         result.append(dict(pointer=pointer, text=str(value), origins=value.origins))
         if value.pf_read is not None:
             result[-1]['pf_read'] = value.pf_read
+        if value.pf_read_spans:
+            result[-1]['pf_read_spans'] = value.pf_read_spans
     elif isinstance(value, dict):
         for key, item in value.items():
             result.extend(text_sources(item, pointer + '/' + str(key).replace('~', '~0').replace('/', '~1')))
@@ -496,14 +636,17 @@ def restore_sources(value, records):
         key = int(key) if isinstance(target, list) else key.replace('~1', '/').replace('~0', '~')
         if target[key] != record['text']:
             raise ValueError('Private source state differs from conversation snapshot')
-        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'))
+        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'),
+                                  record.get('pf_read_spans', []))
 
 
-def model_request(store, raw, sources, call_id, attempt_id, context_id):
-    event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id))
+def model_request(store, raw, sources, call_id, attempt_id, context_id, message_ids=()):
+    store.assert_healthy(settle=3)
+    event = store.begin_event('model_request', dict(call_id=call_id, attempt_id=attempt_id, context_id=context_id, message_ids=list(message_ids)))
     # One transaction for the wire, occurrences and every read of this request.
     with store.batch():
         _record_model_request(store, event, raw, sources, call_id, attempt_id, context_id)
+    store.assert_healthy(quiescent=False)
     return event
 
 
@@ -524,17 +667,17 @@ def _record_model_request(store, event, raw, sources, call_id, attempt_id, conte
             c, d = item['request_range']
             if not (0 <= a <= b <= len(original) and 0 <= c <= d <= len(text)) or original[a:b] != text[c:d]:
                 raise ValueError('Source occurrence range does not match final request')
-            occurrences.append(dict(item, reader='ceo', role=role, context_id=context_id, call_id=call_id,
+            occurrences.append(dict(item, reader=store.identity.get('role', 'ceo'), agent_id=store.identity.get('agent_id'), session_id=store.identity.get('session_id'), role=role, context_id=context_id, call_id=call_id,
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')
-    if any(source.get('pf_read') for source in sources):
+    if any(source.get('pf_read') or source.get('pf_read_spans') for source in sources):
         from .pf_read import record_request
         record_request(store, event, body, sources, context_id)
 
 
-def registered_scripts(api, scripts, before, registration=None):
-    store = api.sql_evidence
+def registered_scripts(api, scripts, before, registration=None, *, role="ceo"):
+    store = api.evidence_for(role)
     if not store or not store.execution_capture:
         return
     capture = ExecutionCapture(store)
@@ -552,8 +695,8 @@ def registered_scripts(api, scripts, before, registration=None):
         capture.safe(store.complete, capture.event, outputs=list(versions.values()))
 
 
-def dashboard_version(api, text, day):
-    store = api.sql_evidence
+def dashboard_version(api, text, day, *, role="ceo"):
+    store = api.evidence_for(role)
     if not store or not store.execution_capture:
         return text
     capture = ExecutionCapture(store)

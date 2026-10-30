@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Run selected Git/PF groups; resume held groups only on an explicit invocation.
+
+Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 supervision/resource-closure failure.
+"""
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import logging
+import os
+from pathlib import Path
+
+from saas_bench import team_batch as batch
+from saas_bench.run_state import write_json
+from saas_bench.run_warnings import AttemptWarnings
+from saas_bench.runtime_options import add_runtime_arguments, runtime_environment
+from saas_bench.systemd_guard import memory_bytes
+import team_controller as controller
+from team_observer import identity
+
+
+def verify_controls(policy):
+    policy = Path(policy).resolve()
+    config = batch.read(policy)
+    expected = config['identity']
+    manifest = identity(expected['manifest'], expected)
+    return config, manifest
+
+
+def main(argv=None):
+    with AttemptWarnings() as warnings:
+        return _main(argv, warnings)
+
+
+def _main(argv, warnings):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--policy', type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--check', action='store_true')
+    mode.add_argument('--live', action='store_true')
+    parser.add_argument('--resume', action='store_true', help='Explicitly continue selected groups from saved checkpoints.')
+    parser.add_argument('--force-resume', action='store_true', help='Record explicit continuation despite validation warnings.')
+    parser.add_argument('--run-id', help='Run only this group run from the policy selection.')
+    parser.add_argument('--week', type=int, help='Replay a saved week boundary; week 1 starts at day 0.')
+    parser.add_argument('--memory-high', type=memory_bytes, default=16 * 1024**3)
+    parser.add_argument('--memory-max', type=memory_bytes, default=20 * 1024**3)
+    parser.add_argument('--memory-swap-max', type=memory_bytes, default=0)
+    add_runtime_arguments(parser)
+    args = parser.parse_args(argv)
+    os.environ.update(runtime_environment(args))
+    if args.resume and not args.live:
+        parser.error('--resume requires --live')
+    config, manifest = verify_controls(args.policy)
+    if args.week is not None and args.week < 1:
+        logging.warning('Recovery week is not a positive integer; week 1 starts at day 0')
+    if args.run_id is not None:
+        manifest = dict(manifest, runs=[batch.selected(manifest, args.run_id)])
+    if args.check:
+        print(json.dumps(dict(status='validated', batch_id=manifest['batch_id'],
+            scheduling='group_independent', runs=[row['run_id'] for row in manifest['runs']],
+            memory_high=args.memory_high, memory_max=args.memory_max,
+            runtime_limits=runtime_environment(args),
+            model_requests=0, credential_read=False, new_attempts=0)))
+        return 0
+    directory = args.policy.resolve().parent
+    outcome = 2
+    with (directory / 'driver.lock').open('a') as lock:
+        from saas_bench.run_warnings import advisory
+        with advisory():
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            options = dict(resume=args.resume, memory_high=args.memory_high,
+                memory_max=args.memory_max, memory_swap_max=args.memory_swap_max)
+            if args.force_resume:
+                options['force_resume'] = True
+            if warnings.rows:
+                options['startup_warnings'] = warnings.rows
+            if args.week is not None:
+                options['week'] = args.week
+            if args.run_id is not None:
+                options['run_id'] = args.run_id
+            controller.supervise(args.policy, **options)
+            exit_record = batch.read(directory / 'controller-exit.json')
+            terminal = batch.read(directory / 'controller-terminal.json') if (directory / 'controller-terminal.json').exists() else {}
+            outcome = controller.exit_code(exit_record) if (exit_record['children_reaped'] and
+                (exit_record['hold'] or exit_record.get('operator_stopped') or
+                    set(terminal) == {entry['run_id'] for entry in manifest['runs']})) else 2
+            return outcome
+        finally:
+            write_json(directory / 'driver-exit.json', dict(time=datetime.now(timezone.utc).isoformat(),
+                returncode=outcome, batch_id=manifest['batch_id'], auto_resume=False))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

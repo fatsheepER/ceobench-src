@@ -1,0 +1,13 @@
+[Unit]
+Description=CEO Bench frozen experiment controller
+
+[Service]
+Type=exec
+WorkingDirectory=@SOURCE_ROOT@
+Environment=PYTHONPATH=@SOURCE_ROOT@/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TMPDIR=@RUN_DIR@/tmp
+ExecStartPre=@PYTHON@ -c "from saas_bench.runtime_temp import prepare_tmpdir; prepare_tmpdir('@RUN_DIR@/tmp')"
+ExecStart=@PYTHON@ @SOURCE_ROOT@/scripts/team_controller.py --policy @POLICY@ --live
+KillMode=control-group
+TimeoutStopSec=720
