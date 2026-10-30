@@ -280,7 +280,7 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
             record = runtime.executor.execute('text_create', dict(text=f'pre-session-{role}',
                 objects=[dict(kind='plan', id='A')], references=[dict(cite='unknown: offline')],
                 applies='0-', reason='offline session ownership'))
-            assert record.startswith('Registered r1.1'), record
+            assert record.startswith(f'Registered {role}:r1.1'), record
         (team.roles['ceo'].workspace / 'marker.txt').write_text('stable')
         ceo_code = "import novamind_api as nm\nnm.pricing.set_prices(A=31)\nprint('PRIVATE-SCRIPT-ceo')\n"
         script_hashes['ceo'] = register(team, 'ceo', 'same.py', ceo_code)

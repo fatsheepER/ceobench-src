@@ -1208,6 +1208,7 @@ class BashAgentToolExecutor:
         if type(offset) is not int or offset < 1 or (limit is not None and (type(limit) is not int or limit < 1)):
             return 'Error: offset and limit must be positive integers'
 
+        total_lines = len(lines)
         # Apply offset (1-indexed)
         start = max(0, offset - 1)
         if limit:
@@ -1219,7 +1220,14 @@ class BashAgentToolExecutor:
         # Format with line numbers
         numbered = []
         source_start = sum(len(line) + 1 for line in content.split('\n')[:start])
-        target = 0
+        scope = ''
+        if start >= total_lines:
+            scope = f'[No lines: offset={offset} is past end of file ({total_lines} lines).]\n'
+        elif start or len(lines) < total_lines:
+            end = start + len(lines)
+            more = f'; next offset={end + 1}' if end < total_lines else ''
+            scope = f'[lines {start + 1}-{end} of {total_lines}{more}]\n'
+        target = len(scope)
         for i, line in enumerate(lines, start=start + 1):
             prefix = f'{i:6d}\t'
             # The inserted separator is the original newline between these lines.
@@ -1229,7 +1237,7 @@ class BashAgentToolExecutor:
             source_start += len(line) + 1
             target += len(prefix) + len(line) + 1
 
-        return '\n'.join(numbered)
+        return scope + '\n'.join(numbered)
 
     def _exec_write_file(self, args: Dict) -> str:
         """Write file contents."""

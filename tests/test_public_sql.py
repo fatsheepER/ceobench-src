@@ -368,6 +368,49 @@ def test_serialized_query_response_has_a_byte_limit(server, monkeypatch):
     assert status == 200 and body['rows'] == [{'n': 42}]
 
 
+def test_query_error_survives_a_64_byte_result_limit(server, monkeypatch):
+    server.start()
+    with monkeypatch.context() as limits:
+        limits.setitem(server.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '64')
+        status, body = request(server, {'sql': 'SELECT 42 AS n'})
+        assert status == 413
+        assert body == dict(success=False, error='SQL response exceeded 64 bytes. Narrow the query.')
+    status, body = request(server, {'sql': 'SELECT 43 AS n'})
+    assert status == 200 and body['rows'] == [{'n': 43}]
+    with server._sql_lock:
+        assert server._sql_lock.wait_for(lambda: server._sql_active == 0, timeout=5)
+    assert not server.conn.in_transaction
+
+
+@pytest.mark.parametrize('body,expected', [
+    ({'sql': ''}, 400),
+    ({'sql': 'SELECT * FROM group_insight_snapshots'}, 403),
+    ({'sql': 'SELECT missing FROM ledger'}, 500),
+])
+def test_query_rejections_keep_their_status_with_a_tiny_result_limit(server, monkeypatch, body, expected):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '64')
+    server.start()
+    status, response = request(server, body)
+    assert status == expected
+    assert response['success'] is False and response['error']
+    assert 'SQL response exceeded' not in response['error']
+
+
+@pytest.mark.parametrize('result_limit', ['0', '64'])
+def test_query_error_details_have_an_independent_bound(server, monkeypatch, result_limit):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', result_limit)
+    server.start()
+    status, response = request(server, {'sql': 'SELECT "' + 'missing_' * 10000 + '" FROM ledger'})
+    assert status == 500
+    assert response == dict(success=False,
+        error='SQL error details exceeded 65536 bytes and were omitted.', error_truncated=True)
+    assert len(json.dumps(response).encode()) <= 65536
+    with monkeypatch.context() as limits:
+        limits.setitem(server.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '1024')
+        status, response = request(server, {'sql': 'SELECT amount FROM ledger'})
+        assert status == 200 and response['rows'] == [{'amount': 42.0}]
+
+
 def test_week_publishes_shocks_database_and_day_together(server):
     from concurrent.futures import ThreadPoolExecutor
     entered, query_started, finish = threading.Event(), threading.Event(), threading.Event()

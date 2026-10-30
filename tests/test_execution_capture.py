@@ -578,10 +578,11 @@ def test_files_boundaries_and_exact_source_ranges(captured, tmp_path):
     ws = executor.workspace_path
     (ws / 'x.txt').write_bytes('第一行\r\n第二行\r\n'.encode())
     value = executor.execute('read_file', {'path': 'x.txt', 'offset': 2, 'limit': 1})
-    assert value == '     2\t第二行'
+    assert value == '[lines 2-2 of 3; next offset=3]\n     2\t第二行'
     field = value.origins[1]
     assert store.get_content(field['version_id'])[1].decode()[slice(*field['source_range'])] == '第二行'
-    assert field['request_range'] == [7, 10]
+    assert field['request_range'] == [39, 42]
+    assert value[slice(*field['request_range'])] == '第二行'
     assert executor.execute('read_file', {'path': 'x.txt', 'offset': 0}).startswith('Error:')
     assert '(3 bytes)' in executor.execute('write_file', {'path': 'z.txt', 'content': '中'})
     edited = executor.execute('edit_file', {'path': 'x.txt', 'old_string': '第二行', 'new_string': 'changed'})

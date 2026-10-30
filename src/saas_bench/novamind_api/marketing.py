@@ -16,7 +16,8 @@ def set_daily_spend(operations: Optional[float] = None,
         development: Daily development budget ($).
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if operations is not None:
@@ -33,7 +34,8 @@ def set_targeted_ad_spend(targeted_spend: Dict[str, Dict[str, float]]) -> Dict:
         targeted_spend: {channel_id: {group_id: $/day}} nested dict.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     return _client.call('set_targeted_ad_spend', {'targeted_spend': targeted_spend})
 
@@ -49,7 +51,8 @@ def set_ads_strength(global_strength: Optional[float] = None,
         by_customer: Per-customer overrides {customer_id: strength}.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if global_strength is not None:
@@ -74,7 +77,8 @@ def set_lead_promotion(global_promotion: Optional[float] = None,
         by_channel_group: Per-channel-group overrides {channel: {group_id: promotion}}.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if global_promotion is not None:

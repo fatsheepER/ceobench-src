@@ -253,6 +253,7 @@ class Retire(Input):
 
 
 class ListTexts(Input):
+    raw: bool = False
     after: Annotated[int, Field(ge=0)] = 0
     limit: Annotated[int, Field(ge=1, le=100)] = 20
 
@@ -307,7 +308,8 @@ def tool_definitions(pf=False, team=False):
                   'supplied references replace the whole list, and [] clears it. '
                   'Earlier revisions remain in registrations.json.',
         'retire': 'Stop using a registered text. Appends a retired revision with a reason and keeps all history.',
-        'list': 'Page through your active registered texts in creation order, with their references and notes. '
+        'list': 'List saved active texts as compact excerpts in creation order. '
+                'Use raw=true for complete records, references and notes. '
                 'Does not check them. Pass next_after as after for the next page.',
     }
     models = MODELS[group]

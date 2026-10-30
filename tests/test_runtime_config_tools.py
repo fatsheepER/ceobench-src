@@ -121,7 +121,7 @@ def test_global_partial_update_leaves_other_scopes_unchanged(tools, name, scope,
     config, new_audit = snapshot(tools)
     assert config == before
     assert new_audit[:-1] == audit and len(new_audit) == len(audit) + 1
-    assert json.loads(new_audit[-1]['settings_json']) == result.data
+    assert json.loads(new_audit[-1]['settings_json']) == {k: v for k, v in result.data.items() if k != 'changes'}
 
 
 def test_ops_legacy_alias_and_integer_customer_keys(tools):

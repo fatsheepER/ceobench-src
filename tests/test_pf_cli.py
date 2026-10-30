@@ -62,14 +62,14 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     assert 'cmd' not in again  # no captured evidence and no writes: no line at all
     long_note = 'x' * 250
     second = executor.execute('bash', {'command': "printf 'a\\nB\\nc\\n' > MEMORY.md", 'note': long_note})
-    assert second.endswith('| wrote MEMORY.md@v2 | note saved (truncated to 200 characters)]'), second
+    assert '| wrote MEMORY.md@v2 | note saved (truncated to 200 characters)' in second, second
     log = executor.execute('bash', {'command': 'cd /workspace && pf log MEMORY.md'})
     lines = log.splitlines()
     assert lines[0] == 'file MEMORY.md: 2 versions, newest first'
     assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
     assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
-    assert lines[3] == ('pf show MEMORY.md@v2 · pf diff MEMORY.md@v1 MEMORY.md@v2 · pf blame MEMORY.md '
-                        'Before changing this source: pf rdepend MEMORY.md@v2 --detail.')
+    assert lines[3:] == ['pf show MEMORY.md@v2', 'pf diff MEMORY.md@v1 MEMORY.md@v2',
+                         'pf blame MEMORY.md', 'Before changing this source: pf rdepend MEMORY.md@v2 --detail.']
     assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
     diff = executor.execute('bash', {'command': 'pf diff MEMORY.md'})
     assert '--- MEMORY.md@v1\n+++ MEMORY.md@v2' in diff and '-b\n+B\n+c' in diff

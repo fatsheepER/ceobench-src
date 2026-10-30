@@ -268,6 +268,34 @@ def log_line(item):
     return ' · '.join(parts)
 
 
+def render_captures(page):
+    root = page['root']
+    counts = lambda values: ', '.join(f'{state}={count}' for state, count in sorted(values.items())) or 'none'
+    lines = [f"Captured in {root['version']} ({page['scope']}): {page['total']} items.",
+             'Scope: saved public responses, nonempty text script output, new/modified files.',
+             'Missing responses are marked; deleted files and empty/binary streams are omitted. Same execution, not a dependency claim.',
+             f"Command status: {root['status']}; scripts: {counts(page['script_statuses'])}.",
+             f"Business calls: {counts(page['call_statuses'])}.",
+             'Capture gaps: ' + (', '.join(page['capture_gaps']) or 'none reported') + '.']
+    states = page['call_statuses']
+    if 'partially_succeeded' in states or ('succeeded' in states and any(
+            state in states for state in ('failed', 'rejected', 'timed_out', 'cancelled'))):
+        lines.append('Partial failure: some business operations succeeded and others failed.')
+    for item in page['items']:
+        if item.get('missing_response'):
+            day = item['day'] if item['day'] is not None else '?'
+            lines.append(f"No handle · day {day} · {item['what']} ({item['status']}; no saved public response)")
+        else:
+            lines.append(item_line(item))
+    if not page['items']:
+        lines.append('No captured items in this scope.')
+    if more := _more(page, 'captured items'):
+        lines.append(more)
+    lines.append('Read a saved item: pf show HANDLE --full')
+    return '\n'.join(lines)
+
+
+
 def render_log(page):
     items = page['items']
     root = page['root']
@@ -278,10 +306,13 @@ def render_log(page):
     tail = [_more(page, 'older')]
     if not root.get('record') and items:
         newest = items[0]['version']
-        tail.append(f'pf show {newest}' + (f" · pf diff {items[1]['version']} {newest}" if len(items) > 1 else '')
-                    + (f" · pf blame {newest.rsplit('@', 1)[0]}" if root.get('layer') == 'file_bytes' else ''))
+        tail.append(f'pf show {shlex.quote(newest)}')
+        if len(items) > 1:
+            tail.append(f"pf diff {shlex.quote(items[1]['version'])} {shlex.quote(newest)}")
+        if root.get('layer') == 'file_bytes':
+            tail.append(f"pf blame {shlex.quote(newest.rsplit('@', 1)[0])}")
         tail.append(f"Before changing this source: pf rdepend {shlex.quote(root['version'])} --detail.")
-    return '\n'.join(lines + [' '.join(filter(None, tail))])
+    return '\n'.join(lines + list(filter(None, tail)))
 
 
 def render_search(page):

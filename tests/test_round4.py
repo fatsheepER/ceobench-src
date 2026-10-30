@@ -67,11 +67,11 @@ def test_failed_citation_keeps_its_identity_and_revision_history(offline_runner)
         assert receipt.startswith(f'Registered r{i}.1'), receipt
         assert 'failed' in receipt and 'sqlite_master' in receipt and 'exit code: 1' in receipt
         assert 'List DB tables' in receipt
-    listed = json.loads(runner._execute_tool('text_list', {'limit': 1}))
+    listed = json.loads(runner._execute_tool('text_list', {'limit': 1, 'raw': True}))
     assert listed['next_after'] == 1 and len(listed['records']) == 1
     assert listed['records'][0]['status'] == 'active'
     assert listed['records'][0]['references'][0]['evidence']['version'] == handle
-    more = json.loads(runner._execute_tool('text_list', {'after': listed['next_after']}))
+    more = json.loads(runner._execute_tool('text_list', {'after': listed['next_after'], 'raw': True}))
     assert [r['version'] for r in more['records']] == ['r2.1']
     history = runner._execute_tool('bash', dict(command='./novamind-operation query '
         '"SELECT * FROM config_overrides ORDER BY day DESC LIMIT 40"; pf log MEMORY.md'))
@@ -80,7 +80,7 @@ def test_failed_citation_keeps_its_identity_and_revision_history(offline_runner)
     revised = runner._execute_tool('text_revise', dict(record='r1', text='Use the actual investment history',
         reason='The earlier citation was a rejected table lookup', references=[dict(cite=correct)]))
     assert revised.startswith('Revised r1.2') and 'config_overrides' in revised
-    listed = json.loads(runner._execute_tool('text_list', {}))
+    listed = json.loads(runner._execute_tool('text_list', {'raw': True}))
     assert [record['version'] for record in listed['records']] == ['r1.2', 'r2.1']
     records = json.loads(runner.tool_executor.text_registry.path.read_text())['records']['r1']
     assert records[0]['references'][0]['evidence']['version'] == handle

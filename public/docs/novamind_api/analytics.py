@@ -24,7 +24,8 @@ def set_targeted_ops_spend(targeted_spend: Dict[str, float]) -> Dict:
         targeted_spend: {group_id: daily_amount} dict.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     return _client.call('set_targeted_ops_spend', {'targeted_spend': targeted_spend})
 
@@ -38,6 +39,7 @@ def set_targeted_dev_spend(targeted_spend: Dict[str, float]) -> Dict:
         targeted_spend: {group_id: daily_amount} dict.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     return _client.call('set_targeted_dev_spend', {'targeted_spend': targeted_spend})

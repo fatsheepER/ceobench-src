@@ -28,6 +28,7 @@
       "failure": "Capacity tier must be 0-7. Use get_cost_info to see all tiers."
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "tier": "int \u2014 selected tier (0-7)",
       "capacity_units": "int \u2014 units/day capacity",
       "cost_per_day": "float \u2014 daily cost in $",

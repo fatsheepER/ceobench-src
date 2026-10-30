@@ -23,7 +23,7 @@ def register_changed_finding(team, role, mode):
     result = runtime.executor.execute('text_create', dict(text='OLD-FINDING-' + role,
         objects=[dict(kind='metric', id='cash')], references=[dict(cite=cite)],
         applies='0-', reason='retained historical finding'))
-    assert result.startswith('Registered r1.1'), result
+    assert result.startswith(f'Registered {role}:r1.1'), result
     changed = runtime.executor.execute('write_file', dict(path='facts.txt', content='changed evidence\n'))
     assert not changed.startswith('Error:'), changed
 

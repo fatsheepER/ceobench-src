@@ -1,5 +1,5 @@
 """PF-only historical queries, rebuilt from immutable capture and declaration records."""
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import closing
 import difflib
 import json
@@ -89,7 +89,7 @@ class Dependencies(Trace):
 
 class Read(Page):
     target: Target | None = None
-    mode: Literal['history', 'content', 'diff'] = 'content'
+    mode: Literal['history', 'content', 'diff', 'captures'] = 'content'
     baseline: Target | None = None
     full: bool = False
 
@@ -183,8 +183,9 @@ class PFQueries:
                 SELECT ? UNION SELECT r.event_id FROM requests r JOIN children c
                 ON json_extract(r.request, '$.parent_event_id')=c.event_id
                 WHERE json_extract(r.request, '$.kind') NOT GLOB 'pf_*')
-                SELECT v.version_id,r.query_id FROM versions v JOIN requests r USING(event_id)
-                WHERE r.event_id IN children AND json_extract(v.metadata, '$.layer')='server_public_response'
+                SELECT v.version_id,r.query_id,json_extract(r.request, '$.kind') AS kind FROM requests r LEFT JOIN versions v
+                ON v.event_id=r.event_id AND json_extract(v.metadata, '$.layer')='server_public_response'
+                WHERE r.event_id IN children AND json_extract(r.request, '$.kind') IN ('sql_query','public_http')
                 ORDER BY r.rowid''', (capture.event,)).fetchall()
             scripts = conn.execute('''SELECT r.event_id, v.version_id FROM requests r
                 LEFT JOIN versions v ON v.version_id=r.event_id || ':stdout'
@@ -233,9 +234,18 @@ class PFQueries:
             if printed:
                 output += ', with ' + ' and '.join(('' if full else 'part of ') + self.resolver.handle(v)
                                                    for v, full, _ in printed)
-        queries = [row['version_id'] for row in observed if row['query_id']]
+        queries = [row['version_id'] for row in observed if row['query_id'] and row['version_id']]
+        sql_count = sum(row['kind'] == 'sql_query' for row in observed)
         query = [self.resolver.handle(queries[0])] if len(queries) == 1 else []
-        line = '[pf: ' + ' | '.join([output] + query + wrote + noted) + ']'
+        counts = []
+        if len(observed) > 1:
+            counts = [f'{sql_count} SQL, {len(observed) - sql_count} API']
+        cursors = self.store.load_state('pf_cursors') or {}
+        cursor = 'c' + str(len(cursors) + 1)
+        cursors[cursor] = dict(operation='pf_read', values=dict(mode='captures',
+            capture_event=capture.event, limit=20, detail=False, scope='this execution'), offset=0, cutoff=None)
+        self.store.save_state('pf_cursors', cursors)
+        line = '[pf: ' + ' | '.join([output] + query + counts + wrote + noted + ['captures: pf more ' + cursor]) + ']'
         return body + '\n' + line + ''.join('\n' + line for line in shown_files)
 
     def _noted(self, version):
@@ -276,6 +286,8 @@ class PFQueries:
                 return pf_render.render_list(page, f"pf search {wanted['id']}", wanted)
             if operation == 'pf_log':
                 return pf_render.render_log(page)
+            if operation == 'pf_read' and self.values.get('mode') == 'captures':
+                return pf_render.render_captures(page)
             if operation == 'pf_read':
                 return pf_render.render_list(page, 'Versions of ' + page['root']['what'])
             if operation == 'pf_dependents':
@@ -321,6 +333,12 @@ class PFQueries:
             if values['all'] or offset:
                 return self._page(matches[::-1], offset, self._describe)
             return self._sections(matches, wanted)
+        if operation == 'pf_read' and values.get('mode') == 'captures' and 'capture_event' in values:
+            page = self._captures(values['capture_event'], offset)
+            if cutoff is None and 'cursor' in args:
+                self.cursors[args['cursor']]['cutoff'] = self.cutoff
+                self.store.save_state(self.cursor_name, self.cursors)
+            return page
         if 'target' not in values:
             raise ValueError('target is required')
         target = self._target(values['target'])
@@ -343,6 +361,13 @@ class PFQueries:
                 raise ValueError('full is supported only for content reads')
             if values['detail'] and mode != 'history':
                 raise ValueError('detail is supported only for history')
+            if mode == 'captures':
+                row = self.nodes[target]
+                event = self.events[row['event_id']]
+                if row['meta']['layer'] not in ('tool_return', 'stdout', 'stderr') or event['request']['kind'] not in ('bash', 'cli_python'):
+                    raise ValueError('captures requires a saved command or script output')
+                self.values = dict(values, capture_event=row['event_id'], scope='latest captured execution for this handle')
+                return self._captures(row['event_id'], offset)
             if mode == 'history':
                 key = self._key(target)
                 listed = [v for v in self.nodes if self._key(v) == key and not self._rerun(v)][::-1]
@@ -901,6 +926,48 @@ class PFQueries:
             ('Active texts', [self._describe(v) for v in texts[::-1][:5]], len(texts)),
             ('Business writes', [self._describe(v) for v in writes[::-1][:5]], len(writes)),
             ('Outputs', [self._describe(v) for v in outputs[:5]], len(outputs))])
+
+    def _captures(self, event_id, offset):
+        with closing(self.store.connect()) as conn:
+            self.store.readable_event(conn, event_id)
+        roots = [v for v, row in self.nodes.items() if row['event_id'] == event_id
+                 and row['meta']['layer'] in ('tool_return', 'stdout', 'stderr')]
+        if not roots:
+            raise ValueError('Captured execution is unavailable in this cursor')
+        root = next((v for v in roots if self.nodes[v]['meta']['layer'] == 'tool_return'), roots[0])
+        children = {event_id}
+        for child, event in self.events.items():
+            if event['request'].get('parent_event_id') in children and not event['request']['kind'].startswith('pf_'):
+                children.add(child)
+        files = {v for child in children for v in self._outputs[child]
+                 if self.nodes[v]['meta']['layer'] == 'file_bytes' and not noise(self.nodes[v]['meta']['object_id'])}
+        versions = [v for v, row in self.nodes.items() if v in files or (
+            row['event_id'] in children and (row['meta']['layer'] == 'server_public_response' or
+            (row['event_id'] != event_id and row['meta']['layer'] in ('stdout', 'stderr')
+             and bool(self.resolver.content(v, public=True)[1]))))]
+        def status(event):
+            result = event['result']
+            return 'unfinished' if result.get('completion') == 'unfinished' else result.get('status', 'result_unknown')
+
+        calls = {child: event for child, event in self.events.items() if child in children
+                 and event['request']['kind'] in ('sql_query', 'public_http')}
+        responses = {self.nodes[v]['event_id'] for v in versions
+                     if self.nodes[v]['meta']['layer'] == 'server_public_response'}
+        missing = []
+        for child, event in calls.items():
+            if child not in responses:
+                request = event['request'].get('request') or {}
+                missing.append(dict(missing_response=True, status=status(event), day=self.event_day.get(child),
+                    what=pf_render.label('server_public_response', event['request']['kind'], request,
+                        event['query'][5] if event['query'] else None,
+                        classification=event['result'].get('classification'))))
+        gaps = sorted({gap for child in children for gap in self.events[child]['result'].get('capture_gaps', [])})
+        return self._page(versions + missing, offset,
+            lambda item: self._describe(item) if isinstance(item, str) else item,
+            root=self._describe(root), scope=self.values['scope'], capture_gaps=gaps,
+            call_statuses=dict(Counter(status(event) for event in calls.values())),
+            script_statuses=dict(Counter(status(self.events[child]) for child in children
+                if self.events[child]['request']['kind'] == 'cli_python')))
 
     def _cursor(self, offset):
         value = dict(operation=self.operation, values=self.values, offset=offset, cutoff=self.cutoff)

@@ -9,6 +9,7 @@ USAGE = '''usage: pf <command> ...
   pf help | pf --help | pf -h          complete command help and examples
   pf log <object>                      versions of a file, an output or a text, newest first
   pf show <handle> [--full]            one saved version
+  pf show <output> --captures         latest execution: responses, output and files
   pf diff <object> | <old> [<new>]     what changed; one object compares its last two versions
   pf blame <file>                      the version and day each line was written
   pf depend <object> [--detail] [--history]   saved source relationships
@@ -205,7 +206,7 @@ def parse_argv(words):
     verb, words = words[0], words[1:]
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}')
-    options = dict(show={'full': False}, depend={'detail': False, 'history': False},
+    options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False},
                    rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': True}).get(verb, {})
     flags, rest = _flags(words, dict(options, help=False))
     if flags.get('help'):
@@ -230,7 +231,9 @@ def parse_argv(words):
     if verb == 'blame':
         return 'pf_blame', {'target': target(first)}
     if verb == 'show':
-        return 'pf_read', {'target': target(first), 'mode': 'content', 'full': bool(flags.get('full'))}
+        if flags.get('captures') and flags.get('full'):
+            raise Usage('Use --captures or --full, not both')
+        return 'pf_read', {'target': target(first), 'mode': 'captures' if flags.get('captures') else 'content', 'full': bool(flags.get('full'))}
     if verb == 'diff':
         if len(rest) == 2:
             return 'pf_read', {'target': target(rest[1]), 'mode': 'diff', 'baseline': target(first)}

@@ -52,10 +52,10 @@ def test_shareable_text_receipts_locate_author_and_revision(mode):
     with make_team(mode, lambda *args: final('done'), 'shareable-texts') as team:
         for role in ROLES:
             receipt = declare(team, role, role + ' original claim', ['unknown: fixture'])
-            assert receipt.startswith('Registered r1.1 (active).')
-            assert 'Shareable reference: ' + role + ':r1.1' in receipt
+            assert receipt.startswith(f'Registered {role}:r1.1 (active).')
+            assert 'Shareable reference:' not in receipt
         growth = team.roles['growth']
-        listing = growth.registry.execute('list', {})
+        listing = growth.registry.execute('list', {'raw': True})
         assert json.loads(listing)['shareable_references'] == {'r1.1': 'growth:r1.1'}
         if mode == 'pf':
             for source in listing.origins:
@@ -69,16 +69,16 @@ def test_shareable_text_receipts_locate_author_and_revision(mode):
         ceo_record = team.roles['ceo'].registry._load()['records']['r2'][-1]
         assert ceo_record['references'][0]['evidence'] == {'record': 'growth:r1.1'}
         revised = growth.executor.execute('text_revise', dict(record='r1', text='growth revised claim', reason='changed'))
-        assert 'Shareable reference: growth:r1.2' in revised
-        assert json.loads(growth.registry.execute('list', {}))['shareable_references'] == {'r1.2': 'growth:r1.2'}
-        assert json.loads(growth.registry.execute('list', dict(after=1)))['shareable_references'] == {}
+        assert 'Revised growth:r1.2' in revised
+        assert json.loads(growth.registry.execute('list', {'raw': True}))['shareable_references'] == {'r1.2': 'growth:r1.2'}
+        assert json.loads(growth.registry.execute('list', dict(after=1, raw=True)))['shareable_references'] == {}
         if mode == 'pf':
             assert 'growth original claim' in pf(team, 'ceo', 'pf show growth:r1.1')
             assert 'growth revised claim' in pf(team, 'ceo', 'pf show growth:r1')
         assert growth.registry._load()['records']['r1'][0]['text'] == 'growth original claim'
         retired = growth.executor.execute('text_retire', dict(record='r1', reason='finished'))
-        assert 'Shareable reference: growth:r1.3' in retired
-        assert json.loads(growth.registry.execute('list', {}))['shareable_references'] == {}
+        assert 'Retired growth:r1.3' in retired
+        assert json.loads(growth.registry.execute('list', {'raw': True}))['shareable_references'] == {}
 
 
 def test_weekly_observations_allow_public_registration_without_exposing_private_sources():
@@ -120,7 +120,7 @@ def test_weekly_observations_allow_public_registration_without_exposing_private_
             args = dict(text=role + ' cash decision', objects=[dict(kind='metric', id='cash')],
                 references=[dict(cite='facts.json', select={'path': '/cash'})], applies='0-', reason='decision')
             selected = runtime.executor.execute('text_create', args)
-            assert selected.startswith('Registered r3.1'), selected
+            assert selected.startswith(f'Registered {role}:r3.1'), selected
             selection = runtime.store.load_state('declaration:r3.1')['references'][0]
             assert selection['version_id'] == version(team, role, 'facts.json')
             content = runtime.store.get_content(selection['version_id'])[1].decode()
@@ -352,7 +352,7 @@ def test_source_navigation_and_lists_keep_role_identity():
             write(team, role, role + '-after')
         ceo = team.roles['ceo']
         for role, runtime in team.roles.items():
-            listed = json.loads(runtime.executor.execute('text_list', {}))
+            listed = json.loads(runtime.executor.execute('text_list', {'raw': True}))
             assert [r['text'] for r in listed['records']] == [role + ' decision']
             assert 'checks' not in listed
         query = ceo.executor.pf_queries
@@ -363,7 +363,7 @@ def test_source_navigation_and_lists_keep_role_identity():
             assert peer.startswith('growth:r1.1 · day 0 · text growth:r1.1'), peer
             assert 'growth:same.txt@v1' in peer and 'Saved source relationships.' in peer
         declare(team, 'ceo', 'ceo follows growth', ['growth:r1.1'])
-        listed = json.loads(ceo.executor.execute('text_list', {}))
+        listed = json.loads(ceo.executor.execute('text_list', {'raw': True}))
         assert [r['version'] for r in listed['records']] == ['r1.1', 'r2.1']
         assert 'checks' not in listed
         for command in ('pf depend ceo:r1', 'pf depend ceo:r2'):

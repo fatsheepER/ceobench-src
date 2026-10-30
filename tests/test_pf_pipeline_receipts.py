@@ -64,7 +64,7 @@ def test_d63_pipe_receipt_read_and_identical_registration(d63, pipe):
     full_request = send(store, full)
     accepted = executor.execute('text_create', arguments,
         model_request_event=full_request, model_context_id='week')
-    assert accepted.startswith('Registered r1.1 (active).'), accepted
+    assert accepted.startswith('Registered growth:r1.1 (active).'), accepted
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert sorted(binding['selected_ranges']) == [[73, 78], [80, 99], [130, 136], [138, 142]]
     store.assert_healthy()

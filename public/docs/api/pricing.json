@@ -45,6 +45,7 @@
       "failure": "Missing price for plan X / Price for plan X must be positive"
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "updated": "Dict[str, float] \u2014 the price changes applied (only keys you sent)",
       "current": "Dict[str, float] \u2014 final prices for all plans {'A': float, 'B': float, 'C': float}",
       "_access": "result['current']['A'] \u2192 current price of plan A"
@@ -105,6 +106,7 @@
       "failure": "Missing tier for plan X / Tier for plan X must be 1-5"
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "updated": "Dict[str, int] \u2014 the tier changes applied (only keys you sent)",
       "current": "Dict[str, int] \u2014 final tiers for all plans {'A': int, 'B': int, 'C': int}",
       "_access": "result['current']['B'] \u2192 current tier of plan B"
@@ -165,6 +167,7 @@
       "failure": "Missing quota for plan X / Quota for plan X cannot be negative"
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "quotas": "Dict[str, int] \u2014 {'A': int, 'B': int, 'C': int} units/day per customer",
       "_access": "result['quotas']['A'] \u2192 plan A daily quota"
     },
@@ -227,6 +230,7 @@
       "failure": "Invalid group IDs / Invalid plan names / Promotion must be non-negative"
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "global": "float \u2014 global promotion $/mo",
       "by_group": "Dict[str, float] \u2014 per-group promotion",
       "by_customer": "Dict[str, float] \u2014 per-customer promotion (customer_id as str key)",

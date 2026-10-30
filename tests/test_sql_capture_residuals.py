@@ -3,6 +3,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 import json
 import os
+import shlex
+import shutil
+import sqlite3
 import threading
 import time
 import urllib.request
@@ -15,6 +18,85 @@ from saas_bench.sql_evidence import SQLEvidenceStore
 from test_execution_capture import captured, records
 from test_public_sql import server
 from test_sql_evidence import identity, settled
+from test_preflight_integration import packed_public
+
+
+@pytest.mark.parametrize('client_kind', ['cli', 'sdk'])
+def test_tiny_sql_limit_delivers_error_and_allows_next_model_request(captured, packed_public, monkeypatch, client_kind):
+    import httpx
+    from openai import OpenAI
+    from saas_bench import public_sql
+    from saas_bench.model_usage import ModelUsage
+    from test_preflight_usage import reply
+    api, store, executor = captured
+    workspace = executor.workspace_path
+    shutil.copy2(packed_public / 'novamind-client', workspace / 'novamind-operation')
+    shutil.copytree(packed_public / 'docs/novamind_api', workspace / 'docs/novamind_api', dirs_exist_ok=True)
+    closed_readers, sent = [], []
+    snapshot = public_sql.query_snapshot
+
+    @contextmanager
+    def tracked_snapshot(*args, **kwargs):
+        with snapshot(*args, **kwargs) as value:
+            yield value
+        try:
+            value[0].execute('SELECT 1')
+        except sqlite3.ProgrammingError as exc:
+            closed_readers.append(str(exc))
+        else:
+            closed_readers.append('open')
+
+    monkeypatch.setattr(public_sql, 'query_snapshot', tracked_snapshot)
+
+    def command(sql):
+        if client_kind == 'cli':
+            return shlex.join(['./novamind-operation', 'query', sql])
+        return shlex.join(['./novamind-operation', 'python-c',
+            f'import novamind_api as nm; print(nm.query({sql!r}))'])
+
+    with monkeypatch.context() as limits:
+        limits.setitem(api.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '64')
+        failed = executor.execute('bash', {'command': command('SELECT 42 AS n')})
+        assert 'SQL response exceeded 64 bytes. Narrow the query.' in failed
+        assert '[exit code: 1]' in failed
+        assert 'RemoteDisconnected' not in failed and 'Failed to connect' not in failed
+    succeeded = executor.execute('bash', {'command': command('SELECT 43 AS n')})
+    assert '43' in succeeded and '[exit code:' not in succeeded
+    settled(api)
+    with api._request_lock:
+        assert api._request_lock.wait_for(lambda: not api._active_requests, timeout=5)
+    queries = [row for row in records(store) if row['request']['kind'] == 'sql_query']
+    assert [row['result']['http_status'] for row in queries] == [413, 200]
+    assert [row['result']['status'] for row in queries] == ['failed', 'succeeded']
+    for row in queries:
+        assert row['delivery']['send_state'] == 'sent'
+        assert row['client_receipt']['receive_state'] == 'received'
+    error_bytes = store.get_content(queries[0]['request']['event_id'] + ':public_response')[1]
+    assert json.loads(error_bytes) == dict(success=False,
+        error='SQL response exceeded 64 bytes. Narrow the query.')
+    assert len(error_bytes) > 64
+    assert len(closed_readers) == 2 and all('closed' in state for state in closed_readers)
+    for row in records(store):
+        if row['request']['kind'] == 'bash':
+            assert row['result']['process_boundary']['phase'] == 'closed'
+            assert row['result']['process_boundary']['children'] == []
+
+    def transport(request):
+        sent.append(json.loads(request.read()))
+        return httpx.Response(200, json=reply('chat'))
+
+    usage = ModelUsage(workspace.parent / 'model-usage.jsonl', 'agent', evidence_store=store)
+    with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
+        payload = dict(model='test-model', messages=[dict(role='user', content=value)
+            for value in (failed, succeeded)])
+        result = usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+    assert result.choices[0].message.content == 'hello'
+    assert len(sent) == 1 and [m['content'] for m in sent[0]['messages']] == [failed, succeeded]
+    store.assert_healthy()
+    checkpoint = workspace.parent / 'settled.sqlite'
+    store.snapshot(checkpoint)
+    assert checkpoint.exists()
 
 
 def test_shared_fault_during_wire_capture_blocks_model_transport(captured, monkeypatch):

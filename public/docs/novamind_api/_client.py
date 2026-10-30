@@ -14,6 +14,16 @@ class NovaMindAPIError(Exception):
     pass
 
 
+def _http_error(error):
+    with error:
+        body = error.read()
+    try:
+        result = json.loads(body)
+    except (ValueError, UnicodeError):
+        return NovaMindAPIError(f"HTTP {error.code}: {body.decode('utf-8', errors='replace')[:500]}")
+    return NovaMindAPIError(result.get('error', f'HTTP {error.code}') if isinstance(result, dict) else f'HTTP {error.code}')
+
+
 class _Vars:
     """Namespace for simulator variables (e.g., current_day)."""
 
@@ -48,10 +58,11 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         args: Tool arguments as a dict
 
     Returns:
-        Dict with the structured result data
+        Dict with the structured result data. Setting updates include changes as
+        {field: {before, after}}; an empty changes dict means unchanged.
 
     Raises:
-        NovaMindAPIError: On failure (also prints to stderr)
+        NovaMindAPIError: On failure
     """
     url = f"{_base_url()}/call"
     payload = json.dumps({"tool": tool_name, "args": args or {}}).encode()
@@ -66,6 +77,8 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     try:
         with urlopen(req) as resp:
             result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
     except json.JSONDecodeError as e:
@@ -139,13 +152,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
         with urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read()
-        try:
-            result = json.loads(body)
-            error_msg = result.get('error', f'HTTP {e.code}')
-        except Exception:
-            error_msg = f"HTTP {e.code}: {body.decode('utf-8', errors='replace')[:500]}"
-        raise NovaMindAPIError(error_msg)
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
 
@@ -171,12 +178,12 @@ def query(sql: str) -> Dict[str, Any]:
     Returns:
         Dict with 'columns' (list of column names), 'rows' (list of dicts),
         'row_count' (returned row count), and 'success'. Results are capped at
-        5,000 rows. If capped, 'truncated' is true and 'warning' describes the
+        20,000 rows by default. If capped, 'truncated' is true and 'warning' describes the
         returned subset. Warnings also print to stderr. Use SQL aggregates for
         population calculations. An explicit LIMIT scopes the requested query;
         absence of a truncation warning does not establish population coverage.
-        SQL values are limited to 1 MiB, accumulated rows to 8 MiB,
-        and the JSON response to 16 MiB. Oversized results fail with HTTP 413.
+        Default limits are 8 MiB per SQL value, 32 MiB accumulated rows,
+        and 64 MiB for the JSON response. Runtime configuration can change these limits. Oversized results fail with HTTP 413. Error responses have a separate 64 KiB limit.
         SQLite formatting can return NULL at its value limit; the response
         warns when NULL also permits an invalid-format interpretation.
 
@@ -197,13 +204,7 @@ def query(sql: str) -> Dict[str, Any]:
         with urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read()
-        try:
-            result = json.loads(body)
-        except Exception:
-            raise NovaMindAPIError(f"Query failed: HTTP {e.code}")
-        error_msg = result.get('error', f'HTTP {e.code}')
-        raise NovaMindAPIError(error_msg)
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
 
@@ -233,6 +234,8 @@ def get_vars() -> Dict[str, Any]:
     try:
         with urlopen(req) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
 
@@ -248,6 +251,8 @@ def _post(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
     try:
         with urlopen(req) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"POST {path} failed: {e}")
 
@@ -260,6 +265,8 @@ def _get(path: str) -> Dict[str, Any]:
     try:
         with urlopen(req) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"GET {path} failed: {e}")
 
@@ -275,6 +282,8 @@ def _delete(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
     try:
         with urlopen(req) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from e
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"DELETE {path} failed: {e}")
 

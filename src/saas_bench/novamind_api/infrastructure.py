@@ -15,7 +15,8 @@ def set_capacity_tier(tier: int) -> Dict:
         tier: Capacity tier level (0-7).
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     return _client.call('set_capacity_tier', {'tier': tier})
 

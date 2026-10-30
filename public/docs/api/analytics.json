@@ -57,6 +57,7 @@
       "failure": "Invalid group IDs: {X}. | Invalid plans: {X}. Valid: ['A', 'B', 'C']. | Customer ID 'X' must be an integer."
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "by_group": "Dict[str, float]",
       "by_plan": "Dict[str, float]",
       "by_group_plan": "Dict[str, Dict[str, float]]",
@@ -117,6 +118,7 @@
       "failure": "Invalid group IDs: {X}. Valid groups: S1-S3, E1-E3, ..."
     },
     "output_schema": {
+      "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "targeted_spend": "Dict[str, float] \u2014 {group_id: $/day}",
       "total_extra_per_day": "float \u2014 total additional dev spend per day",
       "_access": "result['targeted_spend']['E1'] \u2192 E1's extra dev spend"

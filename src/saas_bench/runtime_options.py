@@ -77,7 +77,7 @@ OPTIONS = {
     'sql_column_limit': ('CEOBENCH_SQL_COLUMN_LIMIT', nonnegative_integer, 'SQL column limit, default 512'),
     'sql_cell_limit_bytes': ('CEOBENCH_SQL_CELL_LIMIT_BYTES', nonnegative_integer, 'SQL/value byte limit, default 8388608'),
     'sql_result_limit_bytes': ('CEOBENCH_SQL_RESULT_LIMIT_BYTES', nonnegative_integer, 'SQL result byte limit, default 33554432'),
-    'sql_response_limit_bytes': ('CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', nonnegative_integer, 'SQL JSON byte limit, default 67108864'),
+    'sql_response_limit_bytes': ('CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', nonnegative_integer, 'SQL success JSON byte limit, default 67108864; errors have a separate 65536-byte limit'),
     'bash_output_max_chars': ('CEOBENCH_BASH_OUTPUT_MAX_CHARS', nonnegative_integer, 'Bash model return characters, default 100000; 0 is unlimited'),
     'search_file_limit': ('CEOBENCH_SEARCH_FILE_LIMIT', nonnegative_integer, 'Search candidate files, default 1000; 0 is unlimited'),
     'search_match_limit': ('CEOBENCH_SEARCH_MATCH_LIMIT', nonnegative_integer, 'Search matches, default 2000; 0 is unlimited'),

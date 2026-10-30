@@ -38,6 +38,18 @@ from .enterprise import (
 from ._sql_chunk import chunked_select, chunked_execute
 
 
+def _setting_changes(before, after, prefix=''):
+    changes = {}
+    for key in sorted(before.keys() | after.keys(), key=str):
+        old, new = before.get(key), after.get(key)
+        path = f'{prefix}.{key}' if prefix else str(key)
+        if isinstance(old, dict) or isinstance(new, dict):
+            changes.update(_setting_changes(old or {}, new or {}, path))
+        elif old != new:
+            changes[path] = dict(before=old, after=new)
+    return changes
+
+
 # =====================================================================
 # Helper: render table doc from TABLE_DOCS (for sample_io generation)
 # =====================================================================
@@ -91,6 +103,7 @@ TOOL_DOCS = {
             "failure": "Missing price for plan X / Price for plan X must be positive"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "updated": "Dict[str, float] — the price changes applied (only keys you sent)",
             "current": "Dict[str, float] — final prices for all plans {'A': float, 'B': float, 'C': float}",
             "_access": "result['current']['A'] → current price of plan A"
@@ -145,6 +158,7 @@ TOOL_DOCS = {
             "failure": "Missing tier for plan X / Tier for plan X must be 1-5"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "updated": "Dict[str, int] — the tier changes applied (only keys you sent)",
             "current": "Dict[str, int] — final tiers for all plans {'A': int, 'B': int, 'C': int}",
             "_access": "result['current']['B'] → current tier of plan B"
@@ -188,6 +202,7 @@ TOOL_DOCS = {
             "failure": "Missing spend for X / Spend for X cannot be negative"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "updated": "Dict[str, float] — the spend changes applied (only keys you sent)",
             "current": "Dict[str, float] — final spend {'operations': float, 'development': float}",
             "_access": "result['current']['operations'] → current ops spend"
@@ -246,6 +261,7 @@ TOOL_DOCS = {
             "failure": "Invalid channels: {X}. Valid: {...} / Invalid group IDs for channel 'X': {Y}"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "targeted_spend": "Dict[str, Dict[str, float]] — {channel: {group: $/day}}",
             "total_per_day": "float — total ad spend per day",
             "_access": "result['targeted_spend']['linkedin']['E1'] → E1's LinkedIn spend"
@@ -315,6 +331,7 @@ TOOL_DOCS = {
             "failure": "Invalid group IDs: {X}. | Invalid plans: {X}. Valid: ['A', 'B', 'C']. | Customer ID 'X' must be an integer."
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "by_group": "Dict[str, float]",
             "by_plan": "Dict[str, float]",
             "by_group_plan": "Dict[str, Dict[str, float]]",
@@ -379,6 +396,7 @@ TOOL_DOCS = {
             "failure": "Invalid group IDs: {X}. Valid groups: S1-S3, E1-E3, ..."
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "targeted_spend": "Dict[str, float] — {group_id: $/day}",
             "total_extra_per_day": "float — total additional dev spend per day",
             "_access": "result['targeted_spend']['E1'] → E1's extra dev spend"
@@ -437,6 +455,7 @@ TOOL_DOCS = {
             "failure": "Capacity tier must be 0-7. Use get_cost_info to see all tiers."
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "tier": "int — selected tier (0-7)",
             "capacity_units": "int — units/day capacity",
             "cost_per_day": "float — daily cost in $",
@@ -484,6 +503,7 @@ TOOL_DOCS = {
             "failure": "Missing quota for plan X / Quota for plan X cannot be negative"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "quotas": "Dict[str, int] — {'A': int, 'B': int, 'C': int} units/day per customer",
             "_access": "result['quotas']['A'] → plan A daily quota"
         },
@@ -1741,6 +1761,7 @@ TOOL_DOCS = {
             "failure": "Invalid group IDs / Strength must be between 0 and 1"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "global": "float — global ads strength (0-1)",
             "by_group": "Dict[str, float] — per-group ads strength",
             "by_customer": "Dict[str, float] — per-customer ads strength (customer_id as str key)",
@@ -1777,6 +1798,7 @@ TOOL_DOCS = {
             "failure": "Invalid group IDs / Invalid channels / Promotion must be non-negative"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "global": "float — global lead promotion $/mo",
             "by_group": "Dict[str, float] — per-group promotion",
             "by_channel": "Dict[str, float] — per-channel promotion",
@@ -1827,6 +1849,7 @@ TOOL_DOCS = {
             "failure": "Invalid group IDs / Invalid plan names / Promotion must be non-negative"
         },
         "output_schema": {
+            "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "global": "float — global promotion $/mo",
             "by_group": "Dict[str, float] — per-group promotion",
             "by_customer": "Dict[str, float] — per-customer promotion (customer_id as str key)",
@@ -1941,6 +1964,9 @@ class AgentTools:
             "SELECT * FROM config_history ORDER BY day DESC LIMIT 1"
         ).fetchone()
 
+        if current is None:
+            return ToolResult(False, "No current configuration to update")
+
         if current:
             new_a = prices.get('A', current['price_A'])
             new_b = prices.get('B', current['price_B'])
@@ -1968,9 +1994,13 @@ class AgentTools:
                 current['quota_A'], current['quota_B'], current['quota_C']
             ))
             self.conn.commit()
+        updated_config = self.conn.execute("SELECT * FROM config_history WHERE day=?", (self.current_day,)).fetchone()
+        changes = _setting_changes(dict(current), dict(updated_config))
+        changes.pop("day", None)
 
         changed = ', '.join(f"{k}=${v:.2f}" for k, v in sorted(prices.items()))
         return ToolResult(True, f"Prices updated: {changed}", {
+            'changes': changes,
             'updated': {k: v for k, v in prices.items()},
             'current': {'A': new_a, 'B': new_b, 'C': new_c},
         })
@@ -1999,6 +2029,9 @@ class AgentTools:
             "SELECT * FROM config_history ORDER BY day DESC LIMIT 1"
         ).fetchone()
 
+        if current is None:
+            return ToolResult(False, "No current configuration to update")
+
         if current:
             new_a = tiers.get('A', current['tier_A'])
             new_b = tiers.get('B', current['tier_B'])
@@ -2026,9 +2059,13 @@ class AgentTools:
                 current['quota_A'], current['quota_B'], current['quota_C']
             ))
             self.conn.commit()
+        updated_config = self.conn.execute("SELECT * FROM config_history WHERE day=?", (self.current_day,)).fetchone()
+        changes = _setting_changes(dict(current), dict(updated_config))
+        changes.pop("day", None)
 
         changed = ', '.join(f"{k}=tier{v}" for k, v in sorted(tiers.items()))
         return ToolResult(True, f"Model tiers updated: {changed}", {
+            'changes': changes,
             'updated': {k: v for k, v in tiers.items()},
             'current': {'A': new_a, 'B': new_b, 'C': new_c},
         })
@@ -2065,6 +2102,9 @@ class AgentTools:
             "SELECT * FROM config_history ORDER BY day DESC LIMIT 1"
         ).fetchone()
 
+        if current is None:
+            return ToolResult(False, "No current configuration to update")
+
         if current:
             new_ops = spend.get('operations', current['spend_operations'])
             new_dev = spend.get('development', current['spend_development'])
@@ -2092,9 +2132,13 @@ class AgentTools:
                 current['quota_A'], current['quota_B'], current['quota_C']
             ))
             self.conn.commit()
+        updated_config = self.conn.execute("SELECT * FROM config_history WHERE day=?", (self.current_day,)).fetchone()
+        changes = _setting_changes(dict(current), dict(updated_config))
+        changes.pop("day", None)
 
         changed = ', '.join(f"{k}=${v:.0f}" for k, v in sorted(spend.items()))
         return ToolResult(True, f"Daily spend updated: {changed}", {
+            'changes': changes,
             'updated': {k: v for k, v in spend.items()},
             'current': {'operations': new_ops, 'development': new_dev},
         })
@@ -2178,8 +2222,10 @@ class AgentTools:
 
         self._record_config_override('set_targeted_ad_spend', 'targeted_ad_spend',
                                      {'targeted_spend': targeted_spend})
+        changes = _setting_changes(self.config.targeted_ad_spend, targeted_spend)
         self.config.targeted_ad_spend = targeted_spend
         return ToolResult(True, result_msg, {
+            'changes': changes,
             'targeted_spend': targeted_spend,
             'total_per_day': total_per_day,
         })
@@ -2315,6 +2361,9 @@ class AgentTools:
                 "Pure-group pools collapse to scale_g × spend; mixed pools are composition-weighted."
             )
 
+        changes = _setting_changes(
+            {'by_group': self.config.targeted_ops_spend, 'by_plan': self.config.targeted_ops_spend_by_plan, 'by_group_plan': self.config.targeted_ops_spend_by_group_plan, 'by_customer': self.config.targeted_ops_spend_by_customer},
+            {'by_group': g, 'by_plan': p, 'by_group_plan': gp, 'by_customer': c})
         self._record_config_override(
             'set_targeted_ops_spend', 'targeted_ops_spend',
             {
@@ -2329,6 +2378,7 @@ class AgentTools:
         self.config.targeted_ops_spend_by_group_plan = gp
         self.config.targeted_ops_spend_by_customer = c
         return ToolResult(True, result_msg, {
+            'changes': changes,
             'by_group': g,
             'by_plan': p,
             'by_group_plan': gp,
@@ -2377,8 +2427,10 @@ class AgentTools:
 
         self._record_config_override('set_targeted_dev_spend', 'targeted_dev_spend',
                                      {'targeted_spend': targeted_spend})
+        changes = _setting_changes(self.config.targeted_dev_spend, targeted_spend)
         self.config.targeted_dev_spend = targeted_spend
         return ToolResult(True, result_msg, {
+            'changes': changes,
             'targeted_spend': targeted_spend,
             'total_extra_per_day': total_extra,
         })
@@ -2429,6 +2481,9 @@ class AgentTools:
                 parsed[cid] = float(v)
             customers = parsed
 
+        changes = _setting_changes(
+            {'global': self.config.ads_strength_global, 'by_group': self.config.ads_strength_by_group, 'by_customer': self.config.ads_strength_by_customer},
+            {'global': strength, 'by_group': groups, 'by_customer': customers})
         self._record_config_override('set_ads_strength', 'ads_strength', {
             'global': strength,
             'by_group': groups,
@@ -2438,6 +2493,7 @@ class AgentTools:
         self.config.ads_strength_by_group = groups
         self.config.ads_strength_by_customer = customers
         return ToolResult(True, "Ads strength updated.", {
+            'changes': changes,
             'global': self.config.ads_strength_global,
             'by_group': self.config.ads_strength_by_group,
             'by_customer': {str(k): v for k, v in self.config.ads_strength_by_customer.items()},
@@ -2507,6 +2563,9 @@ class AgentTools:
                 parsed[ch_id] = {k: float(v) for k, v in group_dict.items()}
             channel_groups = parsed
 
+        changes = _setting_changes(
+            {'global': self.config.lead_promotion_global, 'by_group': self.config.lead_promotion_by_group, 'by_channel': self.config.lead_promotion_by_channel, 'by_channel_group': self.config.lead_promotion_by_channel_group},
+            {'global': promotion, 'by_group': groups, 'by_channel': channels, 'by_channel_group': channel_groups})
         self._record_config_override('set_lead_promotion', 'lead_promotion', {
             'global': promotion,
             'by_group': groups,
@@ -2518,6 +2577,7 @@ class AgentTools:
         self.config.lead_promotion_by_channel = channels
         self.config.lead_promotion_by_channel_group = channel_groups
         return ToolResult(True, "Lead promotion updated.", {
+            'changes': changes,
             'global': self.config.lead_promotion_global,
             'by_group': self.config.lead_promotion_by_group,
             'by_channel': self.config.lead_promotion_by_channel,
@@ -2594,6 +2654,9 @@ class AgentTools:
                 parsed_gp[gid] = parsed_inner
             group_plans = parsed_gp
 
+        changes = _setting_changes(
+            {'global': self.config.promotion_global, 'by_group': self.config.promotion_by_group, 'by_customer': self.config.promotion_by_customer, 'by_group_plan': self.config.promotion_by_group_plan},
+            {'global': promotion, 'by_group': groups, 'by_customer': customers, 'by_group_plan': group_plans})
         self._record_config_override('set_promotion', 'promotion', {
             'global': promotion,
             'by_group': groups,
@@ -2605,6 +2668,7 @@ class AgentTools:
         self.config.promotion_by_customer = customers
         self.config.promotion_by_group_plan = group_plans
         return ToolResult(True, "Promotion updated.", {
+            'changes': changes,
             'global': self.config.promotion_global,
             'by_group': self.config.promotion_by_group,
             'by_customer': {str(k): v for k, v in self.config.promotion_by_customer.items()},
@@ -2624,6 +2688,9 @@ class AgentTools:
         current = self.conn.execute(
             "SELECT * FROM config_history ORDER BY day DESC LIMIT 1"
         ).fetchone()
+
+        if current is None:
+            return ToolResult(False, "No current configuration to update")
 
         if current:
             self.conn.execute("""
@@ -2648,13 +2715,16 @@ class AgentTools:
                 current['quota_A'], current['quota_B'], current['quota_C']
             ))
             self.conn.commit()
+        updated_config = self.conn.execute("SELECT * FROM config_history WHERE day=?", (self.current_day,)).fetchone()
+        changes = _setting_changes(dict(current), dict(updated_config))
+        changes.pop("day", None)
 
         cap_info = CAPACITY_TIERS[tier]
         return ToolResult(
             True,
             f"Capacity tier set to {tier}: {cap_info['capacity_units']:,} units/day, "
             f"${cap_info['cost_per_day']:,}/day",
-            data={'tier': tier, 'capacity_units': cap_info['capacity_units'],
+            data={'changes': changes, 'tier': tier, 'capacity_units': cap_info['capacity_units'],
                   'cost_per_day': cap_info['cost_per_day']}
         )
 
@@ -2679,6 +2749,9 @@ class AgentTools:
             "SELECT * FROM config_history ORDER BY day DESC LIMIT 1"
         ).fetchone()
 
+        if current is None:
+            return ToolResult(False, "No current configuration to update")
+
         if current:
             self.conn.execute("""
                 INSERT OR REPLACE INTO config_history (
@@ -2702,11 +2775,14 @@ class AgentTools:
                 quotas['A'], quotas['B'], quotas['C']
             ))
             self.conn.commit()
+        updated_config = self.conn.execute("SELECT * FROM config_history WHERE day=?", (self.current_day,)).fetchone()
+        changes = _setting_changes(dict(current), dict(updated_config))
+        changes.pop("day", None)
 
         return ToolResult(
             True,
             f"Usage quotas updated: A={quotas['A']:,} units/day, B={quotas['B']:,} units/day, C={quotas['C']:,} units/day",
-            data={'quotas': {'A': quotas['A'], 'B': quotas['B'], 'C': quotas['C']}}
+            data={'changes': changes, 'quotas': {'A': quotas['A'], 'B': quotas['B'], 'C': quotas['C']}}
         )
 
     def send_enterprise_deal(self, deals: Optional[List] = None,

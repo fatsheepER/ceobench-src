@@ -2,6 +2,7 @@
 from copy import deepcopy
 from contextlib import nullcontext
 import json
+import re
 from pathlib import Path
 import subprocess
 
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
 from . import evidence_handles, pf_render
 from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
-from .registration_schema import MODELS, cite_text, internal
+from .registration_schema import MODELS, applies_text, cite_text, internal
 from .run_state import write_json
 from .sql_evidence import encoded
 
@@ -157,9 +158,8 @@ class TextRegistry:
             # Git and prefix receipts show only what the Git group can know: the stored reference.
             cited = [self._git_cited(ref['evidence']) for ref in record['references']]
         verb = dict(create='Registered', revise='Revised', retire='Retired')[operation]
-        lines = [f"{verb} {record['version']} ({record['status']})."]
-        if self.identity:
-            lines.append(f"Shareable reference: {self.role}:{record['version']}")
+        handle = (self.role + ":" if self.identity else "") + record["version"]
+        lines = [f"{verb} {handle} ({record['status']})."]
         if retained:
             lines.append('Retained references: ' + (' · '.join(cited) or 'none'))
         elif shown and cited:
@@ -426,10 +426,27 @@ class TextRegistry:
         version, latest = (self.resolver.handle(binding[k]) for k in ('version_id', 'latest_version_id'))
         return dict(shown, version=version, latest=latest, differs=version != latest)
 
-    def _list(self, state, after, limit):
+    def _list(self, state, after, limit, raw=False):
         active = [versions[-1] for key, versions in sorted(state['records'].items(), key=lambda kv: int(kv[0][1:]))
                   if int(key[1:]) > after and versions[-1]['status'] == 'active']
         page = active[:limit]
+        next_after = int(page[-1]['id'][1:]) if len(active) > limit else None
+        if not raw:
+            lines = [f'Saved active texts: {len(page)} of {len(active)} after r{after}.']
+            for record in page:
+                handle = (self.role + ':' if self.identity else '') + record['version']
+                sentence = re.split(r'(?<=[.!?])\s|(?<=[。！？])|\n', record['text'], maxsplit=1)[0]
+                excerpt = pf_render.short(sentence, 120)
+                if sentence != record['text'] and not excerpt.endswith(('...', '…')):
+                    excerpt += ' …'
+                day = record['sim_day'] if record.get('sim_day') is not None else 'unknown'
+                lines.append(f"{handle} · {record['status']} · saved day {day} · applies {pf_render.short(applies_text(record['applies_at']), 120)} · {excerpt}")
+            if not page:
+                lines.append('No active texts in this page.')
+            lines.append('Full records: text_list ' + json.dumps(dict(after=after, limit=limit, raw=True), separators=(',', ':')))
+            if next_after is not None:
+                lines.append('Next: text_list ' + json.dumps(dict(after=next_after, limit=limit), separators=(',', ':')))
+            return CapturedText('\n'.join(lines), [])
         result, origins = '{"records":[', []
         for record in page:
             if result[-1] != '[':

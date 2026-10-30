@@ -40,7 +40,7 @@ def test_cli_source_navigation_preserves_capture_without_replay(workspace, tmp_p
     assert any(row['target'] and row['target']['version'] == handle for row in page['items'])
     assert all('check' not in row for row in page['items'])
     assert not store.load_state('pf_review')
-    send(store, executor.execute('text_list', {}))
+    send(store, executor.execute('text_list', {'raw': True}))
     revised = call(registry, 'revise', record='r2', reason='Reviewed saved source', text='Revised claim')
     assert revised['version'] == 'r2.2'
     history = executor.execute('bash', {'command': 'pf show r2.1 --full'})
@@ -61,7 +61,7 @@ def test_legacy_findings_and_cursor_checks_are_not_delivered(workspace, tmp_path
     store.save_state('pf_cursors', cursors)
     store.save_state('pf_check:legacy', [{'stale': 'OLD_FINDING'}])
     executor.pf_queries = PFQueries(registry)
-    listed = json.loads(executor.execute('text_list', {}))
+    listed = json.loads(executor.execute('text_list', {'raw': True}))
     assert len(listed['records']) == 2
     assert 'checks' not in listed and 'OLD_FINDING' not in json.dumps(listed)
     continued = executor.execute('bash', {'command': f'pf more {cursor}'})

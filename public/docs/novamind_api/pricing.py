@@ -13,7 +13,8 @@ def set_prices(A: Optional[float] = None, B: Optional[float] = None, C: Optional
         C: Monthly price for Plan C (premium tier). Must be positive.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if A is not None:
@@ -34,7 +35,8 @@ def set_model_tiers(A: Optional[int] = None, B: Optional[int] = None, C: Optiona
         C: Model tier for Plan C (1-5).
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if A is not None:
@@ -57,7 +59,8 @@ def set_usage_quotas(A: Optional[int] = None, B: Optional[int] = None, C: Option
         C: Daily usage quota for Plan C.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if A is not None:
@@ -82,7 +85,8 @@ def set_promotion(global_promotion: Optional[float] = None,
         by_group_plan: Per-group-plan promotion {group_id: {plan: promotion}}.
 
     Returns:
-        Dict with update confirmation.
+        Current settings and changes as {field: {before, after}}.
+        Empty changes means unchanged; None marks an added or removed entry.
     """
     args = {}
     if global_promotion is not None:

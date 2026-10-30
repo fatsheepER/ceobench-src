@@ -52,7 +52,7 @@ def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_p
     ref = dict(evidence={'path': 'evidence.json'}, purpose='current',
                select={'path': '/n'}, predicate={'type': 'threshold', 'op': '>=', 'value': 5}, note='retain baseline')
     call(registry, 'create', **declaration(references=[ref]))
-    send(store, executor.execute('text_list', {}))
+    send(store, executor.execute('text_list', {'raw': True}))
     call(registry, 'create', **declaration({'record': 'r1.1'}, text='Forecast'))
     call(registry, 'create', **declaration(references=[dict(evidence={'record': 'r1.1'}, purpose='historical_only')]))
     call(registry, 'create', **declaration())
@@ -365,10 +365,10 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert not any(t['name'].startswith('pf_') for t in child.agent.tool_descriptions)
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote query\.json@v1\]$', output), output
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote query\.json@v1 \| captures: pf more c\d+\]$', output), output
         # A non-zero exit still delivered the SQL result and wrote the file.
         failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
-        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote failed\.json@v1\]$', failed), failed
+        assert re.search(r'\n\[pf: cmd\d+@v1 \| query\d+@v1 \| wrote failed\.json@v1 \| captures: pf more c\d+\]$', failed), failed
         assert 'SELECT' not in output.rsplit('\n', 1)[1]
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
@@ -388,16 +388,16 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
 def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     output = executor.execute('bash', {'command': 'printf 1 > one.txt; printf 2 > two.txt; exit 1'})
-    assert re.search(r'\n\[pf: cmd1@v1 \| wrote one\.txt@v1, two\.txt@v1\]$', output), output
+    assert re.search(r'\n\[pf: cmd1@v1 \| wrote one\.txt@v1, two\.txt@v1 \| captures: pf more c\d+\]$', output), output
     many = ' '.join(f'printf {i} > f{i}.txt;' for i in range(10))
     output = executor.execute('bash', {'command': many})
-    assert output.endswith(' and 4 more]') and output.count('.txt@v1') == 6, output
+    assert ' and 4 more | captures: pf more ' in output and output.count('.txt@v1') == 6, output
     # A changed file gets the next version; the same command returning the same text keeps its handle.
     again = executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'})
-    assert again.endswith('[pf: cmd3@v1 | wrote one.txt@v2]'), again
+    assert '[pf: cmd3@v1 | wrote one.txt@v2 | captures: pf more ' in again, again
     (workspace / 'one.txt').write_text('1')
-    assert executor.execute('bash', {'command': 'printf 3 > one.txt; exit 1'}).endswith(
-        '[pf: cmd3@v1 | wrote one.txt@v4]')
+    assert '[pf: cmd3@v1 | wrote one.txt@v4 | captures: pf more ' in executor.execute(
+        'bash', {'command': 'printf 3 > one.txt; exit 1'})
     history = query(executor, 'pf_read', mode='history', target={'path': 'one.txt'})['items']
     assert history[0]['same_content_as'] == 'one.txt@v2'
 
@@ -464,7 +464,7 @@ def test_script_output_handle_cites_printed_result_without_replaying_queries(off
     runner._execute_tool('bash', {'command': script})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py'})
     assert not runner.evidence_store.fault_path.exists(), runner.evidence_store.fault_path.read_text()
-    footer = re.search(r'\n\[pf: (calc\.py\.out@v1) \| query\d+@v1\]$', output)
+    footer = re.search(r'\n\[pf: (calc\.py\.out@v1) \| query\d+@v1 \| captures: pf more c\d+\]$', output)
     assert footer and 'ledger rows:' in output, output
     store = runner.evidence_store
     settled_request = send(store, output)
@@ -494,10 +494,10 @@ def test_script_output_handle_cites_printed_result_without_replaying_queries(off
     # Running the same script again with the same printed output keeps the handle; a
     # different output is its next version, whatever the surrounding command looks like.
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py 2>&1 | head -5'})
-    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\) \| query\d+@v1\]$', output), output
+    assert re.search(r'\[pf: calc\.py\.out@v1 \(same as day 0\) \| query\d+@v1 \| captures: pf more c\d+\]$', output), output
     runner._execute_tool('bash', {'command': "printf 'print(2)\\nprint(3)\\n' > calc.py"})
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py | head -1'})
-    assert re.search(r'\[pf: cmd\d+@v1, with part of calc\.py\.out@v2\]$', output), output
+    assert re.search(r'\[pf: cmd\d+@v1, with part of calc\.py\.out@v2 \| captures: pf more c\d+\]$', output), output
     assert send(store, output)
     # Only the first line reached the model; whole capture and actual reading stay distinct.
     refused = runner._execute_tool('text_create', declaration({'version': 'calc.py.out@v2'}))

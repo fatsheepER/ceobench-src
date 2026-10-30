@@ -180,6 +180,7 @@ Set in-app advertising strength (0-1). Ads generate revenue but reduce perceived
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "global": "float — global ads strength (0-1)",
   "by_group": "Dict[str, float] — per-group ads strength",
   "by_customer": "Dict[str, float] — per-customer ads strength (customer_id as str key)",
@@ -238,6 +239,7 @@ Set infrastructure capacity tier. Higher tiers handle more usage but cost more p
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "tier": "int — selected tier (0-7)",
   "capacity_units": "int — units/day capacity",
   "cost_per_day": "float — daily cost in $",
@@ -305,6 +307,7 @@ Set promotion (dollar deduction) for new leads. Applied automatically to first b
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "global": "float — global lead promotion $/mo",
   "by_group": "Dict[str, float] — per-group promotion",
   "by_channel": "Dict[str, float] — per-channel promotion",
@@ -381,6 +384,7 @@ Set AI model tiers for plans A, B, and C. Higher tiers = higher quality multipli
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "updated": "Dict[str, int] — the tier changes applied (only keys you sent)",
   "current": "Dict[str, int] — final tiers for all plans {'A': int, 'B': int, 'C': int}",
   "_access": "result['current']['B'] → current tier of plan B"
@@ -449,6 +453,7 @@ Set monthly subscription prices for plans A, B, and C.
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "updated": "Dict[str, float] — the price changes applied (only keys you sent)",
   "current": "Dict[str, float] — final prices for all plans {'A': float, 'B': float, 'C': float}",
   "_access": "result['current']['A'] → current price of plan A"
@@ -517,6 +522,7 @@ Set ongoing promotion (dollar deduction) for existing subscribers. Applied at ea
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "global": "float — global promotion $/mo",
   "by_group": "Dict[str, float] — per-group promotion",
   "by_customer": "Dict[str, float] — per-customer promotion (customer_id as str key)",
@@ -593,6 +599,7 @@ Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "quotas": "Dict[str, int] — {'A': int, 'B': int, 'C': int} units/day per customer",
   "_access": "result['quotas']['A'] → plan A daily quota"
 }
@@ -1141,6 +1148,7 @@ Set daily spending for operations and development. Advertising spend is set via 
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "updated": "Dict[str, float] — the spend changes applied (only keys you sent)",
   "current": "Dict[str, float] — final spend {'operations': float, 'development': float}",
   "_access": "result['current']['operations'] → current ops spend"
@@ -1202,6 +1210,7 @@ Set per-(channel, group) ad spend. THIS IS THE ONLY WAY TO SPEND ON ADVERTISING 
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "targeted_spend": "Dict[str, Dict[str, float]] — {channel: {group: $/day}}",
   "total_per_day": "float — total ad spend per day",
   "_access": "result['targeted_spend']['linkedin']['E1'] → E1's LinkedIn spend"
@@ -1269,6 +1278,7 @@ Set ADDITIONAL per-group development spending on top of the global dev spend. Pr
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "targeted_spend": "Dict[str, float] — {group_id: $/day}",
   "total_extra_per_day": "float — total additional dev spend per day",
   "_access": "result['targeted_spend']['E1'] → E1's extra dev spend"
@@ -1361,6 +1371,7 @@ Set ADDITIONAL operations spending targeted at specific scopes (group, plan, gro
 
 ```json
 {
+  "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "by_group": "Dict[str, float]",
   "by_plan": "Dict[str, float]",
   "by_group_plan": "Dict[str, Dict[str, float]]",

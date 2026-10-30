@@ -53,6 +53,8 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         return output
 
     def query(name, **args):
+        if name == 'text_list':
+            args.setdefault('raw', True)
         if not name.startswith('pf_'):
             output = tool(name, **args)
             return json.loads(output) if name == 'text_list' else executor.text_registry.last_result

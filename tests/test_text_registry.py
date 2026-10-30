@@ -42,6 +42,8 @@ def declaration(evidence=None, **changes):
 
 
 def call(registry, op, **args):
+    if op == 'list':
+        args.setdefault('raw', True)
     text = registry.execute(op, args)
     return json.loads(text) if op == 'list' else registry.last_result
 
@@ -387,7 +389,7 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     ref = dict(evidence={'sql': sql}, purpose='current', predicate=dict(type='compare',
                left={'row': {'channel': 'search'}, 'col': 'cost'}, op='<',
                right={'row': {'channel': 'social'}, 'col': 'cost'}))
-    footer = re.search(r'\[pf: (cmd\d+@v1) \| (query\d+@v1)\]', result)
+    footer = re.search(r'\[pf: (cmd\d+@v1) \| (query\d+@v1) \| captures: pf more c\d+\]', result)
     assert footer, result
     refused = executor.execute('text_create', declaration(references=[dict(ref, evidence={'version': footer[1]})]))
     assert 'For a condition, cite ' + footer[2] + ' with row/col' in refused, refused
@@ -562,7 +564,7 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
         private = restored.workspace_dir / 'sql-evidence.sqlite'
         assert '[exit code:' in child._execute_tool('bash', {'command': 'cat ' + str(private)})
         child._save_checkpoint(7)
-    assert json.loads(restored._execute_tool('text_list', {}))['records'][0]['id'] == 'r1'
+    assert json.loads(restored._execute_tool('text_list', {'raw': True}))['records'][0]['id'] == 'r1'
     import os
     if destination := os.environ.get('CEOBENCH_REGISTRATION_ARTIFACTS'):
         output = Path(destination)

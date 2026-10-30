@@ -229,7 +229,7 @@ def test_owned_registration_memory_and_registered_scripts(team, role):
     assert role + '-memory' in r.agent._get_system_prompt_with_memory()
     args = dict(text=role + '-claim', objects=[dict(kind='plan', id='A')],
         references=[dict(cite='unknown: offline')], applies='0-', reason='offline')
-    assert r.executor.execute('text_create', args).startswith('Registered r1.1')
+    assert r.executor.execute('text_create', args).startswith(f'Registered {role}:r1.1')
     saved = json.loads((r.workspace / 'registrations.json').read_text())['records']['r1'][0]
     assert saved['author'] == saved['role'] == role
     for key, value in r.identity.fields().items():

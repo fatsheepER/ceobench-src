@@ -38,6 +38,8 @@ from .environment import build_weekly_dashboard
 from .public_sql import (PUBLIC_COLUMNS, RESPONSE_LIMIT_BYTES, QueryDenied,
                          QueryResultTooLarge, SnapshotUnavailable, execute_query)
 
+QUERY_ERROR_LIMIT_BYTES = 64 * 1024
+
 
 class RequestRejected(ValueError):
     pass
@@ -728,12 +730,19 @@ class _APIHandler(BaseHTTPRequestHandler):
         from .runtime_options import runtime_value
         response_limit = runtime_value('sql_response_limit_bytes', RESPONSE_LIMIT_BYTES,
             environment=getattr(self.server._api_server, 'runtime_environment', None))
+        if status >= 400:
+            response_limit = QUERY_ERROR_LIMIT_BYTES
         deadline = started + (max(.05, response_budget) if status >= 400 else response_budget)
         for chunk in json.JSONEncoder(default=str).iterencode(data):
             check_deadline(deadline)
             payload = chunk.encode()
             size += len(payload)
             if response_limit and size > response_limit:
+                if status >= 400:
+                    chunks = [json.dumps(dict(success=False,
+                        error=f'SQL error details exceeded {response_limit} bytes and were omitted.',
+                        error_truncated=True)).encode()]
+                    break
                 raise QueryResultTooLarge(f'SQL response exceeded {response_limit} bytes. Narrow the query.')
             chunks.append(payload)
         response = b''.join(chunks)

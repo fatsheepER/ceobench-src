@@ -285,7 +285,7 @@ def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspa
         ref = dict(evidence={'path': 'evidence.json', 'commit': head[:size]}, purpose='current',
                    select={'path': '/missing'}, predicate={'type': 'threshold', 'op': '>', 'value': 9999})
         registry.execute('create', declaration(references=[ref]))
-    listing = json.loads(registry.execute('list', {}))
+    listing = json.loads(registry.execute('list', {'raw': True}))
     assert all(r['references'][0]['evidence']['commit'] == head[:7] for r in listing['records'])
     assert set(workspace.rglob('*')) - before == {registry.path}
     assert (workspace / '.git/index').read_bytes() == index
@@ -301,7 +301,7 @@ def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspa
     # An uncommitted file binds the weekly commit label without committing or copying it.
     (workspace / 'new.json').write_text('{"n":1}')
     registry.execute('create', declaration({'path': 'new.json'}))
-    assert json.loads(registry.execute('list', {}))['records'][-1]['references'][0]['evidence'] == dict(
+    assert json.loads(registry.execute('list', {'raw': True}))['records'][-1]['references'][0]['evidence'] == dict(
         path='new.json', commit='week-1')
     assert (workspace / '.git/index').read_bytes() == index and git(workspace, 'rev-parse', 'HEAD') == head
     assert '{"n":1}' not in registry.path.read_text()
