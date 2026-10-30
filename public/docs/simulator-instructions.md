@@ -100,19 +100,19 @@ Each customer has a personal quality-price curve:
 ### Negotiation Flow
 - Enterprise customers arrive as negotiation threads (stored in the `enterprise_turns` table)
 - Thread types: `new_lead` (inbound), `renegotiation` (you initiate), `churn_prevention`, `plan_change`
-- You MUST respond with `send_enterprise_deal` using compact tuple format: `deals=[[customer_id, [["plan", price_per_seat], ...]]]` — all contracts are month-to-month (1 month)
-- Grace period: 1 day to reply with no penalty
-- Late reply: -0.02 relationship/day after grace period
-- 7-day timeout (1 week): if YOU (the agent) do not reply within 7 days (1 week), the lead is PERMANENTLY LOST (or existing customer cancels). The clock starts when the customer message arrives — you must call `send_enterprise_deal` within 1 simulation week.
+- Before timeout, send offerings with `send_enterprise_deal` using `deals=[[customer_id, [["plan", price_per_seat], ...]]]` or close the negotiation with `reject_enterprise_deal(deals=[{"customer_id": customer_id}])`. All offerings are month-to-month (1 month).
+- Offers sent with `send_enterprise_deal` have a 1-day reply grace period. Later offers reduce relationship by 0.02 per extra day.
+- Explicit rejection closes the negotiation, marks pending new leads lost, and preserves an existing subscription.
+- At 7 days after a customer message without an offer or explicit rejection, the lead is lost or an existing subscriber cancels. Send offerings or explicitly reject before this timeout.
 - Limited negotiation turns per customer — rejection on final turn = customer lost forever
 
 ### Proactive Renegotiation
-- `send_enterprise_deal` auto-detects: if a customer has an open thread, it replies; if no open thread, it initiates a renegotiation
+- `send_enterprise_deal` auto-detects: if a customer has an open thread, it replies; if no open thread, it requires an active enterprise subscription to start renegotiation
 - No separate tool needed — just call `send_enterprise_deal` with `deals=[[customer_id, [["plan", price_per_seat], ...]]]` for any active enterprise subscriber
-- Use `reject_enterprise_deal` to explicitly reject threads — WARNING: rejecting renegotiation/renewal/churn_prevention threads causes the customer to CHURN
+- Use `reject_enterprise_deal` with customer_id to close negotiations. Pending new leads become lost; existing subscriptions remain unchanged.
 
 ### Batch Operations (Efficiency)
-- `send_enterprise_deal(deals=[[cid1, [["plan", price]], [cid2, [["plan", price]]]])` — send offerings to multiple enterprise customers in one call
+- `send_enterprise_deal(deals=[[cid1, [["plan", price]]], [cid2, [["plan", price]]]])` — send offerings to multiple enterprise customers in one call
 - `reject_enterprise_deal(deals=[...])` — reject multiple threads in one call
 - Query the `enterprise_turns` table to read negotiation data (each row is a message identified by `message_id`)
 
@@ -142,12 +142,12 @@ Daily costs: capacity tier + compute (usage × tier cost) + advertising + operat
 ### Operations
 - More ops spending accelerates issue resolution
 - Reduces outage probability
-- Per-group targeting via `set_targeted_ops_spend`
+- `set_targeted_ops_spend` targets groups, plans, group-plan pairs, or customer IDs. Each supplied scope replaces its mapping; {} clears that scope. Omitted or None scopes stay unchanged.
 
 ### Development
 - Customer expected quality changes over time
 - See "Quality Dynamics" above for the exact dev-spending quality-improvement formulas (global vs. per-group)
-- Per-group targeting via `set_targeted_dev_spend`: ACCUMULATES a group-specific quality bonus that persists after spending stops
+- `set_targeted_dev_spend` replaces the whole group mapping; {} clears it. Per-group spend ACCUMULATES a group-specific quality bonus that persists after spending stops
 
 ## R&D Research Tiers
 

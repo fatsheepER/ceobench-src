@@ -293,7 +293,7 @@ TOOL_DOCS = {
             "properties": {
                 "targeted_spend": {
                     "type": "object",
-                    "description": "LEGACY alias for by_group: {group_id: $/day}",
+                    "description": "Legacy alias for by_group. Replaces the whole group mapping; {} clears it. None leaves it unchanged.",
                     "additionalProperties": {"type": "number"},
                 },
                 "by_group": {
@@ -321,10 +321,10 @@ TOOL_DOCS = {
         },
         "parameters": {
             "targeted_spend": "LEGACY alias for by_group (kept for backward compatibility).",
-            "by_group": "Dict[str, float] — {group_id: $/day}. Groups: S1-S3, E1-E3, discovered.",
-            "by_plan": "Dict[str, float] — {plan: $/day}, plan ∈ {A, B, C}. Applies across all groups.",
-            "by_group_plan": "Dict[str, Dict[str, float]] — {group_id: {plan: $/day}}. Intersection of group and plan.",
-            "by_customer": "Dict[str, float] — {customer_id (as string): $/day}. Single-customer targeting.",
+            "by_group": "Dict[str, float] — {group_id: $/day}. Supplied mapping replaces this whole scope; {} clears it. Omitted or None leaves it unchanged. Groups: S1-S3, E1-E3, discovered.",
+            "by_plan": "Dict[str, float] — {plan: $/day}, plan ∈ {A, B, C}. Replaces this whole scope; {} clears it. Omitted or None leaves it unchanged. Applies across all groups.",
+            "by_group_plan": "Dict[str, Dict[str, float]] — {group_id: {plan: $/day}}. Replaces this whole scope; {} clears it. Omitted or None leaves it unchanged. Intersection of group and plan.",
+            "by_customer": "Dict[str, float] — {customer_id (as string): $/day}. Replaces this whole scope; {} clears it. Omitted or None leaves it unchanged. Single-customer targeting.",
         },
         "returns": {
             "success": "Targeted ops spend updated (extra $650/day on top of global ops):\n  Groups: E1: +$300/day\n  Plans: A: +$200/day\n  Group-Plans: E2/B: +$100/day\n  Customers: 1 target(s), +$50/day total",
@@ -342,7 +342,7 @@ TOOL_DOCS = {
         "mechanics": {
             "per_scope_resolution": "Each scope runs its OWN Poisson pool, partitioned by customer group. Within a pool of size |P|, each group g contributes n_g members and draws Poisson(scale_g × spend × n_g / |P|) resolutions, where scale_g = 0.25 for individual groups (S*, D_S*) and scale_g = 0.05 for enterprise groups (E*, D_E*). Enterprise issues are ~5× harder to resolve per $ than individual issues. Pure-group pools (by_group, by_group_plan, by_customer when the customer is in a single group) collapse to scale_g × spend. Mixed pools (by_plan with mixed groups) yield a composition-weighted rate. Scopes are processed independently AFTER the global ops pool; a customer covered by multiple scopes is skipped after first resolution in the day.",
             "cost": "All four scope amounts sum into one 'operations' ledger entry per day.",
-            "leaving_scope_unchanged": "Any argument left as None leaves that scope unchanged. Passing {} clears that scope.",
+            "leaving_scope_unchanged": "A supplied mapping replaces its whole scope, removing omitted entries. Omitted or None arguments leave that scope unchanged. Passing {} clears only that scope. No arguments leaves every scope unchanged. Supply either targeted_spend or by_group, not both.",
         },
         "impact": "Fine-grained targeting of operations spend. Use by_customer to rescue a high-value individual, by_plan for tier-wide support surge, by_group for segment-wide, and by_group_plan for the most precise segment×tier investment.",
         "example_call": {
@@ -387,7 +387,7 @@ TOOL_DOCS = {
         "parameters": {
             "targeted_spend": {
                 "type": "Dict[str, float]",
-                "description": "Dictionary of {group_id: additional_dollars_per_day}. This spend is ADDED to the global dev spend.",
+                "description": "Dictionary of {group_id: additional_dollars_per_day}. Each call replaces the whole group mapping; omitted groups stop receiving targeted spend. {} clears it. This spend is ADDED to the global dev spend.",
                 "groups": "S1-S3, E1-E3, and discovered groups (D_S01-D_S10, D_E01-D_E10)"
             }
         },
@@ -528,7 +528,7 @@ TOOL_DOCS = {
     "send_enterprise_deal": {
         "name": "send_enterprise_deal",
         "category": "Customer Communication",
-        "description": "Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, initiates renegotiation. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). No response within 3 days = customer LOST FOREVER.",
+        "description": "Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, an active enterprise subscription is required to start renegotiation. Identify customers by customer_id, not message_id. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). At 7 days without an agent reply to a customer message, new leads are lost and existing subscribers cancel.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -547,36 +547,37 @@ TOOL_DOCS = {
         "parameters": {
             "deals": {
                 "type": "list[list]",
-                "description": "List of [customer_id, offerings] tuples. offerings = list of [plan, price_per_seat] tuples. All contracts are month-to-month. If customer has an open thread, replies to it; otherwise initiates renegotiation.",
+                "description": "List of [customer_id, offerings] tuples. offerings = list of [plan, price_per_seat] tuples. All contracts are month-to-month. If customer has an open thread, replies to it; otherwise requires an active enterprise subscription to start renegotiation.",
                 "example": [[312, [["A", 9.00], ["B", 14.00]]], [88, [["B", 12.00]]]]
             }
         },
         "returns": {
-            "success": "Processed 2/2 deals:\n  Customer #312: reply sent with 2 offering(s)\n  Customer #88: renegotiation initiated, 2 offering(s) sent",
-            "failure": "Customer #312: not found / Customer #88: already has an active thread / offerings required"
+            "success": "Sent 2/2 enterprise deals:\n  Customer #312: reply sent with 2 offering(s)\n  Customer #88: renegotiation started (200 seats)",
+            "failure": "Customer #312: not found / Customer #88: no active subscription / offerings required"
         },
         "output_schema": {
-            "results": "List[Dict] — one dict per deal with keys: customer_id (int), success (bool), status (str), error (str, if failed)",
-            "_access": "for r in result['results']: print(r['customer_id'], r['status'])"
+            "results": "List[Dict] — successful entries contain customer_id (int) and success (True). Failed entries contain error (str) and customer_id when available; success is omitted.",
+            "_access": "for r in result['results']: print(r.get('customer_id'), r.get('success', False), r.get('error'))",
+            "_note": "The SDK returns results when at least one deal succeeds, including failed entries in mixed batches. If all deals fail, it raises NovaMindAPIError."
         },
-        "impact": "Customer evaluates ALL offerings and picks the one with highest satisfaction. Satisfaction = quality_perceived - quality_required(price) - contract_penalty. Contract lock-in penalty varies per customer group (e.g. price-sensitive individuals ~0.8%/month, strategic enterprises ~0.2%/month — longer contracts penalize satisfaction, offset with lower prices). Customer accepts if best satisfaction > 0, counter-offers otherwise. Max negotiation turns = customer ghosts. Late replies (>1 day) damage relationship -0.02/day. No response within 3 days = customer permanently lost. Renegotiation (no open thread): creates new thread. WARNING: if the customer rejects all offerings OR the thread times out, the customer CHURNS (cancels subscription).",
+        "impact": "Customers evaluate up to 3 [plan, price_per_seat] offerings and choose the best. All contracts last 1 month. Replies more than 1 day after the customer message reduce relationship by 0.02 per extra day. At 7 days without an agent reply, new leads are lost and existing subscribers cancel. Without an open thread, only an active enterprise subscriber can receive a new renegotiation offer.",
         "example_call": {
             "tool": "send_enterprise_deal",
             "arguments": {
-                "deals": [[312, [["A", 9.00, 6], ["B", 14.00, 12]]], [88, [["B", 12.00, 6]]]]
+                "deals": [[312, [["A", 9.00], ["B", 14.00]]], [88, [["B", 12.00]]]]
             }
         },
-        "internal_notes": "Accepts tuple format [cid, [[plan,price,months],...]] or legacy dict format. If customer has open thread, replies (with late-reply penalty). If no open thread, initiates renegotiation (requires active subscription). Satisfaction = Q_perceived - Q_required(price) - contract_lockin_penalty * (months-1). Lock-in penalty is per-customer (sampled from group distribution at creation: S1=0.008, S2=0.005, S3=0.006, E1=0.005, E2=0.003, E3=0.002). Late penalty = -0.02 * max(0, days_since_msg - 1). Max offerings = 3.",
+        "internal_notes": "The tuple format is [customer_id, [[plan, price_per_seat], ...]]. The server also accepts legacy dictionaries and fixes every offering to contract_months=1. Reply to an open negotiation or start renegotiation for an active enterprise subscriber. Late penalty = -0.02 * max(0, days_since_msg - 1). Max offerings = 3.",
         "sample_io": {
             "success": [
-                {"label": "Reply to open thread with 3 offerings", "input": {"deals": [[312, [["A", 9.0, 6], ["B", 14.0, 12], ["C", 22.0, 12]]]]}, "output": "Customer #312: reply sent with 3 offering(s)"},
-                {"label": "Initiate renegotiation (no open thread)", "input": {"deals": [[88, [["B", 12.0, 6], ["B", 11.0, 12]]]]}, "output": "Customer #88: renegotiation started (200 seats). 2 offering(s) sent."},
-                {"label": "Batch", "input": {"deals": [[312, [["A", 9.0, 6]]], [88, [["B", 12.0, 6]]]]}, "output": "Sent 2/2 enterprise deals:\n  Customer #312: reply sent with 1 offering(s)\n  Customer #88: renegotiation started. 1 offering(s) sent."}
+                {"label": "Reply to open thread with 3 offerings", "input": {"deals": [[312, [["A", 9.0], ["B", 14.0], ["C", 22.0]]]]}, "output": "Customer #312: reply sent with 3 offering(s)"},
+                {"label": "Initiate renegotiation (no open thread)", "input": {"deals": [[88, [["B", 12.0], ["B", 11.0]]]]}, "output": "Customer #88: renegotiation started (200 seats)"},
+                {"label": "Batch", "input": {"deals": [[312, [["A", 9.0]]], [88, [["B", 12.0]]]]}, "output": "Sent 2/2 enterprise deals:\n  Customer #312: reply sent with 1 offering(s)\n  Customer #88: renegotiation started (200 seats)"}
             ],
             "failure": [
-                {"label": "Customer not found", "input": {"deals": [[999, [["A", 9.0, 6]]]]}, "output": "Customer #999: not found"},
+                {"label": "Customer not found", "input": {"deals": [[999, [["A", 9.0]]]]}, "output": "Customer #999: not found"},
                 {"label": "Missing offerings", "input": {"deals": [[312, []]]}, "output": "Customer #312: offerings required"},
-                {"label": "Customer has active thread", "input": {"deals": [[88, [["B", 11.0, 6]]]]}, "output": "Processed 0/1 deals (1 failed):\n  Customer #88: already has an active negotiation thread"}
+                {"label": "No active subscription or open thread", "input": {"deals": [[88, [["B", 11.0]]]]}, "output": "Customer #88: no active subscription"}
             ]
         }
     },
@@ -1030,7 +1031,7 @@ TOOL_DOCS = {
     "reject_enterprise_deal": {
         "name": "reject_enterprise_deal",
         "category": "Customer Communication",
-        "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn.",
+        "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. Use customer_id, not message_id. Rejection closes the negotiation, marks pending new leads lost, and leaves existing subscriptions unchanged.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1056,27 +1057,28 @@ TOOL_DOCS = {
             }
         },
         "returns": {
-            "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Customer may cancel.",
-            "failure": "Customer #312: no active thread / Customer #999: not found"
+            "success": "Rejected 2/2 enterprise deals:\n  Customer #312: rejected (new_lead)\n  Customer #88: rejected (churn_prevention)",
+            "failure": "Customer #312: no active thread / deals parameter required"
         },
         "output_schema": {
-            "results": "List[Dict] — one dict per deal with keys: customer_id (int), success (bool), thread_type (str), error (str, if failed)",
-            "_access": "for r in result['results']: print(r['customer_id'], r['success'])"
+            "results": "List[Dict] — successful entries contain customer_id (int) and success (True). Failed entries contain error (str) and customer_id when available; success is omitted.",
+            "_access": "for r in result['results']: print(r.get('customer_id'), r.get('success', False), r.get('error'))",
+            "_note": "The SDK returns results when at least one rejection succeeds, including failed entries in mixed batches. If all rejections fail, it raises NovaMindAPIError."
         },
-        "impact": "For new_lead threads: lead is permanently lost. For renegotiation/renewal threads: customer CHURNS (cancels subscription). For churn_prevention/plan_change threads: customer churns with reputation damage.",
+        "impact": "Rejection closes the active negotiation with close_reason='agent_rejected'. A new_lead subscription still in lead status becomes lost. Rejection leaves an existing subscription unchanged, including renegotiation, renewal, churn_prevention, and plan_change threads.",
         "example_call": {
             "tool": "reject_enterprise_deal",
             "arguments": {"deals": [{"customer_id": 312}]},
         },
         "sample_io": {
             "success": [
-                {"label": "Reject single customer", "input": {"deals": [{"customer_id": 312}]}, "output": "Processed 1/1 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost."},
-                {"label": "Reject existing customer", "input": {"deals": [{"customer_id": 88}]}, "output": "Processed 1/1 rejections:\n  Customer #88: Rejected (churn_prevention). Customer may cancel."},
-                {"label": "Batch rejection", "input": {"deals": [{"customer_id": 312}, {"customer_id": 88}]}, "output": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (plan_change)."}
+                {"label": "Reject single customer", "input": {"deals": [{"customer_id": 312}]}, "output": "Customer #312: rejected (new_lead)"},
+                {"label": "Reject existing customer", "input": {"deals": [{"customer_id": 88}]}, "output": "Customer #88: rejected (churn_prevention)"},
+                {"label": "Batch rejection", "input": {"deals": [{"customer_id": 312}, {"customer_id": 88}]}, "output": "Rejected 2/2 enterprise deals:\n  Customer #312: rejected (new_lead)\n  Customer #88: rejected (plan_change)"}
             ],
             "failure": [
-                {"label": "No active thread", "input": {"deals": [{"customer_id": 999}]}, "output": "Processed 0/1 rejections (1 failed):\n  Customer #999: no active thread"},
-                {"label": "Already closed", "input": {"deals": [{"customer_id": 312}]}, "output": "Processed 0/1 rejections (1 failed):\n  Customer #312: thread already closed"}
+                {"label": "No active thread", "input": {"deals": [{"customer_id": 999}]}, "output": "Customer #999: no active thread"},
+                {"label": "Already closed", "input": {"deals": [{"customer_id": 312}]}, "output": "Customer #312: no active thread"}
             ]
         }
     },
@@ -2252,7 +2254,8 @@ class AgentTools:
         A customer covered by multiple scopes gets multiple chances of being
         resolved that day. All scope amounts sum into a single 'operations' ledger entry.
 
-        Any argument left as None is unchanged; passing {} clears that scope.
+        Each supplied mapping replaces its whole scope. Omitted or None arguments
+        leave that scope unchanged; passing {} clears only that scope.
 
         Args:
             targeted_spend: LEGACY alias for by_group. {group_id: $/day}.
@@ -2397,8 +2400,9 @@ class AgentTools:
         investment compounds over time and persists even after spending stops.
 
         Args:
-            targeted_spend: {group_id: additional_dollars_per_day}
-                Example: {"E1": 500, "S1": 200}
+            targeted_spend: {group_id: additional_dollars_per_day}. Replaces the
+                whole group mapping; omitted groups stop receiving targeted spend.
+                {} clears it. Example: {"E1": 500, "S1": 200}
         """
         # Build set of valid group IDs (initial + discovered only, not undiscovered)
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
@@ -2789,11 +2793,13 @@ class AgentTools:
                              **kwargs) -> ToolResult:
         """Send structured offerings to enterprise customers.
 
-        Compact tuple format: each deal is [customer_id, [[plan, price_per_seat, contract_months], ...]]
+        Compact tuple format: each deal is [customer_id, [[plan, price_per_seat], ...]]
 
         Args:
             deals: List of [customer_id, offerings] tuples.
-                   offerings = list of [plan, price_per_seat, contract_months] tuples.
+                   offerings = list of [plan, price_per_seat] tuples. All contracts last
+                   1 month. Use customer_id, not message_id. Without an open
+                   negotiation, an active enterprise subscription is required.
         """
         if deals is None:
             deals = []
@@ -4112,7 +4118,9 @@ os.chdir('{self.workspace_path}')
 
     def reject_enterprise_deal(self, deals: Optional[List[Dict]] = None,
                                 **kwargs) -> ToolResult:
-        """Reject one or more enterprise deals permanently.
+        """Close enterprise negotiations, marking pending new leads lost.
+
+        Existing subscriptions remain unchanged. Use customer_id, not message_id.
 
         Each deal is identified by customer_id. The system finds the customer's
         active negotiation thread automatically.

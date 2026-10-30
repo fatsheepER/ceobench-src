@@ -3,11 +3,11 @@
     "name": "send_enterprise_deal",
     "python_call": "novamind_api.enterprise.send_enterprise_deal(...)",
     "category": "Customer Communication",
-    "description": "Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, initiates renegotiation. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). No response within 3 days = customer LOST FOREVER.",
+    "description": "Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, an active enterprise subscription is required to start renegotiation. Identify customers by customer_id, not message_id. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). At 7 days without an agent reply to a customer message, new leads are lost and existing subscribers cancel.",
     "parameters": {
       "deals": {
         "type": "list[list]",
-        "description": "List of [customer_id, offerings] tuples. offerings = list of [plan, price_per_seat] tuples. All contracts are month-to-month. If customer has an open thread, replies to it; otherwise initiates renegotiation.",
+        "description": "List of [customer_id, offerings] tuples. offerings = list of [plan, price_per_seat] tuples. All contracts are month-to-month. If customer has an open thread, replies to it; otherwise requires an active enterprise subscription to start renegotiation.",
         "example": [
           [
             312,
@@ -52,14 +52,15 @@
       ]
     },
     "returns": {
-      "success": "Processed 2/2 deals:\n  Customer #312: reply sent with 2 offering(s)\n  Customer #88: renegotiation initiated, 2 offering(s) sent",
-      "failure": "Customer #312: not found / Customer #88: already has an active thread / offerings required"
+      "success": "Sent 2/2 enterprise deals:\n  Customer #312: reply sent with 2 offering(s)\n  Customer #88: renegotiation started (200 seats)",
+      "failure": "Customer #312: not found / Customer #88: no active subscription / offerings required"
     },
     "output_schema": {
-      "results": "List[Dict] \u2014 one dict per deal with keys: customer_id (int), success (bool), status (str), error (str, if failed)",
-      "_access": "for r in result['results']: print(r['customer_id'], r['status'])"
+      "results": "List[Dict] \u2014 successful entries contain customer_id (int) and success (True). Failed entries contain error (str) and customer_id when available; success is omitted.",
+      "_access": "for r in result['results']: print(r.get('customer_id'), r.get('success', False), r.get('error'))",
+      "_note": "The SDK returns results when at least one deal succeeds, including failed entries in mixed batches. If all deals fail, it raises NovaMindAPIError."
     },
-    "impact": "Customer evaluates ALL offerings and picks the one with highest satisfaction. Satisfaction = quality_perceived - quality_required(price) - contract_penalty. Contract lock-in penalty varies per customer group (e.g. price-sensitive individuals ~0.8%/month, strategic enterprises ~0.2%/month \u2014 longer contracts penalize satisfaction, offset with lower prices). Customer accepts if best satisfaction > 0, counter-offers otherwise. Max negotiation turns = customer ghosts. Late replies (>1 day) damage relationship -0.02/day. No response within 3 days = customer permanently lost. Renegotiation (no open thread): creates new thread. WARNING: if the customer rejects all offerings OR the thread times out, the customer CHURNS (cancels subscription).",
+    "impact": "Customers evaluate up to 3 [plan, price_per_seat] offerings and choose the best. All contracts last 1 month. Replies more than 1 day after the customer message reduce relationship by 0.02 per extra day. At 7 days without an agent reply, new leads are lost and existing subscribers cancel. Without an open thread, only an active enterprise subscriber can receive a new renegotiation offer.",
     "example_call": {
       "tool": "send_enterprise_deal",
       "arguments": {
@@ -69,13 +70,11 @@
             [
               [
                 "A",
-                9.0,
-                6
+                9.0
               ],
               [
                 "B",
-                14.0,
-                12
+                14.0
               ]
             ]
           ],
@@ -84,8 +83,7 @@
             [
               [
                 "B",
-                12.0,
-                6
+                12.0
               ]
             ]
           ]
@@ -97,7 +95,7 @@
     "name": "reject_enterprise_deal",
     "python_call": "novamind_api.enterprise.reject_enterprise_deal(...)",
     "category": "Customer Communication",
-    "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn.",
+    "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. Use customer_id, not message_id. Rejection closes the negotiation, marks pending new leads lost, and leaves existing subscriptions unchanged.",
     "parameters": {
       "deals": {
         "type": "list[Dict]",
@@ -137,14 +135,15 @@
       ]
     },
     "returns": {
-      "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Customer may cancel.",
-      "failure": "Customer #312: no active thread / Customer #999: not found"
+      "success": "Rejected 2/2 enterprise deals:\n  Customer #312: rejected (new_lead)\n  Customer #88: rejected (churn_prevention)",
+      "failure": "Customer #312: no active thread / deals parameter required"
     },
     "output_schema": {
-      "results": "List[Dict] \u2014 one dict per deal with keys: customer_id (int), success (bool), thread_type (str), error (str, if failed)",
-      "_access": "for r in result['results']: print(r['customer_id'], r['success'])"
+      "results": "List[Dict] \u2014 successful entries contain customer_id (int) and success (True). Failed entries contain error (str) and customer_id when available; success is omitted.",
+      "_access": "for r in result['results']: print(r.get('customer_id'), r.get('success', False), r.get('error'))",
+      "_note": "The SDK returns results when at least one rejection succeeds, including failed entries in mixed batches. If all rejections fail, it raises NovaMindAPIError."
     },
-    "impact": "For new_lead threads: lead is permanently lost. For renegotiation/renewal threads: customer CHURNS (cancels subscription). For churn_prevention/plan_change threads: customer churns with reputation damage.",
+    "impact": "Rejection closes the active negotiation with close_reason='agent_rejected'. A new_lead subscription still in lead status becomes lost. Rejection leaves an existing subscription unchanged, including renegotiation, renewal, churn_prevention, and plan_change threads.",
     "example_call": {
       "tool": "reject_enterprise_deal",
       "arguments": {

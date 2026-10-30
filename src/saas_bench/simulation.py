@@ -5873,7 +5873,7 @@ Guidelines:
         """Process enterprise customer negotiations - replies and triggers.
 
         This handles:
-        1. Processing agent response timeouts (3-day limit)
+        1. Processing agent response timeouts (7-day limit)
         2. Processing scheduled customer replies
         3. Triggering new negotiations (churn risk, plan changes, etc.)
         4. Updating relationships based on agent response times

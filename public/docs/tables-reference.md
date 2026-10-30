@@ -143,8 +143,8 @@ Enterprise negotiation turns — each row is one message in a conversation. mess
 
 | Column | Description |
 |--------|-------------|
-| `message_id` | INTEGER PRIMARY KEY — Unique message identifier (use this to reference messages in send_enterprise_deal/reject_enterprise_deal) |
-| `customer_id` | INTEGER — Foreign key to customers |
+| `message_id` | INTEGER PRIMARY KEY — Unique message identifier for reading conversation history. Enterprise deal tools take customer_id. |
+| `customer_id` | INTEGER — Foreign key to customers. Use customer_id for send_enterprise_deal and reject_enterprise_deal. |
 | `thread_type` | TEXT — 'new_lead', 'plan_change', 'churn_prevention', 'renegotiation', 'renewal', 'general' |
 | `turn_number` | INTEGER — 0-indexed turn within thread |
 | `sender` | TEXT — 'customer', 'agent', or 'system' |

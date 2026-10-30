@@ -2,8 +2,8 @@
   "table": "enterprise_turns",
   "description": "Enterprise negotiation turns \u2014 each row is one message in a conversation. message_id is the unique identifier for each message.",
   "columns": {
-    "message_id": "INTEGER PRIMARY KEY \u2014 Unique message identifier (use this to reference messages in send_enterprise_deal/reject_enterprise_deal)",
-    "customer_id": "INTEGER \u2014 Foreign key to customers",
+    "message_id": "INTEGER PRIMARY KEY \u2014 Unique message identifier for reading conversation history. Enterprise deal tools take customer_id.",
+    "customer_id": "INTEGER \u2014 Foreign key to customers. Use customer_id for send_enterprise_deal and reject_enterprise_deal.",
     "thread_type": "TEXT \u2014 'new_lead', 'plan_change', 'churn_prevention', 'renegotiation', 'renewal', 'general'",
     "turn_number": "INTEGER \u2014 0-indexed turn within thread",
     "sender": "TEXT \u2014 'customer', 'agent', or 'system'",

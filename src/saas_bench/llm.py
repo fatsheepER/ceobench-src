@@ -141,8 +141,8 @@ You can call any tool infinitely within a week. Call `next_week` to proceed to t
 
 | Tool | Description |
 |------|-------------|
-| `send_enterprise_deal` | Send offerings to enterprise customers. Takes a list of deals (each with customer_id + offerings). Automatically replies to open threads or initiates renegotiation |
-| `reject_enterprise_deal` | Reject enterprise deals. New leads are lost; existing customers may churn |
+| `send_enterprise_deal` | Send offerings to enterprise customers. Takes a list of deals (each with customer_id + offerings). Replies to open threads or starts renegotiation for active enterprise subscribers |
+| `reject_enterprise_deal` | Close enterprise negotiations by customer_id. Pending new leads become lost; existing subscriptions remain unchanged |
 
 ### Analytics & Monitoring
 
