@@ -430,7 +430,6 @@ class ModelUsage:
         self.evidence_store = evidence_store
         self.token_counter = token_counter
         self.source_records = []
-        self.weekly_check = None
         self.context_id = uuid.uuid4().hex if evidence_store or identity else None
         self.last_request_event = None
         self.path = Path(path) if path else None
@@ -509,22 +508,10 @@ class ModelUsage:
                 body = json.loads(body)
             except ValueError:
                 pass
-            weekly = recorder.weekly_check
-            included = bool(weekly and weekly['summary'] and isinstance(body, dict) and any(
-                isinstance(message, dict) and isinstance(message.get('content'), str) and
-                weekly['summary'] in message['content'] for message in body.get('messages', [])))
-
-            def weekly_delivery(state):
-                if weekly is None:
-                    return {}
-                return dict(weekly_check=dict(weekly['receipt'], delivery_state=(
-                    state if included else 'not_in_request') if weekly['summary'] else 'not_applicable'))
-
             recorder.write('http_request', call_id=call_id, attempt_id=attempt_id,
                        method=request.method, endpoint=str(request.url.copy_with(query=None, username='', password='')),
                        client_headers={k: request.headers[k] for k in ('user-agent', 'x-opencode-session') if k in request.headers},
-                       sdk_retry=request.headers.get('x-stainless-retry-count'), body=body,
-                       **weekly_delivery('send_attempted'))
+                       sdk_retry=request.headers.get('x-stainless-retry-count'), body=body)
             try:
                 # Read through our stream wrapper, so interrupted SSE bodies are retained too.
                 streaming = kwargs.get('stream', False)
@@ -565,7 +552,7 @@ class ModelUsage:
                         failure_recorded = True
                     recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
-                               body=body, error=error, **weekly_delivery('response_received'))
+                               body=body, error=error)
                 if response.is_stream_consumed:
                     if response.content and (attempt := _ATTEMPT.get()):
                         attempt.reply_started()
@@ -588,8 +575,7 @@ class ModelUsage:
                     with recorder.lock:
                         recorder.summary['failed_http_attempts'] += 1
                         recorder.summary['failed_attempts_without_usage'] += 1
-                recorder.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__,
-                               **weekly_delivery('send_unknown'))
+                recorder.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__)
                 raise
 
         http_client.send = recorded_send

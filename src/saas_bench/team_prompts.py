@@ -53,16 +53,16 @@ All handles and cursors below illustrate formats only. Replace them with actual 
 - log: To locate an earlier assumption or receipt, use `pf log MEMORY.md` once MEMORY has been captured; for a peer, use its returned role-qualified name. If you already have the exact version, go straight to show.
 - diff: To review a changed plan or reconcile revisions, use `pf diff MEMORY.md` after two content versions exist, or `pf diff growth:notes.md@v1 growth:notes.md@v2` using versions returned by log.
 - rdepend: Before changing a budget, price, or source assumption, use `pf rdepend query1@v1 --detail` on an existing cited source to find registered judgments to review. It follows declared references, not every affected business decision.
-- depend: Before reusing a stale or pending judgment, use `pf depend growth:r4.2 --detail` after reading that existing revision. Read the checked day, source window, expanded scope, and each result. It replays permitted SQL and public read-only APIs, never analyst scripts. Fixed-date queries keep their dates; saved calculations need an explicit recomputation.
+- depend: To trace a judgment's saved sources, use `pf depend growth:r4.2 --detail` after reading that revision. Read each source's date and coverage. Obtain current evidence with public queries or your own calculations when needed.
 - search: If you cannot locate a past rationale, try `pf search --text "KEYWORD"`. For a known business object, use `pf search ACTUAL_ID`, replacing ACTUAL_ID with its real ID. Open the relevant returned versions.
 - blame: If a disputed assumption appears in a saved file, use `pf blame MEMORY.md` once captured to locate its introducing version and day, then inspect that evidence.
 - more: If a needed result continues, use `pf more c2` with its returned cursor. This continues the same snapshot.
 - help: At startup or when syntax is unclear, run `pf help` for examples.
 
-After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. `--history` on depend inspects lineage without a current check. Zero checked sources, cannot_check, or an unrecomputed artifact leave the relevant issue open. A passing selected condition covers that condition only.
+After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. PF navigation reads saved relationships. Assess current validity yourself.
 Group insights retain their survey snapshot_day until a new survey completes; retrieving or checking them does not refresh the survey.
 When registering selected fields, run `pf show HANDLE --full` alone, without a pipe.
-You can also register selected conditions for reusable decisions. Weekly checks test them within their applies window and flag failures or unavailable evidence.
+Optional select/predicate fields store your declared condition without evaluating it.
 '''
 
 PF_ANALYST_HISTORY = '''## PF evidence work
@@ -71,7 +71,7 @@ Use PF to recover evidence, check reused assumptions, and support a handoff; run
 All handles and cursors below illustrate formats only. Replace them with actual role-qualified receipts.
 
 - show: To reuse a saved result or inspect a CEO citation, use `pf show query1@v1 --full` after that output exists, substituting its returned handle. A saved result retains its original date and coverage.
-- depend: Before carrying a pending or old judgment into a new report, use `pf depend r4.2 --detail` after that revision exists. Read the checked day, source window, expanded scope, and each result. It replays permitted SQL and public read-only APIs, never analyst scripts. Fixed-date queries keep their dates. Rerun your own calculations when their inputs changed.
+- depend: To trace a judgment's saved sources, use `pf depend r4.2 --detail` after that revision exists. Read each source's date and coverage. Obtain current evidence with public queries or your own calculations when needed.
 - search: To recover a prior analysis without its filename, try `pf search --text "KEYWORD"`. For a known customer group, deal, or project, use `pf search ACTUAL_ID` with its real ID, then show relevant returned versions.
 - blame: To trace a carried-forward assumption or a changed calculation, use `pf blame MEMORY.md` once captured, then inspect its introducing version and day.
 - log: To find a missing output version, use `pf log notes.md` after that file has been captured, or log the output name from its receipt. Use an already supplied exact handle directly.
@@ -80,9 +80,9 @@ All handles and cursors below illustrate formats only. Replace them with actual 
 - more: If a needed result continues, use `pf more c2` with its returned cursor. This continues the same snapshot.
 - help: At startup or when syntax is unclear, run `pf help` for examples.
 
-Use `--history` on depend for lineage without a current check. Zero checked sources, cannot_check, or an unrecomputed artifact leave the relevant issue open. A passing condition covers only that scope. Revise or retire outdated judgments and hand the CEO the exact resulting version.
+PF navigation reads saved relationships. Assess current validity yourself. Revise or retire outdated judgments and hand the CEO the exact resulting version.
 When registering selected fields, run `pf show HANDLE --full` alone, without a pipe.
-For a reusable judgment tied to an observed value or threshold, register select/predicate. Within its applies window, weekly checks keep testing it and automatically flag failures or unavailable evidence, with scope and day.
+Optional select/predicate fields store your declared condition without evaluating it.
 '''
 
 GIT_CEO_HISTORY = '''## Git evidence review
@@ -100,7 +100,7 @@ Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace th
 - Continue reading: If a needed result was truncated, request the missing read_file range or read a narrower git show range with `sed -n '1,120p'`. Preserve the commit and path while paging.
 - help: At startup or when syntax is unclear, run `git help -a` or `git log -h`.
 
-After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. Cite handoff files as ROLE:PATH@COMMIT using actual values; a bare path binds the weekly closing commit and includes later edits that week. Save useful outputs to files before handoff so they enter the snapshot. A changed file, an unchanged saved calculation, or a weekly notice requires you to assess whether the judgment still holds.
+After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. Cite handoff files as ROLE:PATH@COMMIT using actual values; a bare path binds the weekly closing commit and includes later edits that week. Save useful outputs to files before handoff so they enter the snapshot. Assess whether the judgment still holds using current evidence when needed.
 Group insights retain their survey snapshot_day until a new survey completes; retrieving or checking them does not refresh the survey.
 '''
 
@@ -119,7 +119,7 @@ Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace th
 - Continue reading: If a needed result was truncated, request the missing read_file range or read a narrower git show range with `sed -n '1,120p'`. Preserve the commit and path while paging.
 - help: At startup or when syntax is unclear, run `git help -a` or `git log -h`.
 
-Register reusable judgments with exact evidence and intended applies days. Git weekly checks compare whole cited files and texts; select/predicate are stored without condition evaluation. Recompute values and assess conditions yourself. Revise or retire outdated judgments and supply the complete intended reference list when it changes. Save reusable scripts and outputs, give relative paths, and let the host publish the handoff commit. Share the exact role-qualified text revision or ROLE:PATH@COMMIT from the receipt.
+Register reusable judgments with exact evidence and intended applies days. select/predicate are stored without condition evaluation. Recompute values and assess conditions yourself. Revise or retire outdated judgments and supply the complete intended reference list when it changes. Save reusable scripts and outputs, give relative paths, and let the host publish the handoff commit. Share the exact role-qualified text revision or ROLE:PATH@COMMIT from the receipt.
 '''
 
 CEO_DECISIONS = '''## Team decisions

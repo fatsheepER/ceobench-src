@@ -16,11 +16,10 @@ from saas_bench.execution_capture import at_pointer, restore_sources, text_sourc
 from saas_bench.model_usage import ModelUsage
 from saas_bench.payload_tokens import load_counter
 from saas_bench.pf_read import accounting
-from saas_bench.pf_refresh import refresh
 from saas_bench.public_sql import execute_query
 from saas_bench.sql_evidence import digest
 from test_pf_read import Counter, sample
-from test_pf_stale import record_sql
+from pf_fixtures import record_sql
 from test_preflight_usage import reply
 from test_public_sql import server
 from test_text_registry import captured, declaration, workspace
@@ -33,7 +32,6 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
     assert counter is not None
     store, registry, executor = captured(workspace, tmp_path)
     server.sql_evidence = store
-    executor.pf_queries.refresh = lambda versions, parent: refresh(server, versions, parent)
     wires, requests, actions = [], [], []
     request = dict(model='deepseek-flash', messages=[])
 
@@ -148,58 +146,40 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         read(target={'path': 'facts.txt'})
         assert send('unchanged file')[-1]['mode'] == 'UNCHANGED'
 
-        def check_forecasts(result, reason=None):
+        def inspect_forecasts():
             for record in ('r2', 'r4'):
                 before = server.conn.serialize()
                 declarations = registry.path.read_bytes()
                 count = refresh_count()
                 rows = query('pf_dependencies', target={'record': record}, purpose='current')['items']
-                assert refresh_count() == count + 1
+                assert refresh_count() == count
                 assert server.conn.serialize() == before
                 assert registry.path.read_bytes() == declarations
                 upstream, leaf = rows
-                assert leaf['check']['predicate_result'] == result
-                assert upstream['check']['version_changed'] is False
-                assert upstream['check']['affected'] is (result != 'holds')
-                assert upstream['check']['affected_paths'] == ([] if result == 'holds' else [leaf['path']])
-                assert leaf['check']['notice'] == {
-                    'holds': 'strong_dependency_version_changed', 'fails': 'predicate_failed',
-                    'cannot_check': 'cannot_check'}[result]
-                if reason:
-                    assert reason in leaf['check']['reason']
+                assert leaf['target']['version'] == reference['evidence']['version']
+                assert all('check' not in row for row in rows)
 
         server.conn.execute('UPDATE ledger SET amount=43')
         server.conn.commit()
-        check_forecasts('holds')
+        inspect_forecasts()
         captured_file(original.replace('记录 012:', '修订 012:'))
-        assert send('predicate holds; first delta')[-1]['mode'] == 'DELTA'
+        assert send('updated world; first delta')[-1]['mode'] == 'DELTA'
         server.conn.execute('UPDATE ledger SET amount=39')
         server.conn.commit()
-        check_forecasts('fails')
+        inspect_forecasts()
         final = original.replace('记录 012:', '修订 012:').replace('记录 041:', '修订 041:').removesuffix('\r\n')
         delta2 = captured_file(final)
-        assert send('predicate fails; second delta')[-1]['mode'] == 'DELTA'
+        assert send('updated world; second delta')[-1]['mode'] == 'DELTA'
         # Only a full read in the request right after the compact read is a recovery pair.
         recovery = read(target={'path': 'facts.txt'}, full=True)
         row = send('adjacent explicit full recovery')[-1]
         assert row['mode'] == 'FULL' and row['recovery_of'] == delta2.pf_read['id']
 
-        # The same F -> A -> V paths must retain each concrete unknown reason.
-        for label, amounts, unavailable, reason in [
-            ('NULL', [-1], False, 'selected_value_null'),
-            ('missing row', [], False, 'no rows'),
-            ('ambiguous rows', [43, 43], False, 'multiple rows'),
-            ('wrong type', ['unknown'], False, 'not_numeric'),
-            ('truncated', [43] * 5001, False, 'source_truncated'),
-            ('refresh unavailable', [43], True, 'refresh_failed:failed'),
-        ]:
+        for amounts in ([-1], [], [43, 43], ['unknown'], [43] * 5001):
             server.conn.execute('DELETE FROM ledger')
             server.conn.executemany("INSERT INTO ledger(day,category,amount) VALUES(0,'operations',?)", [(v,) for v in amounts])
             server.conn.commit()
-            server._operation_failed = unavailable
-            check_forecasts('cannot_check', reason)
-            send(label)
-        server._operation_failed = False
+            inspect_forecasts()
 
         # A saved page remains stable after the world changes, and history never refreshes.
         page = query('pf_dependencies', target={'record': 'r2'}, purpose='current', limit=1)
@@ -207,12 +187,12 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         server.conn.execute('UPDATE ledger SET amount=42')
         server.conn.commit()
         tail = query('pf_dependencies', cursor=page['next_cursor'])
-        assert tail['items'][0]['check']['predicate_result'] == 'holds'
+        assert tail['items'][0]['target']['version'] == reference['evidence']['version']
         assert query('pf_dependencies', cursor=page['next_cursor']) == tail
-        assert query('pf_dependencies', target={'record': 'r5'})['items'][1]['check']['reason'] == 'historical_only'
+        assert query('pf_dependencies', target={'record': 'r5'})['items'][1]['historical_only']
         missing = query('pf_dependencies', target={'record': 'r6'})['items'][0]
         assert missing['target'] is None and missing['unexpanded'] == 'missing'
-        assert missing['check']['reason'] == 'No saved evidence'
+        assert missing['reason'] == 'No saved evidence'
         query('text_revise', record='r1', text='A revised', reason='Constructed correction')
         history = query('pf_read', target={'record': 'r1'}, mode='history')
         assert [r['record'] for r in history['items']] == ['r1.2', 'r1.1']

@@ -214,7 +214,7 @@ else:
 print('PRIVATE-BOUNDARY-PASS')
 '''.replace('PATHS', repr([str(p) for p in probes])).replace('PORT', str(team.server.port))
     assert 'PRIVATE-BOUNDARY-PASS' in shell(team, role, code)
-    for endpoint in ('/checkpoint', '/pf-refresh', '/run-metrics'):
+    for endpoint in ('/checkpoint', '/run-metrics'):
         assert raw(team, role, endpoint, {}, headers={'X-Harness-Token': 'PRIVATE-HARNESS-SECRET'})[0] == 403
     for endpoint in ('/call', '/next-week', '/query', '/daily-scripts', '/_capture'):
         req = urllib.request.Request(f'http://127.0.0.1:{team.server.port}{endpoint}', data=b'{}')

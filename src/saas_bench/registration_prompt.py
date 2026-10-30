@@ -19,8 +19,8 @@ Each reference cites one piece of evidence and may carry a short note on what
 you use it for. Its purpose is "current" (default) when the text relies on it
 now, or "historical_only" when it only records a past fact. `applies` gives the
 simulated days the text is about: "49", "49-55", "49-" (from day 49 until
-revised or retired) or "unknown: <reason>". Each week starts with a check of
-your active texts, shown after the dashboard.
+revised or retired) or "unknown: <reason>". Review your judgments using current
+evidence when needed.
 
 The dashboard reflects the last weekly advance; after changing settings within
 a week, query the current settings instead.
@@ -34,8 +34,7 @@ of every week with the message "Week N (day 7N) [week-N]". In `text_create`,
 cite a file by its path (the version this week's closing commit will store, so
 later edits this week are included), an earlier commit as
 `notes/observations.md@week-6` or `notes/observations.md@3f9a2c1`, another text
-as `r4.2`, or `unknown: <reason>`. The weekly check compares the files and texts
-your active texts cite with their current versions.
+as `r4.2`, or `unknown: <reason>`. Read the cited snapshots to review your sources.
 
 Example: MEMORY.md is rewritten almost every week. Before relying on something
 you remember from earlier weeks, `git log -p -2 -- MEMORY.md` shows what the
@@ -51,18 +50,10 @@ including outputs you never saved. After a command, a line such as
 NAME@vK is version K of that file or output, and K rises only when the content
 changes. In `text_create`, cite such a handle, a file path (the version you last
 saw or wrote), a committed file (`MEMORY.md@week-6`), another text (`r4.2`) or
-`unknown: <reason>`. The weekly check reports cited files and texts that changed
-and predicates that no longer hold.
-Register selected conditions for reusable judgments; weekly checks keep testing them
-within their applies window and flag failures or unavailable evidence.
+`unknown: <reason>`. Source navigation reads saved versions and relationships.
+Run current public queries or recompute your calculations when needed.
+Optional select/predicate fields store your declared condition without evaluating it.
 Run `pf show HANDLE --full` alone, without a pipe, before registering selected fields.
-
-After an ordinary reference needs review, the weekly check retains its first
-finding and last verification day instead of rerunning it each week. Revise the
-text or run `pf depend rN --detail` to review it; incomplete scopes leave uncovered
-issues pending. Explicit selected values and predicates keep being checked.
-Repeated timeouts retry after 1, 2, 4, then 8 simulated weeks; `pf depend` retries
-immediately. Fix invalid SQL or replace its reference before relying on it.
 
 Group insights show their survey's `snapshot_day`, separately from the day you
 retrieve them. Only a completed `research_group` survey updates that date.
@@ -87,7 +78,7 @@ pf log MEMORY.md           versions of a file, an output (scripts/an_w7d.py.out)
 pf show MEMORY.md@v8       one saved version
 pf diff MEMORY.md          what the latest version changed; or pf diff MEMORY.md@v6 MEMORY.md@v8
 pf blame MEMORY.md         the version and day each line was written
-pf depend r4               what r4 cites; reruns the queries behind it and reports changes
+pf depend r4               saved sources and relationships behind r4
 pf rdepend scripts/an_w7d.py.out@v1   registered texts that cite it
 pf search ACTUAL_ID        your texts, business writes and latest outputs about that object
 pf search --text "KEYWORD" literal text search across captured history
@@ -121,9 +112,6 @@ def edits(pf):
         ('MEMORY.md is the ONLY way to carry knowledge forward.',
          'MEMORY.md is the only file loaded into your context automatically.'),
         ('## Weekly Workflow', REGISTERED_TEXTS + history + '## Weekly Workflow'),
-        ('1. **Read the dashboard** (automatically shown at start of week)',
-         '1. **Read the dashboard** (automatically shown at start of week, followed by the check of your '
-         'registered texts)'),
         ('2. **Recall context** — read your notes/files from previous weeks',
          '2. **Recall context** — read your notes/files from previous weeks (' +
          ('`pf log` and `pf diff` show how they changed)' if pf else '`git log -p` shows how they changed)')),

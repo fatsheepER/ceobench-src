@@ -324,6 +324,50 @@ def test_serialization_timeout_returns_504(server, monkeypatch):
     assert request(server, {'sql': 'SELECT 1'})[0] == 200
 
 
+@pytest.mark.parametrize('sql,warning', [("SELECT printf('%2000000000s','x') AS n", True),
+                                         ("SELECT printf('') AS n", False),
+                                         ("SELECT printf('%k','x') AS n", True)])
+def test_sql_formatting_null_keeps_warning(server, sql, warning):
+    from saas_bench.public_sql import FORMATTING_NULL_LOSS, FORMATTING_NULL_WARNING
+    execution = {}
+    body = execute_query(server, sql, metadata=execution)
+    assert body['rows'] == [{'n': None}]
+    if warning:
+        assert body['warning'] == FORMATTING_NULL_WARNING
+        assert FORMATTING_NULL_LOSS in execution['losses']
+    else:
+        assert 'warning' not in body and execution['losses'] == []
+
+
+def test_large_sql_value_is_rejected_and_next_query_continues(server, monkeypatch):
+    from saas_bench.public_sql import QueryResultTooLarge
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
+    sql = "SELECT replace(printf('%1000000s','x'),' ','xxx') AS n"
+    with pytest.raises(QueryResultTooLarge, match='1048576 bytes'):
+        execute_query(server, sql)
+    assert execute_query(server, 'SELECT 42 AS n')['rows'] == [{'n': 42}]
+
+
+def test_format_warning_does_not_leak_from_failed_query(server, monkeypatch):
+    from saas_bench.public_sql import QueryResultTooLarge
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_CELL_LIMIT_BYTES', '1048576')
+    sql = "SELECT printf('%2000000000s','x') AS a, replace(printf('%1000000s','x'),' ','xxx') AS b"
+    with pytest.raises(QueryResultTooLarge):
+        execute_query(server, sql)
+    body = execute_query(server, 'SELECT 42 AS n')
+    assert body['rows'] == [{'n': 42}] and 'warning' not in body
+
+
+def test_serialized_query_response_has_a_byte_limit(server, monkeypatch):
+    monkeypatch.setitem(server.runtime_environment, 'CEOBENCH_SQL_RESPONSE_LIMIT_BYTES', '1024')
+    server.start()
+    status, body = request(server, {'sql': "SELECT printf('%2048s','x') AS n"})
+    assert status == 413
+    assert body == dict(success=False, error='SQL response exceeded 1024 bytes. Narrow the query.')
+    status, body = request(server, {'sql': 'SELECT 42 AS n'})
+    assert status == 200 and body['rows'] == [{'n': 42}]
+
+
 def test_week_publishes_shocks_database_and_day_together(server):
     from concurrent.futures import ThreadPoolExecutor
     entered, query_started, finish = threading.Event(), threading.Event(), threading.Event()
@@ -628,50 +672,3 @@ def test_http_failure_diagnostics_preserve_extended_codes(server, monkeypatch,
         assert record['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'
     if code == sqlite3.SQLITE_READONLY_CANTLOCK:
         assert status == 500 and record['sqlite_errorname'] == 'SQLITE_READONLY_CANTLOCK'
-
-
-@pytest.mark.parametrize('failure', ['setup', 'setup_io', 'execute'])
-def test_pf_refresh_service_failure_has_private_diagnostics(server, tmp_path, monkeypatch, capfd, failure):
-    from saas_bench.pf_refresh import refresh
-    from saas_bench.sql_evidence import FORMAT, SQLEvidenceStore
-    from test_pf_stale import record_sql
-    store = SQLEvidenceStore(tmp_path / 'evidence.sqlite', dict(format=FORMAT, run_id='test', branch_id='test',
-                                                            data_source_id='test'))
-    server.sql_evidence = store
-    version = record_sql(store, 'SELECT 1 AS n', dict(success=True, columns=['n'], rows=[{'n': 1}], row_count=1))
-    parent = store.begin_event('pf_weekly_check', {'day': 0})
-    if failure == 'setup':
-        server._operation_failed = True
-    else:
-        connect = sqlite3.connect
-        class Reader(sqlite3.Connection):
-            def execute(self, sql, *args):
-                if sql == 'SELECT 1 AS n':
-                    error = sqlite3.OperationalError('disk I/O error')
-                    error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
-                    raise error
-                return super().execute(sql, *args)
-        def open_reader(*args, **kwargs):
-            if failure == 'setup_io' and kwargs.get('uri'):
-                error = sqlite3.OperationalError('disk I/O error')
-                error.sqlite_errorcode, error.sqlite_errorname = sqlite3.SQLITE_IOERR_WRITE, 'SQLITE_IOERR_WRITE'
-                raise error
-            return connect(*args, **kwargs, factory=Reader)
-        monkeypatch.setattr(sqlite3, 'connect', open_reader)
-    if failure == 'setup_io':
-        with pytest.raises(sqlite3.OperationalError, match='disk I/O error'):
-            refresh(server, [version], parent)
-    else:
-        result = refresh(server, [version], parent)
-        meta, raw = store.get_content(result[version])
-        assert 'sqlite_errorcode' not in json.loads(raw)
-        captured = store.read_event(meta['created_by_event'])['result']
-        assert captured['error_kind'] == 'service' and captured['failure_stage'] == failure
-    diagnostics = [json.loads(line.removeprefix('[public_sql] '))
-                   for line in capfd.readouterr().err.splitlines() if line.startswith('[public_sql] ')]
-    failed, = [row for row in diagnostics if row.get('error_kind') == 'service']
-    if failure == 'setup_io':
-        assert failed['failure_stage'] == 'setup' and failed['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
-    if failure == 'execute':
-        assert failed['sqlite_errorcode'] == captured['sqlite_errorcode'] == sqlite3.SQLITE_IOERR_WRITE
-        assert failed['sqlite_errorname'] == captured['sqlite_errorname'] == 'SQLITE_IOERR_WRITE'

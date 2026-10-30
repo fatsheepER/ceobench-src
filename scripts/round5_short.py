@@ -258,8 +258,7 @@ class PreparationRunner(BashAgentRunner):
         self.agent._request_model = limited_request
         dashboard = self._get_dashboard()
         self.initial_dashboard = str(dashboard)
-        check = self.tool_executor.weekly_check(self.task_day)
-        self.observation = _joined(dashboard, '\n\n', check) if check else dashboard
+        self.observation = dashboard
         self.observation = _joined(self.observation, '\n\n', QUESTION)
         return status
 

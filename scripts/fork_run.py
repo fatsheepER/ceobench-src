@@ -17,11 +17,9 @@ def main():
     parser.add_argument('destination', type=Path, help='New branch run directory (must not exist)')
     parser.add_argument('--mode', choices=['git', 'pf'], required=True)
     parser.add_argument('--branch', required=True, help='Evidence branch ID, e.g. pf-1')
-    parser.add_argument('--stale-checks', action=argparse.BooleanOptionalAction, default=None,
-                        help='PF only: automatic stale checks (default on; off is the offline ablation)')
     args = parser.parse_args()
     destination = clone_sql_run(args.source, args.destination, args.branch,
-                                text_registration=args.mode, pf_stale_checks=args.stale_checks)
+                                text_registration=args.mode)
     checkpoint = json.loads((destination / 'checkpoint.json').read_text())
     print(json.dumps(dict(destination=str(destination), mode=args.mode, branch=args.branch,
                           fork_day=checkpoint['day'], snapshot_id=checkpoint['snapshot_id']), indent=2))

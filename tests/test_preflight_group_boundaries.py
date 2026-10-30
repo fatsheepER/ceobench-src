@@ -255,8 +255,6 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
         left, right = prefix.execute(op, args), control.execute(op, args)
         assert left.encode() == right.encode()
         assert prefix.path.read_bytes() == control.path.read_bytes()
-        # The week-start check is part of what the Agent sees, so it must match too.
-        assert prefix.weekly_check(14) == control.weekly_check(14)
         outputs.append(dict(operation=op, output=left))
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert (workspace / '.git/index').read_bytes() == index

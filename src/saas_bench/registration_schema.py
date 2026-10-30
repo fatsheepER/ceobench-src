@@ -257,14 +257,10 @@ class ListTexts(Input):
     limit: Annotated[int, Field(ge=1, le=100)] = 20
 
 
-class PFListTexts(ListTexts):
-    review: Literal['pending'] | None = Field(default=None, description='Only texts with pending source checks; includes first and last verification days.')
-
-
 GIT_CREATE, GIT_REVISE = _declaration_models(pf=False)
 PF_CREATE, PF_REVISE = _declaration_models(pf=True)
 MODELS = dict(git=dict(create=GIT_CREATE, revise=GIT_REVISE, retire=Retire, list=ListTexts),
-              pf=dict(create=PF_CREATE, revise=PF_REVISE, retire=Retire, list=PFListTexts))
+              pf=dict(create=PF_CREATE, revise=PF_REVISE, retire=Retire, list=ListTexts))
 MODELS['prefix'] = MODELS['git']  # The prefix is the Git configuration, word for word.
 
 
@@ -296,22 +292,16 @@ def compact_schema(node):
 
 def tool_definitions(pf=False, team=False):
     group = 'pf' if pf else 'git'
-    checks = ('Optional select and predicate on a reference make the weekly check test a condition instead '
-              'of reporting any change. Without select or predicate, the check compares whole content; '
-              'select alone compares the selected value for equality. select picks one cell: '
-              '{"row": {"group_id": "EXAMPLE_GROUP"}, "col": "metric"} in a '
-              'query result or CSV file (row uses equality keys), or {"path": "/a/b"} in a JSON file. predicate '
-              'is {"type": "threshold", "op": ">=", "value": 0.5}, {"type": "tolerance", "amount": 5}, '
-              'or {"type": "compare", "left": <select>, "op": "<", "right": <select>} within one query '
-              'result; query handles are listed by pf depend <output> --detail. '
-              'Script outputs and plain text support whole-content equality only.') if pf else (
-              'The weekly check compares whole cited files and registered texts with their current versions. '
-              'Optional select and predicate fields are stored but do not affect this check.')
+    annotations = ('Optional select and predicate fields record your declared condition without evaluating it. '
+                   'select uses row/col for ' + ('a query result or CSV' if pf else 'CSV') +
+                   ', or a JSON Pointer path for JSON. Threshold/tolerance require select. ')
+    if pf:
+        annotations += 'compare uses left/right row/col selectors within one query. '
     descriptions = {
         'create': 'Register a hypothesis, forecast, plan, conclusion or counterevidence (see Registered Texts). '
                   'Each reference is {"cite": ..., "purpose": "current" or "historical_only" (default current), '
                   '"note": what you use it for}; cite is ' + CITE_FORMS[group] + '. applies is "49", "49-55", '
-                  '"49-" (until revised or retired) or "unknown: <reason>". ' + checks +
+                  '"49-" (until revised or retired) or "unknown: <reason>". ' + annotations +
                   ' Notes over 200 characters are truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
                   'supplied references replace the whole list, and [] clears it. '
@@ -341,7 +331,6 @@ def tool_definitions(pf=False, team=False):
                                    '  "applies": "7-13",\n'
                                    '  "reason": "Track this condition over the stated days."\n'
                                    '}\n```\n')
-        descriptions['list'] += ' review="pending" filters pending source checks; checks keeps their original verification dates.'
     if team:
         descriptions = {
             'create': (
@@ -351,13 +340,13 @@ def tool_definitions(pf=False, team=False):
                 'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Cite actual [pf: ...] handles, file paths '
                 'read in this request or written in this context, committed path@week-N or path@COMMIT, registered '
                 'texts, or "unknown: <reason>". Whole-version citations bind saved evidence; coverage is recorded '
-                'separately. Selected fields require a read in this request or your current-context write. Without '
-                'select/predicate, checks compare whole content; select alone checks equality. Use table row/col '
+                'separately. Selected fields require a read in this request or your current-context write. '
+                'select/predicate are stored without condition evaluation. Use table row/col '
                 'selectors or JSON Pointer path. Threshold/tolerance require select; compare uses left/right table '
                 'selectors within one query. To find query handles behind a receipt, run '
                 '`pf depend <receipt-handle> --detail`, then cite a listed query handle with row/col. '
                 'Read that query with `pf show <query-handle> --full` alone before registering selected fields. '
-                'Script stdout and plain text support whole-content equality only. '
+                'Cite script stdout and plain text as whole versions. '
                 'Format-only example; use observed evidence and intended days.\n'
                 'Example request:\n```json\n{"text":"The selected metric is at least '
                 '0.5.","objects":[{"kind":"customer_group","id":"EXAMPLE_GROUP"}],"references":[{"cite":"query1@v1","select":{"row":{"group_id":"EXAMPLE_GROUP"},"col":"metric"},"predicate":{"type":"threshold","op":">=","value":0.5}}],"applies":"7-13","reason":"Track'
@@ -371,8 +360,8 @@ def tool_definitions(pf=False, team=False):
                 'returned exact ROLE:rN.M, not a guessed peer version. Cite a workspace path, committed path@week-N'
                 ' or path@COMMIT, registered text rN.M, or "unknown: <reason>". A bare path binds this week\'s '
                 'closing commit, including later edits. Cite readable peer handoff files as ROLE:PATH@COMMIT with '
-                'the actual host snapshot. Save command output to a file before citing it. Weekly checks compare '
-                'whole cited files and registered texts. select/predicate are stored without condition evaluation; '
+                'the actual host snapshot. Save command output to a file before citing it. '
+                'select/predicate are stored without condition evaluation; '
                 'check selected values and conditions yourself using current read-only evidence. Example below is '
                 'format-only: the saved path and object must exist, and dates must fit the judgment.\nExample '
                 'request:\n```json\n{"text":"Review this group before changing its '
@@ -391,10 +380,6 @@ def tool_definitions(pf=False, team=False):
             'list': (
                 'List your active texts, references, and notes without checking them. Continue with next_after as '
                 'after. shareable_references gives exact role-qualified citations.'
-            ) + (
-                ' Use review="pending" to filter pending source checks; their original verification days are '
-                'retained.'
-                if pf else ''
             ),
         }
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))

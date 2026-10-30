@@ -15,13 +15,6 @@ from .run_state import write_json
 from .sql_evidence import encoded
 
 
-def applies_ended(record, day):
-    """The text's stated applicability ended before this day, e.g. last week's plan for days 42-48."""
-    applies = record.get('applies_at') or {}
-    last = applies.get('end_day', applies.get('day'))
-    return type(last) is int and last < day
-
-
 class TextRegistry:
     def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None):
         if mode not in ('git', 'prefix', 'pf'):
@@ -29,7 +22,6 @@ class TextRegistry:
         self.git_run = subprocess.run
         self.identity = identity
         self.role = identity.role if identity else "ceo"
-        self.automatic_pf_checks = None
         self.workspace = Path(workspace).resolve()
         self.path = self.workspace / 'registrations.json'
         self.mode, self.store, self.sim_day = mode, store, sim_day
@@ -153,15 +145,6 @@ class TextRegistry:
                 raise RuntimeError('Text saved, but private capture failed; collection stopped') from exc
         # Structured form for audits and tests; the agent receives the text receipt.
         self.last_result = result = dict(id=record_id, version=record['version'], status=record['status'])
-        if self.mode == 'pf' and operation in ('create', 'revise'):
-            for ref, binding in zip(record['references'], bindings):
-                version_id = binding.get('version_id')
-                if ref.get('purpose') != 'current' or not ref.get('predicate') or not version_id:
-                    continue
-                meta, _ = self.resolver.content(version_id)
-                if meta['layer'] == 'file_bytes' and (meta.get('object_id') or '').lower().endswith(('.json', '.csv')):
-                    warnings.append('Stored-file predicate: PF checks saved JSON/CSV bytes; it does not rerun the producer or advance fixed query windows. For current metrics, cite a replayable direct query or register a weekly read-only script that uses the current simulated day and updates the file.')
-                    break
         if warnings:
             result['warnings'] = list(dict.fromkeys(warnings))
         retained = (operation == 'revise' and record['text'] != previous['text']
@@ -183,21 +166,6 @@ class TextRegistry:
             lines.append('Cited: ' + ' · '.join(cited))
         if self.mode == 'pf' and operation != 'retire' and (writes := self._week_writes(record)):
             lines.append('Business writes this week touching ' + ', '.join(writes[0]) + ': ' + ' · '.join(writes[1]))
-        if self.mode == 'pf' and operation in ('create', 'revise'):
-            enabled = self.automatic_pf_checks() if callable(self.automatic_pf_checks) else self.automatic_pf_checks
-            day = record['sim_day']
-            if enabled is False:
-                lines.append('Automatic PF weekly checks: disabled.')
-            elif enabled is None or type(day) is not int:
-                lines.append('Next automatic PF weekly check: unknown.')
-            else:
-                next_day = day + 7
-                applies = record.get('applies_at') or {}
-                start = applies.get('start_day', applies.get('day', 0))
-                end = applies.get('end_day', applies.get('day'))
-                included = 'unknown' if 'unknown' in applies else ('yes' if start <= next_day and (end is None or next_day <= end) else 'no')
-                result['next_weekly_check'] = dict(day=next_day, applies=included)
-                lines.append(f'Next weekly check if the run continues: day {next_day}; applies: {included}.')
         lines += result.get('warnings', [])
         return '\n'.join(lines)
 
@@ -335,60 +303,6 @@ class TextRegistry:
                 calls.append(f"day {day} " + pf_render.call_text(parsed))
         return (sorted(touched), calls[-6:]) if calls else None
 
-    def weekly_check(self, day):
-        """Git/prefix week-start digest: cited committed files and texts compared with current ones."""
-        records = self._load()['records']
-        entries, ended = [], []
-        for key in sorted(records, key=lambda k: int(k[1:]), reverse=True):
-            record = records[key][-1]
-            refs = [r for r in record['references'] if r['purpose'] == 'current' and 'unknown' not in r['evidence']]
-            if record['status'] != 'active' or not refs:
-                continue
-            if applies_ended(record, day):
-                ended.append(record['version'])
-                continue
-            changed = [line for line in (self._git_change(r['evidence'], records) for r in refs) if line]
-            entries.append(dict(text=dict(record=record['version'], day=record.get('sim_day'), text=record['text']),
-                                total=len(refs), changed=changed))
-        return pf_render.render_weekly(entries, day, pf=False, ended=ended) if entries or ended else None
-
-    def _git_change(self, evidence, records):
-        if 'record' in evidence:
-            requested = evidence['record']
-            if self.identity and ':' in requested:
-                owner, requested = requested.split(':', 1)
-                peer = self.repository(owner)
-                from .workspace_io import open_file
-                with open_file(peer, peer / 'registrations.json') as stream:
-                    records = json.load(stream)['records']
-            latest = records[requested.split('.')[0]][-1]
-            if latest['version'] == requested:
-                return None
-            return f"text {evidence['record']}: " + ('retired' if latest['status'] == 'retired' else
-                                                      'revised to ' + latest['version'])
-        workspace = self.repository(evidence.get('owner'))
-        cited = (evidence.get('owner', '') + ':' if self.identity else '') + evidence['path'] + '@' + evidence['commit']
-        try:
-            _, full = git_reference(workspace, evidence, run=self.git_run)
-            old = self.git_run(['git', '-C', str(workspace), 'show', f"{full}:{evidence['path']}"],
-                                 capture_output=True, timeout=10, check=True).stdout
-        except (ValueError, subprocess.SubprocessError) as exc:
-            return f'{cited}: cannot check ({exc})'
-        current = workspace / evidence['path']
-        if current.is_symlink() or not current.is_file():
-            return f'{cited}: the file no longer exists'
-        from .workspace_io import open_file
-        try:
-            with open_file(workspace, current) as stream:
-                new = stream.read()
-        except (OSError, ValueError):
-            return f'{cited}: the file no longer exists inside the workspace'
-        if new == old:
-            return None
-        kind = 'json' if evidence['path'].endswith('.json') else 'text'
-        return (f"{cited}: the current file differs ({pf_render.change(kind, old, new)}); "
-                f"git diff {full[:7]} -- {evidence['path']}")
-
     def repository(self, owner=None):
         if not self.identity:
             return self.workspace
@@ -512,18 +426,9 @@ class TextRegistry:
         version, latest = (self.resolver.handle(binding[k]) for k in ('version_id', 'latest_version_id'))
         return dict(shown, version=version, latest=latest, differs=version != latest)
 
-    def _list(self, state, after, limit, review=None):
+    def _list(self, state, after, limit):
         active = [versions[-1] for key, versions in sorted(state['records'].items(), key=lambda kv: int(kv[0][1:]))
                   if int(key[1:]) > after and versions[-1]['status'] == 'active']
-        pending = (self.store.load_state('pf_review') or {}).get('pending', {}) if self.mode == 'pf' else {}
-        checks = {}
-        for record in active:
-            binding = self.store.load_state('declaration:' + record['version']) if self.mode == 'pf' else None
-            if binding and (check := pending.get(binding['version_id'])):
-                checks[record['version']] = dict(status='pending', first_day=check['first_day'], last_day=check['last_day'],
-                    reason=pf_render.dependency_line(check['reason'], relation=False))
-        if review == 'pending':
-            active = [record for record in active if record['version'] in checks]
         page = active[:limit]
         result, origins = '{"records":[', []
         for record in page:
@@ -537,8 +442,6 @@ class TextRegistry:
             result += content
         next_after = int(page[-1]['id'][1:]) if len(active) > limit else None
         result += '],"next_after":' + json.dumps(next_after) + '}'
-        if self.mode == 'pf':
-            result = result[:-1] + ',"checks":' + json.dumps({r['version']: checks.get(r['version']) for r in page}) + '}'
         if self.identity:
             result = result[:-1] + ',"shareable_references":' + json.dumps({
                 r['version']: self.role + ':' + r['version'] for r in page}) + '}'

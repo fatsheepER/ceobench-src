@@ -99,7 +99,7 @@ def run(args):
         reasoning_effort='high', seed=args.seed, total_days=500, scenario='default', initial_cash=1_000_000.,
         workspace_base=output / 'runs' / SEEDS[args.seed] / args.mode, run_kind='formal',
         pricing_file=output / 'pricing.json', continue_from=source, execution_capture=capture,
-        sql_capture=capture, text_registration=args.mode, pf_stale_checks=args.mode == 'pf',
+        sql_capture=capture, text_registration=args.mode,
         stop_after_day=None if args.stop_after_day == 497 else args.stop_after_day)
     environment()  # Reapply after .env loading; no official-provider override can survive.
     BashAgentToolExecutor(runner.agent_workspace, require_sandbox=True).verify_sandbox()

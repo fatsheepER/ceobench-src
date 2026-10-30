@@ -349,7 +349,7 @@ class BashAgentToolExecutor:
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
-                 text_registry=None, pf_stale_checks=True, pf_refresh=None,
+                 text_registry=None,
                  identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None,
                  bash_memory_limit_bytes=None):
         """Initialize the tool executor.
@@ -393,22 +393,11 @@ class BashAgentToolExecutor:
         self.pf_queries = None
         if text_registry and text_registry.mode == 'pf':
             from saas_bench.pf_queries import PFQueries
-            self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh,
-                                       call_timeout=self.pf_timeout)
-        if text_registry:
-            text_registry.automatic_pf_checks = lambda: bool(self.pf_queries and self.pf_queries.stale_checks)
+            self.pf_queries = PFQueries(text_registry, call_timeout=self.pf_timeout)
         self.capture = None
         self.world_status = None
         self.authorize = None
         self.preserved_process = None
-
-    def weekly_check(self, day):
-        """Week-start check of active registered texts, or None when nothing is registered."""
-        if self.pf_queries:
-            return self.pf_queries.weekly_check(day)
-        if self.text_registry and self.text_registry.mode in ('git', 'prefix'):
-            return self.text_registry.weekly_check(day)
-        return None
 
     def verify_sandbox(self):
         if sys.platform != 'linux':

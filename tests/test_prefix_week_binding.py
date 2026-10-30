@@ -137,6 +137,7 @@ def test_finalized_prefix_forks_share_public_bytes_and_exact_evidence(offline_ru
         if mode == 'pf':
             b = child.evidence_store.load_state('declaration:r1.1')['references'][0]
             assert child.evidence_store.get_content(b['version_id'])[1] == b'{"n":2}'
-            assert 'unavailable' not in child.tool_executor.weekly_check(7)
+            graph = child.tool_executor.pf_queries.answer('pf_dependencies', dict(target={'record': 'r1'}))
+            assert graph['items'][0]['target']['version'] == child.tool_executor.text_registry.resolver.handle(b['version_id'])
         else:
             assert child.evidence_store is None

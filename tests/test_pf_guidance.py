@@ -4,11 +4,10 @@ import re
 import pytest
 
 from saas_bench import pf_cli, registration_prompt, team_prompts
-from saas_bench.pf_refresh import refresh
 from saas_bench.public_sql import execute_query
 from saas_bench.registration_schema import PF_CREATE, PF_REVISE, tool_definitions
 from saas_bench.role_policy import ROLES
-from test_pf_stale import record_sql
+from pf_fixtures import record_sql
 from test_preflight_team_evidence import pf, write
 from test_preflight_team_flow import calls, make_team
 from test_public_sql import server
@@ -55,7 +54,7 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
             if mode == 'pf':
                 assert '## Git evidence' not in system
                 assert 'alone, without a pipe' in system
-                assert 'within their applies window' in system if role == 'ceo' else 'Within its applies window' in system
+                assert 'store your declared condition without evaluating it' in system
                 assert description.count('Example request:') == 1
                 assert '`pf depend <receipt-handle> --detail`' in description
                 assert 'then cite a listed query handle with row/col' in description
@@ -84,6 +83,15 @@ def test_compare_json_path_error_gives_table_selector_fix(side, path):
                 references=[dict(cite='query1@v1', predicate=predicate)], applies='7-', reason='Review')
     with pytest.raises(ValidationError, match='row/col on both left and right; JSON paths are not supported'):
         PF_CREATE.model_validate(args)
+
+
+def test_standalone_git_condition_guidance_matches_its_schema():
+    create = tool_definitions(pf=False)[0]
+    description = create['description']
+    assert 'without evaluating it' in description
+    assert 'query' not in description and 'compare' not in description
+    assert 'Threshold/tolerance require select' in description
+    assert 'compare' not in json.dumps(create['parameters'])
 
 
 def test_d0_prompt_example_runs_and_full_help_reaches_all_role_wires():
@@ -155,7 +163,6 @@ def test_help_peer_example_reads_exact_version_and_compares_one_object():
 def test_published_condition_and_review_examples(workspace, tmp_path, server, team):
     store, registry, executor = captured(workspace, tmp_path)
     server.sql_evidence = store
-    executor.pf_queries.refresh = lambda versions, parent: refresh(server, versions, parent)
     sql = "SELECT 'EXAMPLE_GROUP' AS group_id,NULLIF(amount,-1)/100.0 AS metric FROM ledger WHERE day=0"
     server.conn.execute('UPDATE ledger SET amount=60')
     server.conn.commit()
@@ -170,19 +177,17 @@ def test_published_condition_and_review_examples(workspace, tmp_path, server, te
     assert executor.execute('text_create', args).startswith('Registered r1.1')
     show_text, check, history = commands(2)
     assert args['text'] in executor.execute('bash', {'command': show_text})
-    for amount, status in ((60, 'predicate holds'), (40, 'PREDICATE FAILS'), (-1, 'cannot check')):
+    for amount in (60, 40, -1):
         server.conn.execute('UPDATE ledger SET amount=?', (amount,))
         server.conn.commit()
         before = server.conn.serialize()
         result = executor.execute('bash', {'command': check})
         assert server.conn.serialize() == before
-        assert 'Checked day 7' in result and 'expanded dependencies' in result
-        assert status in result, result
-        assert 'query1@v1' in result
-    executor.pf_queries.refresh = lambda *_: pytest.fail('Historical inspection must not refresh')
+        assert 'Saved source relationships.' in result and 'query1@v1' in result
+        assert 'predicate holds' not in result and 'PREDICATE FAILS' not in result
+        assert all('check' not in row for row in executor.pf_queries.last_answer['items'])
     result = executor.execute('bash', {'command': history})
-    assert 'Not checked (--history lists history only)' in result
-    assert 'not checked' in result and 'predicate holds' not in result and 'PREDICATE FAILS' not in result
+    assert 'Saved source relationships.' in result
     partial = executor.execute('bash', {'command': show_query + ' | head -1'})
     assert 'PF final delivery: partial' in partial
     send(store, partial)

@@ -58,7 +58,7 @@ def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_p
     call(registry, 'create', **declaration())
     call(registry, 'revise', record='r1', text='Corrected assumption', reason='Changed interpretation')
     page = query(executor, 'pf_dependencies', target={'record': 'r2'})
-    assert len(page['items']) == 2 and page['stale_check'] == 'not_performed'
+    assert len(page['items']) == 2 and all('check' not in row for row in page['items'])
     assert page['items'][0]['target']['record'] == 'r1.1'
     assert page['items'][1]['note'] == 'retain baseline'
     assert page['items'][1]['predicate']['value'] == 5
@@ -453,7 +453,7 @@ def test_path_dependents_survive_boundary_snapshots_of_unchanged_bytes(workspace
     assert query(executor, 'pf_dependents', target={'path': 'evidence.json'})['items'] == []
 
 
-def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offline_runner):
+def test_script_output_handle_cites_printed_result_without_replaying_queries(offline_runner):
     """Agents run SDK scripts and read printed summaries, never the raw query response."""
     runner = offline_runner(text_registration='pf')
     runner.agent.current_day = 0
@@ -480,16 +480,17 @@ def test_script_output_handle_cites_printed_result_and_reruns_its_queries(offlin
     created = runner._execute_tool('text_create', declaration({'version': footer.group(1)}))
     assert created.startswith('Registered r1.1 (active).\nCited: calc.py.out@v1 (day 0)'), created
     assert runner.tool_executor.text_registry.last_result['evidence'][0]['version'] == footer.group(1)
+    with closing(store.connect()) as conn:
+        queries_before = conn.execute('SELECT event_id FROM requests WHERE query_id IS NOT NULL').fetchall()
     traced = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'}, purpose='current', depth=4)
-    assert traced['stale_check'] == 'performed'
+    assert all('check' not in row for row in traced['items'])
+    with closing(store.connect()) as conn:
+        assert conn.execute('SELECT event_id FROM requests WHERE query_id IS NOT NULL').fetchall() == queries_before
     upstream = [i for i in traced['items'] if (i['target'] or {}).get('sql') == 'SELECT COUNT(*) AS n FROM ledger']
     assert upstream and upstream[0]['kind'] == 'same_execution' and upstream[0]['path'][1] == footer.group(1)
-    assert upstream[0]['check']['version_changed'] is False, json.dumps(upstream[0]['check'])
-    # Rerun, not reused: an equal result is a new acquisition of the same content, so one handle.
     handle = upstream[0]['target']['version']
-    assert upstream[0]['check']['current_version'] == handle
-    rerun = query(runner.tool_executor, 'pf_read', mode='history', target={'version': handle})['items']
-    assert len(rerun) == 1 and rerun[0]['version'] == handle  # PF reruns are not listed as history
+    history = query(runner.tool_executor, 'pf_read', mode='history', target={'version': handle})['items']
+    assert len(history) == 1 and history[0]['version'] == handle
     # Running the same script again with the same printed output keeps the handle; a
     # different output is its next version, whatever the surrounding command looks like.
     output = runner._execute_tool('bash', {'command': './novamind-operation python calc.py 2>&1 | head -5'})

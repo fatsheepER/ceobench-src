@@ -91,8 +91,6 @@ def test_weekly_observations_allow_public_registration_without_exposing_private_
         for role, runtime in team.roles.items():
             observation = observations[role] = team._observation(
                 role, CapturedText('Weekly dashboard'), team._script_output(role))
-            weekly = next(o['version_id'] for o in observation.origins
-                          if runtime.store.get_content(o['version_id'])[0]['layer'] == 'weekly_check')
             script = next(o['version_id'] for o in observation.origins
                           if runtime.store.get_content(o['version_id'])[0]['layer'] == 'tool_return')
             assert role + '-SCRIPT-EVIDENCE' in observation
@@ -108,10 +106,10 @@ def test_weekly_observations_allow_public_registration_without_exposing_private_
             request = runtime.usage.last_request_event
             slots = [request + suffix for suffix in (':wire', ':occurrences', ':pf_reads', ':reconstructed')]
             captured = {slot: runtime.store.get_content(slot) for slot in slots}
-            assert weekly in {o['version_id'] for o in json.loads(captured[request + ':occurrences'][1])}
+            assert script in {o['version_id'] for o in json.loads(captured[request + ':occurrences'][1])}
             assert version(team, role, 'facts.json') in {
                 o['version_id'] for o in json.loads(captured[request + ':reconstructed'][1])}
-            declare(team, role, role + ' decision after weekly check',
+            declare(team, role, role + ' decision after observation',
                     ['same.txt', evidence_handles.index(runtime.store).name(script), 'r1.1'])
             bindings = runtime.store.load_state('declaration:r2.1')['references']
             assert [b['status'] for b in bindings] == ['resolved'] * 3
@@ -129,8 +127,8 @@ def test_weekly_observations_allow_public_registration_without_exposing_private_
             key_start, cash_start = content.index('"cash"'), content.index('100')
             assert selection['selected_ranges'] == [[key_start, key_start + 6], [cash_start, cash_start + 3]]
             assert {slot: runtime.store.get_content(slot) for slot in slots} == captured
-            assert 'inaccessible' in runtime.executor.execute('pf_read', dict(target={'version': weekly})).lower()
-            assert '[exit code: 1]' in pf(team, role, 'pf show ' + weekly)
+            assert 'inaccessible' in runtime.executor.execute('pf_read', dict(target={'version': request + ':wire'})).lower()
+            assert '[exit code: 1]' in pf(team, role, 'pf show ' + request + ':wire')
             saved = runtime.registry.path.read_bytes()
             partial = runtime.executor.execute('read_file', dict(path='facts.json', limit=1))
             send(team, role, [observation, partial])
@@ -190,7 +188,8 @@ def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wire
                 assert user['content'][c:d] == raw.decode()[a:b]
                 assert (item['reader'], item['session_id'], item['context_id']) == (
                     role, runtime.identity.session_id, runtime.usage.context_id)
-            assert {'dashboard', 'weekly_check', 'tool_return'} <= layers
+            assert {'dashboard', 'tool_return'} <= layers
+            assert 'weekly_check' not in layers
             ledger = json.loads(runtime.store.get_content(events[0] + ':pf_reads')[1])
             assert len(ledger) == 1 and ledger[0]['mode'] == 'FULL'
             read = ledger[0]
@@ -345,52 +344,30 @@ def test_ceo_copy_traversal_stops_without_ops_body_summary_or_snippet():
             runtime.store.assert_healthy()
 
 
-def test_weekly_registration_roots_and_review_hints_keep_role_identity():
+def test_source_navigation_and_lists_keep_role_identity():
     with make_team('pf', lambda *args: final('done'), 'weekly-role-scope') as team:
         for role in ROLES:
             write(team, role, role + '-before')
             declare(team, role, role + ' decision', [role + ':same.txt@v1'])
             write(team, role, role + '-after')
         ceo = team.roles['ceo']
-        first = ceo.executor.weekly_check(7)
-        assert 'Registered texts: 1 active; 1 within their applies window.' in first, first
-        assert 'Checked this week: 1 text; 1 with changed evidence:' in first
-        assert 'ceo:r1.1 (day 0)' in first and 'growth decision' not in first
-        assert 'Details: pf depend ceo:r1.' in first
-        assert 'pf depend ceo:r1 rechecks one text.' in first
-        pending = ceo.store.load_state('pf_review')['pending']
-        assert len(pending) == 1 and {v.split('/')[1] for v in pending} == {'ceo'}
-        listed = json.loads(ceo.executor.execute('text_list', {'review': 'pending'}))
-        assert [r['version'] for r in listed['records']] == ['r1.1']
-        assert list(listed['checks']) == ['r1.1']
-        foreign = team.roles['growth'].store.load_state('declaration:r1.1')['version_id']
-        ceo.store.save_state('pf_review', dict(pending={**pending, foreign: next(iter(pending.values()))}, ended=[]))
-        second = ceo.executor.weekly_check(14)
-        assert 'ceo:r1.1 (last verified day 7)' in second and 'growth decision' not in second
-        assert {v.split('/')[1] for v in ceo.store.load_state('pf_review')['pending']} == {'ceo'}
+        for role, runtime in team.roles.items():
+            listed = json.loads(runtime.executor.execute('text_list', {}))
+            assert [r['text'] for r in listed['records']] == [role + ' decision']
+            assert 'checks' not in listed
         query = ceo.executor.pf_queries
         searched = query.answer('pf_search', dict(text='growth decision'))
         assert any(item['version'] == 'growth:r1.1' for item in searched['items'])
         for target in ({'record': 'growth:r1.1'}, {'version': 'growth:r1.1'}):
             peer = ceo.executor.execute('pf_dependencies', dict(target=target, detail=True))
             assert peer.startswith('growth:r1.1 · day 0 · text growth:r1.1'), peer
-            assert 'growth:same.txt@v1' in peer and 'changed' in peer
+            assert 'growth:same.txt@v1' in peer and 'Saved source relationships.' in peer
         declare(team, 'ceo', 'ceo follows growth', ['growth:r1.1'])
-        third = ceo.executor.weekly_check(21)
-        assert 'Registered texts: 2 active; 2 within their applies window.' in third, third
-        assert 'ceo:r2.1 (day 0)' in third and 'text growth:r1.1' in third
-        assert '1 underlying source changed:' in third
-        pending = ceo.store.load_state('pf_review')['pending']
-        assert len(pending) == 2 and {v.split('/')[1] for v in pending} == {'ceo'}
-        listed = json.loads(ceo.executor.execute('text_list', {'review': 'pending'}))
+        listed = json.loads(ceo.executor.execute('text_list', {}))
         assert [r['version'] for r in listed['records']] == ['r1.1', 'r2.1']
-        assert set(listed['checks']) == {'r1.1', 'r2.1'}
+        assert 'checks' not in listed
         for command in ('pf depend ceo:r1', 'pf depend ceo:r2'):
             assert pf(team, 'ceo', command).startswith(command.split()[-1] + '.1 ·')
-        for role in ROLES[1:]:
-            own = team.roles[role].executor.weekly_check(7)
-            assert 'Registered texts: 1 active; 1 within their applies window.' in own
-            assert role + ':r1.1 (day 0)' in own and 'ceo decision' not in own
         denied = pf(team, 'growth', 'pf depend ops_finance:r1 --detail')
         assert 'inaccessible' in denied.lower() and 'ops_finance-before' not in denied
         for runtime in team.roles.values():
@@ -499,7 +476,7 @@ def test_git_role_same_name_scripts_registrations_current_files_and_reopened_ref
         refs = reopened._load()['records']['r2'][0]['references']
         assert [r['evidence']['owner'] for r in refs] == ['growth', 'ops_finance']
         write(team, 'growth', 'growth-CHANGED')
-        assert 'growth:same.txt@week-1' in reopened.weekly_check(0)
+        assert reopened._load()['records']['r2'][0]['references'] == refs
         assert 'growth-CURRENT' == team._git(team.roles['growth'], 'show', 'HEAD:same.txt')
         assert not list((team.root / 'private').rglob('*.sqlite'))
 

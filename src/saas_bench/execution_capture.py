@@ -349,7 +349,7 @@ def public_handler(method):
                        and handler.headers.get('X-Harness-Status') == 'flags')
         if (not store or not store.execution_capture) and not status_only:
             return method(handler)
-        if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh', '/run-metrics'):
+        if handler.path in ('/health', '/game-status', '/checkpoint', '/run-metrics'):
             handler._control_capture = bool(store and store.execution_capture)
             try:
                 if status_only:

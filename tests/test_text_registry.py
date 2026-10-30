@@ -163,6 +163,25 @@ def test_notes_and_predicate_fields_are_saved_without_evaluation(workspace):
             call(registry, 'create', **declaration(references=[dict(ref, **changes)]))
 
 
+@pytest.mark.parametrize('mode', ['git', 'prefix', 'pf'])
+@pytest.mark.parametrize('applies', ['7-', '7-13', '14', '21-', '0-6', 'unknown: open scope'])
+def test_revision_retains_declared_scope_and_condition_metadata(workspace, tmp_path, mode, applies):
+    from saas_bench.registration_schema import parse_applies
+    store, registry, executor = captured(workspace, tmp_path, mode)
+    send(store, executor.execute('read_file', {'path': 'evidence.json'}))
+    ref = dict(evidence={'path': 'evidence.json'}, purpose='current', select={'path': '/n'},
+               predicate={'type': 'threshold', 'op': '<', 'value': 6})
+    scope = parse_applies(applies)
+    call(registry, 'create', **declaration(references=[ref], applies_at=scope))
+    call(registry, 'revise', record='r1', reason='Keep inherited scope and evidence')
+    history = json.loads(registry.path.read_text())['records']['r1']
+    assert history[-1]['references'] == history[0]['references']
+    assert history[-1]['applies_at'] == history[0]['applies_at'] == scope
+    assert history[-1]['references'][0]['select'] == ref['select']
+    assert history[-1]['references'][0]['predicate'] == ref['predicate']
+    assert history[-1]['status'] == 'active'
+
+
 def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
     text = executor.execute('read_file', {'path': 'evidence.json'})
@@ -417,7 +436,6 @@ def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, serv
     monkeypatch.setenv('CEOBENCH_BASH_OUTPUT_MAX_CHARS', '30000')
     import shlex
     from test_sql_evidence import settled
-    from saas_bench.pf_stale import compare
     store, registry, executor = captured(workspace, tmp_path)
     server.sql_evidence = store
     server.start()
@@ -440,8 +458,6 @@ def test_packed_cli_query_retains_scope_in_model_input(workspace, tmp_path, serv
     assert body['success'] and body['truncated'] and body['row_count'] == 5000
     assert meta['source_truncated']
     assert body == json.loads(store.get_content(meta['derived_from'])[1])
-    with pytest.raises(ValueError, match='source_truncated'):
-        compare(registry.resolver, meta['derived_from'], meta['derived_from'], {}, 'query')
     nested = 'import json, subprocess; r=json.loads(subprocess.check_output(' + repr(shlex.split(command)) + ')); print(len(r["rows"]))'
     result = executor.execute('bash', {'command': 'python -c ' + shlex.quote(nested)})
     event = send(store, result)

@@ -1,4 +1,4 @@
-"""Agent-facing text for PF queries and the weekly check: one line per item, one detail level."""
+"""Agent-facing text for PF source queries: one line per item, one detail level."""
 from collections import Counter
 import difflib
 import json
@@ -178,7 +178,7 @@ def change(kind, old_raw, new_raw):
 def survey_dates(item):
     if 'snapshot_day' not in item:
         return []
-    return [f"survey day {item['snapshot_day']}; acquired day {item.get('day')}; checked day {item['checked_day']}",
+    return [f"survey day {item['snapshot_day']}; acquired day {item.get('day')}",
             item['refresh_hint']]
 
 
@@ -301,71 +301,28 @@ def render_search(page):
     return '\n'.join(lines)
 
 
-def status(check, row):
-    """One phrase for one dependency's check result."""
-    if row.get('historical_only'):
-        return 'historical only, not checked'
-    if check is None:
-        return 'not checked'
-    if check.get('reason') == 'write_receipt':
-        return 'write receipt, not compared'
-    scope = check.get('evaluation_scope')
-    day = check.get('checked_day')
-    checked = str(day) if day is not None else 'unknown'
-    prefix = ''
-    if scope == 'stored_artifact':
-        observed = check.get('cited_observed_day')
-        context = check.get('cited_context_day')
-        cited = (f'cited observation day {observed}' if observed is not None else
-                 f"cited observation day unknown; cited version context day {context if context is not None else 'unknown'}")
-        prefix = (f"stored artifact; {cited}; "
-                  f"checked day {checked}; not recomputed by PF; current-world metric unverified; ")
-    elif scope == 'captured_value':
-        prefix = f'captured value; checked day {checked}; current-world value unverified; '
-    elif scope is None:
-        prefix = f'evaluation scope unknown; checked day {checked}; '
-    current = 'now' if scope == 'refreshed_read' else 'stored version'
-    now = f" ({current} {check['current_version']})" if check.get('version_changed') and check.get('current_version') else ''
-    if check['predicate_result'] == 'fails':
-        result = f'PREDICATE FAILS{now}: ' + check.get('summary', '')
-    elif check['predicate_result'] == 'holds':
-        result = (f'predicate holds{now}: ' if check['version_changed'] else 'unchanged; predicate holds: ') + check.get('summary', '')
-    elif check['predicate_result'] == 'cannot_check':
-        result = 'cannot check: ' + str(check.get('reason'))
-    elif check['version_changed']:
-        result = f'changed{now}: ' + check.get('summary', 'changed')
-    else:
-        result = 'unchanged itself' if check['affected'] else 'unchanged'
-    if check.get('sources'):
-        result += '; ' + check['sources']
-    elif check['affected'] and check['predicate_result'] not in ('fails', 'cannot_check') and not check['version_changed']:
-        result += '; a source changed'
-    return prefix + result
-
-
 def dependency_line(row, relation=True):
     target = row['target']
     what = item_line(target) if target else 'evidence unavailable'
     if target is None:
         what += f" ({row.get('reason') or row.get('unexpanded')})"
     head = (row['relation'] + ' ' if relation else '') + what
-    extras = [status(row.get('check'), row)]
+    extras = ['historical only'] if row.get('historical_only') else []
+    if row.get('select'):
+        extras.append('declared select ' + json.dumps(row['select'], separators=(',', ':'), sort_keys=True))
     if row.get('predicate'):
-        extras.append('predicate ' + json.dumps({k: number(v) for k, v in row['predicate'].items()},
+        extras.append('declared predicate ' + json.dumps({k: number(v) for k, v in row['predicate'].items()},
                                                  separators=(',', ':'), sort_keys=True))
     if row.get('note'):
         extras.append('note: ' + short(row['note'], 120))
     if row.get('unexpanded') == 'depth_limit':
         extras.append('depth limit; dependencies beyond this item were not expanded')
-    return head + ' — ' + ' — '.join(extras)
+    return head + (' — ' + ' — '.join(extras) if extras else '')
 
 
 def render_dependencies(page):
     root, detail = page['root'], page.get('detail')
-    checked = page.get('stale_check') == 'performed'
-    lines = [item_line(root),
-             (f"Checked day {page.get('checked_day') if page.get('checked_day') is not None else 'unknown'}; within expanded dependencies; scopes below describe what was evaluated; advisory." if checked else
-              'Not checked (--history lists history only).')]
+    lines = [item_line(root), 'Saved source relationships.']
     if page.get('unexpanded'):
         lines.append('Incomplete: depth limit reached at ' + ', '.join(page['unexpanded']) +
                      '. Continue with ' + '; '.join('pf depend ' + v for v in page['unexpanded']) + '.')
@@ -378,10 +335,6 @@ def render_dependencies(page):
     tail = [_more(page, 'items')]
     if not detail:
         tail.append(f"pf depend {root['version']} --detail lists the expanded queries, reads and files.")
-    # Name a pair that was just compared, so the example is directly usable.
-    pair = next((row['diff_pair'] for row in page['items'] if row.get('diff_pair')), None)
-    if pair:
-        tail.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
     return '\n'.join(lines + [' '.join(filter(None, tail))])
 
 
@@ -407,115 +360,3 @@ def render_dependents(page):
 
 def plural(n, noun):
     return f'{n} {noun}' + ('' if n == 1 else 's')
-
-
-def render_weekly(entries, day, pf, ended=(), underlying=(), condition_only=0, pending=0,
-                  *, active=None, eligible=None, predicates_checked=False, rendered=None):
-    """Week-start check: texts whose directly cited evidence changed, then short summaries.
-
-    Show changes to existing data even behind a cited output. Pure additions share a line.
-    """
-    flagged = [e for e in entries if e['changed']]
-    stored = list({row.get('condition_id', row['target']['version']): row for e in entries
-                   for row in e.get('stored_conditions', [])}.values())
-    marks = []
-    lines = [f'=== Check of your registered texts (day {day}) ===']
-    if active is not None:
-        lines.append(f'Registered texts: {active} active; {eligible} within their applies window.')
-    checked = 'Checked this week: ' + plural(len(entries), 'text')
-    if not entries:
-        lines.append(checked + '; no new freshness conclusion.')
-    elif not flagged and pending:
-        lines.append(f'{checked}; {condition_only} for continuing conditions or read retries. No new direct issues in these checks.')
-    elif not flagged and stored:
-        lines.append(checked + '; no condition fails in the evaluated scope.')
-    elif not flagged:
-        lines.append(checked + '; cited files and texts are unchanged' +
-                     (' and no predicate fails.' if pf and predicates_checked else '.'))
-    else:
-        lines.append(f'{checked}; {len(flagged)} with changed evidence:')
-    if pf and entries and not predicates_checked:
-        lines.append('No structured predicates were checked.')
-    if stored:
-        lines.append('Stored artifact conditions use file bytes; not recomputed by PF; current-world metrics unverified.')
-        for row in stored[:3]:
-            check = row['check']
-            observed = check.get('cited_observed_day')
-            if row.get('condition_id'):
-                marks.append((len(lines), row['condition_id']))
-            label = (f"{row['source'].get('record', row['source']['version'])} reference {row['reference_index'] + 1}: "
-                     if row.get('reference_index') is not None else '')
-            lines.append(f"  {label}{row['target']['version']}: cited observation day {observed if observed is not None else 'unknown'}; checked day {check.get('checked_day')}; {check['predicate_result']} on stored bytes.")
-    seen, displayed, shared = set(), 0, 0
-    for entry in flagged:
-        rows = [row if isinstance(row, str) else dependency_line(row, relation=False) for row in entry['changed']]
-        distinct = [row for row in dict.fromkeys(rows) if row not in seen]
-        if not distinct:
-            shared += 1
-            continue
-        if displayed == 8:
-            continue
-        seen.update(distinct)
-        displayed += 1
-        text = entry['text']
-        lines.append(f"{text['record']} (day {text['day']}): \"{short(text['text'], 90)}\"")
-        for row_text in distinct[:3]:
-            row = next((r for r, text in zip(entry['changed'], rows) if text == row_text), None)
-            label = ''
-            if isinstance(row, dict) and row.get('condition_id'):
-                marks.append((len(lines), row['condition_id']))
-                outcome = row.get('check', {}).get('predicate_result', 'not_checked').replace('_', ' ')
-                label = f"reference {row['reference_index'] + 1} ({outcome}): "
-            lines.append('  - ' + label + short(row_text, 320))
-        for row in entry['changed'][:3]:
-            if isinstance(row, dict) and row.get('check', {}).get('sources'):
-                lines.append('    ' + short(row['check']['sources'], 240))
-        if len(distinct) > 3:
-            lines.append(f"  - and {len(distinct) - 3} more source changes")
-    if shared:
-        lines.append(f'{shared} additional texts share the source changes above.')
-    if len(flagged) > displayed + shared:
-        lines.append(f'{len(flagged) - displayed - shared} additional texts have changed evidence.')
-    if underlying:
-        lines.append(f"Only added rows in checked sources for {plural(len(underlying), 'text')}; "
-                     f"pf depend {underlying[0].split('.')[0]} shows one.")
-        pair = next((entry['diff_pair'] for entry in entries
-                     if entry['text']['version'] in underlying and entry.get('diff_pair')), None)
-        if pair:
-            lines.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
-    if ended:
-        lines.append(f"Not checked: {plural(len(ended), 'text')} past the applies window.")
-    if flagged:
-        example = flagged[0]['text']['record'].split('.')[0]
-        if pf:
-            pair = next((row['diff_pair'] for entry in flagged for row in entry['changed']
-                         if isinstance(row, dict) and row.get('diff_pair')), None)
-            if pair:
-                lines.append('See what changed: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
-                lines.append(f'Before changing this source: pf rdepend {shlex.quote(pair[0])} --detail.')
-        lines.append(f'Details: pf depend {example}.' if pf else 'Details: run the git diff shown on each line.')
-    if rendered is not None:
-        offsets, offset = [], 0
-        for line in lines:
-            offsets.append(offset)
-            offset += len(line) + 1
-        for line_index, identity in marks:
-            rendered.setdefault(identity, []).append([offsets[line_index], offsets[line_index] + len(lines[line_index])])
-    return '\n'.join(lines)
-
-
-def render_pending(items, day):
-    """Resurface dated content changes without pretending to have rechecked them."""
-    additions = sum(p['reason']['check'].get('change_kind') == 'append_only' for p in items)
-    lines = [f'Last findings: {plural(additions, "text")} with only added rows; {len(items) - additions} with other changes or unavailable evidence.']
-    changed = [p for p in items if p['first_day'] != day
-               and p['reason']['check'].get('change_kind') == 'content_changed']
-    changed.sort(key=lambda p: (-(p['last_day'] or 0), p['record']))
-    for p in changed[:3]:
-        lines.append(f"{p['record']} (last verified day {p['last_day'] if p['last_day'] is not None else 'unknown'}): "
-                     + short(dependency_line(p['reason'], relation=False), 240))
-        if pair := p['reason'].get('diff_pair'):
-            lines.append('See the last verified change: pf diff %s %s.' % tuple(map(shlex.quote, pair)))
-    if len(changed) > 3:
-        lines.append(f'{len(changed) - 3} more texts have earlier content-change findings.')
-    return '\n' + '\n'.join(lines)

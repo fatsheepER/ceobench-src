@@ -329,7 +329,7 @@ class _APIHandler(BaseHTTPRequestHandler):
 
     def admit(self):
         api = self.server._api_server
-        controls = ('/checkpoint', '/pf-refresh', '/run-metrics')
+        controls = ('/checkpoint', '/run-metrics')
         if api.team_mode and ((self.role is None and self.path not in controls) or
                               (self.role is not None and self.path in controls)):
             self._send_json({'success': False, 'error': 'Host-bound access required'}, 403)
@@ -344,7 +344,7 @@ class _APIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             if (self.server._api_server.read_only_task and
-                    self.path not in ('/call', '/query', '/checkpoint', '/pf-refresh', '/run-metrics')):
+                    self.path not in ('/call', '/query', '/checkpoint', '/run-metrics')):
                 self._send_json({'success': False, 'error': 'Decision preparation cannot change the world'}, 403)
                 return
             if self.path == '/call':
@@ -355,7 +355,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
-            elif self.path in ('/checkpoint', '/pf-refresh', '/run-metrics'):
+            elif self.path in ('/checkpoint', '/run-metrics'):
                 import secrets
                 expected_token = self.server._api_server.checkpoint_token
                 supplied_token = self.headers.get('X-Harness-Token', '')
@@ -367,27 +367,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                     api = self.server._api_server
                     self._send_json({'day': api.tools.current_day,
                                      'usage': api.simulator.customer_simulator.usage_recorder.summary})
-                    return
-                if self.path == '/pf-refresh':
-                    if (set(body) not in ({'versions', 'parent'}, {'versions', 'parent', 'remaining_seconds'})
-                            or not isinstance(body.get('parent'), str) or
-                            not isinstance(body['versions'], list) or
-                            not all(isinstance(v, str) for v in body['versions']) or
-                            ('remaining_seconds' in body and
-                             (type(body['remaining_seconds']) not in (int, float) or
-                              not math.isfinite(body['remaining_seconds']) or body['remaining_seconds'] <= 0))):
-                        self._send_json({'error': 'versions and parent are required'}, 400)
-                        return
-                    from .pf_refresh import refresh
-                    from .pf_deadline import budget_scope
-                    try:
-                        with budget_scope(timeout=min(body.get('remaining_seconds', self.server._api_server.QUERY_TIMEOUT_SECONDS),
-                                                      self.server._api_server.QUERY_TIMEOUT_SECONDS)):
-                            result = refresh(self.server._api_server, body['versions'], body['parent'])
-                    except (ValueError, KeyError, TimeoutError, SnapshotUnavailable) as exc:
-                        self._send_json({'error': type(exc).__name__}, 400)
-                        return
-                    self._send_json({'versions': result})
                     return
                 if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)

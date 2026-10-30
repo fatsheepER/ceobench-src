@@ -129,7 +129,7 @@ def test_single_agent_resume_can_change_capture_without_claiming_historical_cove
     source.agent.current_day = 0
     source._save_checkpoint(0)
     resumed = BashAgentRunner(continue_from=source.workspace_dir, workspace_base=tmp_path, api_key='offline',
-        execution_capture=enable, sql_capture=enable, text_registration='prefix' if enable else 'off', pf_stale_checks=False)
+        execution_capture=enable, sql_capture=enable, text_registration='prefix' if enable else 'off')
     try:
         resumed.setup()
         resumed._restore_from_checkpoint(resumed._load_checkpoint())

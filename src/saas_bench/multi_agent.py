@@ -188,10 +188,6 @@ class MultiAgentRuntime:
             runtime.usage.request_check = self._check_model_send
         self._guard_business_operations()
         self.server.request_finished_callback = self._settle_pending_operations
-        for runtime in self.roles.values():
-            if runtime.executor.pf_queries:
-                from .pf_refresh import refresh
-                runtime.executor.pf_queries.refresh = lambda versions, parent, store=runtime.store: refresh(self.server, versions, parent, store=store)
         for store in [*stores.values(), *audits.values(), *(r.usage for r in runtimes.values())]:
             if store is not None:
                 store.world_state = lambda: self.server.world_state_id
@@ -560,34 +556,8 @@ class MultiAgentRuntime:
         return text
 
     def _observation(self, role, dashboard, scripts):
-        runtime = self.roles[role]
-        day = self.server.tools.current_day
-        started = None
-        if runtime.registry.mode == 'git':
-            runtime.usage.weekly_check = None
-            started = runtime.audit.record('git_weekly_check', day=day, status='started')
-        try:
-            check = runtime.executor.weekly_check(day)
-        except BaseException as exc:
-            if started:
-                runtime.audit.record('git_weekly_check', day=day, status='failed',
-                    check_id=started['event_id'], error=type(exc).__name__, detail=str(exc),
-                    delivery_state='not_assembled')
-            raise
-        if started:
-            result = runtime.audit.record('git_weekly_check', day=day, status='succeeded',
-                check_id=started['event_id'], outcome='summary_ready' if check else 'not_applicable',
-                summary=check, delivery_state='not_assembled')
-        observation = (join_text(dashboard, '\n\nYour private registered-script output\n', scripts)
-                       if scripts else dashboard)
-        observation = join_text(observation, '\n\n', check) if check else observation
-        if started:
-            receipt = dict(check_id=started['event_id'], result_event_id=result['event_id'], day=day,
-                outcome=result['outcome'], summary_chars=len(check or ''),
-                delivery_state='assembled' if check else 'not_applicable')
-            runtime.usage.weekly_check = dict(receipt=receipt, summary=check)
-            runtime.audit.record('git_weekly_check_delivery', status='assembled', **receipt)
-        return observation
+        return (join_text(dashboard, '\n\nYour private registered-script output\n', scripts)
+                if scripts else dashboard)
 
     def _run_analyst(self, role, requests, dashboard=None):
         runtime = self.roles[role]

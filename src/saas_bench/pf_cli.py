@@ -11,7 +11,7 @@ USAGE = '''usage: pf <command> ...
   pf show <handle> [--full]            one saved version
   pf diff <object> | <old> [<new>]     what changed; one object compares its last two versions
   pf blame <file>                      the version and day each line was written
-  pf depend <object> [--detail] [--history]   what it cites; reruns and checks current references
+  pf depend <object> [--detail] [--history]   saved source relationships
   pf rdepend <object> [--detail] [--all]      registered texts that cite it
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about an object
   pf search --text "KEYWORD"           literal text in public captured history, newest first
@@ -34,25 +34,23 @@ pf show growth:notes.md@v1 --full
 This reads saved content, not a current verification. A bare growth:notes.md would
 read the latest version, which may differ from the cited one. Check the returned
 version and reading scope. Stop when the cited content answers the question;
-use depend only if a current dependency check is needed.
+use depend when you need its saved source relationships.
 
 2. Review an old conclusion
 When deciding whether to reuse a registered conclusion, read its saved revision,
-then check its current dependencies if needed:
+then inspect its saved source relationships if needed:
 ```bash
 pf show r1.1 --full
 pf depend r1.1 --detail
 ```
-For historical inspection without a current check:
+To follow declared references without automatic capture relationships:
 ```bash
 pf depend r1.1 --detail --history
 ```
-depend replays permitted SQL and public read-only API calls, never analyst scripts.
-A SQL query with fixed dates keeps those dates when replayed. Read the checked day,
-expanded scope and per-reference results. Historical-only references are not checked.
-Zero checked sources and cannot_check provide no passing condition. Stop when the
-needed scope has a result; if a source cannot be checked, repair or replace that
-reference, obtain other evidence or keep the uncertainty explicit.
+depend reads captured versions and relationships. It does not replay SQL or APIs,
+evaluate conditions, or decide whether a judgment is valid. Read the source dates
+and coverage. Run new public queries or your calculations when current evidence is
+needed. --detail expands the recorded paths, subject to the reported depth limit.
 
 3. Find versions and revise references
 When evidence changed, inspect its history and compare versions of the same object:
@@ -81,12 +79,9 @@ synthetic handle, group, metric, threshold and days with the observed evidence a
 the intended claim. Selected fields must be covered in your current model input
 or your own current-context file write; a truncated or partial view may omit them.
 Before registering selected fields, run pf show alone, without a pipe.
-purpose defaults to current. historical_only records past evidence without checking
-it against the current world. With no select/predicate, checks compare whole content;
-select alone checks equality of the selected value. A threshold check reports holds,
-fails or cannot_check. Holds applies only to that declared condition and checked
-scope; it does not verify the whole conclusion. Stop after registration accepts the
-intended condition. A missing selected field needs an adequate read, not a guessed value.
+purpose defaults to current. historical_only marks a reference as past evidence.
+select and predicate store your declared condition without evaluating it.
+A missing selected field needs an adequate read, not a guessed value.
 
 5. Locate evidence
 Replace KEYWORD with the words you need to find; this works before any registration:
@@ -103,7 +98,7 @@ Read the relevant returned version with show.
 Other boundaries: blame locates the version and day each saved file line was written.
 rdepend follows declared references, not every consumer or inferred business impact.
 more takes the actual cursor returned by a paginated result and continues that frozen
-snapshot. It does not refresh the check. Preserve scope headers when reading results;
+snapshot. Preserve scope headers when reading results;
 pipes and redirection can leave only a partial view.
 '''
 

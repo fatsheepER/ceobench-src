@@ -97,7 +97,6 @@ class BashAgentRunner:
         sql_capture: Optional[bool] = None,
         execution_capture: Optional[bool] = None,
         text_registration: Optional[str] = None,
-        pf_stale_checks: Optional[bool] = None,
         stop_after_day: Optional[int] = None,
     ):
         from saas_bench.model_usage import load_pricing
@@ -115,10 +114,9 @@ class BashAgentRunner:
             supplied = dict(model=model, provider=provider, base_url=base_url,
                             seed=seed, scenario=scenario, total_days=total_days,
                             initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind,
-                            text_registration=text_registration, pf_stale_checks=pf_stale_checks,
+                            text_registration=text_registration,
                             sql_capture=sql_capture, execution_capture=execution_capture)
             saved = dict(saved, text_registration=saved_manifest.get('text_registration', 'off'),
-                pf_stale_checks=saved_manifest.get('pf_stale_checks', False),
                 sql_capture=bool(saved_manifest.get('sql_evidence')),
                 execution_capture=(saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution')
             effective = dict(saved)
@@ -139,10 +137,8 @@ class BashAgentRunner:
             model, provider, base_url = (effective[k] for k in ('model', 'provider', 'base_url'))
             seed, scenario, total_days, initial_cash, reasoning_effort = (
                 effective[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
-            run_kind, text_registration, pf_stale_checks, sql_capture, execution_capture = (
-                effective[k] for k in ('run_kind', 'text_registration', 'pf_stale_checks', 'sql_capture', 'execution_capture'))
-            if supplied['pf_stale_checks'] is None and text_registration != 'pf':
-                pf_stale_checks = False
+            run_kind, text_registration, sql_capture, execution_capture = (
+                effective[k] for k in ('run_kind', 'text_registration', 'sql_capture', 'execution_capture'))
             if pricing_file is None:
                 self.pricing_registration = saved_manifest.get('pricing')
             elif self.pricing_registration != saved_manifest.get('pricing'):
@@ -150,9 +146,6 @@ class BashAgentRunner:
                     new=self.pricing_registration, effective_at='new_recovery_attempt'))
         self._source_manifest = saved_manifest if continue_from else None
         self.text_registration = text_registration or 'off'
-        self.pf_stale_checks = (self.text_registration == 'pf' if pf_stale_checks is None else pf_stale_checks)
-        if self.pf_stale_checks and self.text_registration != 'pf':
-            raise ValueError('Automatic stale checks require PF mode')
         if self.text_registration not in ('off', 'git', 'prefix', 'pf'):
             raise ValueError('Invalid text registration mode')
         if self.text_registration in ('prefix', 'pf'):
@@ -445,7 +438,7 @@ class BashAgentRunner:
     def _http_post(self, path: str, data: Optional[Dict] = None, timeout: float = 1800) -> Dict:
         body = json.dumps(data or {}).encode()
         headers = {'Content-Type': 'application/json'}
-        if path in ('/checkpoint', '/pf-refresh', '/run-metrics'):
+        if path in ('/checkpoint', '/run-metrics'):
             headers['X-Harness-Token'] = self._checkpoint_token
         req = urllib.request.Request(
             self._server_url(path), data=body,
@@ -453,14 +446,6 @@ class BashAgentRunner:
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
-
-    def _pf_refresh(self, versions, parent):
-        from saas_bench.api_server import NovaMindAPIServer
-        from saas_bench.pf_deadline import budget_scope
-        with budget_scope(timeout=NovaMindAPIServer.QUERY_TIMEOUT_SECONDS) as budget:
-            remaining = budget.remaining()
-            return self._http_post('/pf-refresh', dict(versions=versions, parent=parent,
-                remaining_seconds=remaining), timeout=remaining)['versions']
 
     def _get_cash(self) -> float:
         """Use the same status receipt as the run loop."""
@@ -787,7 +772,6 @@ __pycache__/
             manifest['text_registration'] = self.text_registration
         if self.text_registration == 'pf':
             from saas_bench.payload_tokens import tokenizer_config
-            manifest['pf_stale_checks'] = self.pf_stale_checks
             manifest['pf_read_tokenizer'] = tokenizer_config(self.provider, self.model)
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
@@ -1187,7 +1171,6 @@ __pycache__/
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
             evidence_store=self.evidence_store,
             text_registry=registry,
-            pf_stale_checks=self.pf_stale_checks, pf_refresh=self._pf_refresh,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions(registry is not None, self.text_registration == 'pf')
@@ -1237,7 +1220,6 @@ __pycache__/
             'label': self.label,
             'public_dir_override': os.environ.get('NOVAMIND_PUBLIC_DIR') or None,
             'text_registration': self.text_registration,
-            'pf_stale_checks': self.pf_stale_checks,
         }
         with open(self.workspace_dir / "config.json", 'w') as f:
             json.dump(config, f, indent=2)
@@ -1392,13 +1374,6 @@ __pycache__/
             resumed = getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
             observation = self.agent._last_observation if resumed else dashboard
             if not resumed:
-                # A new week's context: registered texts whose cited evidence changed follow the dashboard.
-                _t0 = _time.monotonic()
-                check = self.tool_executor.weekly_check(sim_day)
-                if check:
-                    self._log_tool_result(0, sim_day, '_weekly_check', {}, check)
-                    self._log_timing("weekly_check", sim_day, elapsed_s=round(_time.monotonic() - _t0, 3))
-                    observation = _joined(dashboard, '\n\n', check)
                 observation = _joined(observation, '\n\n',
                     'Forecast units: All 12 cash forecast values for next-week are USD. '
                     'For 20.7 million USD, submit 20700000 or 20.7e6.')
@@ -1752,8 +1727,6 @@ def main():
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
     parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
-    parser.add_argument('--pf-stale-checks', action=argparse.BooleanOptionalAction, default=None,
-                        help='Automatic current-purpose PF dependency checks; default on in PF, disable for offline ablation')
     parser.add_argument('--text-registration', choices=['off', 'git', 'prefix', 'pf'], default=None,
                         help='Shared text tools; prefix privately binds evidence, pf validates delivered evidence; default off')
     parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
@@ -1775,7 +1748,6 @@ def main():
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
         sql_capture=args.sql_capture, execution_capture=args.execution_capture, text_registration=args.text_registration,
-        pf_stale_checks=args.pf_stale_checks,
         stop_after_day=args.stop_after_day,
     )
 

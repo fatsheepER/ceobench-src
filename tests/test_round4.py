@@ -40,22 +40,19 @@ def test_mixed_pf_output_can_be_cited_and_traced(offline_runner, command):
     graph = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'},
                   include_execution=True, depth=4)
     assert any('config_overrides' in (row['target'] or {}).get('sql', '') for row in graph['items'])
-    # A pure PF check can refresh SQL, but is still a retrieval, not new business evidence.
-    checked = runner._execute_tool('bash', dict(command='pf depend r1 --detail'))
-    assert not re.search(r'\[pf: cmd\d+@v\d+', checked)
-    version = checked.origins[0]['version_id']
+    retrieved = runner._execute_tool('bash', dict(command='pf depend r1 --detail'))
+    assert not re.search(r'\[pf: cmd\d+@v\d+', retrieved)
+    version = retrieved.origins[0]['version_id']
     assert runner.evidence_store.get_content(version)[0]['pf_retrieval']
     runner.tool_executor.pf_queries._index(None)
     assert version not in runner.tool_executor.pf_queries.nodes
-    assert any(event['request'].get('parent_event_id') == checked.pf_calls[0]['event_id']
-               and event['result'].get('refresh_of') for event in runner.tool_executor.pf_queries.events.values())
-    send(runner.evidence_store, checked)
+    send(runner.evidence_store, retrieved)
     with pytest.raises(ValueError, match='Only public captured evidence'):
         resolver = runner.tool_executor.text_registry.resolver
         resolver.resolve({'version': resolver.handle(version)}, {})
 
 
-def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runner):
+def test_failed_citation_keeps_its_identity_and_revision_history(offline_runner):
     runner = offline_runner(text_registration='pf')
     output = runner._execute_tool('bash', dict(command='./novamind-operation python-c \'\n'
         'import novamind_api as nm\nprint(nm.query("SELECT name FROM sqlite_master"))\n\'',
@@ -70,19 +67,11 @@ def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runn
         assert receipt.startswith(f'Registered r{i}.1'), receipt
         assert 'failed' in receipt and 'sqlite_master' in receipt and 'exit code: 1' in receipt
         assert 'List DB tables' in receipt
-    query = runner.tool_executor.pf_queries
-    assert 'original_execution_failed' in query.weekly_check(7)
-    saved = runner.evidence_store.load_state('pf_review')
-    second = query.weekly_check(14)
-    assert runner.evidence_store.load_state('pf_review') == saved
-    assert 'Pending review: 2 active texts' in second and 'original_execution_failed' not in second
-    listed = json.loads(runner._execute_tool('text_list', {'review': 'pending', 'limit': 1}))
+    listed = json.loads(runner._execute_tool('text_list', {'limit': 1}))
     assert listed['next_after'] == 1 and len(listed['records']) == 1
     assert listed['records'][0]['status'] == 'active'
-    check = listed['checks']['r1.1']
-    assert check['first_day'] == check['last_day'] == 7
-    assert 'original_execution_failed' in check['reason'] and handle in check['reason']
-    more = json.loads(runner._execute_tool('text_list', {'review': 'pending', 'after': listed['next_after']}))
+    assert listed['records'][0]['references'][0]['evidence']['version'] == handle
+    more = json.loads(runner._execute_tool('text_list', {'after': listed['next_after']}))
     assert [r['version'] for r in more['records']] == ['r2.1']
     history = runner._execute_tool('bash', dict(command='./novamind-operation query '
         '"SELECT * FROM config_overrides ORDER BY day DESC LIMIT 40"; pf log MEMORY.md'))
@@ -91,11 +80,8 @@ def test_failed_citation_keeps_its_identity_and_dated_review_reason(offline_runn
     revised = runner._execute_tool('text_revise', dict(record='r1', text='Use the actual investment history',
         reason='The earlier citation was a rejected table lookup', references=[dict(cite=correct)]))
     assert revised.startswith('Revised r1.2') and 'config_overrides' in revised
-    third = query.weekly_check(21)
-    assert 'Pending review:' in third
-    listed = json.loads(runner._execute_tool('text_list', {'review': 'pending'}))
-    assert 'r2.1' in listed['checks'] and 'r1.1' not in listed['checks']
-    assert listed['checks']['r2.1']['first_day'] == listed['checks']['r2.1']['last_day'] == 7
+    listed = json.loads(runner._execute_tool('text_list', {}))
+    assert [record['version'] for record in listed['records']] == ['r1.2', 'r2.1']
     records = json.loads(runner.tool_executor.text_registry.path.read_text())['records']['r1']
     assert records[0]['references'][0]['evidence']['version'] == handle
     assert records[1]['references'][0]['evidence']['version'] == correct
@@ -288,128 +274,26 @@ def test_checkpoint_cadence_keeps_weekly_metrics_without_duplicate_world_saves(o
     assert [json.loads(line)['day'] for line in (runner.workspace_dir / 'weekly.jsonl').read_text().splitlines()] == list(range(7, end_day+1, 7))
 
 
-def test_pending_review_keeps_conditions_live_and_manual_scope_matters(workspace, tmp_path, server):
-    from test_pf_stale import chain, forward
-    from test_text_registry import call, declaration
-    store, registry, executor = chain(workspace, tmp_path, server)
-    source = store.load_state('declaration:r1.1')['references'][0]['version_id']
-    handle = registry.resolver.handle(source)
-    send(store, executor.execute('pf_read', {'target': {'version': handle}}))
-    call(registry, 'revise', record='r1', reason='add an explicit condition', references=[
-        dict(evidence={'version': handle}, purpose='current'),
-        dict(evidence={'version': handle}, purpose='current', select={'col': 'amount'},
-             predicate={'type': 'threshold', 'op': '>=', 'value': 40})])
-    query = executor.pf_queries
-    refreshed = []
-    original = query.refresh
-    query.refresh = lambda versions, parent: (refreshed.append(versions) or original(versions, parent))
-    server.conn.execute('UPDATE ledger SET amount=39'); server.conn.commit()
-    first = query.weekly_check(7)
-    assert 'PREDICATE FAILS' in first and 'Pending review:' in first
-    pending = store.load_state('pf_review')['pending']
-    root = next(v for v in pending if query.records[v]['version'] == 'r1.2')
-    server.conn.execute('UPDATE ledger SET amount=42'); server.conn.commit()
-    second = query.weekly_check(14)
-    assert 'PREDICATE FAILS' not in second
-    assert store.load_state('pf_review')['pending'][root]['last_day'] == 7
-    assert len(refreshed) == 2 and all(len(v) == 1 for v in refreshed)
-    # A complete manual check of this root can clear it after the source recovers.
-    forward(executor, 'r1', depth=1)
-    assert root not in store.load_state('pf_review')['pending']
-    query._index(None)
-    warm = {v: list(e) for v, e in query.outgoing.items() if e}
-    query._index(None)
-    assert query.index_stats['new_versions'] == 0
-    from saas_bench.pf_queries import PFQueries
-    cold = PFQueries(registry)
-    cold._index(None)
-    assert {v: list(e) for v, e in cold.outgoing.items() if e} == warm
-
-
-def test_refresh_sources_share_deadline_and_next_call_can_continue(workspace, tmp_path, server, monkeypatch):
-    from saas_bench.pf_refresh import refresh
-    from saas_bench.public_sql import execute_query
-    from test_pf_stale import record_sql
-    store, _, _ = captured(workspace, tmp_path)
-    server.sql_evidence = store
-    slow_sql = 'WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x'
-    slow = record_sql(store, slow_sql, {'success': True, 'columns': ['n'], 'rows': [{'n': 0}], 'row_count': 1})
-    fast = record_sql(store, 'SELECT amount FROM ledger', execute_query(server, 'SELECT amount FROM ledger'))
-    parent = store.begin_event('pf_weekly_check', {'day': 0})
-    monkeypatch.setattr(server, 'QUERY_TIMEOUT_SECONDS', 2)
-    result = refresh(server, [slow, fast], parent)
-    receipts = [store.read_event(store.get_content(result[v])[0]['created_by_event'])['result'] for v in (slow, fast)]
-    assert [r['http_status'] for r in receipts] == [504, 504]
-    assert [r['attempted'] for r in receipts] == [True, False]
-    assert receipts[0]['attempted_sql'] == slow_sql
-    resumed = refresh(server, [fast], parent)
-    receipt = store.read_event(store.get_content(resumed[fast])[0]['created_by_event'])['result']
-    assert receipt['http_status'] == 200 and receipt['attempted'] is True
-    store.complete(parent)
-
-
-@pytest.mark.parametrize('selection', [{}, {'select': {'col': 'amount'}}])
-def test_retry_backoff_and_manual_retry_do_not_block_other_sources(workspace, tmp_path, server, selection):
-    from test_pf_stale import chain, forward
-    from saas_bench.public_sql import PUBLIC_POLICY_VERSION
-    from saas_bench.sql_evidence import encoded
-    store, registry, executor = chain(workspace, tmp_path, server, **selection)
-    query, attempts = executor.pf_queries, []
-    refresh = query.refresh
-    day = [7]
-    registry.sim_day = lambda: day[0]
-    def timeout(versions, parent):
-        attempts.append(day[0])
-        output = {}
-        for version in versions:
-            event = store.begin(encoded({'sql': 'SELECT amount FROM ledger'}), PUBLIC_POLICY_VERSION, parent)
-            store.finish(event, 504, '', encoded({'success': False, 'error': 'refresh_timed_out'}),
-                         dict(day=day[0], attempted=True))
-            store.delivered(event, 'internal')
-            output[version] = event + ':public_response'
-        return output
-    query.refresh = timeout
-    for current in [7, 14, 21, 28, 35]:
-        day[0] = current
-        query.weekly_check(current)
-    assert attempts == [7, 14, 28]
-    forward(executor, 'r1')
-    assert attempts == [7, 14, 28, 35]
-    recovered_on = []
-    def successful(versions, parent):
-        recovered_on.append(day[0])
-        return refresh(versions, parent)
-    query.refresh = successful
-    for current in [42, 91, 98]:
-        day[0] = current
-        query.weekly_check(current)
-    assert recovered_on == ([91, 98] if selection else [91])
-    assert not store.load_state('pf_refresh_failures')
-    if not selection:
-        pending = store.load_state('pf_review')['pending']
-        assert pending and all(not p['conditions'] for p in pending.values())
-
-
 def test_recovery_before_first_fork_checkpoint_preserves_group(offline_runner, tmp_path):
     from saas_bench.run_state import clone_sql_run, recover_run, tree_hash, write_json
     from test_preflight_integration import advance
     prefix = offline_runner(text_registration='prefix')
     advance(prefix)
     prefix._save_checkpoint(7)
-    for mode, stale in [('git', None), ('pf', True), ('pf', False)]:
-        name = f'{mode}-{stale}'
+    for mode in ('git', 'pf'):
+        name = mode
         source = clone_sql_run(prefix.workspace_dir, tmp_path / name, name,
-                               text_registration=mode, pf_stale_checks=stale)
+                               text_registration=mode)
         before = tree_hash(source)
         recovered_path = recover_run(source, tmp_path / (name + '-recovery'))
         recovered = offline_runner(recovered_path)
         assert recovered.text_registration == mode
-        assert recovered.pf_stale_checks is bool(stale)
         assert bool(recovered.evidence_store) is (mode == 'pf')
         assert tree_hash(source) == before
         # A second interruption before publication still inherits the prefix generation.
         again = offline_runner(recover_run(recovered_path, tmp_path / (name + '-again')))
-        assert again.text_registration == mode and again.pf_stale_checks is bool(stale)
+        assert again.text_registration == mode
+        assert bool(again.evidence_store) is (mode == 'pf')
         manifest = json.loads((source / 'manifest.json').read_text())
         manifest['configuration']['seed'] += 1
         write_json(source / 'manifest.json', manifest)
@@ -417,13 +301,15 @@ def test_recovery_before_first_fork_checkpoint_preserves_group(offline_runner, t
         assert (revised / 'checkpoint.json').exists()
 
 
-def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_path):
+def test_saved_survey_dates_reach_log_and_full_read(workspace, tmp_path):
     from saas_bench.execution_capture import finish_http
     from saas_bench.sql_evidence import encoded
-    from test_pf_stale import cite
+    from pf_fixtures import cite
     store, registry, executor = captured(workspace, tmp_path)
     day = [7]
     registry.sim_day = lambda: day[0]
+    dashboard = store.begin_event('dashboard_generation', {'day': 7})
+    store.complete(dashboard)
     def acquire(parent=None):
         event = store.begin_event('public_http', dict(method='POST', path='/call',
             parsed=dict(tool='get_group_insights', args={'group_id': 'S1'})), parent=parent)
@@ -433,14 +319,13 @@ def test_unchanged_survey_dates_reach_weekly_log_and_full_read(workspace, tmp_pa
     version = acquire()
     handle = registry.resolver.handle(version)
     cite(store, registry, executor, version)
-    executor.pf_queries.refresh = lambda versions, parent: {v: acquire(parent) for v in versions}
     day[0] = 308
-    assert 'Survey dates' not in executor.weekly_check(308)
     output = executor.execute('bash', dict(command=f'pf log {handle}'))
-    assert 'survey day 0' in output and 'checked day 308' in output
+    assert 'survey day 0' in output
     assert 'acquired day' in output and 'research_group' in output
     header = json.loads(executor.execute('pf_read', dict(target={'version': handle})).split('\n')[0])
     assert header['target']['snapshot_day'] == 0
+    assert header['target']['day'] == 7
 
 
 def test_failed_background_checkpoint_keeps_the_previous_pointer(offline_runner, monkeypatch):

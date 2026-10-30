@@ -154,7 +154,7 @@ def test_prompts_integrate_at_single_anchors_and_git_names_the_memory_commit(wor
     assert git_memory_line(workspace) == f'[git: MEMORY.md last committed in week-3 ({head}) | git log -p -- MEMORY.md]'
 
 
-def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp_path):
+def test_receipts_preserve_declared_applicability_and_references(workspace, tmp_path):
     registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
     text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
                                            reason='r', references=[dict(cite='evidence.json', note='why')]))
@@ -165,9 +165,6 @@ def test_receipts_are_text_and_the_weekly_check_skips_ended_texts(workspace, tmp
     assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
     assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
     call(registry, 'create', **declaration({'record': 'r1.2'}, text='Depends on the plan'))
-    assert registry.weekly_check(7).startswith('=== Check of your registered texts (day 7) ===\nChecked this week: 2 texts')
-    late = registry.weekly_check(14)
-    assert late.endswith('Not checked: 1 text past the applies window.'), late
     with pytest.raises(ValueError, match='applies must be'):
         registry.execute('create', dict(text='x', objects=[dict(kind='plan', id='B')], applies='soon',
                                         reason='r', references=[]))
@@ -193,8 +190,7 @@ def test_pf_receipt_lists_this_weeks_writes_on_the_same_objects(offline_runner):
     assert lines[2].startswith('Business writes this week touching S1: day 0 set_targeted_dev_spend(') and '500' in lines[2]
     other = runner._execute_tool('text_create', dict(text='About S2', objects=[dict(kind='customer_group', id='S2')],
                                                      applies='0-', reason='plan', references=[]))
-    assert other == ('Registered r2.1 (active).\n'
-                     'Next weekly check if the run continues: day 7; applies: yes.')
+    assert other == 'Registered r2.1 (active).'
 
 
 @pytest.mark.parametrize('mode', ['prefix', 'pf'])
@@ -268,7 +264,7 @@ def test_explicit_latest_diff_uses_itself_even_with_only_one_version(workspace, 
 def test_bare_command_query_and_read_names_resolve_latest(workspace, tmp_path, server):
     from saas_bench.execution_capture import finish_http
     from saas_bench.public_sql import execute_query
-    from test_pf_stale import record_sql
+    from pf_fixtures import record_sql
     store, registry, executor = captured(workspace, tmp_path)
     output = executor.execute('bash', {'command': 'echo x > out.txt'})
     command = re.search(r'\[pf: (cmd\d+)@', output).group(1)
@@ -357,7 +353,7 @@ def test_reverse_detail_hint_matches_declared_reference_traversal(workspace, tmp
 
 
 def test_reverse_detail_does_not_follow_automatic_query_output_edges(workspace, tmp_path):
-    from test_pf_stale import record_sql, cite
+    from pf_fixtures import record_sql, cite
     store, registry, executor = captured(workspace, tmp_path)
     event = store.begin_event('bash', {'command': 'python report.py'})
     source = record_sql(store, 'SELECT n FROM sample',

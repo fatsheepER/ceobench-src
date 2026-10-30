@@ -178,7 +178,7 @@ def restore_sql_evidence(run, directory, checkpoint, identity):
     store.assert_healthy()
 
 
-def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_stale_checks=None):
+def clone_sql_run(source, destination, branch_id, *, text_registration=None):
     """Clone a frozen SQL-capture checkpoint, assigning an explicit new branch."""
     import re
     source, destination = Path(source), Path(destination)
@@ -191,15 +191,12 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
         raise ValueError('Fork snapshots must be taken at a completed week boundary')
     manifest = json.loads((directory / 'manifest.json').read_text())
     parent = manifest['sql_evidence']
-    if pf_stale_checks is not None and text_registration != 'pf':
-        raise ValueError('Stale check setting is chosen when forking a PF branch')
     if text_registration is not None:
         if manifest.get('text_registration') != 'prefix' or text_registration not in ('git', 'pf'):
             raise ValueError('Registration forks must change prefix to git or pf')
         manifest['text_registration'] = text_registration
         if text_registration == 'pf':
             from .payload_tokens import tokenizer_config
-            manifest['pf_stale_checks'] = True if pf_stale_checks is None else pf_stale_checks
             config = manifest['configuration']
             manifest['pf_read_tokenizer'] = tokenizer_config(config['provider'], config['model'])
     from contextlib import closing
