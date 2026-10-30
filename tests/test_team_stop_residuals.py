@@ -111,37 +111,29 @@ def test_listener_start_failure_closes_real_runtime_and_next_start(tmp_path, mon
 
 @pytest.mark.parametrize('bash_timeout', [480, 1200])
 def test_analyst_failure_cancels_partner_bash_before_publication(tmp_path, monkeypatch, bash_timeout):
-    marker = tmp_path / 'running'
-    runtime = MultiAgentRuntime.__new__(MultiAgentRuntime)
-    runtime.effective_end, runtime._pool, runtime._stage = 497, None, 'boundary'
-    runtime._lifecycle = WorkerLifecycle()
-    runtime.server = SimpleNamespace(tools=SimpleNamespace(current_day=0), public_dashboard=lambda: 'offline')
-    runtime._set_phase = lambda phase: setattr(runtime.server, 'team_phase', phase)
-    runtime._natural_end = lambda: False
-    runtime._rotate_sessions = lambda: None
-    runtime._script_output = lambda role: ''
-    runtime._message = lambda role, text: SimpleNamespace(receiver=role)
-    executor = BashAgentToolExecutor(workspace_path=tmp_path, bash_timeout=bash_timeout)
-    executor.lifecycle = runtime._lifecycle
-    monkeypatch.setattr(executor, '_bwrap', lambda: None)
+    from test_preflight_team_flow import final, make_team
+    with make_team('git', lambda *args: final('unused'), 'partner-failure',
+                   analyst_bash_timeout=bash_timeout) as runtime:
+        executor = runtime.roles['ops_finance'].executor
+        marker = executor.workspace_path / 'running'
+        def analyst(role, requests, dashboard=None):
+            if role == 'growth':
+                wait_until(marker.exists)
+                raise RuntimeError('offline analyst failure')
+            executor.execute('bash', dict(command='touch running; sleep 60'))
 
-    def analyst(role, requests, dashboard=None):
-        if role == 'growth':
-            wait_until(marker.exists)
-            raise RuntimeError('offline analyst failure')
-        executor.execute('bash', dict(command=f'touch {marker}; sleep 60'))
-
-    runtime._run_analyst = analyst
-    started = time.monotonic()
-    outcome = runtime.run(stop_after_day=7)
-    assert time.monotonic() - started < 5
-    assert outcome.reason == 'failed'
-    assert runtime.server.team_phase == 'paused'
-    assert executor.last_status == 'cancelled'
-    assert executor._bash_facts['boundary_closed']
-    assert executor._bash_facts['process_boundary']['descendants_closed']
-    assert executor._bash_facts['cancelled'] == 'analyst_failure'
-    assert not executor._bash_facts['timed_out']
+        monkeypatch.setattr(runtime, '_run_analyst', analyst)
+        started = time.monotonic()
+        outcome = runtime.run(stop_after_day=7)
+        assert time.monotonic() - started < 5
+        assert outcome.reason == 'failed' and 'offline analyst failure' in runtime.failure
+        assert runtime.server.team_phase == 'paused'
+        assert executor.last_status == 'cancelled'
+        assert executor._bash_facts['boundary_closed']
+        assert executor._bash_facts['process_boundary']['descendants_closed']
+        assert executor._bash_facts['cancelled'] == 'role_failure'
+        assert not executor._bash_facts['timed_out']
+        assert not any(t.name.startswith('team-role') and t.is_alive() for t in threading.enumerate())
 
 
 @pytest.mark.parametrize('phase', ['headers', 'stream', 'reuse_headers'])

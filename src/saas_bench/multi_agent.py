@@ -1,5 +1,6 @@
-from dataclasses import asdict, dataclass, replace
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass, field, replace
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 import json
 import logging
@@ -56,6 +57,20 @@ class TeamMessage:
     status: str = 'queued'
     reply: str | None = None
     handoff_commit: str | None = None
+    kind: str = 'weekly_task'
+    enqueue_sequence: int | None = None
+    input_accepted: bool = False
+    received_request_event: str | None = None
+
+
+@dataclass
+class RoleWorker:
+    jobs: deque = field(default_factory=deque)
+    inbox: deque = field(default_factory=deque)
+    job: Future | None = None
+    question: TeamMessage | None = None
+    waiting: TeamMessage | None = None
+    thread_id: int | None = None
 
 
 class MultiAgentRuntime:
@@ -92,6 +107,11 @@ class MultiAgentRuntime:
         self.messages = []
         self.failure = None
         self._pool = None
+        self._team_condition = threading.Condition()
+        self._workers = {role: RoleWorker() for role in ROLES}
+        self._workers_stopping = False
+        self._worker_error = None
+        self._advancing = False
         self._checkpoint_lock = threading.RLock()
         self._safe_point = False
         self._stage = 'boundary'
@@ -183,9 +203,12 @@ class MultiAgentRuntime:
         self.server = NovaMindAPIServer(tools, simulator=simulator, conn=conn,
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
+        self.server.team_permission = self._team_permission
         self.server.script_check = self._check
-        for runtime in self.roles.values():
+        for role, runtime in self.roles.items():
             runtime.usage.request_check = self._check_model_send
+            runtime.agent.before_request_callback = lambda role=role: self._intake_questions(role)
+            runtime.agent.response_callback = lambda role=role, **facts: self._record_question_receipts(role)
         self._guard_business_operations()
         self.server.request_finished_callback = self._settle_pending_operations
         for store in [*stores.values(), *audits.values(), *(r.usage for r in runtimes.values())]:
@@ -409,6 +432,10 @@ class MultiAgentRuntime:
                 server.authorize_team(role, 'advance')
                 if server._operation_failed or server._step_day_timed_out:
                     return advance(*args, role=role, **kwargs)
+                with self._team_condition:
+                    if self._questions_pending():
+                        raise PermissionError('Team requests are pending. Finish this tool batch, answer them, then retry next-week.')
+                    self._advancing = True
                 operation = self._begin_operation('api:advance')
             settlement = None
 
@@ -419,7 +446,14 @@ class MultiAgentRuntime:
                 self._settle_pending_operations()
 
             try:
-                return advance(*args, role=role, on_settled=settled, **kwargs)
+                result = advance(*args, role=role, on_settled=settled, **kwargs)
+                if (result.get('error') == 'prediction_save_failed' and settlement is None
+                        and result.get('day') == server.tools.current_day
+                        and not server._operation_failed and not server._step_day_timed_out):
+                    with self._team_condition:
+                        self._advancing = False
+                        self._team_condition.notify_all()
+                return result
             except Exception as exc:
                 if settlement is not None:
                     self._finish_operation(operation, advance_outcome=settlement)
@@ -517,25 +551,231 @@ class MultiAgentRuntime:
 
     def _transition(self, message, status, reply=None):
         with self._message_lock:
-            if message.status == 'delivered':
-                raise RuntimeError('Message was already delivered')
-            message.status = status
-            if reply is not None:
-                message.reply = reply
+            if message.status in ('delivered', 'rejected', 'cancelled', 'failed'):
+                if status == message.status and (reply is None or reply == message.reply):
+                    return
+                raise RuntimeError('Conflicting terminal message result')
+            record = replace(message, status=status, reply=message.reply if reply is None else reply)
             with self.message_path.open('a') as stream:
-                stream.write(json.dumps(asdict(message), ensure_ascii=False) + '\n')
+                stream.write(json.dumps(asdict(record), ensure_ascii=False) + '\n')
                 stream.flush()
                 os.fsync(stream.fileno())
+            message.status, message.reply = record.status, record.reply
 
-    def _message(self, role, text):
-        if role not in ROLES[1:] or not isinstance(text, str) or not text.strip():
-            raise ValueError('ask_analyst requires growth or ops_finance and a nonempty message')
-        message = TeamMessage(uuid.uuid4().hex, 'ceo', role, text,
+    def _message(self, role, text, *, sender='ceo', kind='weekly_task'):
+        if role not in ROLES or not isinstance(text, str) or not text.strip():
+            raise ValueError('A request needs a valid role and a nonempty message')
+        message = TeamMessage(uuid.uuid4().hex, sender, role, text,
             self.server.tools.current_day, self.server.world_state_id,
-            self.roles['ceo'].identity.session_id, self.roles[role].identity.session_id)
-        self.messages.append(message)
-        self._transition(message, 'queued')
+            self.roles[sender].identity.session_id, self.roles[role].identity.session_id, kind=kind)
+        with self._message_lock:
+            self.messages.append(message)
+        if kind == 'weekly_task':
+            self._transition(message, 'queued')
         return message
+
+    def _team_permission(self, role, operation):
+        with self._team_condition:
+            worker = self._workers[role]
+            if worker.waiting is not None:
+                raise PermissionError(f'{role} is waiting for a team reply')
+            if worker.question is not None:
+                if operation == 'advance':
+                    raise PermissionError('Answer the team request without advancing the week')
+                return True
+            if operation == 'advance' and self._questions_pending():
+                raise PermissionError('Team requests are pending. Finish this tool batch, answer them, then retry next-week.')
+        return False
+
+    def _questions_pending(self):
+        return any(worker.inbox or worker.question or worker.waiting for worker in self._workers.values())
+
+    def _request(self, sender, receiver, text):
+        if receiver not in ROLES or not isinstance(text, str) or not text.strip():
+            return 'Error: A request needs a valid role and a nonempty message.'
+        message = self._message(receiver, text, sender=sender, kind='question')
+        refusal = None
+        with self._team_condition:
+            owner = self._workers[sender]
+            if owner.thread_id != threading.get_ident():
+                raise RuntimeError('Only the role owner may send a request')
+            if self._advancing or self._workers_stopping:
+                refusal = 'This week is closing; the request was not accepted.'
+            else:
+                target = receiver
+                while True:
+                    if target == sender:
+                        refusal = 'Circular wait: this request was refused. Continue or ask after the other request finishes.'
+                        break
+                    waiting = self._workers[target].waiting
+                    if waiting is None or waiting.status in ('completed', 'delivered'):
+                        break
+                    target = waiting.receiver
+            if refusal is None:
+                message.status = 'admitting'
+                message.enqueue_sequence = 1 + max((m.enqueue_sequence or 0 for m in self.messages), default=0)
+                owner.waiting = message
+                self._workers[receiver].inbox.append(message)
+        if refusal is not None:
+            self._transition(message, 'rejected', refusal)
+            return f'Error: {refusal} request_id={message.request_id}'
+        self._transition(message, 'queued')
+        with self._team_condition:
+            self._team_condition.notify_all()
+        while True:
+            self._lifecycle.check(retry=True)
+            with self._team_condition:
+                if self._worker_error is not None:
+                    raise self._worker_error
+                if message.status == 'completed':
+                    return message
+                self._team_condition.wait(.1)
+
+    def _submit_role(self, role, function, *args, **kwargs):
+        result = Future()
+        with self._team_condition:
+            self._workers[role].jobs.append((result, function, args, kwargs))
+            self._team_condition.notify_all()
+        return result
+
+    def _wait_roles(self, futures):
+        while not all(future.done() for future in futures):
+            with self._team_condition:
+                error = self._worker_error
+            if error is not None:
+                raise error
+            self._lifecycle.check(retry=True)
+            wait(futures, timeout=.1)
+        if self._worker_error is not None:
+            raise self._worker_error
+        for future in futures:
+            future.result()
+
+    def _role_loop(self, role):
+        worker = self._workers[role]
+        worker.thread_id = threading.get_ident()
+        try:
+            while True:
+                with self._team_condition:
+                    while not self._workers_stopping and (
+                            worker.inbox and worker.inbox[0].status == 'admitting' or
+                            not worker.jobs and not worker.inbox):
+                        self._team_condition.wait(.1)
+                        self._lifecycle.check(retry=True)
+                    if self._workers_stopping:
+                        return
+                    if worker.inbox:
+                        job = None
+                    else:
+                        job = worker.jobs.popleft()
+                        worker.job = job[0]
+                if job is None:
+                    self._service_inbox(role)
+                else:
+                    future, function, args, kwargs = job
+                    try:
+                        result = function(*args, **kwargs)
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                        raise
+                    else:
+                        with self._team_condition:
+                            worker.job = None
+                        future.set_result(result)
+        except BaseException as exc:
+            with self._team_condition:
+                self._worker_error = self._worker_error or exc
+                self._team_condition.notify_all()
+            self._lifecycle.cancel(getattr(exc, 'reason', 'role_failure'))
+        finally:
+            with self._team_condition:
+                worker.job = None
+                self._team_condition.notify_all()
+
+    def _accept_question(self, request, *, queued=False):
+        active = self._workers[request.receiver].question
+        if queued:
+            instruction = (f'Queued after active request_id={active.request_id}. Continue answering that active request. '
+                           if active else 'Queued for later. Continue your current weekly task. ')
+            instruction += 'The host will activate this queued request by ID after earlier work finishes.'
+        else:
+            instruction = ('Answer this request in final text. You may use your tools. '
+                           'This answers only the request; the host will resume your prior task afterward.')
+        self.roles[request.receiver].agent.add_input(
+            f'Team request | request_id={request.request_id} | from={request.sender} | '
+            f'to={request.receiver} | day={request.day}\n{request.text}\n{instruction}', day=request.day)
+        request.input_accepted = True
+        self._transition(request, 'queued' if queued else 'running')
+
+    def _intake_questions(self, role):
+        if self._pool is None:
+            return
+        worker = self._workers[role]
+        if worker.thread_id != threading.get_ident():
+            raise RuntimeError('Only the role owner may accept request input')
+        with self._team_condition:
+            inbox = list(worker.inbox)
+            while any(request.status == 'admitting' for request in inbox):
+                self._lifecycle.check(retry=True)
+                self._team_condition.wait(.1)
+        for request in inbox:
+            if not request.input_accepted:
+                self._accept_question(request, queued=True)
+
+    def _record_question_receipts(self, role):
+        usage = self.roles[role].usage
+        for request in self.messages:
+            if (request.kind == 'question' and request.receiver == role and request.input_accepted
+                    and request.received_request_event is None and request.status in ('queued', 'running')):
+                request.received_request_event = (usage.last_request_event or
+                    ('http:' + usage.last_http_attempt_id if usage.last_http_attempt_id else 'call:' + usage.last_call_id))
+                try:
+                    self._transition(request, request.status)
+                except Exception as exc:
+                    raise RunCancelled('team_message_evidence_failed', str(exc)) from exc
+
+    def _service_inbox(self, role, *, resume=None):
+        worker, runtime = self._workers[role], self.roles[role]
+        handled = False
+        while True:
+            with self._team_condition:
+                while worker.inbox and worker.inbox[0].status == 'admitting':
+                    self._lifecycle.check(retry=True)
+                    self._team_condition.wait(.1)
+                if not worker.inbox:
+                    break
+                request = worker.inbox.popleft()
+                worker.question = request
+            try:
+                self._check()
+                if request.input_accepted:
+                    runtime.agent.add_input(f'Now answer queued request_id={request.request_id} in final text. '
+                        'This answers only that request; the host will resume your prior task afterward.', day=request.day)
+                    self._transition(request, 'running')
+                else:
+                    self._accept_question(request)
+                answer = self._drive_role(role, completion='answer', question=request)
+                request.handoff_commit = self._snapshot_history(runtime, f'Team reply {request.request_id[:7]} (day {request.day})')
+                self._transition(request, 'completed', answer)
+                handled = True
+            except BaseException:
+                self._transition(request, 'failed')
+                raise
+            finally:
+                with self._team_condition:
+                    worker.question = None
+                    self._team_condition.notify_all()
+        if handled and resume:
+            runtime.agent.add_input('The requested replies are complete. Resume ' + resume + '.',
+                day=self.server.tools.current_day)
+        return handled
+
+    def _stop_role_workers(self):
+        with self._team_condition:
+            self._workers_stopping = True
+            self._team_condition.notify_all()
+        if self._worker_error is not None:
+            self._lifecycle.cancel(getattr(self._worker_error, 'reason', 'role_failure'))
 
     def _script_output(self, role):
         operation = None
@@ -567,27 +807,14 @@ class MultiAgentRuntime:
         for request in requests:
             try:
                 self._check()
-                self._transition(request, 'running')
                 runtime.agent.add_input(join_text(observation, '\n\n', request.text) if observation is not None else request.text,
                     day=request.day)
-                answer = runtime.agent.act('', 0, False, {'day': request.day})
+                request.input_accepted = True
+                self._transition(request, 'running')
+                answer = self._drive_role(role, completion='answer')
                 observation = None
-                while not isinstance(answer, FinalText):
-                    self._check()
-                    if answer is None:
-                        raise RuntimeError('Analyst returned no answer')
-                    while answer is not None:
-                        self._check()
-                        result = runtime.executor.execute(answer.tool, answer.arguments,
-                            model_request_event=runtime.usage.last_request_event,
-                            model_context_id=runtime.usage.context_id)
-                        runtime.agent.record_tool_result(result)
-                        answer = runtime.agent.next_tool_action()
-                    self._check()
-                    answer = runtime.agent.act('', 0, False, {'day': request.day})
-                self._check()
                 request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {request.request_id[:7]} (day {request.day})')
-                self._transition(request, 'completed', answer.text)
+                self._transition(request, 'completed', answer)
             except BaseException:
                 self._transition(request, 'failed')
                 raise
@@ -598,95 +825,95 @@ class MultiAgentRuntime:
                   f'request_world_state_id={request.world_state_id} | request_id={request.request_id}\n'
                   f'Workspace: {self.roles[request.receiver].workspace}\n'
                   f'Snapshot commit: {request.handoff_commit}\n')
+        if request.kind == 'question':
+            header = (f'Team reply | from={request.receiver} | to={request.sender} | day={request.day} | '
+                      f'request_id={request.request_id} | request_world_state_id={request.world_state_id}\n'
+                      f'Workspace: {self.roles[request.receiver].workspace}\n'
+                      f'Snapshot commit: {request.handoff_commit}\n')
         return join_text(header, '\n', request.reply)
 
     def _parallel(self, requests, dashboard=None):
         groups = {role: [r for r in requests if r.receiver == role] for role in ROLES[1:]}
-        futures = [self._pool.submit(self._run_analyst, role, group, dashboard)
+        futures = [self._submit_role(role, self._run_analyst, role, group, dashboard)
                    for role, group in groups.items() if group]
-        pending = set(futures)
-        try:
-            while pending:
-                self._check()
-                completed, pending = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    future.result()
+        self._wait_roles(futures)
+        while True:
             self._check()
-        except BaseException:
-            self._lifecycle.cancel('analyst_failure')
-            raise
+            with self._team_condition:
+                if not self._questions_pending():
+                    break
+                self._team_condition.wait(.1)
         return requests
 
     def ask_analyst(self, role, message):
-        if self.phase not in ('ceo_opening', 'ceo') or self._pool is None:
-            raise PermissionError('Only the active CEO can ask an analyst')
-        return self._ask_batch([dict(arguments=dict(role=role, message=message))])[0]
-
-    def _ask_batch(self, calls):
-        caller_phase = self.phase
-        self._set_phase('asking')
-        requests, results = [], []
-        for call in calls:
-            try:
-                args = call['arguments']
-                request = self._message(args.get('role'), args.get('message'))
-            except (ValueError, AttributeError) as exc:
-                results.append(f'Error: {exc}')
-            else:
-                requests.append(request)
-                results.append(request)
-        self._parallel(requests)
-        for request in requests:
-            self._transition(request, 'delivered')
-        self._set_phase(caller_phase)
-        return [self._handoff(r) if isinstance(r, TeamMessage) else r for r in results]
+        if role not in ROLES[1:]:
+            return 'Error: ask_analyst requires growth or ops_finance.'
+        return self._request('ceo', role, message)
 
     def _run_ceo(self, *, completion='advance'):
         runtime = self.roles['ceo']
+        self._check()
+        if not self._week.get('ceo_started'):
+            runtime.agent.add_input(self._week['observation'], day=self.server.tools.current_day)
+            self._week['ceo_started'] = True
+        return self._drive_role('ceo', completion=completion)
+
+    def _drive_role(self, role, *, completion, question=None):
+        runtime = self.roles[role]
         previous_policy = runtime.agent.allow_final_text
         runtime.agent.allow_final_text = completion == 'answer'
+        day = self.server.tools.current_day
         try:
-            day = self.server.tools.current_day
-            self._check()
-            if not self._week.get('ceo_started'):
-                runtime.agent.add_input(self._week['observation'], day=day)
-                self._week['ceo_started'] = True
-            action = runtime.agent.act('', 0, False, {'day': day})
-            for request in self.messages:
-                if request.status == 'completed' and request.request_id in self._week.get('weekly_request_ids', []):
-                    self._transition(request, 'delivered')
             while self.server.tools.current_day == day:
                 self._check()
+                if question is None:
+                    self._service_inbox(role, resume='your current weekly task')
+                action = runtime.agent.act('', 0, False, {'day': day})
+                if role == 'ceo' and question is None:
+                    for request in self.messages:
+                        if request.status == 'completed' and request.request_id in self._week.get('weekly_request_ids', []):
+                            self._transition(request, 'delivered')
                 if isinstance(action, FinalText) and completion == 'answer':
                     return action.text
                 if action is None or isinstance(action, FinalText):
-                    raise RuntimeError('CEO must advance through the weekly API')
+                    raise RuntimeError('CEO must advance through the weekly API' if role == 'ceo' else 'Analyst returned no answer')
+                asked = False
                 while action is not None:
                     self._check()
-                    if action.tool == 'ask_analyst':
-                        calls = []
-                        for call in runtime.agent._pending_tool_calls:
-                            if call['name'] != 'ask_analyst':
-                                break
-                            calls.append(call)
-                        for result in self._ask_batch(calls):
-                            runtime.agent.record_tool_result(result)
-                        if not runtime.agent._pending_tool_calls:
-                            self._boundary('ask_completed')
+                    if action.tool in ('ask_agent', 'ask_analyst'):
+                        args = action.arguments if isinstance(action.arguments, dict) else {}
+                        if action.tool == 'ask_analyst' and role != 'ceo':
+                            result = 'Error: Only the CEO can use ask_analyst. Use ask_agent.'
+                        elif action.tool == 'ask_analyst':
+                            result = self.ask_analyst(args.get('role'), args.get('message'))
+                        else:
+                            result = self._request(role, args.get('role'), args.get('message'))
+                        runtime.agent.record_tool_result(self._handoff(result) if isinstance(result, TeamMessage) else result)
+                        if isinstance(result, TeamMessage):
+                            self._transition(result, 'delivered')
+                            with self._team_condition:
+                                self._workers[role].waiting = None
+                                self._team_condition.notify_all()
+                        asked = True
                     else:
-                        operation = self._begin_operation('ceo_tool:' + action.tool)
+                        operation = self._begin_operation('ceo_tool:' + action.tool) if role == 'ceo' else None
                         try:
                             result = runtime.executor.execute(action.tool, action.arguments,
                                 model_request_event=runtime.usage.last_request_event,
                                 model_context_id=runtime.usage.context_id)
                             runtime.agent.record_tool_result(result)
                         finally:
-                            self._finish_operation(operation, runtime.executor)
+                            if operation is not None:
+                                self._finish_operation(operation, runtime.executor)
                     if self.server.tools.current_day != day:
                         return
                     action = runtime.agent.next_tool_action()
-                self._check()
-                action = runtime.agent.act('', 0, False, {'day': day})
+                if asked and role == 'ceo' and question is None and self._stage in ('ceo_opening', 'ceo'):
+                    with self._team_condition:
+                        safe = not self._questions_pending() and all(
+                            worker.job is None for name, worker in self._workers.items() if name != 'ceo')
+                    if safe:
+                        self._boundary('ask_completed')
         finally:
             runtime.agent.allow_final_text = previous_policy
 
@@ -698,48 +925,24 @@ class MultiAgentRuntime:
         self._lifecycle.hold = Path(hold) if hold and Path(hold).name == 'STOP' else None
         self._set_phase(self._stage)
         try:
-            with self._lifecycle, ThreadPoolExecutor(max_workers=2) as pool:
+            with self._lifecycle, ThreadPoolExecutor(max_workers=3, thread_name_prefix="team-role") as pool:
                 self._pool = pool
-                while True:
-                    day = self.server.tools.current_day
-                    natural_end = self._natural_end()
-                    if natural_end or day >= stop_after_day:
-                        self._set_phase('stopped')
-                        return RunOutcome(day, 'natural_end' if natural_end else 'observation_end')
-                    self._check()
-                    if self._stage == 'boundary':
-                        self._rotate_sessions()
-                        self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING),
-                            ceo_started=False)
-                        self._stage = 'ceo_opening'
-                        self._set_phase('ceo_opening')
-                    if self._stage == 'ceo_opening':
-                        directions = self._run_ceo(completion='answer')
-                        self._week['directions'] = directions
-                        self._stage = 'ceo_scripts'
-                        self._set_phase('ceo_scripts')
-                        ceo_scripts = self._script_output('ceo')
-                        self._check()
-                        self._stage = 'analysis'
-                        self._set_phase('analysis')
-                        dashboard = self.server.public_dashboard()
-                        requests = [self._message(role, join_text(WEEKLY_TASKS[role], '\n\nCEO directions\n', directions))
-                                    for role in ROLES[1:]]
-                        self._parallel(requests, dashboard)
-                        observation = join_text(self.server.public_dashboard(), '\n\n', CEO_CLOSING)
-                        observation = self._observation('ceo', observation, ceo_scripts)
-                        for request in requests:
-                            observation = join_text(observation, '\n\n', self._handoff(request))
-                        self._week.update(observation=observation, ceo_started=False,
-                            weekly_request_ids=[request.request_id for request in requests])
-                        self._stage = 'ceo'
-                        self._set_phase('ceo')
-                        self._boundary('answers_ready')
-                    elif self._stage != 'ceo':
-                        raise RuntimeError('Team interrupted outside a recoverable boundary')
-                    self._run_ceo()
-                    self._close_week()
-                    self._boundary('week_boundary')
+                self._workers_stopping = False
+                self._worker_error = None
+                workers = [pool.submit(self._role_loop, role) for role in ROLES]
+                try:
+                    return self._run_weeks(stop_after_day)
+                except BaseException as exc:
+                    self._lifecycle.cancel(getattr(exc, 'reason', 'runtime_failure'))
+                    raise
+                finally:
+                    if self._worker_error is not None or self._lifecycle.reason:
+                        self._lifecycle.cancel(getattr(self._worker_error, 'reason', 'role_failure'))
+                    self._stop_role_workers()
+                    wait(workers)
+                    for message in self.messages:
+                        if message.kind == 'question' and message.status in ('admitting', 'queued', 'running'):
+                            self._transition(message, 'cancelled', self._lifecycle.reason or 'Run ended')
         except RunCancelled as exc:
             self.failure = getattr(exc, 'reason', str(exc))
             cause = exc.__cause__
@@ -766,6 +969,54 @@ class MultiAgentRuntime:
             return RunOutcome(self.server.tools.current_day, 'failed')
         finally:
             self._pool = None
+
+    def _run_weeks(self, stop_after_day):
+        while True:
+            day = self.server.tools.current_day
+            natural_end = self._natural_end()
+            if natural_end or day >= stop_after_day:
+                self._set_phase('stopped')
+                return RunOutcome(day, 'natural_end' if natural_end else 'observation_end')
+            self._check()
+            if self._stage == 'boundary':
+                with self._team_condition:
+                    self._advancing = False
+                self._rotate_sessions()
+                self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING),
+                    ceo_started=False)
+                self._stage = 'ceo_opening'
+                self._set_phase('ceo_opening')
+            if self._stage == 'ceo_opening':
+                opening = self._submit_role('ceo', self._run_ceo, completion='answer')
+                self._wait_roles([opening])
+                directions = opening.result()
+                self._week['directions'] = directions
+                self._stage = 'ceo_scripts'
+                self._set_phase('ceo_scripts')
+                scripts = self._submit_role('ceo', self._script_output, 'ceo')
+                self._wait_roles([scripts])
+                ceo_scripts = scripts.result()
+                self._check()
+                self._stage = 'analysis'
+                self._set_phase('analysis')
+                dashboard = self.server.public_dashboard()
+                requests = [self._message(role, join_text(WEEKLY_TASKS[role], '\n\nCEO directions\n', directions))
+                            for role in ROLES[1:]]
+                self._parallel(requests, dashboard)
+                observation = join_text(self.server.public_dashboard(), '\n\n', CEO_CLOSING)
+                observation = self._observation('ceo', observation, ceo_scripts)
+                for request in requests:
+                    observation = join_text(observation, '\n\n', self._handoff(request))
+                self._week.update(observation=observation, ceo_started=False,
+                    weekly_request_ids=[request.request_id for request in requests])
+                self._stage = 'ceo'
+                self._set_phase('ceo')
+                self._boundary('answers_ready')
+            elif self._stage != 'ceo':
+                raise RuntimeError('Team interrupted outside a recoverable boundary')
+            self._wait_roles([self._submit_role('ceo', self._run_ceo)])
+            self._close_week()
+            self._boundary('week_boundary')
 
     def _close_week(self):
         while self.roles['ceo'].agent._pending_tool_calls:

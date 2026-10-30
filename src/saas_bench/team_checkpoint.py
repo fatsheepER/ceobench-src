@@ -126,6 +126,9 @@ def checkpoint(runtime, destination=None):
     with runtime._checkpoint_lock, ExitStack() as stack:
         if runtime._pool is not None and not runtime._safe_point:
             raise RuntimeError('Team roles must stop at a quiescent handoff before checkpoint')
+        with runtime._team_condition:
+            if runtime._questions_pending():
+                raise RuntimeError('Team requests must finish before checkpoint')
         if runtime._stage not in ('boundary', 'ceo_opening', 'ceo'):
             raise RuntimeError('Team is outside a recoverable handoff')
         _known_operation(runtime.root)

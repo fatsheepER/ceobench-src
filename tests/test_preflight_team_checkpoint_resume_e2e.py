@@ -115,8 +115,8 @@ class ModelHandler(BaseHTTPRequestHandler):
             counts[key] = counts.get(key, 0) + 1
             turn = counts[key]
             with (directory / (mode + '-model-requests.jsonl')).open('a') as stream:
-                stream.write(json.dumps(dict(role=role, day=day, turn=turn, body=body)) + '\n')
-        if mode == 'interrupt' and day == 7 and role == 'ceo' and turn == 2:
+                stream.write(json.dumps(dict(role=role, day=day, turn=turn, phase=team.phase, body=body)) + '\n')
+        if mode == 'interrupt' and day == 7 and role == 'ceo' and team.phase == 'ceo':
             for name, runtime in team.roles.items():
                 assert (runtime.workspace / 'notebook.md').read_text() == name + ' midweek notes\nextra notes\n'
                 assert (runtime.workspace / 'draft.py').read_text() == 'LIMIT = 99\n'
@@ -147,7 +147,8 @@ class ModelHandler(BaseHTTPRequestHandler):
                 references=[], applies=str(day) + '-', reason='Save the weekly planning rationale'))])
             message = calls(*actions)
         else:
-            message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Continue the saved weekly plan.')
+            message = (final('Open the week with the saved plan.') if team.phase == 'ceo_opening' else
+                calls(('bash', dict(command=ADVANCE)))) if role == 'ceo' else final('Continue the saved weekly plan.')
         response = completion(message, body.get('stream', False))
         self.send_response(response.status_code)
         self.send_header('content-type', response.headers.get('content-type', 'application/json'))
@@ -283,6 +284,12 @@ def test_real_cli_manual_resume_after_midweek_sigkill_restores_selected_week_bou
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=15)
+            if target := os.environ.get('CEOBENCH_REQUEST_EVIDENCE'):
+                evidence = Path(target) / ('cli-resume-' + group)
+                evidence.mkdir(parents=True, exist_ok=True)
+                for name in ('interrupt-output.txt', 'interrupt-model-requests.jsonl', 'kill-ready.json'):
+                    if (directory / name).exists():
+                        shutil.copyfile(directory / name, evidence / name)
     assert process_group_members(process.pid) == [], 'Killed worker must leave no subprocesses'
     manifest_path = directory / 'batch/manifest.json'
     manifest = batch.read(manifest_path)
@@ -316,5 +323,14 @@ def test_real_cli_manual_resume_after_midweek_sigkill_restores_selected_week_bou
     assert all('Midweek draft' not in json.dumps(row['body']) for row in requests if row['day'] == 7)
     assert all(path.read_bytes() == original for path, original in immutable.items())
     assert tree_hash(first, exact=True) == source_before and tree_hash(snapshot, exact=True) == snapshot_before
-    print(json.dumps(dict(group=group, interrupted_day=ready['day'], resumed_day=record['day'],
-        restored=observed, checkpoint_rollback=record['checkpoint_rollback'], source_preserved=True)))
+    proof = dict(group=group, interrupted_day=ready['day'], resumed_day=record['day'],
+        restored=observed, checkpoint_rollback=record['checkpoint_rollback'], source_preserved=True,
+        killed_at=ready, original_attempt=json.loads(immutable[first / 'attempt.json']), resumed_attempt=record,
+        source_before=source_before, source_after=tree_hash(first, exact=True),
+        snapshot_before=snapshot_before, snapshot_after=tree_hash(snapshot, exact=True))
+    if target := os.environ.get('CEOBENCH_REQUEST_EVIDENCE'):
+        evidence = Path(target) / ('cli-resume-' + group)
+        evidence.mkdir(parents=True, exist_ok=True)
+        write_json(evidence / 'recovery-proof.json', proof)
+        shutil.copyfile(directory / 'resume-model-requests.jsonl', evidence / 'resume-model-requests.jsonl')
+    print(json.dumps(proof))

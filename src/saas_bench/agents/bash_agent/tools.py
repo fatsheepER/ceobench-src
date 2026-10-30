@@ -301,9 +301,16 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
         definitions = definitions + tool_definitions(pf=pf_queries, team=team or ask_analyst)
+    if team:
+        definitions = definitions + [dict(name='ask_agent', description=
+            "Ask another team role a focused question in this week's conversation. You wait for its reply before any further tool or model work. "
+            "The recipient receives the question after its current complete tool batch, can use its own tools, and answers in final text. "
+            "A circular wait returns a failure for this request only. Include relevant references and settings already changed.",
+            parameters=dict(type='object', properties=dict(role=dict(type='string', enum=['ceo', 'growth', 'ops_finance']),
+                message=dict(type='string')), required=['role', 'message'], additionalProperties=False))]
     if ask_analyst:
         definitions = definitions + [dict(name='ask_analyst', description=
-            "Ask growth or ops_finance a focused question in this week's existing conversation. "
+            "CEO entry for ask_agent, limited to growth or ops_finance. Wait for this reply before continuing. "
             "Include relevant evidence references, candidate actions and settings already changed. "
             "The analyst answers the new question without a fresh dashboard or weekly script run. "
             "Returns a host handoff header with author, day, world state, request ID, workspace and snapshot commit, followed by free text.",

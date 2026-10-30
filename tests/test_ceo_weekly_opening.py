@@ -241,7 +241,8 @@ def test_batch_wrapper_and_opening_ask_and_answers_ready_checkpoint_recovery(tmp
                 else:
                     message = calls(('ask_analyst', dict(role='growth', message='EARLY-QUESTION')))
             else:
-                message = final('EARLY-ANSWER' if messages[-1]['content'] == 'EARLY-QUESTION'
+                message = final('EARLY-ANSWER' if 'Team request |' in messages[-1]['content']
+                                and '\nEARLY-QUESTION\n' in messages[-1]['content']
                                 else role + '-EXACT-FORMAL-REPORT')
             return completion(message, body.get('stream', False))
         return OpenAI(api_key='OFFLINE-ONLY', base_url='https://opencode.ai/zen/go/v1', max_retries=0,

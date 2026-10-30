@@ -234,5 +234,16 @@ partial-update or replacement rules.
 All roles can read business MEMORY.md, scripts, reports, saved outputs,
 registrations and history in the listed workspaces. Write only your own workspace.
 '''
+    prompt += '''Use ask_agent(role, message) for focused synchronous requests to another role.
+Requests arrive after your current model response and complete tool batch. Answer the
+identified request in final text, using your tools if needed. That answer ends only
+the question. The host resumes unfinished weekly work afterward. A completed role
+returns idle after answering, in the same weekly conversation without rerunning scripts.
+While waiting for a reply you do no other work. Requests are handled in arrival order.
+A circular-wait refusal affects only that request; continue or adjust your question.
+CEO may also use ask_analyst for the same mechanism with an expert recipient.
+Do not advance time while answering a request. If next-week reports pending team
+requests, finish the current batch and answer them before retrying advancement.
+'''
     history = '' if role == 'ceo' else (PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
     return prompt + HANDOFF + '\n' + history

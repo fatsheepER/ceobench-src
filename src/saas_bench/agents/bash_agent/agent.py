@@ -129,6 +129,7 @@ class BashAgent(BaseAgent):
         invalid_generation_attempts=None,
         memory_max_chars=None,
         max_output_tokens=None,
+        before_request_callback=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -147,6 +148,7 @@ class BashAgent(BaseAgent):
         self.model = model
         self.max_turns_per_day = max_turns_per_day
         self.response_callback = response_callback
+        self.before_request_callback = before_request_callback
         self.reasoning_effort = reasoning_effort
         self.tool_result_callback = tool_result_callback
         self.workspace_path = workspace_path or Path('.')
@@ -677,6 +679,12 @@ class BashAgent(BaseAgent):
         """True when a non-empty reasoning effort other than 'none' is set."""
         return bool(self.reasoning_effort) and self.reasoning_effort != 'none'
 
+    def _before_model_request(self):
+        if self._pending_tool_calls:
+            raise RuntimeError('Finish the current tool batch before requesting another model response')
+        if self.before_request_callback:
+            self.before_request_callback()
+
     def _call_llm(self) -> Optional[Action | FinalText]:
         """Call the LLM and parse the response into an action."""
         if self.use_anthropic:
@@ -693,6 +701,7 @@ class BashAgent(BaseAgent):
         import openai
 
         while True:
+            self._before_model_request()
             messages = []
             for msg in self.conversation:
                 m = {'role': msg.role, 'content': msg.content or ''}
@@ -916,6 +925,7 @@ class BashAgent(BaseAgent):
         import openai
 
         while True:
+            self._before_model_request()
             # Build input array from conversation
             input_items = []
             for msg in self.conversation:
@@ -1197,6 +1207,7 @@ class BashAgent(BaseAgent):
         no_tool_retries = 0
 
         while True:
+            self._before_model_request()
             messages = []
             for msg in self.conversation:
                 if msg.role == 'system':

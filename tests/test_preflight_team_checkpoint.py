@@ -119,6 +119,32 @@ def behavior(runtime):
         return (f'Analyst handoff | role={role} | day={day} | request_world_state_id=state-{worlds.index(world)} | request_id=request-{index}\n'
                 f'Workspace: {workspace}\nSnapshot commit: tree-{tree}\n')
 
+    reply_header = re.compile(r'Team reply \| from=(\w+) \| to=(\w+) \| day=(\d+) \| request_id=(\w+) \| request_world_state_id=(\w+)\n'
+                              r'Workspace: ([^\n]+)\nSnapshot commit: ([0-9a-f]+)\n')
+    question_header = re.compile(r'Team request \| request_id=([0-9a-f]+) \| from=(\w+) \| to=(\w+) \| day=(\d+)')
+
+    def normalize_reply(match):
+        role, sender, day, request_id, world, workspace, commit = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
+        assert request.kind == 'question'
+        assert (role, sender, int(day), world, commit) == (request.receiver, request.sender,
+            request.day, request.world_state_id, request.handoff_commit)
+        assert workspace == '<ROOT>/roles/' + role
+        tree = runtime._git(runtime.roles[role], 'rev-parse', commit + '^{tree}')
+        return (f'Team reply | from={role} | to={sender} | day={day} | request_id=request-{index} | '
+                f'request_world_state_id=state-{worlds.index(world)}\nWorkspace: {workspace}\nSnapshot commit: tree-{tree}\n')
+
+    def normalize_question(match):
+        request_id, sender, receiver, day = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
+        assert request.kind == 'question'
+        assert (sender, receiver, int(day)) == (request.sender, request.receiver, request.day)
+        return f'Team request | request_id=request-{index} | from={sender} | to={receiver} | day={day}'
+
+    def normalize_content(text):
+        return question_header.sub(normalize_question, reply_header.sub(normalize_reply,
+            header.sub(normalize_handoff, text))) if isinstance(text, str) else text
+
     for role, item in runtime.roles.items():
         conversation = [dict(role=message.role, content=message.content,
             name=message.name, reasoning_content=message.reasoning_content)
@@ -126,14 +152,14 @@ def behavior(runtime):
         conversation = json.loads(json.dumps(conversation).replace(root, '<ROOT>'))
         for message in conversation:
             if isinstance(message['content'], str):
-                message['content'] = header.sub(normalize_handoff, message['content'])
+                message['content'] = normalize_content(message['content'])
                 message['content'] = re.sub(r'(\[git: MEMORY\.md last committed in (?:week-\d+ \()?)([0-9a-f]{7})',
                     lambda match: match[1] + 'tree:' + runtime._git(item, 'rev-parse', match[2] + '^{tree}'),
                     message['content'])
         state[role] = dict(conversation=conversation,
             files={str(path.relative_to(item.workspace)): path.read_text() for path in item.workspace.glob('*.txt')},
             memory=(item.workspace / 'MEMORY.md').read_text(),
-            history=re.sub(r'Analyst handoff [0-9a-f]{7}', 'Analyst handoff <ID>', runtime._git(item, 'log', '--format=%s')),
+            history=re.sub(r'(Analyst handoff|Team reply) [0-9a-f]{7}', r'\1 <ID>', runtime._git(item, 'log', '--format=%s')),
             trees=runtime._git(item, 'log', '--format=%T'), usage=item.usage.summary)
     ledger = [tuple(row) for row in runtime.server.conn.execute('SELECT day,category,amount,note FROM ledger ORDER BY rowid')]
     state['world'] = dict(day=runtime.server.tools.current_day, ledger=ledger,
@@ -141,7 +167,7 @@ def behavior(runtime):
         rng=runtime.server.simulator.rng.bit_generator.state,
         tools_rng=runtime.server.tools.rng.bit_generator.state)
     state['messages'] = [(message.sender, message.receiver, message.text, message.day,
-        message.status, message.reply) for message in runtime.messages]
+        message.status, normalize_content(message.reply)) for message in runtime.messages]
     return state
 
 

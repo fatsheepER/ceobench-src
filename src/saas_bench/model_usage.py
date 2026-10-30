@@ -432,6 +432,8 @@ class ModelUsage:
         self.source_records = []
         self.context_id = uuid.uuid4().hex if evidence_store or identity else None
         self.last_request_event = None
+        self.last_http_attempt_id = None
+        self.last_call_id = None
         self.path = Path(path) if path else None
         self.role = role
         self.pricing = pricing or {}
@@ -553,6 +555,8 @@ class ModelUsage:
                     recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
                                body=body, error=error)
+                    if not error and response.status_code < 400:
+                        recorder.last_http_attempt_id = attempt_id
                 if response.is_stream_consumed:
                     if response.content and (attempt := _ATTEMPT.get()):
                         attempt.reply_started()
@@ -639,6 +643,8 @@ class ModelUsage:
     def _call(self, api, request, invoke, **context):
         self.request_check()
         self.last_request_event = None
+        self.last_http_attempt_id = None
+        self.last_call_id = None
         self.call_world_state = self.world_state()
         replacements = []
         if self.evidence_store:
@@ -680,6 +686,7 @@ class ModelUsage:
                         raise ValueError(message)
                     if self.expected_model is not None and raw.get('model') != self.expected_model:
                         logging.warning('Returned model differs from frozen configuration')
+                    self.last_call_id = call_id
                     return response
                 except Exception as exc:
                     last_model_error = exception_details(exc)

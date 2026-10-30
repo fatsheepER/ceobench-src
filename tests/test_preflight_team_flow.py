@@ -203,7 +203,6 @@ def probe_ceo_frozen(team):
 def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatch):
     monkeypatch.setenv('CEOBENCH_MEMORY_MAX_CHARS', '40000')
     initial_barriers = {day: threading.Barrier(2) for day in (0, 7)}
-    ask_barriers = {day: threading.Barrier(2) for day in (0, 7)}
     counters, completed, sessions, script_hashes = {}, {}, {}, {}
     lock = threading.Lock()
 
@@ -263,11 +262,15 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
             question = messages[-1]['content']
             assert isinstance(question, str) and f'QUESTION-D{day}' in question
             if n == 3:
-                ask_barriers[day].wait(timeout=10)
-                team.test_event('analyst_ask_overlap', role=role)
+                if role == 'ops_finance':
+                    assert any(m.kind == 'question' and m.receiver == 'growth' and
+                               m.day == day and m.status == 'delivered' for m in team.messages)
+                team.test_event('analyst_ask_sequential', role=role)
                 if role == 'growth':
                     probe_ceo_frozen(team)
             if role == 'growth' and n == 4:
+                assert any(m.kind == 'question' and m.receiver == 'ops_finance' and
+                           m.day == day and m.status == 'delivered' for m in team.messages)
                 assert f'REPLY-growth-D{day}-3' in rendered
             return final(f'REPLY-{role}-D{day}-{n}. Answer to {question}')
         assert completed.get(('growth', day)) and completed.get(('ops_finance', day))
