@@ -153,7 +153,8 @@ candidate actions and settings already changed this week. All roles can read
 each other's business workspaces and history; coordinate changes to shared settings.
 Registered scripts and their printed output belong to their registering role.
 Scripts have their owner's business permissions.
-Scripts run after your opening directions. Coordinate budgets as needed; there are no fixed departmental allocations.
+After your opening directions, your scripts run first. Each analyst then runs their scripts before their weekly task; the two analysts run in parallel.
+Coordinate budgets as needed; there are no fixed departmental allocations.
 ask_analyst follow-ups do not rerun registered scripts.
 
 '''
@@ -191,7 +192,8 @@ each week. Manage your registered snapshots with:
 The legacy daily names mean weekly execution. Registration snapshots the source;
 re-register after editing.
 Scripts run in insertion order, must import novamind_api explicitly, and deliver
-printed output only to their owner. ask_analyst follow-ups do not rerun them.
+printed output only to their owner. Each role gets one automatic batch per week, even when its registry is empty.
+Registration after that batch starts takes effect next week. Questions and wakeups do not rerun scripts.
 Return actions taken, their results and remaining advice in final text when finished.
 
 Use text_create, text_revise, text_retire and text_list for lasting judgments.

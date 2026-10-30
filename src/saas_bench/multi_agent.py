@@ -26,6 +26,21 @@ from .text_registry import TextRegistry
 from .team_prompts import CEO_OPENING, CEO_CLOSING, WEEKLY_TASKS, system_prompt
 
 
+@dataclass(frozen=True)
+class RoleWeek:
+    day: int
+    session_id: str
+    initialized: bool = False
+    scripts_status: str = 'pending'
+    scripts_output: str = ''
+    scripts_error: str | None = None
+    weekly_status: str = 'pending'
+    weekly_request_id: str | None = None
+
+    def snapshot(self):
+        return dict(vars(self))
+
+
 @dataclass
 class RoleRuntime:
     identity: AgentIdentity
@@ -36,6 +51,7 @@ class RoleRuntime:
     usage: ModelUsage
     store: SQLEvidenceStore | None
     audit: RoleAudit
+    week: RoleWeek | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +564,19 @@ class MultiAgentRuntime:
                 runtime.store.identity.update(identity.fields())
             write_json(self.root / 'private' / identity.role / 'identity.json', identity.fields())
             runtime.agent.reset()
+            runtime.week = RoleWeek(self.server.tools.current_day, identity.session_id)
+            self._update_role_week(identity.role)
+
+    def _update_role_week(self, role, **changes):
+        runtime = self.roles[role]
+        runtime.week = replace(runtime.week, **changes)
+        write_json(self.root / 'private' / role / 'week-state.json', runtime.week.snapshot())
+
+    def _role_input(self, role, observation, *, day):
+        runtime = self.roles[role]
+        runtime.agent.add_input(observation, day=day)
+        if runtime.week is not None and not runtime.week.initialized:
+            runtime.week = replace(runtime.week, initialized=True)
 
     def _transition(self, message, status, reply=None):
         with self._message_lock:
@@ -701,11 +730,12 @@ class MultiAgentRuntime:
         else:
             instruction = ('Answer this request in final text. You may use your tools. '
                            'This answers only the request; the host will resume your prior task afterward.')
-        self.roles[request.receiver].agent.add_input(
+        self._role_input(request.receiver,
             f'Team request | request_id={request.request_id} | from={request.sender} | '
             f'to={request.receiver} | day={request.day}\n{request.text}\n{instruction}', day=request.day)
         request.input_accepted = True
         self._transition(request, 'queued' if queued else 'running')
+        self._update_role_week(request.receiver)
 
     def _intake_questions(self, role):
         if self._pool is None:
@@ -749,7 +779,7 @@ class MultiAgentRuntime:
             try:
                 self._check()
                 if request.input_accepted:
-                    runtime.agent.add_input(f'Now answer queued request_id={request.request_id} in final text. '
+                    self._role_input(role, f'Now answer queued request_id={request.request_id} in final text. '
                         'This answers only that request; the host will resume your prior task afterward.', day=request.day)
                     self._transition(request, 'running')
                 else:
@@ -766,7 +796,7 @@ class MultiAgentRuntime:
                     worker.question = None
                     self._team_condition.notify_all()
         if handled and resume:
-            runtime.agent.add_input('The requested replies are complete. Resume ' + resume + '.',
+            self._role_input(role, 'The requested replies are complete. Resume ' + resume + '.',
                 day=self.server.tools.current_day)
         return handled
 
@@ -776,6 +806,31 @@ class MultiAgentRuntime:
             self._team_condition.notify_all()
         if self._worker_error is not None:
             self._lifecycle.cancel(getattr(self._worker_error, 'reason', 'role_failure'))
+
+    def _automatic_scripts(self, role):
+        week = self.roles[role].week
+        if week is None or (week.day, week.session_id) != (
+                self.server.tools.current_day, self.roles[role].identity.session_id):
+            raise RuntimeError('Automatic scripts require the current role week')
+        if week.scripts_status in ('succeeded', 'script_error'):
+            return week.scripts_output
+        if week.scripts_status != 'pending':
+            raise RuntimeError('Automatic scripts already started; restore a prior checkpoint')
+        expected = 'ceo_scripts' if role == 'ceo' else 'analysis'
+        if self._stage != expected or 'directions' not in self._week:
+            raise RuntimeError('Automatic scripts must follow CEO opening')
+        self._update_role_week(role, scripts_status='running')
+        try:
+            output = self._script_output(role)
+            classifications = {record['classification'] for record in self.server.role_script_results[role]}
+            status = 'script_error' if 'script_error' in classifications else 'succeeded'
+            self._update_role_week(role, scripts_status=status, scripts_output=output)
+            return output
+        except BaseException as exc:
+            classifications = {record['classification'] for record in self.server.role_script_results[role]}
+            status = 'unknown' if 'unknown' in classifications else 'interrupted'
+            self._update_role_week(role, scripts_status=status, scripts_error=str(exc))
+            raise
 
     def _script_output(self, role):
         operation = None
@@ -802,21 +857,28 @@ class MultiAgentRuntime:
 
     def _run_analyst(self, role, requests, dashboard=None):
         runtime = self.roles[role]
-        scripts = self._script_output(role) if dashboard is not None else None
+        scripts = self._automatic_scripts(role) if dashboard is not None else None
         observation = self._observation(role, dashboard, scripts) if dashboard is not None else None
         for request in requests:
             try:
                 self._check()
-                runtime.agent.add_input(join_text(observation, '\n\n', request.text) if observation is not None else request.text,
+                if request.kind == 'weekly_task':
+                    self._update_role_week(role, weekly_status='in_progress', weekly_request_id=request.request_id)
+                self._role_input(role, join_text(observation, '\n\n', request.text) if observation is not None else request.text,
                     day=request.day)
                 request.input_accepted = True
                 self._transition(request, 'running')
+                self._update_role_week(role)
                 answer = self._drive_role(role, completion='answer')
                 observation = None
                 request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {request.request_id[:7]} (day {request.day})')
                 self._transition(request, 'completed', answer)
+                if request.kind == 'weekly_task':
+                    self._update_role_week(role, weekly_status='completed')
             except BaseException:
                 self._transition(request, 'failed')
+                if request.kind == 'weekly_task':
+                    self._update_role_week(role, weekly_status='interrupted')
                 raise
         return requests
 
@@ -851,12 +913,17 @@ class MultiAgentRuntime:
         return self._request('ceo', role, message)
 
     def _run_ceo(self, *, completion='advance'):
-        runtime = self.roles['ceo']
         self._check()
-        if not self._week.get('ceo_started'):
-            runtime.agent.add_input(self._week['observation'], day=self.server.tools.current_day)
-            self._week['ceo_started'] = True
-        return self._drive_role('ceo', completion=completion)
+        self._update_role_week('ceo', weekly_status='in_progress')
+        try:
+            if not self._week.get('ceo_started'):
+                self._role_input('ceo', self._week['observation'], day=self.server.tools.current_day)
+                self._week['ceo_started'] = True
+                self._update_role_week('ceo')
+            return self._drive_role('ceo', completion=completion)
+        except BaseException:
+            self._update_role_week('ceo', weekly_status='interrupted')
+            raise
 
     def _drive_role(self, role, *, completion, question=None):
         runtime = self.roles[role]
@@ -951,9 +1018,6 @@ class MultiAgentRuntime:
                 details.append(type(cause).__name__ + ': ' + str(cause))
                 cause = cause.__cause__
             self.failure_detail = '; '.join(details) or None
-            if self.failure == 'registered_script_transient_infrastructure':
-                self._stage = 'boundary'
-                self._week = {}
             self._set_phase('stopped' if str(exc) == 'natural_end' else 'paused')
             return RunOutcome(self.server.tools.current_day, 'natural_end' if str(exc) == 'natural_end' else 'paused')
         except BusinessOutcomeUnknown as exc:
@@ -993,7 +1057,7 @@ class MultiAgentRuntime:
                 self._week['directions'] = directions
                 self._stage = 'ceo_scripts'
                 self._set_phase('ceo_scripts')
-                scripts = self._submit_role('ceo', self._script_output, 'ceo')
+                scripts = self._submit_role('ceo', self._automatic_scripts, 'ceo')
                 self._wait_roles([scripts])
                 ceo_scripts = scripts.result()
                 self._check()
@@ -1025,6 +1089,8 @@ class MultiAgentRuntime:
         for runtime in self.roles.values():
             from .registration_evidence import week_commit_subject
             self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
+        if self.roles['ceo'].week is not None:
+            self._update_role_week('ceo', weekly_status='completed')
         self._stage = 'boundary'
         self._week = {}
         self._set_phase('boundary')

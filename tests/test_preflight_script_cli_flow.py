@@ -54,10 +54,14 @@ def test_deployed_cli_snapshot_runs_next_week_and_reaches_owner_input(mode):
                 if turn == 3:
                     return calls(('bash', dict(command='pf depend r1 --detail && pf log auto-result.json')))
                 if turn == 4:
-                    assert 'not recomputed' in rendered
-                    assert 'cited observation day 7' in rendered
-                    assert 'checked day 7' in rendered
-                    assert 'auto-result.json@v1 · day 7' in rendered
+                    receipt = next(message['content'] for message in reversed(body['messages'])
+                                   if message.get('role') == 'tool' and message.get('name') == 'bash')
+                    assert 'Saved source relationships.' in receipt
+                    assert 'declared select {"path":"/day"}' in receipt
+                    assert 'declared predicate' in receipt
+                    assert f'{role}:auto-result.json@v1 · day 7' in receipt
+                    assert 'checked day' not in receipt.lower()
+                    assert 'predicate holds' not in receipt and 'PREDICATE FAILS' not in receipt
             followup = 5 if mode == 'pf' else 2
             if day == 7 and turn == followup:
                 return calls(('bash', dict(command='./novamind-operation remove-daily-script weekly.py && '

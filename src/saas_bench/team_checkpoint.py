@@ -260,13 +260,14 @@ def _freeze(runtime, directory):
     result = server._last_day_result
     if result is not None and not is_dataclass(result):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
+    role_weeks = {name: role.week.snapshot() if role.week else None for name, role in runtime.roles.items()}
     state = dict(version=1, saved_at=datetime.now(timezone.utc).isoformat(),
         source_root=str(runtime.root), configuration=runtime.configuration,
         runtime_environment=dict(server.runtime_environment),
         benchmark_config=asdict(server.tools.config), day=server.tools.current_day,
         seed=server.tools.seed, tools_rng=server.tools.rng.bit_generator.state,
         shared_rng=server.tools.rng is server.simulator.rng,
-        stage=runtime._stage, week=runtime._week, phase=runtime.phase,
+        stage=runtime._stage, week=runtime._week, role_weeks=role_weeks, phase=runtime.phase,
         world_state_id=server.world_state_id, roles=roles,
         messages=[asdict(message) for message in runtime.messages], failure=runtime.failure,
         scripts={role: server.get_daily_scripts(role) for role in runtime.roles},
@@ -275,7 +276,7 @@ def _freeze(runtime, directory):
         evidence=evidence, live_customer=server.simulator.customer_simulator is not None,
         public_artifacts=artifact_hashes(runtime._public_dir),
         source_sha256=tree_hash(Path(__file__).parent),
-        sources=text_sources(dict(week=runtime._week, dashboard=server._last_dashboard,
+        sources=text_sources(dict(week=runtime._week, role_weeks=role_weeks, dashboard=server._last_dashboard,
             script_results=server.role_script_results)))
     if server.shock_manager:
         state['scenario'] = asdict(server.shock_manager.scenario)
@@ -472,7 +473,7 @@ def _relocate_prompt(text, original, destination):
 
 def restore_runtime_state(runtime, state):
     from .execution_capture import restore_sources
-    from .multi_agent import TeamMessage
+    from .multi_agent import RoleWeek, TeamMessage
     from .simulation import DayResult
     server = runtime.server
     original = state['source_root']
@@ -482,7 +483,8 @@ def restore_runtime_state(runtime, state):
     server.world_state_id = state['world_state_id']
     runtime.messages = [TeamMessage(**message) for message in state['messages']]
     runtime.failure = None
-    captured = dict(week=runtime._week, dashboard=state['dashboard'], script_results=state['script_results'])
+    captured = dict(week=runtime._week, role_weeks=state.get('role_weeks', {}),
+        dashboard=state['dashboard'], script_results=state['script_results'])
     restore_sources(captured, state['sources'])
     runtime._week = captured['week']
     if 'observation' in runtime._week:
@@ -512,6 +514,22 @@ def restore_runtime_state(runtime, state):
                 message.content = role.agent._get_system_prompt_with_memory()
         role.agent._last_observation = _relocate_prompt(role.agent._last_observation, old_workspace, new_workspace)
         role.agent.total_turns = saved['total_turns']
+        week = captured['role_weeks'].get(name)
+        if week is not None:
+            role.week = RoleWeek(**week)
+        elif runtime._stage != 'boundary':
+            logging.warning('Checkpoint has no explicit role week for %s; script history remains unknown', name)
+            request = next((message for message in reversed(runtime.messages)
+                if message.kind == 'weekly_task' and message.receiver == name and message.day == state['day']), None)
+            weekly_status = ('completed' if request and request.status in ('completed', 'delivered') else
+                'interrupted' if request and request.status in ('failed', 'cancelled') else
+                'in_progress' if name == 'ceo' or request else 'pending')
+            role.week = RoleWeek(state['day'], role.identity.session_id,
+                initialized=role.agent.current_day == state['day'],
+                scripts_status='pending' if runtime._stage == 'ceo_opening' else 'unknown',
+                weekly_status=weekly_status, weekly_request_id=request.request_id if request else None)
+        if role.week is not None:
+            runtime._update_role_week(name)
     customer = server.simulator.customer_simulator
     if 'simulator_usage' in state:
         usage = customer.usage_recorder

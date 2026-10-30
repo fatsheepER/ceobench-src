@@ -194,7 +194,9 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             saved = json.loads((snapshot / 'team.json').read_text())
             assert all(restored.roles[role].identity.session_id == saved['roles'][role]['identity']['session_id']
                 for role in ROLES)
-            relocated_sources = text_sources(dict(week=restored._week, dashboard=restored.server._last_dashboard,
+            relocated_sources = text_sources(dict(week=restored._week,
+                role_weeks={name: role.week.snapshot() if role.week else None for name, role in restored.roles.items()},
+                dashboard=restored.server._last_dashboard,
                 script_results=restored.server.role_script_results))
             assert len(relocated_sources) == len(saved['sources'])
             for old, new in zip(saved['sources'], relocated_sources):

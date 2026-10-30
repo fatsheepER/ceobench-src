@@ -127,12 +127,10 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
         assert record['facts']['boundary_closed'] is True
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'PARTIAL-OUT\n'
         assert all(not executor.preserved_process for executor in team.server.role_executors.values())
-        from saas_bench.team_checkpoint import validate_snapshot
-        from saas_bench.run_state import tree_hash
-        paused = team.checkpoint()
-        assert tree_hash(paused / 'roles', exact=True) == tree_hash(team.root / 'roles', exact=True)
-        _, state = validate_snapshot(paused)
-        assert state['day'] == 0
+        assert team._stage == ('ceo_scripts' if role == 'ceo' else 'analysis')
+        assert team.roles[role].week.scripts_status == 'interrupted'
+        with pytest.raises(RuntimeError, match='recoverable handoff'):
+            team.checkpoint()
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
