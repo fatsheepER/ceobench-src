@@ -1145,7 +1145,7 @@ class NovaMindAPIServer:
         phase = self.team_phase
         if operation == 'read':
             return
-        allowed = ('ceo_scripts', 'ceo') if role == 'ceo' else ('analysis', 'asking')
+        allowed = ('ceo_opening', 'ceo_scripts', 'ceo') if role == 'ceo' else ('analysis', 'asking')
         if phase not in allowed or (operation == 'advance' and phase != 'ceo'):
             raise PermissionError(f'{role} {operation} is frozen during {phase}')
 

@@ -12,7 +12,7 @@ import pytest
 from saas_bench import team_batch as batch
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_team_batch import changed_manifest, frozen
-from test_preflight_team_flow import ADVANCE, PREDICTIONS, calls, completion, final, make_team, raw
+from test_preflight_team_flow import ADVANCE, PREDICTIONS, calls, completion, final, make_team, opening_response, raw
 
 
 def wait_until(predicate):
@@ -374,6 +374,8 @@ def test_cli_failure_holds_once_and_manual_checkpoint_resume_preserves_failed_at
         def respond(request):
             sent.append(role)
             body = json.loads(request.content)
+            if response := opening_response(role, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Offline analyst answer.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(role, 'advance-terminal', transport=httpx.MockTransport(respond))
@@ -395,16 +397,17 @@ def test_cli_failure_holds_once_and_manual_checkpoint_resume_preserves_failed_at
     first = batch.prepare(path, entry['run_id'], live=True, client_factory=client, simulator_factory=failing_simulator)
     directory = batch.attempts(entry)[0]
     assert first['status'] == 'paused' and first['runtime_failure'] == 'world_operation_failed'
-    assert first['hold'] and 'unknown' not in first['hold_detail'].lower()
-    assert sent.count('ceo') == 1
+    assert first['hold']
+    assert sent.count('ceo') == 2
     receipts = [json.loads(row.read_text()) for row in (directory / 'runtime/private/operations').glob('*.json')]
     advance = next(row for row in receipts if row['kind'] == 'api:advance')
     wrapper = next(row for row in receipts if row['kind'] == 'ceo_tool:bash')
     assert advance['status'] == wrapper['status'] == 'failed'
+    assert wrapper['recovery']['classification'] == 'known_advance_failure'
     assert advance['advance']['reached_day'] == 2 and advance['advance']['last_completed_day'] == 1
     assert wrapper['finalization']['process_boundary']['descendants_closed'] is True
     usage = [json.loads(row) for row in (directory / 'runtime/private/ceo/model-usage.jsonl').read_text().splitlines()]
-    assert sum(row['event'] == 'request' for row in usage) == 1
+    assert sum(row['event'] == 'request' for row in usage) == 2
     original = {row: row.read_bytes() for row in directory.rglob('*') if row.is_file()}
     resumed = batch.prepare(path, entry['run_id'], resume=True, live=True, week=1, force_resume=True,
         client_factory=client, simulator_factory=batch.simulator)

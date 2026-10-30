@@ -16,7 +16,7 @@ from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.team_checkpoint import validate_snapshot
 from test_preflight_team_batch import frozen
 from test_preflight_team_checkpoint import fast_simulator
-from test_preflight_team_flow import ADVANCE, calls, completion, final, make_team, raw
+from test_preflight_team_flow import ADVANCE, calls, completion, final, make_team, raw, opening_response
 from test_preflight_team_readonly_recovery import managed_git
 
 
@@ -157,6 +157,8 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
     def resume_client(role):
         def resume_response(request):
             body = json.loads(request.content)
+            if response := opening_response(role, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(role, 'pending-write-resume', transport=httpx.MockTransport(resume_response))
@@ -243,6 +245,8 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
         def resume_response(request):
             body = json.loads(request.content)
             resumed_wire.append((sender, body))
+            if response := opening_response(sender, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if sender == 'ceo' else final('Existing data checked.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(sender, 'late-write-resume', transport=httpx.MockTransport(resume_response))

@@ -33,6 +33,7 @@
 - 企业协商的客户标识、拒绝与七天超时，以及公共 SDK 的定向 ops 四范围和 dev 组映射替换契约，从 `tests/test_enterprise_sdk_contracts.py` 定位。
 - 推进失败终态、客户端先退出及关闭交错从 `tests/test_advance_terminal.py` 定位。
 - 自动周检、重放及状态传播已删除。周初看板、注册脚本、全文交接与检查点恢复的真实模型输入从 `tests/test_week_start_observation.py` 定位；主动来源查询不重放、不判断条件及旧 findings 不再投递从 `tests/test_pf_readonly_sources.py` 定位。
+- CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。
 - 故障后该组进入 HOLD，记录原因并等待人工从 checkpoint 续跑。controller 每次启动对每个运行只启动一次 worker；正常完成后继续该组队列中的下一项，不自动回滚或重启，也不累计同位置失败次数。
 - 人工续跑可以反复指定任意历史 checkpoint 或 `--week N`，含第 1 周的初始周界。历史 HOLD、STOP、审批与哈希信息只作提醒。snapshot、manifest、D0、环境、工作区、RNG、Bash 策略与 scope 校验只记日志及 attempt 提示；`--force-resume` 记录操作者明确选择继续。
 - 全部 checkpoint 保留。故障现场保留在原 attempt，人工恢复使用新 attempt，并将选点后的执行记为作废。`scripts/team_driver.py` 支持旧配对批次和单组选择。每组默认 MemoryHigh 16G、MemoryMax 20G；主动 STOP 仍可停止当前执行。

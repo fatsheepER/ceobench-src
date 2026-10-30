@@ -22,7 +22,7 @@ from .run_state import tree_hash, write_json
 from .run_lifecycle import BusinessOutcomeUnknown, RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
 from .text_registry import TextRegistry
-from .team_prompts import WEEKLY_TASKS, system_prompt
+from .team_prompts import CEO_OPENING, CEO_CLOSING, WEEKLY_TASKS, system_prompt
 
 
 @dataclass
@@ -568,8 +568,9 @@ class MultiAgentRuntime:
             try:
                 self._check()
                 self._transition(request, 'running')
-                answer = runtime.agent.act(join_text(observation, '\n\n', request.text) if observation is not None else request.text,
-                    0, False, {'day': request.day})
+                runtime.agent.add_input(join_text(observation, '\n\n', request.text) if observation is not None else request.text,
+                    day=request.day)
+                answer = runtime.agent.act('', 0, False, {'day': request.day})
                 observation = None
                 while not isinstance(answer, FinalText):
                     self._check()
@@ -617,11 +618,12 @@ class MultiAgentRuntime:
         return requests
 
     def ask_analyst(self, role, message):
-        if self.phase != 'ceo' or self._pool is None:
+        if self.phase not in ('ceo_opening', 'ceo') or self._pool is None:
             raise PermissionError('Only the active CEO can ask an analyst')
         return self._ask_batch([dict(arguments=dict(role=role, message=message))])[0]
 
     def _ask_batch(self, calls):
+        caller_phase = self.phase
         self._set_phase('asking')
         requests, results = [], []
         for call in calls:
@@ -636,46 +638,57 @@ class MultiAgentRuntime:
         self._parallel(requests)
         for request in requests:
             self._transition(request, 'delivered')
-        self._set_phase('ceo')
+        self._set_phase(caller_phase)
         return [self._handoff(r) if isinstance(r, TeamMessage) else r for r in results]
 
-    def _run_ceo(self, observation):
+    def _run_ceo(self, *, completion='advance'):
         runtime = self.roles['ceo']
-        day = self.server.tools.current_day
-        self._check()
-        action = runtime.agent.act('' if self._week.get('ceo_started') else observation,
-            0, False, {'day': day})
-        self._week['ceo_started'] = True
-        while self.server.tools.current_day == day:
+        previous_policy = runtime.agent.allow_final_text
+        runtime.agent.allow_final_text = completion == 'answer'
+        try:
+            day = self.server.tools.current_day
             self._check()
-            if action is None or isinstance(action, FinalText):
-                raise RuntimeError('CEO must advance through the weekly API')
-            while action is not None:
-                self._check()
-                if action.tool == 'ask_analyst':
-                    calls = []
-                    for call in runtime.agent._pending_tool_calls:
-                        if call['name'] != 'ask_analyst':
-                            break
-                        calls.append(call)
-                    for result in self._ask_batch(calls):
-                        runtime.agent.record_tool_result(result)
-                    if not runtime.agent._pending_tool_calls:
-                        self._boundary('ask_completed')
-                else:
-                    operation = self._begin_operation('ceo_tool:' + action.tool)
-                    try:
-                        result = runtime.executor.execute(action.tool, action.arguments,
-                            model_request_event=runtime.usage.last_request_event,
-                            model_context_id=runtime.usage.context_id)
-                        runtime.agent.record_tool_result(result)
-                    finally:
-                        self._finish_operation(operation, runtime.executor)
-                if self.server.tools.current_day != day:
-                    return
-                action = runtime.agent.next_tool_action()
-            self._check()
+            if not self._week.get('ceo_started'):
+                runtime.agent.add_input(self._week['observation'], day=day)
+                self._week['ceo_started'] = True
             action = runtime.agent.act('', 0, False, {'day': day})
+            for request in self.messages:
+                if request.status == 'completed' and request.request_id in self._week.get('weekly_request_ids', []):
+                    self._transition(request, 'delivered')
+            while self.server.tools.current_day == day:
+                self._check()
+                if isinstance(action, FinalText) and completion == 'answer':
+                    return action.text
+                if action is None or isinstance(action, FinalText):
+                    raise RuntimeError('CEO must advance through the weekly API')
+                while action is not None:
+                    self._check()
+                    if action.tool == 'ask_analyst':
+                        calls = []
+                        for call in runtime.agent._pending_tool_calls:
+                            if call['name'] != 'ask_analyst':
+                                break
+                            calls.append(call)
+                        for result in self._ask_batch(calls):
+                            runtime.agent.record_tool_result(result)
+                        if not runtime.agent._pending_tool_calls:
+                            self._boundary('ask_completed')
+                    else:
+                        operation = self._begin_operation('ceo_tool:' + action.tool)
+                        try:
+                            result = runtime.executor.execute(action.tool, action.arguments,
+                                model_request_event=runtime.usage.last_request_event,
+                                model_context_id=runtime.usage.context_id)
+                            runtime.agent.record_tool_result(result)
+                        finally:
+                            self._finish_operation(operation, runtime.executor)
+                    if self.server.tools.current_day != day:
+                        return
+                    action = runtime.agent.next_tool_action()
+                self._check()
+                action = runtime.agent.act('', 0, False, {'day': day})
+        finally:
+            runtime.agent.allow_final_text = previous_policy
 
     def run(self, *, stop_after_day, hold=None):
         if type(stop_after_day) is not int or stop_after_day <= 0 or stop_after_day % 7 or stop_after_day > self.effective_end:
@@ -696,6 +709,13 @@ class MultiAgentRuntime:
                     self._check()
                     if self._stage == 'boundary':
                         self._rotate_sessions()
+                        self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING),
+                            ceo_started=False)
+                        self._stage = 'ceo_opening'
+                        self._set_phase('ceo_opening')
+                    if self._stage == 'ceo_opening':
+                        directions = self._run_ceo(completion='answer')
+                        self._week['directions'] = directions
                         self._stage = 'ceo_scripts'
                         self._set_phase('ceo_scripts')
                         ceo_scripts = self._script_output('ceo')
@@ -703,21 +723,21 @@ class MultiAgentRuntime:
                         self._stage = 'analysis'
                         self._set_phase('analysis')
                         dashboard = self.server.public_dashboard()
-                        requests = [self._message(role, WEEKLY_TASKS[role])
+                        requests = [self._message(role, join_text(WEEKLY_TASKS[role], '\n\nCEO directions\n', directions))
                                     for role in ROLES[1:]]
                         self._parallel(requests, dashboard)
-                        for request in requests:
-                            self._transition(request, 'delivered')
-                        observation = self._observation('ceo', dashboard, ceo_scripts)
+                        observation = join_text(self.server.public_dashboard(), '\n\n', CEO_CLOSING)
+                        observation = self._observation('ceo', observation, ceo_scripts)
                         for request in requests:
                             observation = join_text(observation, '\n\n', self._handoff(request))
-                        self._week = dict(observation=observation, ceo_started=False)
+                        self._week.update(observation=observation, ceo_started=False,
+                            weekly_request_ids=[request.request_id for request in requests])
                         self._stage = 'ceo'
                         self._set_phase('ceo')
                         self._boundary('answers_ready')
                     elif self._stage != 'ceo':
                         raise RuntimeError('Team interrupted outside a recoverable boundary')
-                    self._run_ceo(self._week['observation'])
+                    self._run_ceo()
                     self._close_week()
                     self._boundary('week_boundary')
         except RunCancelled as exc:

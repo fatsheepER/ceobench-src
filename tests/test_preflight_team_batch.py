@@ -18,7 +18,7 @@ from saas_bench.role_policy import ROLES
 from saas_bench.run_state import build_manifest, file_hash, tree_hash, write_json
 from saas_bench.team_checkpoint import validate_snapshot
 from saas_bench.team_usage import aggregate
-from test_preflight_team_flow import ADVANCE, calls, completion, final
+from test_preflight_team_flow import ADVANCE, calls, completion, final, opening_response
 
 
 PRICES = dict(source='offline acceptance fixture', basis='USD per 1000 tokens',
@@ -309,6 +309,8 @@ def test_pending_tail_survives_real_prepare_resume_and_next_model_calls(frozen, 
         def respond(request):
             calls_sent.append(role)
             request_body = json.loads(request.content)
+            if response := opening_response(role, request_body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
             return completion(message, request_body.get('stream', False))
         return batch.checked_client(role, 'pending-tail', transport=httpx.MockTransport(respond))
@@ -528,6 +530,8 @@ def test_offline_engineering_batch_runs_real_cli_and_pauses_resumes(frozen, tmp_
         def respond(request):
             body = json.loads(request.content)
             wire.append(dict(role=role, body=body))
+            if response := opening_response(role, body):
+                return response
             if role == 'ceo' and pause_once[0]:
                 pause_once[0] = False
                 active = batch.attempts(batch.selected(copied, run_id))[-1]
@@ -695,9 +699,12 @@ def test_killed_host_and_failed_restore_retain_safe_checkpoint(frozen, tmp_path,
     entry = next(row for row in copied['runs'] if row['group'] == 'git')
     script = '''import os, signal, sys, json, httpx
 from saas_bench import team_batch as batch
-from test_preflight_team_flow import completion, final
+from test_preflight_team_flow import completion, final, opening_response
 def client(role):
     def respond(request):
+        body = json.loads(request.content)
+        if response := opening_response(role, body):
+            return response
         if role == 'ceo':
             os.kill(os.getpid(), signal.SIGKILL)
         body = json.loads(request.content)
@@ -728,6 +735,8 @@ batch.prepare(sys.argv[1], sys.argv[2], live=True, client_factory=client, simula
     def client(role):
         def respond(request):
             body = json.loads(request.content)
+            if response := opening_response(role, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Use existing public data.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(role, 'offline', transport=httpx.MockTransport(respond))
@@ -888,7 +897,9 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
         def transport(request):
             sent.append(role)
             body = json.loads(request.content)
-            return completion(final('Use existing public data.'), body.get('stream', False))
+            response = opening_response(role, body)
+            assert response is not None, 'Pending analyst evidence must prevent further model work'
+            return response
         return batch.checked_client(role, 'offline', transport=httpx.MockTransport(transport))
 
     monkeypatch.setattr(api_server, 'execute_query', delayed_query)
@@ -923,7 +934,7 @@ def test_pending_sql_pauses_real_team_and_preserves_safe_recovery(frozen, tmp_pa
             assert 'checkpoint_error' not in result
             assert result['hold'] and (directory / 'HOLD').exists()
             assert growth.store.fault is None and not growth.store.fault_path.exists()
-            assert sent == []
+            assert sent == ['ceo']
             with closing(growth.store.connect()) as conn:
                 rows = [growth.store.read_event(row[0]) for row in conn.execute(
                     'SELECT event_id FROM requests WHERE branch=?', (growth.store.identity['branch_id'],))]

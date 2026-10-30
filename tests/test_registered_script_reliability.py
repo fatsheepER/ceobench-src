@@ -6,7 +6,7 @@ import pytest
 
 from saas_bench.role_policy import ROLES
 from test_preflight_team_checkpoint import fast_simulator
-from test_preflight_team_flow import ADVANCE, calls, final, make_team
+from test_preflight_team_flow import ADVANCE, calls, final, make_team, opening_response
 
 
 def register_actions(role, code):
@@ -79,7 +79,8 @@ def test_prestart_enospc_pauses_at_boundary_without_script_error_model_input(mod
         from saas_bench.team_checkpoint import validate_snapshot
         _, state = validate_snapshot(snapshots[-1])
         assert state['day'] == 7
-        assert all(item['day'] == 0 for item in team.test_wire)
+        assert all(item['day'] == 0 or item['day'] == 7 and item['role'] == 'ceo' for item in team.test_wire)
+        assert sum(item['day'] == 7 for item in team.test_wire) == 1
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -172,7 +173,7 @@ def test_permanent_pf_capture_fault_retains_raw_evidence_and_prior_checkpoint(mo
             team.checkpoint()
         with pytest.raises(RuntimeError, match='capture failed'):
             store.assert_healthy()
-        assert not team.test_wire
+        assert [item['role'] for item in team.test_wire] == ['ceo']
 
 
 from test_preflight_team_readonly_recovery import managed_git
@@ -191,6 +192,11 @@ def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_pat
     executor.execute('write_file', dict(path='weekly.py', content="print('RESUMED-SCRIPT')\n"))
     assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
     source = batch.save_checkpoint(team, directory, record, 'week_boundary')
+    ceo = team.roles['ceo']
+    ceo.agent.client.close()
+    ceo.agent.client = batch.checked_client('ceo', 'transient-opening', transport=httpx.MockTransport(
+        lambda request: opening_response('ceo', json.loads(request.content))))
+    ceo.usage.attach(ceo.agent.client)
     original = Boundary.__init__
     def fail_start(*args, **kwargs):
         raise OSError(errno.ENOSPC, 'injected inode exhaustion')
@@ -208,6 +214,8 @@ def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_pat
         def respond(request):
             body = json.loads(request.content)
             wire.append(dict(role=role, messages=body['messages']))
+            if response := opening_response(role, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('Existing data checked.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(role, 'transient-resume', transport=httpx.MockTransport(respond))
@@ -239,7 +247,7 @@ def test_real_launcher_pre_auth_failure_retains_stderr_and_closes_resources(mode
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b''
         assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b'HOST-ENOSPC\n'
         assert not registered.preserved_process
-        assert not team.test_wire
+        assert [item['role'] for item in team.test_wire] == ['ceo']
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -264,7 +272,7 @@ def test_unknown_registered_business_write_retains_receipt_and_skips_model(mode,
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'WRITE-BEGIN\n'
         operations = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
         assert any(row['kind'] == 'api:set_prices' and row['status'] == 'running' for row in operations)
-        assert not team.test_wire
+        assert [item['role'] for item in team.test_wire] == ['ceo']
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -327,7 +335,7 @@ def test_pre_auth_open_streams_preserve_partial_host_evidence_and_skip_model(mod
             assert record['classification'] == 'unknown'
             assert record['facts']['boundary_closed'] is False
             assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b'PARTIAL-HOST\n'
-            assert not team.test_wire
+            assert [item['role'] for item in team.test_wire] == ['ceo']
         finally:
             process = registered.preserved_process
             if process:

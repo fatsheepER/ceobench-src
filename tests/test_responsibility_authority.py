@@ -307,7 +307,7 @@ def test_unknown_expert_write_holds_real_attempt_and_preserves_checkpoint(manage
     from saas_bench.run_lifecycle import BusinessOutcomeUnknown, RunCancelled
     from saas_bench.team_checkpoint import validate_snapshot
     from test_preflight_team_checkpoint import clients, dispose, fast_simulator
-    from test_preflight_team_flow import completion
+    from test_preflight_team_flow import completion, opening_response
 
     team, directory, record, manifest, entry = managed_git
     mode = entry['group']
@@ -325,6 +325,8 @@ def test_unknown_expert_write_holds_real_attempt_and_preserves_checkpoint(manage
         def respond(request):
             body = json.loads(request.content)
             wire.append(dict(role=role, body=body))
+            if response := opening_response(role, body):
+                return response
             if role == 'growth' and len([r for r in wire if r['role'] == 'growth']) == 1:
                 message = calls(('bash', dict(command="python -c \"import novamind_api as n; n.marketing.set_daily_spend(operations=555)\"")))
             elif role == 'growth':
@@ -353,7 +355,7 @@ def test_unknown_expert_write_holds_real_attempt_and_preserves_checkpoint(manage
     writes = [r for r in operations(team) if r['kind'] == 'api:set_daily_spend']
     assert writes == [dict(kind='api:set_daily_spend', role='growth', day=0, status='running')]
     assert len([r for r in wire if r['role'] == 'growth']) == 1
-    assert not any(r['role'] == 'ceo' for r in wire)
+    assert [r['role'] for r in wire if r['role'] == 'ceo'] == ['ceo']
     with pytest.raises((RunCancelled, BusinessOutcomeUnknown)):
         runtime = team.roles['growth']
         request = dict(model=runtime.agent.model, messages=[dict(role='user', content='must wait for manual resume')])
@@ -423,11 +425,17 @@ def test_registered_expert_writes_run_in_analysis_and_enter_owner_model(mode, mo
             assert raw(team, role, '/daily-scripts', dict(name='owner-script.py', content=script))[1]['success']
         assert team.run(stop_after_day=7).reason == 'observation_end', (team.failure, team.failure_detail)
         assert sorted(phases) == [('set_ads_strength', 'analysis'), ('set_capacity_tier', 'analysis')]
+        ceo_requests = 0
         for item in team.test_wire:
             role, body = item['role'], item['body']
             rendered = '\n'.join(m.get('content') or '' for m in body['messages'])
             if role == 'ceo':
+                ceo_requests += 1
                 assert len(team.messages) == 2
+                if ceo_requests == 1:
+                    assert 'request_world_state_id=' not in rendered
+                    assert all(message.reply not in rendered for message in team.messages)
+                    continue
                 for message in team.messages:
                     assert message.world_state_id != team.server.world_state_id
                     assert 'request_world_state_id=' + message.world_state_id in rendered
@@ -438,6 +446,7 @@ def test_registered_expert_writes_run_in_analysis_and_enter_owner_model(mode, mo
                 assert peer + '-REGISTERED-BUSINESS' not in rendered
                 assert 'owner-script.py' in rendered
                 assert ("'global': 0.6" if role == 'growth' else "'tier': 2") in rendered
+        assert ceo_requests == 2
         assert team.server.tools.config.ads_strength_global == 0.6
         assert team.server.conn.execute('SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 2
         receipts = [r for r in operations(team) if r['kind'] in ('api:set_ads_strength', 'api:set_capacity_tier')]

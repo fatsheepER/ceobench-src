@@ -43,6 +43,12 @@ def final(text):
     return dict(role='assistant', content=text)
 
 
+def opening_response(role, body):
+    from saas_bench.team_prompts import CEO_OPENING
+    if role == 'ceo' and body['messages'][-1]['role'] == 'user' and CEO_OPENING in body['messages'][-1]['content']:
+        return completion(final('Assess the current business and coordinate this week\'s actions.'), body.get('stream', False))
+
+
 def completion(message, stream=False):
     common = dict(id=uuid.uuid4().hex, created=1, model='deepseek-v4.1-flash')
     usage = dict(prompt_tokens=20, completion_tokens=10, total_tokens=30,
@@ -64,7 +70,7 @@ def completion(message, stream=False):
 
 
 @contextmanager
-def make_team(mode, responder, label, **runtime_options):
+def make_team(mode, responder, label, *, opening_responder=None, **runtime_options):
     base = Path(os.environ.get('CEOBENCH_TEAM_ARTIFACTS', tempfile.mkdtemp(prefix='team-flow-')))
     base.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix=f'{label}-{mode}-', dir=base))
@@ -88,7 +94,11 @@ def make_team(mode, responder, label, **runtime_options):
             with lock:
                 wire.append(dict(role=role, day=tools.current_day, body=body))
             event('model_start', role=role)
-            result = responder(holder['team'], role, body)
+            if role == 'ceo' and holder['team'].phase == 'ceo_opening':
+                result = (opening_responder(holder['team'], role, body) if opening_responder else
+                          final('Assess the current business and coordinate this week\'s actions.'))
+            else:
+                result = responder(holder['team'], role, body)
             event('model_end', role=role)
             if isinstance(result, httpx.Response):
                 return result
@@ -405,7 +415,8 @@ def test_pause_during_analyst_wait_stops_before_ceo(mode):
     with make_team(mode, respond, 'pause') as team:
         team.run(stop_after_day=7)
         assert team.server.tools.current_day == 0
-        assert {w['role'] for w in team.test_wire} == set(ROLES[1:])
+        assert team.test_wire[0]['role'] == 'ceo'
+        assert {w['role'] for w in team.test_wire[1:]} == set(ROLES[1:])
         probe_ceo_frozen(team)
 
 
@@ -461,12 +472,12 @@ def test_bankruptcy_during_week_stops_remaining_scripts_and_tools(mode, trigger,
         assert outcome.reason == 'natural_end' and outcome.day == 0
         assert not (team.roles['ceo'].workspace / 'after-bankruptcy').exists()
         if trigger == 'ceo_script':
-            assert not team.test_wire
+            assert [w['role'] for w in team.test_wire] == ['ceo']
             records = [json.loads(line) for line in team.roles['ceo'].audit.path.read_text().splitlines()]
             executions = [r for r in records if r['kind'] == 'registered_script_execution']
             assert not any(r['name'] == 'second.py' and r['status'] == 'succeeded' for r in executions)
         else:
-            assert len([w for w in team.test_wire if w['role'] == 'ceo']) == 1
+            assert len([w for w in team.test_wire if w['role'] == 'ceo']) == 2
         for executor in (team.roles['ceo'].executor, team.server.role_executors['ceo']):
             assert executor.execute('write_file', dict(path='late', content='denied')).startswith('Error:')
             assert executor.last_status != 'succeeded'

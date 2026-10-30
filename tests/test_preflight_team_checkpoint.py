@@ -21,7 +21,7 @@ from saas_bench.role_policy import ROLES
 from saas_bench.run_state import write_json
 from saas_bench.simulation import DayResult, Simulator
 from saas_bench.tools import AgentTools
-from test_preflight_team_flow import ADVANCE, calls, completion, final, raw
+from test_preflight_team_flow import ADVANCE, calls, completion, final, opening_response, raw
 
 
 PRICING = dict(source='offline fixed table', basis='USD per 1000 tokens',
@@ -47,6 +47,8 @@ def clients():
     def create(role):
         def respond(request):
             body = json.loads(request.content)
+            if response := opening_response(role, body):
+                return response
             messages = body['messages']
             if role != 'ceo':
                 question = messages[-1]['content']

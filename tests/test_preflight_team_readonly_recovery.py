@@ -12,7 +12,7 @@ from saas_bench.team_checkpoint import validate_snapshot
 from saas_bench.run_state import file_hash, tree_hash, write_json
 from test_preflight_team_batch import frozen
 from test_preflight_team_checkpoint import fast_simulator
-from test_preflight_team_flow import ADVANCE, calls, completion, final
+from test_preflight_team_flow import ADVANCE, calls, completion, final, opening_response
 from test_preflight_team_batch import managed_team
 
 
@@ -177,6 +177,8 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
     def resume_client(name):
         def resume_response(request):
             body = json.loads(request.content)
+            if response := opening_response(name, body):
+                return response
             message = calls(('bash', dict(command=ADVANCE))) if name == 'ceo' else final('Existing data checked.')
             return completion(message, body.get('stream', False))
         return batch.checked_client(name, 'resume-test', transport=httpx.MockTransport(resume_response))

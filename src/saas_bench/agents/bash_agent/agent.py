@@ -404,19 +404,7 @@ class BashAgent(BaseAgent):
         self._day_advanced = False
         self._new_dashboard = ""
 
-    def act(self, observation: str, reward: float, done: bool, info: Dict[str, Any]) -> Optional[Action | FinalText]:
-        """Choose an action based on the observation.
-
-        The agent processes tool outputs and decides the next action.
-        After day advancement is detected, context is refreshed.
-        """
-        if done:
-            return None
-
-        self._last_observation = observation
-
-        # Check if this is a new day (context refresh)
-        current_day = info.get('day', 0)
+    def _prepare_day(self, observation, current_day):
         if current_day > self.current_day:
             if self._skip_next_refresh:
                 # Mid-day resume: conversation was restored from snapshot.
@@ -428,11 +416,26 @@ class BashAgent(BaseAgent):
                 self.current_day = current_day
                 self.turns_today = 0
 
+    def add_input(self, observation: str, *, day: int):
+        """Accept a new task independently of requesting the next model response."""
+        if self._pending_tool_calls:
+            raise RuntimeError('Finish the current tool batch before supplying new input')
+        self._prepare_day(observation, day)
+        self.conversation.append(Message(role='user', content=observation))
+        self._last_observation = observation
+        self._observation_recorded = True
+
+    def act(self, observation: str, reward: float, done: bool, info: Dict[str, Any]) -> Optional[Action | FinalText]:
+        """Choose an action, refreshing context after day advancement."""
+        if done:
+            return None
+        self._last_observation = observation
+        self._prepare_day(observation, info.get('day', 0))
+
         # Safety: force next_week if too many turns (0 = no limit)
         if self.max_turns_per_day > 0 and self.turns_today >= self.max_turns_per_day:
             return Action(tool='bash', arguments={'command': './novamind-operation next-week'})
 
-        # If we have pending tool call results to process, add them
         if getattr(self, '_observation_recorded', False):
             self._observation_recorded = False
         else:

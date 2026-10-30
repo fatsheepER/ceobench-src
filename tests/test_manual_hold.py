@@ -11,7 +11,7 @@ from test_preflight_group_join import group_batch
 from test_preflight_team_controller import controller
 from test_preflight_team_observer import observer
 from test_preflight_team_batch import changed_manifest, frozen, managed_team
-from test_preflight_team_flow import completion, final
+from test_preflight_team_flow import completion, final, opening_response
 
 
 @pytest.mark.parametrize('entrypoint', ['controller', 'driver'])
@@ -75,6 +75,8 @@ def test_real_model_failure_writes_hold_without_creating_another_attempt(frozen,
     monkeypatch.setattr(WorkerLifecycle, 'sleep', lambda self, seconds: delays.append(seconds))
     def client(role):
         def respond(request):
+            if response := opening_response(role, json.loads(request.content)):
+                return response
             if role == 'ceo':
                 sent.append(request)
                 if failure == 'network':
@@ -109,7 +111,9 @@ def test_unknown_public_business_result_holds_for_manual_resume(frozen, tmp_path
         def respond(request):
             return completion(final('Analyst answer.'), json.loads(request.content).get('stream', False))
         return batch.checked_client(role, 'offline-business', transport=httpx.MockTransport(respond))
-    def unknown(runtime, observation):
+    def unknown(runtime, *, completion='advance'):
+        if completion == 'answer':
+            return 'Coordinate this week.'
         original = runtime.server.tools.set_prices
         def write_then_disconnect(args):
             original(args)

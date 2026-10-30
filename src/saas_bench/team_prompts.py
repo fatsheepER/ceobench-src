@@ -25,6 +25,14 @@ WEEKLY_TASKS = {
                    'and +182 days. Report actions taken, returned results and remaining recommendations. Keep unchanged findings brief.',
 }
 
+CEO_OPENING = '''Open this week with goals, constraints and priority questions for Growth and OpsFinance.
+Use the prior week's results, your MEMORY.md and current cash and settings. Ask focused questions if needed.
+Finish with your directions in final text. Registered scripts and the analysts' weekly work run afterward.
+Do not advance time during opening.'''
+
+CEO_CLOSING = '''Continue your opening conversation with the updated dashboard and both full analyst handoffs below.
+Resolve material gaps or disagreements, coordinate final actions and cash forecasts, then advance through next-week.'''
+
 HANDOFF = '''For conclusions that affect a decision, distinguish observed facts from estimates.
 Include data coverage and units, assumptions, specific recommendations and their
 conditions, locatable supporting evidence, and missing information. Use concise
@@ -125,7 +133,11 @@ Register reusable judgments with exact evidence and intended applies days. selec
 
 CEO_DECISIONS = '''## Team decisions
 
-Start each week with the Growth and OpsFinance handoffs. Use their existing
+Open each week with goals, constraints and priority questions using the previous
+week's results, your MEMORY.md and current cash and settings. Give directions in
+final text; do not advance yet. Registered scripts then run and Growth and OpsFinance
+complete their weekly work in parallel. Continue this same conversation to close
+the week with their full handoffs and an updated dashboard. Use their existing
 evidence where it supports the decision. For a specific gap, open the evidence,
 ask the responsible analyst, or verify it yourself. Avoid repeating a full
 investigation already covered by the handoffs. Independent public queries,
@@ -141,6 +153,7 @@ candidate actions and settings already changed this week. All roles can read
 each other's business workspaces and history; coordinate changes to shared settings.
 Registered scripts and their printed output belong to their registering role.
 Scripts have their owner's business permissions.
+Scripts run after your opening directions. Coordinate budgets as needed; there are no fixed departmental allocations.
 ask_analyst follow-ups do not rerun registered scripts.
 
 '''
@@ -154,9 +167,13 @@ research delays and competitors affect future demand and costs. Use the public
 API and table docs for mechanics and current values.
 
 Your initialized session advances in seven-day steps, controlled by the CEO.
-Each week resets your conversation and loads your own MEMORY.md, the dashboard,
-private registered-script outputs. Files persist.
-The dashboard describes the last advance; settings may have changed since then.
+Each week resets your conversation and loads your own MEMORY.md. Files persist.
+The CEO opens first. A focused opening question may arrive before your weekly task.
+Answer it without treating it as the completed weekly task. After CEO directions,
+your registered scripts run and your weekly task includes the dashboard, directions
+and private script output in this same conversation.
+The dashboard includes the last advance's results and current settings when generated.
+Settings may have changed since then.
 Group insights retain their survey snapshot_day until a new survey completes.
 Use ./novamind-operation python or python-c with novamind_api for public
 SQL queries and permitted business APIs. Read docs/api, docs/tables and docs/cli.md for details.

@@ -167,11 +167,16 @@ def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wire
             with closing(runtime.store.connect()) as conn:
                 events = [r[0] for r in conn.execute("SELECT event_id FROM requests WHERE branch=? "
                     "AND json_extract(request,'$.kind')='model_request' ORDER BY seq", (role,))]
-            wire = json.loads(runtime.store.get_content(events[0] + ':wire')[1])
-            assert wire == next(r['body'] for r in team.test_wire if r['role'] == role)
-            index, user = next((i, m) for i, m in enumerate(wire['messages']) if m['role'] == 'user')
+            offset = int(role == 'ceo')
+            if role == 'ceo':
+                opening = json.loads(runtime.store.get_content(events[0] + ':wire')[1])
+                assert opening == next(r['body'] for r in team.test_wire if r['role'] == role)
+                assert 'Your private registered-script output' not in opening['messages'][-1]['content']
+            wire = json.loads(runtime.store.get_content(events[offset] + ':wire')[1])
+            assert wire == [r['body'] for r in team.test_wire if r['role'] == role][offset]
+            index, user = [(i, m) for i, m in enumerate(wire['messages']) if m['role'] == 'user'][-1]
             pointer = f'/messages/{index}/content'
-            occurrences = json.loads(runtime.store.get_content(events[0] + ':occurrences')[1])
+            occurrences = json.loads(runtime.store.get_content(events[offset] + ':occurrences')[1])
             occurrences = [o for o in occurrences if o['json_pointer'] == pointer]
             layers = set()
             for item in occurrences:
@@ -184,7 +189,7 @@ def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wire
                     role, runtime.identity.session_id, runtime.usage.context_id)
             assert {'dashboard', 'tool_return'} <= layers
             assert 'weekly_check' not in layers
-            ledger = json.loads(runtime.store.get_content(events[0] + ':pf_reads')[1])
+            ledger = json.loads(runtime.store.get_content(events[offset] + ':pf_reads')[1])
             assert len(ledger) == 1 and ledger[0]['mode'] == 'FULL'
             read = ledger[0]
             a, b = read['request_range']
@@ -195,7 +200,7 @@ def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wire
             assert runtime.store.get_content(read['actual_version'])[1].decode() == user['content'][a:b]
             assert (read['reader'], read['session_id'], read['context_id']) == (
                 role, runtime.identity.session_id, runtime.usage.context_id)
-            next_reads = json.loads(runtime.store.get_content(events[1] + ':pf_reads')[1])
+            next_reads = json.loads(runtime.store.get_content(events[offset + 1] + ':pf_reads')[1])
             assert next_reads[0]['mode'] == 'FULL' and next_reads[-1]['mode'] in ('UNCHANGED', 'DELTA')
             assert next_reads[-1]['chain'][0]['range'] == [a, b]
             original = runtime.store.get_content(read['target'])[1].decode()

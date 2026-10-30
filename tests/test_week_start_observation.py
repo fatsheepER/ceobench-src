@@ -44,20 +44,24 @@ def test_new_week_delivers_dashboard_scripts_and_full_handoffs_without_checks(mo
             register(team, role, 'report.py', 'print(' + repr('PRIVATE-SCRIPT-' + role) + ')')
         outcome = team.run(stop_after_day=14)
         assert outcome.reason == 'observation_end', team.failure
-        assert len(team.test_wire) == 6
+        assert len(team.test_wire) == 8
         for role, runtime in team.roles.items():
             usage = rows(runtime.usage.path)
             sent = [row for row in usage if row['event'] == 'http_request']
             actual = [row['body'] for row in team.test_wire if row['role'] == role]
             assert [row['body'] for row in sent] == actual
-            assert len(sent) == 2
-            for row, day in zip(sent, (0, 7)):
-                user = next(message['content'] for message in row['body']['messages']
-                            if message['role'] == 'user')
+            assert len(sent) == (4 if role == 'ceo' else 2)
+            for index, row in enumerate(sent):
+                day = (index // 2 if role == 'ceo' else index) * 7
+                user = [message['content'] for message in row['body']['messages']
+                        if message['role'] == 'user'][-1]
                 assert f'=== Week {day // 7 + 1} Dashboard (Day {day}) ===' in user
-                assert 'PRIVATE-SCRIPT-' + role in user
                 assert 'OLD-FINDING-' not in user
                 assert 'Check of your registered texts' not in user
+                if role == 'ceo' and index % 2 == 0:
+                    assert 'PRIVATE-SCRIPT-' not in user
+                    continue
+                assert 'PRIVATE-SCRIPT-' + role in user
                 if role == 'ceo':
                     for analyst in ROLES[1:]:
                         assert reports[analyst] in user
@@ -105,12 +109,15 @@ def test_answers_ready_checkpoint_keeps_observation_without_check_state(tmp_path
         assert len(initial_requests) == 2
         for request in initial_requests:
             assert restored._handoff(request) in restored._week['observation']
+        prior_requests = [row for row in rows(restored.roles['ceo'].usage.path) if row['event'] == 'http_request']
         assert restored.run(stop_after_day=7).reason == 'observation_end', restored.failure
         sent = [row for row in rows(restored.roles['ceo'].usage.path) if row['event'] == 'http_request']
+        assert sent[:len(prior_requests)] == prior_requests
+        sent = sent[len(prior_requests):]
         assert sent
         for row in sent:
             assert 'weekly_check' not in row
-            user = next(message['content'] for message in row['body']['messages'] if message['role'] == 'user')
+            user = [message['content'] for message in row['body']['messages'] if message['role'] == 'user'][-1]
             assert 'Dashboard' in user
             assert 'OLD-FINDING-' not in user
             assert 'Check of your registered texts' not in user
