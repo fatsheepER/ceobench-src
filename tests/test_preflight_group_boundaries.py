@@ -287,7 +287,13 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
     if delivery == 'partial':
         assert binding['reading_scope'] == 'partial'
     if delivery in ('same', 'changed'):
-        assert (binding['version_id'] != binding['latest_version_id']) == (delivery == 'changed')
+        assert binding['version_id'] == binding['latest_version_id']
+        assert binding['git_content_matches']
+        expected = b'{"n":9}' if delivery == 'changed' else b'{"n":7}'
+        assert store.get_content(binding['version_id'])[1] == expected
+        if delivery == 'changed':
+            assert binding['reading_scope'] == 'not_in_request'
+            assert binding['delivered_in'] == []
     for forbidden in ('delivered_in', 'version_id', 'git_content_matches', head):
         assert forbidden not in prefix.path.read_text()
         assert forbidden not in json.dumps(outputs)
@@ -299,7 +305,7 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
                                                 registration=json.loads(prefix.path.read_text())))
 
 
-def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspace, tmp_path):
+def test_explicit_git_references_do_not_copy_and_bare_files_snapshot_without_evaluating(workspace, tmp_path):
     from saas_bench.text_registry import TextRegistry
     registry = TextRegistry(workspace, 'git')
     head = git(workspace, 'rev-parse', 'HEAD')
@@ -322,11 +328,11 @@ def test_git_references_never_save_cited_contents_or_evaluate_predicates(workspa
         with pytest.raises(ValueError):
             registry.execute('create', declaration(evidence))
         assert registry.path.read_bytes() == original
-    # An uncommitted file binds the weekly commit label without committing or copying it.
     (workspace / 'new.json').write_text('{"n":1}')
     registry.execute('create', declaration({'path': 'new.json'}))
-    assert json.loads(registry.execute('list', {'raw': True}))['records'][-1]['references'][0]['evidence'] == dict(
-        path='new.json', commit='week-1')
+    evidence = json.loads(registry.execute('list', {'raw': True}))['records'][-1]['references'][0]['evidence']
+    assert evidence['path'] == 'new.json'
+    assert git(workspace, 'show', evidence['commit'] + ':new.json') == '{"n":1}'
     assert (workspace / '.git/index').read_bytes() == index and git(workspace, 'rev-parse', 'HEAD') == head
     assert '{"n":1}' not in registry.path.read_text()
     executor = BashAgentToolExecutor(workspace, text_registry=registry)
@@ -407,11 +413,18 @@ print(json.dumps(results))'''
         structured = child.tool_executor.text_registry.last_result
         assert result.startswith('Revised r1.2 (active).\nRetained references: facts.json@')
         if mode == 'pf':
-            assert structured['evidence'][0]['version'] == 'facts.json@v2'
-            assert child.evidence_store.get_content(binding['version_id'])[1] == b'{"n":8}'
+            assert structured['evidence'][0]['version'] == 'facts.json@v1'
+            assert child.evidence_store.get_content(binding['version_id'])[1] == b'{"n":7}'
         else:
             assert 'evidence' not in structured
-        assert not re.search(r'\b[0-9a-f]{8,64}\b', result)
+        evidence = json.loads(public_json)['records']['r1'][0]['references'][0]['evidence']
+        if mode == 'git':
+            assert evidence['commit'] in result
+        else:
+            assert not re.search(r'\b[0-9a-f]{8,64}\b', result)
+        assert child._execute_tool('bash', {'command': 'git show ' +
+            shlex.quote(evidence['commit'] + ':facts.json')}).split('\n[', 1)[0].strip() == '{"n":7}'
+        assert binding['version_id'] not in result
         assert child._checkpoint_token not in json.dumps(probes)
         child._save_checkpoint(7)
         assert not any(child._checkpoint_token in p.read_text(errors='ignore') for p in

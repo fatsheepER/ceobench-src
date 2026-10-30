@@ -31,10 +31,13 @@ GIT_HISTORY = '''## File History (git)
 
 Your working directory is a Git repository. The harness commits it at the end
 of every week with the message "Week N (day 7N) [week-N]". In `text_create`,
-cite a file by its path (the version this week's closing commit will store, so
-later edits this week are included), an earlier commit as
+cite a saved file by its path to snapshot its current bytes immediately, or an earlier commit as
 `notes/observations.md@week-6` or `notes/observations.md@3f9a2c1`, another text
-as `r4.2`, or `unknown: <reason>`. Read the cited snapshots to review your sources.
+as `r4.2`, or `unknown: <reason>`. Later edits do not change a saved snapshot.
+Peer paths use `ROLE:PATH`; their snapshots are stored in your repository and
+the receipt names the source. Read `PATH@COMMIT` with `git show COMMIT:PATH`,
+or `git -C ROLE_WORKSPACE show COMMIT:PATH` for another role's repository.
+Only named saved files are snapshotted; save SQL or command output before citing it.
 
 Example: MEMORY.md is rewritten almost every week. Before relying on something
 you remember from earlier weeks, `git log -p -2 -- MEMORY.md` shows what the

@@ -28,6 +28,7 @@
 - 工具和业务子调用保留现有的期限与资源关闭契约；模型网络重试不设置总等待预算或全局截止时间。取消须唤醒实际阻塞操作；清理与持久化有独立且有界的预算，外层强杀期限须容纳它们。监测和停止通路独立于被监测工作占用的资源。
 - 回归从真实公共客户端和运行包装层进入。涉及模型发送时覆盖 `ModelUsage`，涉及停止时覆盖 controller；用本地 HTTP、真实子进程和假模型响应验证客户端先退出、服务端晚完成、断连、重复收尾及伙伴失败。断言下一次调用实际继续或按预期暂停、资源终态、attempt 状态与检查点恢复资格。
 - SQL 收尾与 PF 期限从 `tests/test_sql_capture_residuals.py`、`tests/test_pf_deadline.py` 定位；停止与资源隔离从 `tests/test_team_stop_residuals.py`、`tests/test_preflight_memory_guards.py` 定位。新增故障测试须证明修复前会失败，再验证修复后的完整路径。
+- Git 文件登记即时快照、来源与存放角色、覆写后读取、Git 回收保留及 checkpoint 恢复从 `tests/test_git_registration_snapshot.py` 定位；prefix 登记时捕获匹配从 `tests/test_prefix_week_binding.py` 定位。
 - Git/PF 共享业务流水、实际提交段、同值设置、公开列、旧世界补表与恢复引用从 `tests/test_business_ledger.py`、`tests/test_business_ledger_public.py`、`tests/test_business_ledger_faults.py` 定位。公共来源分类来自角色的模型与注册脚本独立监听器。
 - 高频回执的摘要、完整捕获清单、设置差异与实际模型输入从 `tests/test_receipt_outputs.py` 定位；SQL 极小结果上限下的错误发送及公共客户端继续从 `tests/test_public_sql.py`、`tests/test_sql_capture_residuals.py` 定位。
 - 职责写权完整入口矩阵、专家操作回执与互读路径从 `tests/test_responsibility_authority.py` 定位；跨角色历史与私有层隔离从 `tests/test_preflight_multi_agent.py`、`tests/test_preflight_team_evidence.py` 定位。

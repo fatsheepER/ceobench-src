@@ -158,12 +158,15 @@ def test_receipts_preserve_declared_applicability_and_references(workspace, tmp_
     registry = TextRegistry(workspace, 'git', sim_day=lambda: 7)
     text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
                                            reason='r', references=[dict(cite='evidence.json', note='why')]))
-    assert text == "Registered r1.1 (active).\nCited: evidence.json@week-2 (this week's closing commit)"
+    evidence = registry._load()['records']['r1'][0]['references'][0]['evidence']
+    cited = 'evidence.json@' + evidence['commit'] + ' (snapshot of evidence.json)'
+    assert text == 'Registered r1.1 (active).\nCited: ' + cited
     assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == (
-        "Revised r1.2 (active).\nRetained references: evidence.json@week-2 (this week's closing commit)")
+        'Revised r1.2 (active).\nRetained references: ' + cited)
     stored = json.loads(registry.path.read_text())['records']['r1'][-1]
     assert stored['applies_at'] == {'start_day': 7, 'end_day': 13}
-    assert stored['references'][0]['evidence'] == {'path': 'evidence.json', 'commit': 'week-2'}
+    assert stored['references'][0]['evidence'] == evidence
+    assert git(workspace, 'show', evidence['commit'] + ':evidence.json') == '{"n":7}'
     call(registry, 'create', **declaration({'record': 'r1.2'}, text='Depends on the plan'))
     with pytest.raises(ValueError, match='applies must be'):
         registry.execute('create', dict(text='x', objects=[dict(kind='plan', id='B')], applies='soon',

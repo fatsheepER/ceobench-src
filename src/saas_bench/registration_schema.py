@@ -64,7 +64,7 @@ class Compare(Input):
 
 
 CITE_FORMS = dict(
-    git='a workspace file path (the version this week\'s closing commit week-N will store), path@week-N or '
+    git='a saved workspace file path (snapshotted immediately), path@week-N or '
         'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>"',
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
        'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
@@ -360,9 +360,10 @@ def tool_definitions(pf=False, team=False):
                 'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Choose dates to cover the intended '
                 'review. Omitted revision references retain the list; supplied references replace it. Share the '
                 'returned exact ROLE:rN.M, not a guessed peer version. Cite a workspace path, committed path@week-N'
-                ' or path@COMMIT, registered text rN.M, or "unknown: <reason>". A bare path binds this week\'s '
-                'closing commit, including later edits. Cite readable peer handoff files as ROLE:PATH@COMMIT with '
-                'the actual host snapshot. Save command output to a file before citing it. '
+                ' or path@COMMIT, registered text rN.M, or "unknown: <reason>". A bare path saves its current '
+                'bytes immediately; later edits do not change it. Use ROLE:PATH for a peer file; the snapshot '
+                'is stored in your repository and the receipt names its source. Read the returned PATH@COMMIT '
+                'with git show COMMIT:PATH in the named role repository. Save command output to a file before citing it. '
                 'select/predicate are stored without condition evaluation; '
                 'check selected values and conditions yourself using current read-only evidence. Example below is '
                 'format-only: the saved path and object must exist, and dates must fit the judgment.\nExample '

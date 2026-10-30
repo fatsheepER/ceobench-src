@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from .execution_capture import CapturedText, CURRENT_EVENT, origin
 from . import evidence_handles, pf_render
-from .registration_evidence import EvidenceResolver, git_reference, week_label, weekly_reference
+from .registration_evidence import EvidenceResolver, git_reference, native_repository, snapshot_reference, retain_snapshot
 from .registration_schema import MODELS, applies_text, cite_text, internal
 from .run_state import write_json
 from .sql_evidence import encoded
@@ -56,15 +56,7 @@ class TextRegistry:
 
     def _git_reference(self, workspace, evidence):
         if self.identity:
-            git_dir = workspace / '.git'
-            objects = git_dir / 'objects'
-            aliases = (git_dir / 'commondir', objects / 'info/alternates')
-            if (workspace.resolve() != workspace or git_dir.is_symlink() or objects.is_symlink() or
-                    not git_dir.is_dir() or not objects.is_dir() or
-                    any(path.exists() or path.is_symlink() for path in aliases) or
-                    any(path.is_symlink() for path in objects.rglob('*'))):
-                raise ValueError("Git citations need the named role's native repository. "
-                                 'Remove Git aliases or cite the peer as ROLE:path@commit.')
+            native_repository(workspace)
         return git_reference(workspace, evidence, run=self.git_run)
 
     def execute(self, operation, args):
@@ -113,9 +105,12 @@ class TextRegistry:
         elif self.store:
             binding = self.store.load_state('declaration:' + previous['version'])
             bindings = binding['references'] if binding else []
+        if operation == 'create' or 'references' in values:
+            for ref in record['references']:
+                if 'snapshot_source' in ref:
+                    retain_snapshot(self.workspace, ref['evidence']['commit'], run=self.git_run)
         records.setdefault(record_id, []).append(record)
-        # Validate every reference before touching the workspace. A failed declaration
-        # does not consume a revision or save partially validated references.
+        # Publish only after every reference validates and each snapshot is retained.
         if self.identity:
             import os
             import uuid
@@ -145,12 +140,8 @@ class TextRegistry:
                 version = self.store.version(event, 'registered_text', encoded(record),
                                              layer='registered_text', object_id='record:' + record_id)
                 private = dict(version_id=version, references=bindings)
-                if any(b.get('awaiting_week') for b in bindings):
-                    pending = self.store.load_state('weekly_declarations') or []
-                    self.store.save_state('weekly_declarations', pending + [record['version']])
-                else:
-                    self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
-                                       object_id='declaration:' + record['version'])
+                self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
+                                   object_id='declaration:' + record['version'])
                 self.store.save_state('declaration:' + record['version'], private)
                 if owned:
                     self.store.complete(event)
@@ -169,7 +160,9 @@ class TextRegistry:
             cited = [self._pf_cited(b, ref['evidence']) for b, ref in zip(bindings, record['references'])]
         else:
             # Git and prefix receipts show only what the Git group can know: the stored reference.
-            cited = [self._git_cited(ref['evidence']) for ref in record['references']]
+            cited = [self._git_cited(ref['evidence']) +
+                     (' (snapshot of ' + cite_text(ref['snapshot_source']) + ')' if 'snapshot_source' in ref else '')
+                     for ref in record['references']]
         verb = dict(create='Registered', revise='Revised', retire='Retired')[operation]
         handle = (self.role + ":" if self.identity else "") + record["version"]
         lines = [f"{verb} {handle} ({record['status']})."]
@@ -182,81 +175,12 @@ class TextRegistry:
         lines += result.get('warnings', [])
         return '\n'.join(lines)
 
-    def finalize_week(self, label):
-        """Publish prefix declarations against the exact bytes of their closing commit.
-
-        Provisional bindings live only in private state, never in the dependency
-        graph. Historical revisions are finalized too, including inherited refs.
-        """
-        if self.mode != 'prefix':
-            return
-        pending = self.store.load_state('weekly_declarations') or []
-        if not pending:
-            return
-        records = {r['version']: r for history in self._load()['records'].values() for r in history}
-        for revision in pending[:]:
-            private = self.store.load_state('declaration:' + revision)
-            refs = private['references']
-            if not any(b.get('awaiting_week') == label for b in refs):
-                continue
-            for i, (ref, binding) in enumerate(zip(records[revision]['references'], refs)):
-                if binding.get('awaiting_week') == label:
-                    refs[i] = self._closing_binding(ref, binding)
-            if any(b.get('awaiting_week') for b in refs):
-                self.store.save_state('declaration:' + revision, private)
-                continue
-            event = self.store.begin_event('prefix_week_binding', dict(revision=revision, week=label))
-            # The declaration and its lookup state become visible together. A crash
-            # cannot publish an old missing edge alongside the completed binding.
-            with self.store.batch():
-                self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
-                                   object_id='declaration:' + revision)
-                self.store.save_state('declaration:' + revision, private)
-                pending.remove(revision)
-                self.store.save_state('weekly_declarations', pending)
-                self.store.complete(event)
-
-    def _closing_binding(self, ref, provisional):
-        binding = dict(git_week=provisional['awaiting_week'])
-        try:
-            evidence, full = self._git_reference(self.workspace, ref['evidence'])
-            binding['git_commit'] = full
-            raw = self._git_output(['git', '-C', str(self.workspace), 'show', full + ':' + evidence['path']])
-            handles = evidence_handles.index(self.store)
-            handles.refresh()
-            candidates = [v for group in reversed(handles.groups.get(handles.object_key('file', evidence['path'], evidence.get('owner')), []))
-                          for v in reversed(group['members'])]
-            matches = [v for v in candidates if self.resolver.content(v)[1] == raw]
-            if not matches:
-                raise ValueError('Closing commit file bytes were not captured in the prefix')
-            if provisional.get('status') == 'resolved' and provisional.get('version_id') in matches:
-                # Retain actual registration-time delivery, never a later read/write.
-                binding.update({k: v for k, v in provisional.items() if k != 'awaiting_week'})
-                binding['latest_version_id'] = candidates[0]
-            elif ref.get('select') or ref.get('predicate'):
-                raise ValueError('Selected closing-commit bytes were not available at registration')
-            else:
-                binding.update(self.resolver._whole_binding(matches[0], candidates[0], [], 'committed_bytes'))
-            binding.update(status='resolved', git_content_matches=True)
-        except ValueError as exc:
-            binding.update(status='unknown', reason=str(exc))
-        return binding
-
-    def assert_week_finalized(self, day):
-        if self.mode == 'prefix':
-            for revision in self.store.load_state('weekly_declarations') or []:
-                private = self.store.load_state('declaration:' + revision)
-                if any(int(b['awaiting_week'].split('-')[1]) * 7 <= day
-                       for b in private['references'] if b.get('awaiting_week')):
-                    raise RuntimeError('Closing-week evidence binding is incomplete: ' + revision)
-
     def _git_cited(self, evidence):
         if 'unknown' in evidence:
             return f"unknown ({evidence['unknown']})"
         if 'record' in evidence:
             return evidence['record']
-        text = cite_text(evidence)
-        return text + (" (this week's closing commit)" if evidence.get('commit') == week_label(self.sim_day()) else '')
+        return cite_text(evidence)
 
     def _pf_cited(self, binding, evidence):
         shown = self._display_binding(binding)
@@ -346,7 +270,8 @@ class TextRegistry:
         workspace = self.repository(owner)
         if 'unknown' in evidence:
             return dict(status='unknown', reason=evidence['unknown'])
-        full = label = None
+        full = None
+        source_evidence = evidence
         if self.mode == 'pf' and 'path' in evidence and 'commit' not in evidence \
                 and evidence_handles.VERSIONED.fullmatch(evidence['path']):
             evidence = ref['evidence'] = {'version': evidence['path']}  # forecast.json@v3 written as a path
@@ -370,12 +295,14 @@ class TextRegistry:
             evidence['record'] = (record_owner + ':' if self.identity else '') + target['version']
         elif self.mode in ('git', 'prefix') and 'path' in evidence and 'commit' not in evidence \
                 and '@' not in evidence['path']:
-            ref['evidence'] = weekly_reference(workspace, evidence['path'], week_label(self.sim_day()), run=self.git_run)
-            label = ref['evidence']['commit']
-            if self.identity:
-                ref['evidence']['owner'] = owner
             if (ref.get('select') or ref.get('predicate')) and not evidence['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
+            ref['evidence'], full = snapshot_reference(workspace, evidence['path'], self.workspace,
+                owner if self.identity else None, run=self.git_run)
+            ref['snapshot_source'] = dict(evidence)
+            if self.identity:
+                ref['evidence']['owner'] = self.role
+            workspace = self.workspace
         elif self.mode in ('git', 'prefix') or (
                 'path' in evidence and ('commit' in evidence or '@' in evidence['path'])):
             # PF keeps the Git group's committed-file references (design 4.1).
@@ -390,12 +317,9 @@ class TextRegistry:
             path = Path(evidence['path'])
             if path.is_absolute() or '..' in path.parts or path.as_posix() != evidence['path']:
                 raise ValueError('Evidence path must be workspace-relative')
-        binding = (dict(status='git', git_commit=full) if full else
-                   dict(status='git', git_week=label) if label else dict(status='registered_text', **evidence))
+        binding = dict(status='git', git_commit=full) if full else dict(status='registered_text', **evidence)
         if self.mode == 'git':
             return binding
-        if label:
-            binding['awaiting_week'] = label
         accept = None
         if full:
             # Keep the Git identity distinct from the delivered PF version. Bind only a
@@ -406,9 +330,10 @@ class TextRegistry:
                 raw = self.store.get_content(version)[1]
                 return blob == self._git_output(['git', '-C', str(workspace), 'hash-object', '--stdin'],
                                                        input=raw).decode().strip()
+        lookup = source_evidence if 'snapshot_source' in ref else ref['evidence']
         try:
             try:
-                binding.update(self.resolver.resolve(ref['evidence'], ref, accept=accept), status='resolved')
+                binding.update(self.resolver.resolve(lookup, ref, accept=accept), status='resolved')
                 if full:
                     binding['git_content_matches'] = True
             except ValueError:
@@ -416,7 +341,7 @@ class TextRegistry:
                     raise
                 # No delivered capture has the committed bytes: record the last delivered
                 # version and the mismatch, which traversal reports as a missing edge.
-                binding.update(self.resolver.resolve(ref['evidence'], ref), status='resolved',
+                binding.update(self.resolver.resolve(lookup, ref), status='resolved',
                                git_content_matches=False)
         except ValueError as exc:
             if self.mode == 'pf' and not full:

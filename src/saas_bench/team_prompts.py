@@ -109,7 +109,7 @@ Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace th
 - Continue reading: If a needed result was truncated, request the missing read_file range or read a narrower git show range with `sed -n '1,120p'`. Preserve the commit and path while paging.
 - help: At startup or when syntax is unclear, run `git help -a` or `git log -h`.
 
-After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. Cite handoff files as ROLE:PATH@COMMIT using actual values; a bare path binds the weekly closing commit and includes later edits that week. Save useful outputs to files before handoff so they enter the snapshot. Assess whether the judgment still holds using current evidence when needed.
+After a material change, retain, revise, or retire your judgment and pass corrections to the responsible analyst. Cite handoff files as ROLE:PATH@COMMIT using actual values; a bare path snapshots the current saved bytes immediately. Peer snapshots live in your own repository, with their source role and path shown in the receipt. Later edits do not change the saved reference. Save useful outputs to files before handoff so they enter the snapshot. Assess whether the judgment still holds using current evidence when needed.
 Group insights retain their survey snapshot_day until a new survey completes; retrieving or checking them does not refresh the survey.
 '''
 
@@ -128,7 +128,7 @@ Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace th
 - Continue reading: If a needed result was truncated, request the missing read_file range or read a narrower git show range with `sed -n '1,120p'`. Preserve the commit and path while paging.
 - help: At startup or when syntax is unclear, run `git help -a` or `git log -h`.
 
-Register reusable judgments with exact evidence and intended applies days. select/predicate are stored without condition evaluation. Recompute values and assess conditions yourself. Revise or retire outdated judgments and supply the complete intended reference list when it changes. Save reusable scripts and outputs, give relative paths, and let the host publish the handoff commit. Share the exact role-qualified text revision or ROLE:PATH@COMMIT from the receipt.
+Register reusable judgments with exact evidence and intended applies days. A bare saved path snapshots its current bytes immediately; later edits do not change it. Peer snapshots live in your repository and the receipt identifies their source. select/predicate are stored without condition evaluation. Recompute values and assess conditions yourself. Revise or retire outdated judgments and supply the complete intended reference list when it changes. Save reusable scripts and outputs, give relative paths, and let the host publish the handoff commit. Share the exact role-qualified text revision or ROLE:PATH@COMMIT from the receipt.
 '''
 
 CEO_DECISIONS = '''## Team decisions

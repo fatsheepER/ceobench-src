@@ -63,6 +63,10 @@ def test_three_roles_receive_shared_rules_and_mode_specific_example(mode):
                 assert '## PF evidence' not in system
                 assert 'pf show' not in description and 'pf depend' not in description
                 assert 'stored without condition evaluation' in description
+                assert 'saves its current bytes immediately' in description
+                assert 'later edits' not in system.lower().replace('later edits do not change', '')
+                assert 'snapshots' in history
+                assert 'weekly closing commit' not in system
                 from saas_bench.registration_schema import GIT_CREATE
                 GIT_CREATE.model_validate(example(description))
             assert tools['text_create']['parameters'] == tool_definitions(pf=mode == 'pf')[0]['parameters']

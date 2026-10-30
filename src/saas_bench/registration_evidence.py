@@ -3,6 +3,7 @@ from contextlib import closing, contextmanager
 import csv
 import io
 import json
+import os
 from pathlib import PurePosixPath
 import re
 import shlex
@@ -14,11 +15,6 @@ from .sql_evidence import PUBLIC_LAYERS
 
 
 WEEK_LABEL = re.compile('week-[1-9][0-9]*')
-
-
-def week_label(day):
-    """Label of the weekly harness commit that closes the week containing day."""
-    return f'week-{max(day or 0, 0) // 7 + 1}'
 
 
 def week_commit_subject(label):
@@ -50,7 +46,7 @@ def git_reference(workspace, evidence, run=subprocess.run):
         subject = week_commit_subject(commit)
         matches = [line[:40] for line in git('log', '--format=%H %s').splitlines() if line[41:] == subject]
         if not matches:
-            raise ValueError('That weekly commit does not exist yet; a bare path cites this week\'s file')
+            raise ValueError('That weekly commit does not exist yet; use an existing commit or snapshot a bare path')
         full = matches[-1]
     else:
         if not re.fullmatch('[0-9a-fA-F]{1,40}', commit):
@@ -68,20 +64,68 @@ def git_reference(workspace, evidence, run=subprocess.run):
     return dict(path=path, commit=commit if WEEK_LABEL.fullmatch(commit or '') else full[:7]), full
 
 
-def weekly_reference(workspace, path, label, run=subprocess.run):
-    """Cite a working-tree file as the weekly harness commit labelled `label` will store it."""
+def native_repository(workspace):
+    git_dir = workspace / '.git'
+    objects = git_dir / 'objects'
+    aliases = (git_dir / 'commondir', objects / 'info/alternates')
+    if (workspace.resolve() != workspace or git_dir.is_symlink() or objects.is_symlink() or
+            not git_dir.is_dir() or not objects.is_dir() or
+            any(path.exists() or path.is_symlink() for path in aliases) or
+            any(path.is_symlink() for path in objects.rglob('*'))):
+        raise ValueError("Git citations need the named role's native repository. "
+                         'Remove Git aliases or cite the peer as ROLE:path@commit.')
+
+
+def snapshot_reference(workspace, path, destination, source_owner=None, run=subprocess.run):
+    """Save only the named bytes in the caller's Git objects without staging files."""
+    from .workspace_io import open_file
     p = PurePosixPath(path)
-    if not path or p.is_absolute() or '..' in p.parts or p.as_posix() != path or '\x00' in path:
-        raise ValueError('Evidence path must be a normalized workspace-relative file path')
-    target = workspace / path
-    if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(workspace):
-        raise ValueError('Reference must name an existing workspace file, or use unknown with a reason')
+    if (not path or not p.parts or p.is_absolute() or '..' in p.parts or p.as_posix() != path or
+            '\x00' in path or '.git' in p.parts or p.parts[0] == 'sessions'):
+        raise ValueError('Evidence must name a normalized business file inside the workspace')
+    native_repository(destination)
+    native_repository(workspace)
     ignored = run(['git', '-C', str(workspace), 'check-ignore', '-q', '--', path],
-                             capture_output=True, timeout=10)
+                  capture_output=True, timeout=10)
     if ignored.returncode == 0:
-        raise ValueError('File is ignored by Git and never committed; use unknown with a reason')
-    # Bound silently to that week's closing commit; later edits in the week are included.
-    return dict(path=path, commit=label)
+        raise ValueError('File is ignored by Git; save it at a tracked path or use unknown with a reason')
+    if ignored.returncode != 1:
+        raise ValueError('Cannot check the source repository; no declaration was registered')
+    try:
+        with open_file(workspace, workspace / path) as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read()
+            after = os.fstat(stream.fileno())
+    except OSError as exc:
+        raise ValueError('Reference must name an existing regular workspace file, or use unknown with a reason') from exc
+    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError('File changed while being snapshotted; retry after its writer finishes')
+
+    def git(*args, data=None):
+        result = run(['git', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null',
+                      '-c', 'user.name=CEO Bench', '-c', 'user.email=ceobench@localhost',
+                      '-c', 'commit.gpgsign=false', '-C', str(destination), *args],
+                     input=data, capture_output=True, timeout=10)
+        if result.returncode:
+            raise ValueError('Could not save the named file snapshot; no declaration was registered')
+        return result.stdout.decode().strip()
+
+    blob = git('hash-object', '-w', '--stdin', data=raw)
+    mode = '100755' if before.st_mode & 0o111 else '100644'
+    entry = f'{mode} blob {blob}\t{p.name}\0'.encode()
+    tree = git('mktree', '-z', data=entry)
+    for part in reversed(p.parts[:-1]):
+        tree = git('mktree', '-z', data=f'040000 tree {tree}\t{part}\0'.encode())
+    source = (source_owner + ':' if source_owner else '') + path
+    commit = git('commit-tree', tree, data=('Registered file snapshot of ' + source + '\n').encode())
+    return dict(path=path, commit=commit), commit
+
+
+def retain_snapshot(workspace, commit, run=subprocess.run):
+    result = run(['git', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-C', str(workspace), 'update-ref', '--no-deref',
+                  'refs/ceobench/snapshots/' + commit, commit], capture_output=True, timeout=10)
+    if result.returncode:
+        raise ValueError('Could not retain the file snapshot; no declaration was registered')
 
 
 def json_spans(text):

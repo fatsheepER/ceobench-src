@@ -596,9 +596,6 @@ __pycache__/
                 f"Week {self._last_committed_week} (day {wd})",
                 once_key=f"week-{self._last_committed_week}",
             )
-            registry = getattr(getattr(self, 'tool_executor', None), 'text_registry', None)
-            if registry:
-                registry.finalize_week(f'week-{self._last_committed_week}')
 
     def _initialize_from_public_repo(self):
         """Copy the published layout into the agent workspace and create a session.
@@ -916,8 +913,6 @@ __pycache__/
         from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
         from saas_bench.db_protection import encrypt_plain_atomic
         self._wait_checkpoint()  # At most one immutable generation is being processed.
-        if self.tool_executor.text_registry:
-            self.tool_executor.text_registry.assert_week_finalized(day)
         started = _time.monotonic()
         if self.agent and self.agent._pending_tool_calls:
             raise RuntimeError('Cannot checkpoint a tool with an unknown outcome')
