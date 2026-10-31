@@ -19,7 +19,7 @@ from saas_bench import team_batch as batch, systemd_guard
 from saas_bench.run_lifecycle import RunCancelled
 sys.path.insert(0, str(batch.ROOT / 'tests'))
 from test_preflight_team_checkpoint import fast_simulator
-from test_preflight_team_flow import ADVANCE, calls, completion, final
+from test_preflight_team_flow import ADVANCE, calls, completion, final, opening_response
 sys.path.insert(0, str(batch.ROOT / 'scripts'))
 import team_controller, team_observer
 
@@ -74,6 +74,8 @@ checked = batch.checked_client
 def client(role, session, **kwargs):
     def respond(request):
         body = json.loads(request.content)
+        if opening := opening_response(role, body):
+            return opening
         run = sys.argv[sys.argv.index('--worker') + 1]
         policy = Path(sys.argv[sys.argv.index('--policy') + 1])
         manifest = batch.read(batch.read(policy)['identity']['manifest'])

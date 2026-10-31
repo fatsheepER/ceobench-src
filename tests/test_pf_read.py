@@ -431,13 +431,11 @@ def test_agent_snapshot_restore_pruning_and_new_week(workspace, tmp_path):
     wires = []
     def handle(request):
         wires.append(json.loads(request.content))
-        body = reply('chat')
-        body['choices'][0]['message']['tool_calls'] = [dict(id='call', type='function',
-            function=dict(name='pf_read', arguments='{"target":{"path":"facts.txt"}}'))]
-        return httpx.Response(200, json=body)
+        return httpx.Response(200, json=reply('chat'))
     client = OpenAI(api_key='offline', max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
     def agent():
         value = BashAgent(get_bash_agent_tool_descriptions(True, True), client, workspace_path=workspace,
+            allow_final_text=True,
             usage_recorder=ModelUsage(None, 'agent', evidence_store=store, token_counter=Counter()))
         value._snapshot_path = workspace / 'conversation.json'
         value.current_day = 0

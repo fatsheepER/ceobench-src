@@ -135,23 +135,28 @@ c.close()
 print('SCRIPT-CLIENT-EXITED')
 '''
         assert raw(team, 'growth', '/daily-scripts', {'name': 'late.py', 'content': program})[0] == 200
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                running = pool.submit(team.server._run_daily_scripts_internal, 'growth')
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = pool.submit(team.server._run_daily_scripts_internal, 'growth')
+            try:
                 assert entered.wait(10)
-                output = running.result(timeout=10)
-                assert 'SCRIPT-CLIENT-EXITED' in output['late.py']
+                wait_until(lambda: team.server.role_script_results['growth'])
+                script = team.server.role_script_results['growth'][0]
+                assert script['facts']['boundary_closed'] is True
+                assert b'SCRIPT-CLIENT-EXITED' in (Path(script['evidence']) / 'stdout.bin').read_bytes()
                 assert team.server.role_executors['growth'].registered_execution is False
+                assert not running.done()
+            finally:
                 release.set()
-        finally:
-            release.set()
+            output = running.result(timeout=10)
+            assert 'SCRIPT-CLIENT-EXITED' in output['late.py']
         wait_until(lambda: not team.server.public_request_state()['active'])
         assert raw(team, 'growth', '/call', {'tool': 'set_capacity_tier', 'args': {'tier': 4}, 'initiator': 'registered_script'})[0] == 200
         rows = records(team)
         assert [(r['actor'], r['initiator'], r['outcome']) for r in rows] == [
             ('growth', 'registered_script', 'succeeded'), ('growth', 'model', 'succeeded')]
         assert query(team, 'SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1')[0]['capacity_tier'] == 4
-        sample('script-late-' + mode, {'operations': rows, 'effects': effects(team), 'script_output': str(output['late.py'])})
+        sample('script-late-' + mode, {'operations': rows, 'effects': effects(team),
+            'script_output': str(output['late.py']), 'script_execution': script})
 
 
 @pytest.mark.parametrize('mode', ('git', 'pf'))
