@@ -69,6 +69,7 @@ def test_failed_group_holds_once_and_only_manual_invocation_restarts(observer, c
 
 @pytest.mark.parametrize('failure,requests', [('network', 5), ('invalid_reply', 4), ('invalid_arguments', 4)])
 def test_real_model_failure_writes_hold_without_creating_another_attempt(frozen, tmp_path, monkeypatch, failure, requests):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '5')
     path = changed_manifest(frozen, tmp_path, lambda manifest: None)
     entry = next(row for row in batch.read(path)['runs'] if row['group'] == 'git')
     sent, delays = [], []

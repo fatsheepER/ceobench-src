@@ -61,7 +61,7 @@ OPTIONS = {
     'analyst_bash_timeout': ('CEOBENCH_ANALYST_BASH_TIMEOUT_SECONDS', positive_number, 'Analyst Bash timeout, default 480 seconds'),
     'analyst_bash_warn_after': ('CEOBENCH_ANALYST_BASH_WARN_AFTER_SECONDS', nonnegative_number, 'Analyst Bash timing notice, default 120 seconds'),
     'bash_memory_max': ('CEOBENCH_BASH_MEMORY_MAX_BYTES', bash_memory_bytes, 'Bash address space, default 8G; unlimited disables this limit'),
-    'model_request_attempts': ('CEOBENCH_MODEL_REQUEST_ATTEMPTS', nonnegative_integer, 'Network attempts per logical request, default 5; 0 is unlimited'),
+    'model_request_attempts': ('CEOBENCH_MODEL_REQUEST_ATTEMPTS', nonnegative_integer, 'Network attempts per logical request, default 0 (unlimited)'),
     'model_retry_delays': ('CEOBENCH_MODEL_RETRY_DELAYS', retry_delays, 'Retry seconds, default 10,20,40,80; the last interval repeats'),
     'model_attempt_seconds': ('CEOBENCH_MODEL_ATTEMPT_SECONDS', nonnegative_number, 'First response byte wait, default 600 seconds; 0 is unlimited'),
     'invalid_generation_attempts': ('CEOBENCH_INVALID_GENERATION_ATTEMPTS', nonnegative_integer, 'Invalid generations per act, default 4; 0 is unlimited'),
@@ -88,7 +88,7 @@ OPTIONS = {
 
 DEFAULTS = dict(ceo_bash_timeout=1200, ceo_bash_warn_after=0,
     analyst_bash_timeout=480, analyst_bash_warn_after=120, bash_memory_max=8 * 1024**3,
-    model_request_attempts=5, model_retry_delays='10,20,40,80', model_attempt_seconds=600,
+    model_request_attempts=0, model_retry_delays='10,20,40,80', model_attempt_seconds=600,
     invalid_generation_attempts=4, advance_timeout=0, advance_warn_after=600,
     public_python_timeout=1800, pf_timeout=600, sql_timeout=600, sql_response_timeout=120,
     checkpoint_wait=600, completion_wait=30, sql_row_limit=20000, sql_column_limit=512,

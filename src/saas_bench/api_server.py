@@ -951,22 +951,15 @@ class _TrackedHTTPServer(ThreadingHTTPServer):
 
 
 def registered_script_classification(facts, error=None):
-    import errno
-    boundary = facts.get('process_boundary') or {}
-    resource_errno = {errno.ENOSPC, errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.EDQUOT}
-    if (facts.get('error_errno') in resource_errno or boundary.get('spawn_errno') in resource_errno or
-            facts.get('timed_out') or facts.get('cancelled') or
-            facts.get('exit_code') == -9 or boundary.get('exit_code') == -9):
-        return 'transient_infrastructure'
-    if facts.get('process_started') is False or facts.get('target_started') is not True and not error:
-        return 'transient_infrastructure'
-    if facts.get('boundary_closed') is not True or error:
+    if facts.get('boundary_closed') is not True:
         return 'unknown'
     if facts.get('target_started') is not True:
-        return 'transient_infrastructure'
-    if facts.get('exit_code') == 0:
+        return 'script_error'
+    if facts.get('exit_code') is None:
+        return 'unknown'
+    if facts.get('exit_code') == 0 and not error and not facts.get('timed_out'):
         return 'succeeded'
-    return 'script_error' if facts.get('exit_code') is not None else 'unknown'
+    return 'script_error'
 
 
 class _UnixHTTPServer(_TrackedHTTPServer):
@@ -1328,12 +1321,20 @@ class NovaMindAPIServer:
                                         business_operation=business_operation)
             if result.get('error') == 'prediction_save_failed':
                 with self._lock:
-                    if business_operation is not None:
-                        if business_operation.commit_failed:
-                            self._operation_failed = True
+                    if result.get('prediction_transaction') not in ('not_started', 'rolled_back'):
+                        self._operation_failed = True
+                        if business_operation is not None:
                             business_operation.finish(unknown=True)
-                        else:
+                    else:
+                        outcome = dict(status='failed', old_day=old_day, target_day=old_day + 7,
+                            reached_day=old_day, last_completed_day=old_day, progression='not_advanced',
+                            error='prediction_save_failed', prediction_transaction=result['prediction_transaction'])
+                        result = dict(result, advance=outcome)
+                        if business_operation is not None:
                             business_operation.finish(result)
+                        if on_settled:
+                            on_settled(outcome)
+                        self._advance_outcome = outcome
                 return result
             if self._advance_outcome is None and result.get('error') != 'step_week_timeout':
                 self._operation_failed = True
@@ -1397,10 +1398,12 @@ class NovaMindAPIServer:
         # Persist predictions before stepping the world (so submit_day reflects
         # the day the prediction was made, not the post-step day).
         if predictions and self.conn is None:
-            return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
+            return dict(success=False, error='prediction_save_failed', day=old_day,
+                        prediction_transaction='not_started')
         if predictions and self.conn is not None:
             from saas_bench.database import save_predictions as _save_predictions
             _pred_exc_tb = None
+            prediction_transaction = 'unknown'
             try:
                 with self._lock:
                     from contextlib import nullcontext
@@ -1411,11 +1414,18 @@ class NovaMindAPIServer:
                             _save_predictions(connection, old_day, predictions, _time.time())
                             connection.commit()
                         except Exception:
+                            import traceback
+                            _pred_exc_tb = traceback.format_exc()
                             if connection.in_transaction:
                                 connection.rollback()
+                                if connection.in_transaction:
+                                    raise RuntimeError('Prediction rollback left a transaction open')
                                 if business_operation is not None:
                                     business_operation.commit_failed = False
-                            raise
+                            else:
+                                raise
+                    if _pred_exc_tb is not None:
+                        prediction_transaction = 'rolled_back'
             except Exception:
                 import traceback
                 _pred_exc_tb = traceback.format_exc()
@@ -1423,7 +1433,8 @@ class NovaMindAPIServer:
                 # Log AFTER releasing the lock so a buffered stderr write can't
                 # back-pressure the lock holder. (run 27c000a5 d105 hang.)
                 print(_pred_exc_tb, file=sys.stderr, flush=True)
-                return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
+                return dict(success=False, error='prediction_save_failed', day=old_day,
+                            prediction_transaction=prediction_transaction)
 
         # Run step_week in a worker thread so we can enforce a timeout.
         _step_start = _time.monotonic()
@@ -1651,6 +1662,9 @@ class NovaMindAPIServer:
                     facts.update(error_type=type(failure).__name__, error_errno=getattr(failure, 'errno', None))
                 raw_stdout, raw_stderr = executor._raw_streams
                 classification = registered_script_classification(facts, failure)
+                if self._operation_failed or self._step_day_timed_out:
+                    classification = 'unknown'
+                    facts['business_operation_unknown'] = True
                 if executor.evidence_store and executor.evidence_store.fault:
                     classification = 'unknown'
                     facts['capture_fault'] = executor.evidence_store.fault
@@ -1667,8 +1681,10 @@ class NovaMindAPIServer:
                 if audit:
                     audit.record('registered_script_execution', **record)
             results[name] = output
-            if self.team_mode and classification in ('transient_infrastructure', 'unknown'):
+            if self.team_mode and classification == 'unknown':
                 break
+            if self.team_mode and self.team_phase is not None and self.script_check:
+                self.script_check()
         if executor.evidence_store:
             executor.evidence_store.assert_healthy(quiescent=False)
         return results

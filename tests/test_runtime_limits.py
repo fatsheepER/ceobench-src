@@ -55,6 +55,7 @@ def test_runtime_environment_snapshot_keeps_defaults_and_explicit_values(monkeyp
     assert saved['CEOBENCH_ANALYST_BASH_TIMEOUT_SECONDS'] == '480.0'
     assert saved['CEOBENCH_SQL_ROW_LIMIT'] == '17'
     assert saved['CEOBENCH_MODEL_RETRY_DELAYS'] == '10,20,40,80'
+    assert saved['CEOBENCH_MODEL_REQUEST_ATTEMPTS'] == '0'
     assert 'CEOBENCH_MODEL_MAX_OUTPUT_TOKENS' not in saved
 
 
@@ -136,12 +137,17 @@ def test_truncated_bash_search_and_glob_keep_readable_full_outputs(tmp_path, mon
     assert (tmp_path / path).read_text().splitlines() == ['candidate-0', 'candidate-1', 'candidate-2']
 
 
-def test_public_python_timeout_is_configurable(monkeypatch, tmp_path):
+def test_public_python_timeout_is_configurable(monkeypatch, tmp_path, capsys):
     from saas_bench import _public_cli
     monkeypatch.setattr(_public_cli, '_base_dir', lambda: tmp_path)
     monkeypatch.setenv('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '.05')
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(SystemExit) as failed:
         _public_cli._execute_python('__env__', 1, 'import time; time.sleep(1)')
+    assert failed.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'timed out after 0.05 seconds (TimeoutExpired)' in captured.err
+    assert 'Output is partial.' in captured.err
     monkeypatch.setenv('CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '0')
     with pytest.raises(SystemExit) as result:
         _public_cli._execute_python('__env__', 1, 'print("completed")')

@@ -303,6 +303,7 @@ def test_model_usage_pause_and_provider_error_are_visible_without_hold(observer,
 
 @pytest.mark.parametrize('recover', [True, False])
 def test_real_harness_transport_retry_uses_five_requests_without_hold(observer, monkeypatch, recover):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '5')
     path = observer.log(role='pf')
     requests, waits = [], []
 

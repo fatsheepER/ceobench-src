@@ -118,6 +118,7 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
     role.agent.client.close()
     role.agent.client = batch.checked_client('ceo', 'pending-write-test', transport=httpx.MockTransport(transport))
     role.usage.attach(role.agent.client)
+    team._rotate_sessions()
     team._stage = 'ceo'
     team._week = dict(observation='Offline pending-write check.', ceo_started=False)
     team._set_phase('ceo')
@@ -210,6 +211,7 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
     role = team.roles['ceo']
     role.agent.client.close()
     role.agent.client = role.usage.attach(batch.checked_client('ceo', 'confirmed-write-test', transport=httpx.MockTransport(transport)))
+    team._rotate_sessions()
     team._stage = 'ceo'
     team._week = dict(observation='Offline late-write check.', ceo_started=False)
     team._set_phase('ceo')

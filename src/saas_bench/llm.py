@@ -9,7 +9,9 @@ from openai import OpenAI
 
 from .config import BenchmarkConfig
 from .database import add_api_cost, get_total_api_cost
-from .model_usage import ModelUsage
+from .model_usage import InvalidModelResponse, ModelUsage, usage_values
+from .run_lifecycle import RunCancelled
+from .runtime_options import runtime_value
 
 
 # Default AGENT.md content (can be overridden by loading from file)
@@ -233,10 +235,20 @@ class AgentLLM:
         self.agent_md_content = self._load_agent_md(agent_md_path)
 
     def _request(self, input_items, tools, day):
-        request = dict(model=self.model, input=input_items, tools=tools,
+        request = dict(model=self.model, input=list(input_items), tools=tools,
                        reasoning={"effort": self.reasoning_effort, "summary": "detailed"})
-        return self.usage_recorder.call('responses', request,
-            lambda: self.client.responses.create(**request), day=day)
+        limit = runtime_value('invalid_generation_attempts', 4)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self.usage_recorder.call('responses', request,
+                    lambda: self.client.responses.create(**request), day=day, outer_attempt=attempt)
+            except InvalidModelResponse as exc:
+                if limit and attempt >= limit:
+                    raise RunCancelled('model_attempt_limit',
+                        f'No valid reply after {attempt} model requests. Last invalid generation: {exc}') from exc
+                request['input'].append(dict(role='user', content=exc.feedback))
 
     def _load_agent_md(self, agent_md_path: Optional[Path] = None) -> str:
         """Load AGENT.md content from file or use default."""
@@ -246,6 +258,8 @@ class AgentLLM:
 
     def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """Calculate cost for GPT-5.2."""
+        if input_tokens is None or output_tokens is None:
+            return None
         input_cost = input_tokens * self.config.gpt52_medium_input_cost_per_1k / 1000
         output_cost = output_tokens * self.config.gpt52_medium_output_cost_per_1k / 1000
         return input_cost + output_cost
@@ -332,8 +346,8 @@ What actions will you take today?"""
             tools, day,
         )
 
-        input_tokens = response.usage.input_tokens
-        output_tokens = response.usage.output_tokens
+        usage = usage_values(response, 'responses')
+        input_tokens, output_tokens = usage['input_tokens'], usage['output_tokens']
         cost = self._calculate_cost(input_tokens, output_tokens)
 
         self.cost_tracker.record_cost(
@@ -379,8 +393,8 @@ What actions will you take today?"""
 
         response = self._request(input_items, tools, day)
 
-        input_tokens = response.usage.input_tokens
-        output_tokens = response.usage.output_tokens
+        usage = usage_values(response, 'responses')
+        input_tokens, output_tokens = usage['input_tokens'], usage['output_tokens']
         cost = self._calculate_cost(input_tokens, output_tokens)
 
         self.cost_tracker.record_cost(
@@ -478,8 +492,8 @@ What actions will you take today?"""
             {"role": "user", "content": user_prompt}
         ]
 
-        input_tokens = response.usage.input_tokens
-        output_tokens = response.usage.output_tokens
+        usage = usage_values(response, 'responses')
+        input_tokens, output_tokens = usage['input_tokens'], usage['output_tokens']
         cost = self._calculate_cost(input_tokens, output_tokens)
 
         self.cost_tracker.record_cost(

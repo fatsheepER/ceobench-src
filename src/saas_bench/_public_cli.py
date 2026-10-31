@@ -343,14 +343,20 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
         raise
     script_end(captured, result.stdout, result.stderr, result.returncode,
                'timeout' if timeout_error is not None else None)
+    for name, raw, target in (('stdout', result.stdout, sys.stdout), ('stderr', result.stderr, sys.stderr)):
+        if not raw:
+            continue
+        try:
+            rendered = decode_output(raw)
+            rendered.encode(target.encoding or 'utf-8')
+        except UnicodeError:
+            rendered = repr(raw)
+            print(f'[Python output rendering error: {name} could not be decoded or encoded; '
+                  'escaped raw bytes shown.]', file=sys.stderr, flush=True)
+        print(rendered, end="", file=target, flush=True)
     if timeout_error is not None:
-        raise timeout_error
-    result.stdout, result.stderr = decode_output(result.stdout), decode_output(result.stderr)
-
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
+        print(f'\n[Python script unfinished: timed out after {script_timeout} seconds '
+              '(TimeoutExpired). Output is partial.]', file=sys.stderr, flush=True)
 
     _log_history(session_id, {
         "type": "python_exec",
@@ -360,7 +366,7 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
         "timestamp": time.time(),
     })
 
-    sys.exit(result.returncode)
+    sys.exit(1 if timeout_error is not None else result.returncode)
 
 
 @observed

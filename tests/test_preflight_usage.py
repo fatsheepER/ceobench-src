@@ -9,7 +9,7 @@ from openai import OpenAI
 from saas_bench.config import BenchmarkConfig
 from saas_bench.customer_llm import CustomerSimulator
 from saas_bench.database import init_database
-from saas_bench.model_usage import FIELDS, ModelUsage, cost_usd, usage_values
+from saas_bench.model_usage import FIELDS, InvalidModelResponse, ModelUsage, cost_usd, usage_values
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
@@ -140,7 +140,7 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     from saas_bench.sql_evidence import SQLEvidenceStore
     from test_sql_evidence import identity, event_ids
     store = SQLEvidenceStore(tmp_path / 'private.sqlite', identity(capture_scope='execution')) if capture else None
-    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent', evidence_store=store)
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent', evidence_store=store, model_request_attempts=5)
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     client = recorder.attach(Anthropic(api_key='test-secret', max_retries=1,
                                       http_client=httpx.Client(transport=httpx.MockTransport(handle))))
@@ -302,24 +302,24 @@ def test_go_malformed_stream_preserves_partial_tools_and_retries_transport_trunc
     agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='instructions',
                       workspace_path=tmp_path, usage_recorder=recorder, response_callback=lambda **kwargs: responses.append(kwargs))
     truncated = fault in ('missing_done', 'missing_both')
+    action = agent.act('dashboard', 0, False, {'day': 7})
+    assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
+    assert len(requests) == 2 and len(responses) == 1
     if truncated:
-        action = agent.act('dashboard', 0, False, {'day': 7})
-        assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
-        assert len(requests) == 2 and requests[0] == requests[1]
-        assert len(responses) == 1
+        assert requests[0] == requests[1]
     else:
-        with pytest.raises(RunCancelled, match='model_request_failed'):
-            agent.act('dashboard', 0, False, {'day': 7})
-        assert not agent._pending_tool_calls
-        assert len(requests) == 1
-        assert not responses and len(agent.conversation) == 2
-    assert recorder.summary['calls'] == 1
-    assert recorder.summary['errors'] == recorder.summary['missing_cost'] == int(not truncated)
-    assert recorder.summary['known']['input_tokens'] == (10 if truncated else None)
-    assert recorder.summary['missing']['input_tokens'] == int(not truncated)
+        assert requests[0] != requests[1]
+        assert 'previous response was invalid' in requests[1]['messages'][-1]['content']
+    assert recorder.summary['calls'] == (1 if truncated else 2)
+    assert recorder.summary['errors'] == int(not truncated)
+    assert recorder.summary['missing_cost'] == 0
+    assert recorder.summary['known']['input_tokens'] == (10 if truncated else 20)
+    assert recorder.summary['missing']['input_tokens'] == 0
     entries = [json.loads(line) for line in recorder.path.read_text().splitlines()]
     logical = [row for row in entries if row['event'] == 'response']
-    assert len(logical) == 1 and logical[0]['error'] == (None if truncated else 'RunCancelled')
+    assert len(logical) == (1 if truncated else 2)
+    assert logical[0]['error'] == (None if truncated else 'InvalidModelResponse')
+    assert logical[-1]['error'] is None
     first_http = next(row for row in entries if row['event'] == 'http_response')
     assert first_http['body'] == payloads[0]
     done = fault not in ('missing_done', 'missing_both')
@@ -330,6 +330,7 @@ def test_go_malformed_stream_preserves_partial_tools_and_retries_transport_trunc
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
 @pytest.mark.parametrize('fault', ['connection', 'no_tool', 'status'])
 def test_model_regeneration_or_transport_uses_its_shared_budget(tmp_path, monkeypatch, api, fault):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '5')
     from saas_bench.agents.bash_agent.agent import BashAgent
     from saas_bench.run_lifecycle import RunCancelled
     monkeypatch.setattr('time.sleep', lambda _: None)
@@ -449,9 +450,9 @@ def test_malformed_response_is_recorded_before_returning(tmp_path, monkeypatch, 
     monkeypatch.setattr(recorder.lifecycle, 'sleep', lambda _: None)
     malformed = reply(api)
     malformed[field] = None
-    with pytest.raises(RunCancelled, match='model_request_failed') as error:
+    with pytest.raises(InvalidModelResponse, match=field) as error:
         recorder.call(api, {}, lambda: malformed)
-    assert field in str(error.value.__cause__)
+    assert error.value.response == malformed
     assert recorder.summary['errors'] == 1
     assert recorder.summary['known']['input_tokens'] == 10
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] == malformed

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
-from ...model_usage import ModelUsage, physical_usage_summary, plain, usage_values
+from ...model_usage import InvalidModelResponse, ModelUsage, physical_usage_summary, plain, usage_values
 from ...run_lifecycle import RunCancelled
 from ...runtime_options import nonnegative_integer, positive_integer, runtime_value
 
@@ -50,7 +50,7 @@ _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day
 
 def _stream_chat_completion(client, request, check=lambda: None):
     import httpx
-    from openai import APIConnectionError, LengthFinishReasonError
+    from openai import LengthFinishReasonError
     from openai.lib.streaming.chat import ChatCompletionStreamState
     from openai.types.chat import ChatCompletionChunk
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCallFunction
@@ -58,12 +58,36 @@ def _stream_chat_completion(client, request, check=lambda: None):
 
     state = ChatCompletionStreamState()
     received = False
+    invalid = None
+    raw = dict(stream=[], model=None, usage=None)
     with client.chat.completions.create(**request) as stream:
-        try:
-            for chunk in stream:
-                check()
-                chunk = ChatCompletionChunk.model_validate(
-                    chunk.model_dump(exclude_unset=True, warnings=False), strict=True)
+        done = False
+        # Decode events here so a malformed event cannot close the SDK iterator
+        # before the transport's completion marker has been checked.
+        events = stream._iter_events()
+        for event in events:
+            check()
+            if event.data == '[DONE]':
+                done = True
+                break
+            raw['stream'].append(event.data)
+            try:
+                data = event.json()
+            except json.JSONDecodeError as exc:
+                invalid = invalid or str(exc)
+                continue
+            if isinstance(data, dict):
+                if data.get('error'):
+                    raise ValueError('Provider error: ' + json.dumps(data['error'], ensure_ascii=False))
+                raw['model'] = data.get('model', raw['model'])
+                if data.get('usage') is not None:
+                    raw['usage'] = data['usage']
+            try:
+                chunk = ChatCompletionChunk.model_validate(data, strict=True)
+            except ValidationError as exc:
+                invalid = invalid or str(exc)
+                continue
+            if invalid is None:
                 received = True
                 for choice in chunk.choices:
                     for tool in choice.delta.tool_calls or []:
@@ -76,20 +100,27 @@ def _stream_chat_completion(client, request, check=lambda: None):
                         for field in ('name', 'arguments'):
                             if getattr(tool.function, field) is None:
                                 tool.function.model_fields_set.discard(field)
-                state.handle_chunk(chunk)
+                try:
+                    state.handle_chunk(chunk)
+                except (IndexError, KeyError, TypeError, ValueError) as exc:
+                    invalid = str(exc)
+        if not done:
+            raise httpx.RemoteProtocolError('Chat completion stream ended before [DONE]')
+        if invalid is None:
             if not received:
-                raise ValueError('Chat completion stream ended without an assistant chunk')
-            snapshot = state.current_completion_snapshot
-            if not snapshot.choices or any(not choice.finish_reason for choice in snapshot.choices):
-                raise ValueError('Chat completion stream ended without finish_reason')
-            for choice in snapshot.choices:
-                for tool in choice.message.tool_calls or []:
-                    if (not isinstance(tool.id, str) or not tool.id.strip() or tool.type != 'function'
-                            or tool.function is None or not isinstance(tool.function.name, str)
-                            or not tool.function.name.strip()):
-                        raise ValueError('Chat completion stream ended with incomplete tool metadata')
-        except (httpx.TransportError, json.JSONDecodeError, ValidationError) as exc:
-            raise APIConnectionError(message=str(exc), request=stream.response.request) from exc
+                invalid = 'Chat completion stream ended without an assistant chunk'
+            else:
+                snapshot = state.current_completion_snapshot
+                if not snapshot.choices or any(not choice.finish_reason for choice in snapshot.choices):
+                    invalid = 'Chat completion stream ended without finish_reason'
+                for choice in snapshot.choices:
+                    for tool in choice.message.tool_calls or []:
+                        if (not isinstance(tool.id, str) or not tool.id.strip() or tool.type != 'function'
+                                or tool.function is None or not isinstance(tool.function.name, str)
+                                or not tool.function.name.strip()):
+                            invalid = 'Chat completion stream ended with incomplete tool metadata'
+        if invalid is not None:
+            raise InvalidModelResponse(invalid, api='chat', response=raw, phase='stream_schema')
         try:
             return state.get_final_completion()
         except LengthFinishReasonError as exc:
@@ -880,6 +911,9 @@ class BashAgent(BaseAgent):
                     arguments=json.loads(tc.function.arguments or '{}')) for tc in assistant_msg.tool_calls]
                 return self.next_tool_action()
 
+            except InvalidModelResponse as exc:
+                self._record_invalid_generation(exc.phase, exc.response, exc.feedback)
+                continue
             except Exception as e:
                 if self.evidence_store:
                     self.evidence_store.assert_healthy(quiescent=False)
@@ -1054,6 +1088,9 @@ class BashAgent(BaseAgent):
                     arguments=json.loads(fc.arguments or '{}')) for fc in function_calls]
                 return self.next_tool_action()
 
+            except InvalidModelResponse as exc:
+                self._record_invalid_generation(exc.phase, exc.response, exc.feedback)
+                continue
             except Exception as e:
                 if self.evidence_store:
                     self.evidence_store.assert_healthy(quiescent=False)
@@ -1356,6 +1393,9 @@ class BashAgent(BaseAgent):
                     arguments=block.input or {}) for block in tool_use_blocks]
                 return self.next_tool_action()
 
+            except InvalidModelResponse as exc:
+                self._record_invalid_generation(exc.phase, exc.response, exc.feedback)
+                continue
             except Exception as e:
                 if self.evidence_store:
                     self.evidence_store.assert_healthy(quiescent=False)

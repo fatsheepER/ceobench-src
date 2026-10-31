@@ -23,6 +23,92 @@ from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
 
 
+@pytest.mark.parametrize('actor,provider,api', [
+    ('agent', 'deepseek', 'chat'), ('agent', 'openai', 'responses'),
+    ('agent', 'anthropic', 'messages'), ('simulator', 'deepseek', 'chat'),
+    ('simulator', 'opencode', 'chat'), ('simulator', 'openai', 'responses'),
+    ('simulator', 'anthropic', 'messages'), ('simulator', 'bedrock', 'messages'),
+    ('legacy', 'openai', 'responses')])
+@pytest.mark.parametrize('mode', ['corrected', 'exhausted', 'invalid_json', 'nested', 'empty'])
+def test_successful_malformed_reply_uses_bounded_model_correction(tmp_path, monkeypatch, actor, provider, api, mode):
+    from saas_bench.agents.bash_agent.agent import FinalText
+    requests, waits = [], []
+    monkeypatch.setenv('CEOBENCH_INVALID_GENERATION_ATTEMPTS', '4')
+    monkeypatch.setenv('CEOBENCH_SIMULATOR_USAGE_LOG', str(tmp_path / 'usage.jsonl'))
+    def respond(request):
+        requests.append(json.loads(request.content))
+        assert len(requests) <= 5
+        if len(requests) <= (4 if mode == 'exhausted' else 1):
+            if mode == 'invalid_json':
+                return httpx.Response(200, headers={'content-type': 'application/json'}, content=b'{broken')
+            malformed = reply(api, usage=False)
+            if mode == 'empty':
+                malformed[dict(chat='choices', responses='output', messages='content')[api]] = []
+            elif mode == 'nested':
+                if api == 'chat':
+                    malformed['choices'][0]['message']['content'] = ['invalid text']
+                elif api == 'responses':
+                    malformed['output'][0]['content'] = None
+                else:
+                    malformed['content'] = [{}]
+            else:
+                malformed[dict(chat='choices', responses='output', messages='content')[api]] = None
+            return httpx.Response(200, json=malformed)
+        return httpx.Response(200, json=reply(api, usage=False))
+    http = httpx.Client(transport=httpx.MockTransport(respond))
+    client = (AnthropicBedrock(aws_access_key='offline', aws_secret_key='offline', aws_region='us-east-2',
+        http_client=http, max_retries=2) if provider == 'bedrock' else
+        (Anthropic if api == 'messages' else OpenAI)(api_key='offline', http_client=http, max_retries=2))
+    conn = init_database(':memory:')
+    config = BenchmarkConfig(agent_llm_model='test-model')
+    if actor == 'simulator':
+        target = CustomerSimulator(client if api != 'messages' else None, conn, config)
+        if api == 'messages':
+            setattr(target, '_bedrock_client' if provider == 'bedrock' else '_anthropic_client',
+                    target.usage_recorder.attach(client))
+        invoke = lambda: target.complete_text(provider=provider, model='test-model', user='original task', max_tokens=30)
+    elif actor == 'legacy':
+        target = AgentLLM(client, conn, config, CostTracker(conn, config))
+        target.usage_recorder.path = tmp_path / 'usage.jsonl'
+        invoke = lambda: target.get_action({'day': 0, 'cash': 1000}, [], 0)
+    else:
+        target = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model',
+            reasoning_effort='high' if api == 'responses' else None, max_output_tokens=30,
+            usage_recorder=ModelUsage(tmp_path / 'usage.jsonl', 'ceo'), workspace_path=tmp_path,
+            allow_final_text=True)
+        invoke = lambda: target.act('original task', 0, False, {'day': 0})
+    monkeypatch.setattr(target.usage_recorder.lifecycle, 'sleep', waits.append)
+    try:
+        if mode == 'exhausted':
+            with pytest.raises(RunCancelled, match='model_attempt_limit'):
+                invoke()
+            assert len(requests) == 4
+        else:
+            result = invoke()
+            assert len(requests) == 2
+            if actor == 'simulator':
+                assert result == ('hello', None, None)
+            elif actor == 'legacy':
+                assert result[0].output_text == 'hello' and result[1] is None
+            else:
+                assert result == FinalText('hello') and not target._pending_tool_calls
+        assert waits == [] and client.max_retries == 2
+        last_input = requests[1]['input' if api == 'responses' else 'messages'][-1]
+        assert 'previous' in json.dumps(last_input['content']).lower()
+        rows = [json.loads(line) for line in target.usage_recorder.path.read_text().splitlines()]
+        responses = [row for row in rows if row['event'] == 'response']
+        assert len(responses) == len(requests)
+        assert all(row['model_attempts'] == 1 for row in responses)
+        assert responses[0]['error'] == 'InvalidModelResponse'
+        assert all(value is None for value in target.usage_recorder.summary['known'].values())
+        if mode == 'exhausted':
+            invoke()
+            assert len(requests) == 5
+    finally:
+        client.close()
+        conn.close()
+
+
 @pytest.mark.parametrize('mode', ['corrected', 'exhausted', 'interrupted'])
 @pytest.mark.parametrize('arguments_key', ['extra_data', 'invalid_json', 'non_object', 'empty'])
 def test_completed_stream_invalid_arguments_use_generation_correction(tmp_path, monkeypatch, mode, arguments_key):
@@ -234,7 +320,7 @@ def test_customer_network_retries_preserve_request_and_sdk_policy(tmp_path, monk
     requests, waits = [], []
     def handle(request):
         requests.append(json.loads(request.content))
-        if len(requests) < 5:
+        if len(requests) < 7:
             raise httpx.ConnectError('temporary disconnect', request=request)
         return httpx.Response(200, json=reply(api))
     http = httpx.Client(transport=httpx.MockTransport(handle))
@@ -251,14 +337,14 @@ def test_customer_network_retries_preserve_request_and_sdk_policy(tmp_path, monk
     try:
         assert customer.complete_text(provider=provider, model='test-model', user='same user input',
             system='same system input', max_tokens=30) == ('hello', 10, 2)
-        assert len(requests) == 5 and all(request == requests[0] for request in requests)
-        assert waits == [10, 20, 40, 80] and client.max_retries == 2
+        assert len(requests) == 7 and all(request == requests[0] for request in requests)
+        assert waits == [10, 20, 40, 80, 80, 80] and client.max_retries == 2
         rows = [json.loads(line) for line in (tmp_path / 'usage.jsonl').read_text().splitlines()]
         assert len({row['call_id'] for row in rows}) == 1
         assert customer.usage_recorder.summary['calls'] == 1
-        assert customer.usage_recorder.summary['http_attempts'] == 5
-        assert customer.usage_recorder.summary['failed_http_attempts'] == 4
-        assert rows[-1]['error'] is None and rows[-1]['model_attempts'] == 5
+        assert customer.usage_recorder.summary['http_attempts'] == 7
+        assert customer.usage_recorder.summary['failed_http_attempts'] == 6
+        assert rows[-1]['error'] is None and rows[-1]['model_attempts'] == 7
     finally:
         client.close()
         conn.close()
@@ -267,8 +353,8 @@ def test_customer_network_retries_preserve_request_and_sdk_policy(tmp_path, monk
 @pytest.mark.parametrize('role', ['ceo', 'growth', 'ops_finance', 'simulator'])
 @pytest.mark.parametrize('error_type', [httpx.ConnectError, httpx.ReadTimeout, ssl.SSLError,
                                        socket.gaierror, ConnectionResetError])
-def test_all_roles_retry_network_errors_exactly_five_times(monkeypatch, role, error_type):
-    recorder, waits, requests = ModelUsage(None, role), [], []
+def test_explicit_finite_limit_stops_all_roles_after_five_attempts(monkeypatch, role, error_type):
+    recorder, waits, requests = ModelUsage(None, role, model_request_attempts=5), [], []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     def handle(request):
         requests.append(request)
@@ -299,7 +385,7 @@ def test_generic_sdk_connection_error_does_not_hide_a_nonnetwork_cause(cause):
 @pytest.mark.parametrize('status', [400, 401, 403, 408, 409, 429, 500, 503])
 def test_http_errors_retry_temporary_rejections_and_preserve_cause(monkeypatch, status):
     requests, waits = [], []
-    recorder = ModelUsage(None, 'ceo')
+    recorder = ModelUsage(None, 'ceo', model_request_attempts=5)
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     def handle(request):
         requests.append(request)
@@ -322,7 +408,7 @@ def test_http_errors_retry_temporary_rejections_and_preserve_cause(monkeypatch, 
 
 def test_each_silent_attempt_timeout_wakes_own_socket_without_cancelling_peer(monkeypatch):
     monkeypatch.setattr('saas_bench.model_usage.MODEL_ATTEMPT_SECONDS', .01)
-    recorder, waits, calls = ModelUsage(None, 'ceo'), [], []
+    recorder, waits, calls = ModelUsage(None, 'ceo', model_request_attempts=5), [], []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     def invoke():
         calls.append(1)
@@ -379,7 +465,7 @@ def test_sdk_watchdog_owns_response_and_reused_connection(monkeypatch, phase):
             assert not self.cancelled
             self.callback()
     monkeypatch.setattr('saas_bench.model_usage.threading.Timer', ManualTimer)
-    recorder, peer_recorder = ModelUsage(None, 'ceo'), ModelUsage(None, 'growth')
+    recorder, peer_recorder = ModelUsage(None, 'ceo', model_request_attempts=5), ModelUsage(None, 'growth')
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
     warm = phase != 'first_body'
     channel, remote = socket.socketpair()
@@ -443,14 +529,15 @@ def test_operator_cancellation_during_backoff_prevents_another_request(monkeypat
     assert calls == [1]
 
 
-def test_threaded_agent_retries_five_network_requests(monkeypatch):
+def test_threaded_agent_honors_explicit_five_request_limit(monkeypatch):
     failures, requests = [], []
     def handle(request):
         requests.append(request)
         raise httpx.ConnectError('offline', request=request)
     client = OpenAI(api_key='offline', max_retries=2,
         http_client=httpx.Client(transport=httpx.MockTransport(handle)))
-    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='same')
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, model='test-model', system_prompt='same',
+                      usage_recorder=ModelUsage(None, 'ceo', model_request_attempts=5))
     monkeypatch.setattr(agent.usage_recorder.lifecycle, 'sleep', lambda _: None)
     request = dict(model='test-model', messages=[{'role': 'user', 'content': 'same'}])
     def invoke():

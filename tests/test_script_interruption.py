@@ -121,13 +121,31 @@ def test_public_python_timeout_keeps_empty_or_undecodable_streams_healthy(captur
         'import sys\nsys.stdout.buffer.write(' + repr(stdout) + ')\nsys.stdout.flush()\nwhile True: pass\n')
     monkeypatch.setitem(executor.extra_env, 'CEOBENCH_PUBLIC_PYTHON_TIMEOUT_SECONDS', '.15')
     executor.bash_timeout, executor.bash_warn_after = 4, .1
-    output = executor.execute('bash', {'command': 'python driver.py 2>&1 | tail -12'})
-    assert 'TimeoutExpired' in output
-    child, = [row for row in records(store) if row['request']['kind'] == 'cli_python']
+    output = executor.execute('bash', {'command': 'python driver.py'})
+    assert 'Script execution unfinished' in output or 'Python script unfinished' in output
+    assert 'Output is partial' in output and '[exit code: 1]' in output
+    rows = records(store)
+    child, = [row for row in rows if row['request']['kind'] == 'cli_python']
     assert child['result']['error'] == 'timeout' and child['result']['exit_code'] == -9
     assert store.get_content(child['request']['event_id'] + ':stdout_bytes')[1] == stdout
+    bash = rows[0]
+    outer_stdout = store.get_content(bash['request']['event_id'] + ':stdout_bytes')[1]
+    outer_stderr = store.get_content(bash['request']['event_id'] + ':stderr_bytes')[1]
+    assert outer_stdout == (repr(stdout).encode() if stdout else b'')
+    assert b'Output is partial' in outer_stderr
+    if stdout:
+        assert "b'partial-out\\xff'" in output
+        assert b'Python output rendering error' in outer_stderr
+    assert bash['result']['boundary_closed'] is True
+    assert executor.preserved_process is None
     assert store.fault is None and not store.fault_path.exists()
     store.assert_healthy()
+    usage = ModelUsage(None, 'ops_finance', evidence_store=store)
+    with model_server() as (url, sent), usage.attach(OpenAI(api_key='offline', base_url=url, max_retries=0)) as client:
+        request = dict(model='test-model', messages=[dict(role='user', content=output)])
+        usage.call('chat', request, lambda: client.chat.completions.create(**request))
+        assert len(sent) == 1 and sent[0]['messages'][0]['content'] == output
+    assert executor.execute('bash', {'command': 'echo next-tool'}) == 'next-tool\n'
 
 
 def test_promised_script_output_corruption_still_blocks_model(captured, monkeypatch):

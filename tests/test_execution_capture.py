@@ -97,10 +97,10 @@ def shortened(self, *args, **kwargs):
 subprocess.Popen.communicate = shortened
 try:
     cli._execute_python('__env__', int(os.environ['NOVAMIND_API_PORT']), CODE, 'timeout.py')
-except subprocess.TimeoutExpired as exc:
+except SystemExit as exc:
+    assert exc.code == 1
     child, = children
     assert child.returncode == EXPECTED
-    assert exc.stdout == b'partial-out\\xff' and exc.stderr == b'partial-err'
     try:
         os.kill(child.pid, 0)
     except ProcessLookupError:
@@ -113,6 +113,8 @@ except subprocess.TimeoutExpired as exc:
     executor.bash_timeout = 5
     result = executor.execute('bash', {'command': 'python driver.py'})
     assert 'TimeoutExpired' in result and '[exit code: 1]' in result, result
+    assert "b'partial-out\\xff'" in result and 'partial-err' in result
+    assert 'Python output rendering error' in result and 'Output is partial' in result
     assert 'AssertionError' not in result, result
     settled(api)
     rows = records(store)

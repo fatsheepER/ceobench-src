@@ -1022,7 +1022,8 @@ class BashAgentToolExecutor:
                 if not boundary.verified:
                     raise
                 decode_error = exc
-                stdout, stderr = repr(raw_stdout), repr(raw_stderr)
+                stdout = repr(raw_stdout) if raw_stdout else ''
+                stderr = repr(raw_stderr) if raw_stderr else ''
 
             if lifecycle:
                 lifecycle.check()
@@ -1044,7 +1045,7 @@ class BashAgentToolExecutor:
                     raise NextDayTimeoutError('Server operation outcome unknown',
                                               partial_stdout=stdout, partial_stderr=stderr)
 
-            if decode_error:
+            if decode_error and not getattr(self, 'registered_execution', False):
                 raise decode_error
 
             output_parts = []
@@ -1052,6 +1053,13 @@ class BashAgentToolExecutor:
                 output_parts.append(stdout)
             if stderr:
                 output_parts.append(f"[stderr]\n{stderr}")
+            if decode_error:
+                self._bash_error = decode_error
+                output_parts.append('[Output rendering error: escaped raw bytes shown.]')
+                if self.capture:
+                    for name, value in (('stdout', stdout), ('stderr', stderr)):
+                        self.capture.blob(name, value, name, derived_from=self.capture.event + ':' + name + '_bytes',
+                            extent='partial' if self._timed_out else 'full', representation='python_bytes_repr')
             if self._timed_out:
                 output_parts.append(f'Error: Command timed out after {self.bash_timeout:g} seconds. '
                     'Task terminated; descendant cleanup and output stream closure verified. Output is partial.')

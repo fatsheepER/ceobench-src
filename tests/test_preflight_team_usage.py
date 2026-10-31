@@ -233,7 +233,7 @@ def test_real_sdk_http_retry_retains_known_failed_usage_once(tmp_path, monkeypat
 
 
 def test_model_mismatch_preserves_raw_usage_and_continues(tmp_path, monkeypatch, caplog):
-    from saas_bench.run_lifecycle import RunCancelled
+    from saas_bench.model_usage import InvalidModelResponse
     recorder = ModelUsage(tmp_path / 'model.jsonl', 'ceo', PRICES['rates'], expected_model='frozen-model')
     waits = []
     monkeypatch.setattr(recorder.lifecycle, 'sleep', waits.append)
@@ -247,7 +247,7 @@ def test_model_mismatch_preserves_raw_usage_and_continues(tmp_path, monkeypatch,
     assert row['cost_usd'] == pytest.approx(.0113)
     recorder.expected_model = 'test-model'
     assert recorder.call('chat', {}, lambda: body(), day=7)['model'] == 'test-model'
-    with pytest.raises(RunCancelled, match='model_request_failed'):
+    with pytest.raises(InvalidModelResponse, match='response must be an object'):
         recorder.call('chat', {}, lambda: None, day=14)
     assert json.loads(recorder.path.read_text().splitlines()[-1])['response'] is None
 

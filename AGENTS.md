@@ -42,7 +42,7 @@
 - 人工续跑可以反复指定任意历史 checkpoint 或 `--week N`，含第 1 周的初始周界。历史 HOLD、STOP、审批与哈希信息只作提醒。snapshot、manifest、D0、环境、工作区、RNG、Bash 策略与 scope 校验只记日志及 attempt 提示；`--force-resume` 记录操作者明确选择继续。
 - 全部 checkpoint 保留。故障现场保留在原 attempt，人工恢复使用新 attempt，并将选点后的执行记为作废。`scripts/team_driver.py` 支持旧配对批次和单组选择。每组默认 MemoryHigh 16G、MemoryMax 20G；主动 STOP 仍可停止当前执行。
 - 回退作废轨迹的用量按组与角色记入 waste，配对比较只使用保留轨迹。组耗时按检查点继承链扣除作废执行段，角色耗时为模型逻辑请求耗时，缺失字段保持 null。定位见 `tests/test_recovery_waste.py`。
-- 所有角色与模拟器的网络错误统一最多五次尝试，失败后间隔依次为 10、20、40、80 秒。首次回复最多等 600 秒，无回复超时记为一次网络失败；流式回复开始后不按累计时长截断。不设总等待预算或全局截止时间。网络五次失败、每轮第四次模型请求后仍无有效回复、业务操作结果未知时进入 HOLD，等人工续跑。非网络错误直接结束本次执行并记录 HOLD，显式 STOP 和操作者取消保留。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_manual_hold.py`、`tests/test_resume_advisories.py`、`tests/test_preflight_team_recovery.py`。
+- 所有角色与模拟器默认持续重试模型网络错误（`model_request_attempts=0`），失败后间隔依次为 10、20、40、80 秒，此后保持 80 秒。显式正数参数仍表示有限尝试次数。首次回复最多等 600 秒，无回复超时记为一次网络失败；流式回复开始后不按累计时长截断。不设总等待预算或全局截止时间。成功响应中的无效内容进入有限纠错，每轮第四次模型请求后仍无有效回复则 HOLD。网络失败本身不因累计次数进入 HOLD。显式有限尝试耗尽、业务操作结果未知、必要状态无法保存或资源无法关闭时进入 HOLD，等人工续跑。已结束且结果明确、资源已关闭的脚本超时和非零退出把真实部分输出交回原角色，空 stdout 保持空；伙伴继续执行。不可重试的 HTTP 拒绝、提供方错误和配置错误直接记录 HOLD，显式 STOP 和操作者取消保留。缺失 usage、费用和耗时保持 null，不阻断执行。持续重试、失败输出与预测回滚终态定位见 `tests/test_continuous_run.py`，真实 controller STOP 定位见 `tests/test_continuous_stop.py`。聚焦检查定位见 `tests/test_model_recovery_retry.py`、`tests/test_manual_hold.py`、`tests/test_resume_advisories.py`、`tests/test_preflight_team_recovery.py`。
 
 # 测试执行与验收成本
 

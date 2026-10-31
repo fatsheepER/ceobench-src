@@ -221,7 +221,7 @@ class MultiAgentRuntime:
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, script_role_sockets=script_sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
         self.server.team_permission = self._team_permission
-        self.server.script_check = self._check
+        self.server.script_check = self._check_model_send
         for role, runtime in self.roles.items():
             runtime.usage.request_check = self._check_model_send
             runtime.agent.before_request_callback = lambda role=role: self._intake_questions(role)
@@ -464,8 +464,8 @@ class MultiAgentRuntime:
 
             try:
                 result = advance(*args, role=role, on_settled=settled, **kwargs)
-                if (result.get('error') == 'prediction_save_failed' and settlement is None
-                        and result.get('day') == server.tools.current_day
+                if (result.get('error') == 'prediction_save_failed' and settlement is not None
+                        and settlement.get('progression') == 'not_advanced'
                         and not server._operation_failed and not server._step_day_timed_out):
                     with self._team_condition:
                         self._advancing = False
@@ -845,8 +845,6 @@ class MultiAgentRuntime:
         classifications = {record['classification'] for record in self.server.role_script_results[role]}
         if 'unknown' in classifications:
             raise RunCancelled('registered_script_outcome_unknown')
-        if 'transient_infrastructure' in classifications:
-            raise RunCancelled('registered_script_transient_infrastructure')
         text = ''
         for name, output in outputs.items():
             text = join_text(text, '\n' if text else '', join_text(name, '\n', output))

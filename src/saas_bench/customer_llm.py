@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from .config import BenchmarkConfig, CUSTOMER_GROUPS, ChurnReason
-from .model_usage import ModelUsage, usage_values
+from .model_usage import InvalidModelResponse, ModelUsage, usage_values
+from .run_lifecycle import RunCancelled
 from .runtime_options import runtime_value
 from .database import (
     get_customer_persona, get_group_characteristics, get_world_context,
@@ -158,6 +159,7 @@ class CustomerSimulator:
 
     def __init__(self, client: OpenAI, conn: sqlite3.Connection, config: BenchmarkConfig):
         self.max_output_tokens = runtime_value('model_max_output_tokens', None)
+        self.invalid_generation_attempts = runtime_value('invalid_generation_attempts', 4)
         self.usage_recorder = ModelUsage(os.environ.get('CEOBENCH_SIMULATOR_USAGE_LOG'), 'simulator', config.model_pricing)
         self.client = self.usage_recorder.attach(client)
         self.conn = conn
@@ -242,10 +244,22 @@ class CustomerSimulator:
                 kwargs = dict(model=model, reasoning={"effort": reasoning_effort or "low"},
                               input=messages, max_output_tokens=max_tokens)
                 invoke = lambda: self.client.responses.create(**kwargs)
-        response = self.usage_recorder.call(api, kwargs, invoke, day=self.current_day, provider=provider)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = self.usage_recorder.call(api, kwargs, invoke, day=self.current_day,
+                                                  provider=provider, outer_attempt=attempt)
+                break
+            except InvalidModelResponse as exc:
+                if self.invalid_generation_attempts and attempt >= self.invalid_generation_attempts:
+                    raise RunCancelled('model_attempt_limit',
+                        f'No valid reply after {attempt} model requests. Last invalid generation: {exc}') from exc
+                kwargs['input' if api == 'responses' else 'messages'].append(
+                    dict(role='user', content=exc.feedback))
         usage = usage_values(response, api)
         if api == 'messages':
-            text = response.content[0].text
+            text = ''.join(block.text for block in response.content if block.type == 'text')
         elif api == 'chat':
             text = response.choices[0].message.content
         else:

@@ -47,15 +47,20 @@ def test_script_error_reaches_owner_verbatim_and_owner_repairs(mode, exit_code):
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_prestart_enospc_pauses_at_boundary_without_script_error_model_input(mode, monkeypatch):
+def test_prestart_enospc_reaches_owner_and_all_roles_continue(mode, monkeypatch):
     from saas_bench.process_boundary import Boundary
     turns = {}
     def responder(team, role, body):
         day = team.server.tools.current_day
-        assert day == 0
-        turn = turns[role] = turns.get(role, 0) + 1
-        if turn == 1:
+        turn = turns[role, day] = turns.get((role, day), 0) + 1
+        if day == 0 and turn == 1:
             return register_actions(role, "print('read-only')\n")
+        if day == 7:
+            assert 'No space left on device' in json.dumps(body['messages'])
+            assert team.roles[role].week.scripts_status == 'script_error'
+            if turn == 1:
+                return calls(('bash', dict(command='echo NEXT-' + role)))
+            assert 'NEXT-' + role in body['messages'][-1]['content']
         return final(role + ' advice') if role != 'ceo' else calls(('bash', dict(command=ADVANCE)))
     with make_team(mode, responder, 'registered-enospc') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
@@ -65,22 +70,25 @@ def test_prestart_enospc_pauses_at_boundary_without_script_error_model_input(mod
         team.checkpoint_callback = checkpoint
         original = Boundary.__init__
         def fail_at_week(self, *args, **kwargs):
-            if team.server.tools.current_day == 7:
+            if team.server.tools.current_day == 7 and 'read-only' in args[0]:
                 raise OSError(errno.ENOSPC, 'No space left on device')
             return original(self, *args, **kwargs)
         monkeypatch.setattr(Boundary, '__init__', fail_at_week)
         outcome = team.run(stop_after_day=14)
-        assert (outcome.day, outcome.reason) == (7, 'paused')
-        assert team.failure == 'registered_script_transient_infrastructure'
-        record = team.server.role_script_results['ceo'][0]
-        assert record['classification'] == 'transient_infrastructure'
-        assert record['facts']['process_started'] is False
-        assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b''
+        assert (outcome.day, outcome.reason) == (14, 'observation_end'), team.failure
+        assert team.failure is None
+        for role in ROLES:
+            record = team.server.role_script_results[role][0]
+            assert record['classification'] == 'script_error'
+            assert record['facts']['process_started'] is False
+            assert record['facts']['boundary_closed'] is True
+            assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b''
+            assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b''
+            assert turns[role, 7] == 2
+            assert team.roles[role].week.weekly_status == 'completed'
         from saas_bench.team_checkpoint import validate_snapshot
         _, state = validate_snapshot(snapshots[-1])
-        assert state['day'] == 7
-        assert all(item['day'] == 0 or item['day'] == 7 and item['role'] == 'ceo' for item in team.test_wire)
-        assert sum(item['day'] == 7 for item in team.test_wire) == 1
+        assert state['day'] == 14
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -103,11 +111,19 @@ def test_readonly_script_keeps_evidence_without_business_wrapper(mode):
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('role', ROLES)
 @pytest.mark.parametrize('failure', ['timeout', 'killed'])
-def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, role, failure):
+def test_closed_resource_failure_reaches_owner_and_partner_models(mode, role, failure):
     code = "import time, os, signal\nprint('PARTIAL-OUT', flush=True)\n"
     code += "time.sleep(60)\n" if failure == 'timeout' else "os.kill(os.getpid(), signal.SIGKILL)\n"
+    turns = {}
     def responder(team, sender, body):
-        assert sender != role, 'Failed script owner received a model request'
+        turns[sender] = turns.get(sender, 0) + 1
+        if sender == role:
+            assert 'PARTIAL-OUT' in json.dumps(body['messages'])
+            assert team.roles[role].week.scripts_status == 'script_error'
+            assert ('timed out' if failure == 'timeout' else 'exit code') in json.dumps(body['messages'])
+        if turns[sender] == 1:
+            return calls(('bash', dict(command='echo NEXT-' + sender)))
+        assert 'NEXT-' + sender in body['messages'][-1]['content']
         return final(sender + ' advice') if sender != 'ceo' else calls(('bash', dict(command=ADVANCE)))
     with make_team(mode, responder, 'registered-resource') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
@@ -119,18 +135,18 @@ def test_resource_failure_keeps_partial_streams_and_never_reaches_model(mode, ro
             team.server.role_executors[role].bash_timeout = .3
         outcome = team.run(stop_after_day=7)
         team.server.role_executors[role].bash_timeout = script_timeout
-        assert (outcome.day, outcome.reason) == (0, 'paused'), team.failure
-        assert team.failure == 'registered_script_transient_infrastructure'
+        assert (outcome.day, outcome.reason) == (7, 'observation_end'), team.failure
+        assert team.failure is None
         record = team.server.role_script_results[role][0]
-        assert record['classification'] == 'transient_infrastructure'
+        assert record['classification'] == 'script_error'
         assert record['facts']['target_started'] is True
         assert record['facts']['boundary_closed'] is True
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'PARTIAL-OUT\n'
         assert all(not executor.preserved_process for executor in team.server.role_executors.values())
-        assert team._stage == ('ceo_scripts' if role == 'ceo' else 'analysis')
-        assert team.roles[role].week.scripts_status == 'interrupted'
-        with pytest.raises(RuntimeError, match='recoverable handoff'):
-            team.checkpoint()
+        assert turns == {peer: 2 for peer in ROLES}
+        assert team.roles[role].week.scripts_status == 'script_error'
+        assert all(runtime.week.weekly_status == 'completed' for runtime in team.roles.values())
+        assert team.checkpoint().is_dir()
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -179,9 +195,8 @@ from test_preflight_team_batch import frozen
 
 
 @pytest.mark.parametrize('managed_git', ['git', 'pf'], indirect=True)
-def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_path, monkeypatch):
-    from saas_bench import team_batch as batch
-    from saas_bench.process_boundary import Boundary
+def test_script_receipt_failure_holds_original_attempt_and_resumes_checkpoint(managed_git, tmp_path, monkeypatch):
+    from saas_bench import run_state, team_batch as batch
     from saas_bench.team_checkpoint import validate_snapshot
     from test_preflight_team_flow import completion
     import httpx
@@ -195,18 +210,25 @@ def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_pat
     ceo.agent.client = batch.checked_client('ceo', 'transient-opening', transport=httpx.MockTransport(
         lambda request: opening_response('ceo', json.loads(request.content))))
     ceo.usage.attach(ceo.agent.client)
-    original = Boundary.__init__
-    def fail_start(*args, **kwargs):
-        raise OSError(errno.ENOSPC, 'injected inode exhaustion')
-    monkeypatch.setattr(Boundary, '__init__', fail_start)
+    original = run_state.write_json
+    def fail_script_receipt(path, value):
+        if Path(path).name == 'execution.json':
+            raise OSError(errno.EIO, 'injected script receipt persistence failure')
+        return original(path, value)
+    monkeypatch.setattr(run_state, 'write_json', fail_script_receipt)
     paused = batch.execute(team, manifest, entry, directory, record, tmp_path / 'HOLD')
     assert paused['status'] == 'paused'
-    assert paused['runtime_failure'] == 'registered_script_transient_infrastructure'
+    assert 'injected script receipt persistence failure' in paused['runtime_failure']
+    assert paused['hold'] is True
     assert paused['reason'] == 'paused'
+    assert paused['checkpoint'] == str(source)
+    assert any(path.read_bytes() == b'RESUMED-SCRIPT\n'
+               for path in (team.root / 'private/ceo/scripts').glob('*/stdout.bin'))
+    assert not any(executor.preserved_process for executor in team.server.role_executors.values())
     _, saved = validate_snapshot(paused['checkpoint'])
     assert (saved['day'], saved['stage']) == (0, 'boundary')
     team.close()
-    monkeypatch.setattr(Boundary, '__init__', original)
+    monkeypatch.setattr(run_state, 'write_json', original)
     wire = []
     def client(role):
         def respond(request):
@@ -227,7 +249,13 @@ def test_transient_weekly_script_pause_resumes_real_attempt(managed_git, tmp_pat
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 def test_real_launcher_pre_auth_failure_retains_stderr_and_closes_resources(mode, monkeypatch):
-    with make_team(mode, lambda team, role, body: final('unused'), 'registered-launcher') as team:
+    def responder(team, role, body):
+        if role == 'ceo':
+            assert 'HOST-ENOSPC' in json.dumps(body['messages'])
+            assert team.roles[role].week.scripts_status == 'script_error'
+            return calls(('bash', dict(command=ADVANCE)))
+        return final(role + ' advice')
+    with make_team(mode, responder, 'registered-launcher') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         executor = team.roles['ceo'].executor
         executor.execute('write_file', dict(path='weekly.py', content="print('MUST-NOT-RUN')\n"))
@@ -235,17 +263,17 @@ def test_real_launcher_pre_auth_failure_retains_stderr_and_closes_resources(mode
         registered = team.server.role_executors['ceo']
         monkeypatch.setattr(registered, '_build_bwrap_cmd', lambda *args: ['bash', '-c', "printf 'HOST-ENOSPC\\n' >&2; exit 1"])
         outcome = team.run(stop_after_day=7)
-        assert (outcome.day, outcome.reason) == (0, 'paused'), team.failure
-        assert team.failure == 'registered_script_transient_infrastructure'
+        assert (outcome.day, outcome.reason) == (7, 'observation_end'), team.failure
+        assert team.failure is None
         record = team.server.role_script_results['ceo'][0]
-        assert record['classification'] == 'transient_infrastructure'
+        assert record['classification'] == 'script_error'
         assert record['facts']['process_boundary']['coverage'] == 'preauthentication_no_target'
         assert record['facts']['process_boundary']['descendants_closed'] is None
         assert record['facts']['target_started'] is False
         assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b''
         assert (Path(record['evidence']) / 'stderr.bin').read_bytes() == b'HOST-ENOSPC\n'
         assert not registered.preserved_process
-        assert [item['role'] for item in team.test_wire] == ['ceo']
+        assert set(item['role'] for item in team.test_wire) == set(ROLES)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -274,27 +302,49 @@ def test_unknown_registered_business_write_retains_receipt_and_skips_model(mode,
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_partner_script_cancel_retains_streams_and_closed_resources(mode):
+def test_unknown_partner_write_cancels_script_and_retains_closed_partial_streams(mode, monkeypatch):
+    import time
+    from saas_bench import api_server
     with make_team(mode, lambda team, role, body: final('unused'), 'registered-partner') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         for role in ROLES[1:]:
             executor = team.roles[role].executor
-            executor.execute('write_file', dict(path='weekly.py', content=f"import time\nprint('{role}-BEGIN', flush=True)\ntime.sleep(60)\n"))
+            code = f"print('{role}-BEGIN', flush=True)\n"
+            code += ("import novamind_api as n\nn.infrastructure.set_capacity_tier(2)\n" if role == 'growth' else
+                     "import time\nfrom pathlib import Path\nPath('partner-started').touch()\ntime.sleep(60)\n")
+            executor.execute('write_file', dict(path='weekly.py', content=code))
             assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        team.server.role_executors['growth'].bash_timeout = .5
+        write = api_server._TOOL_DISPATCH['set_capacity_tier']
+        def lose_write_completion(tools, args):
+            deadline = time.monotonic() + 5
+            while not (team.roles['ops_finance'].workspace / 'partner-started').exists():
+                assert time.monotonic() < deadline, 'Partner script did not start'
+                time.sleep(.01)
+            write(tools, args)
+            raise OSError(errno.EIO, 'partner write completion lost')
+        monkeypatch.setitem(api_server._TOOL_DISPATCH, 'set_capacity_tier', lose_write_completion)
         outcome = team.run(stop_after_day=7)
-        assert outcome.reason == 'paused', team.failure
-        assert team.failure == 'registered_script_transient_infrastructure'
+        assert outcome.reason in ('paused', 'failed'), team.failure
+        assert 'unknown' in team.failure.lower()
+        assert team.server._operation_failed is True
+        assert team.server.role_script_results['growth'][0]['classification'] == 'unknown'
+        assert team.server.role_script_results['growth'][0]['facts']['business_operation_unknown'] is True
         for role in ROLES[1:]:
             record = team.server.role_script_results[role][0]
-            assert record['classification'] == 'transient_infrastructure'
             assert record['facts']['boundary_closed'] is True
             assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == f'{role}-BEGIN\n'.encode()
             assert not team.server.role_executors[role].preserved_process
         assert team.server.role_script_results['ops_finance'][0]['status'] == 'cancelled'
+        assert [item['role'] for item in team.test_wire] == ['ceo']
+        with pytest.raises(RuntimeError, match='recoverable handoff'):
+            team.checkpoint()
         if mode == 'pf':
-            for role in team.roles.values():
-                role.store.assert_healthy()
+            store = team.roles['ops_finance'].store
+            assert store.fault is None, store.fault
+            fault = json.loads(store.fault_path.read_text())
+            assert fault['reason'] == 'Execution outcome unknown; branch paused'
+            with pytest.raises(RuntimeError, match='collection stopped'):
+                store.assert_healthy()
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])

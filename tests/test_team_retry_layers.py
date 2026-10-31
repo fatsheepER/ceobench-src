@@ -26,8 +26,8 @@ def test_same_seed_clones_retry_each_role_in_one_layer(frozen, tmp_path, monkeyp
             def respond(request):
                 assert client.max_retries == 0
                 wire.append(request)
-                assert len(wire) <= 5
-                if len(wire) < 5:
+                assert len(wire) <= 7
+                if len(wire) < 7:
                     return httpx.Response(503, json={'error': {'message': 'temporary provider overload'}})
                 body = json.loads(request.content)
                 return completion(calls(('read_file', {'path': 'MEMORY.md'})), body.get('stream', False))
@@ -57,10 +57,10 @@ def test_same_seed_clones_retry_each_role_in_one_layer(frozen, tmp_path, monkeyp
                 assert action.tool == 'read_file' and action.arguments == {'path': 'MEMORY.md'}
                 assert runtime.agent.client.max_retries == 0
                 wire = received[entry['group'], role]
-                assert len(wire) == 5
-                assert [request.headers['x-stainless-retry-count'] for request in wire] == ['0'] * 5
+                assert len(wire) == 7
+                assert [request.headers['x-stainless-retry-count'] for request in wire] == ['0'] * 7
                 assert all(request.content == wire[0].content for request in wire)
-                assert waits == [10, 20, 40, 80]
+                assert waits == [10, 20, 40, 80, 80, 80]
 
                 rows = [json.loads(line) for line in runtime.usage.path.read_text().splitlines()]
                 logical_requests = [row for row in rows if row['event'] == 'request']
@@ -69,15 +69,15 @@ def test_same_seed_clones_retry_each_role_in_one_layer(frozen, tmp_path, monkeyp
                 responses = [row for row in rows if row['event'] == 'http_response']
                 assert len(logical_requests) == len(logical_responses) == 1
                 assert logical_requests[0]['outer_attempt'] == 1
-                assert logical_responses[0]['model_attempts'] == 5
+                assert logical_responses[0]['model_attempts'] == 7
                 assert logical_responses[0]['error'] is None
                 assert len({row['call_id'] for row in rows}) == 1
-                assert len(attempts) == len({row['attempt_id'] for row in attempts}) == 5
+                assert len(attempts) == len({row['attempt_id'] for row in attempts}) == 7
                 assert {row['attempt_id'] for row in attempts} == {row['attempt_id'] for row in responses}
-                assert [row['status'] for row in responses] == [503] * 4 + [200]
+                assert [row['status'] for row in responses] == [503] * 6 + [200]
                 assert runtime.usage.summary['calls'] == 1
-                assert runtime.usage.summary['http_attempts'] == 5
-                assert runtime.usage.summary['failed_http_attempts'] == 4
+                assert runtime.usage.summary['http_attempts'] == 7
+                assert runtime.usage.summary['failed_http_attempts'] == 6
             assert team.server.tools.current_day == 0
             assert team.server.conn.serialize() == world_before
         assert set(received) == {(group, role) for group in ('git', 'pf') for role in ROLES}

@@ -554,6 +554,7 @@ def test_freeze_waits_for_inflight_ceo_write_before_shared_dashboard(mode, monke
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 def test_http_retry_attempt_limit_ignores_historical_hold(mode, monkeypatch):
+    monkeypatch.setenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', '5')
     waits = []
 
     def immediate_sleep(lifecycle, seconds):

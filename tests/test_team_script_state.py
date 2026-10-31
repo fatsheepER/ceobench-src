@@ -32,7 +32,8 @@ def save_evidence(team, label, **facts):
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
 @pytest.mark.parametrize('role', ['ceo', 'growth'])
-def test_partial_script_batch_does_not_become_new_week_boundary(mode, role):
+def test_partial_script_batch_receipt_failure_does_not_become_new_week_boundary(mode, role, monkeypatch):
+    from saas_bench import run_state
     def responder(team, sender, body):
         return calls(('bash', dict(command=ADVANCE))) if sender == 'ceo' else final(sender + ' report')
 
@@ -42,18 +43,27 @@ def test_partial_script_batch_does_not_become_new_week_boundary(mode, role):
             "from pathlib import Path\nimport novamind_api as n\n"
             "with open('executions.txt', 'a') as out: out.write('first\\n')\n"
             "n.infrastructure.set_capacity_tier(2)\nprint('FIRST-COMPLETED', flush=True)\n")
-        register_cli(team, role, 'second.py', "import time\nprint('PARTIAL-SECOND', flush=True)\ntime.sleep(60)\n")
+        register_cli(team, role, 'second.py', "print('PARTIAL-SECOND', flush=True)\nraise ValueError('ordinary script error')\n")
         before = team.checkpoint()
-        team.server.role_executors[role].bash_timeout = .4
+        failed_receipts = []
+        write_json = run_state.write_json
+        def fail_second_receipt(path, data):
+            if Path(path).name == 'execution.json' and data['name'] == 'second.py':
+                failed_receipts.append(Path(path))
+                raise OSError('second script receipt could not be saved')
+            return write_json(path, data)
+        monkeypatch.setattr(run_state, 'write_json', fail_second_receipt)
         outcome = team.run(stop_after_day=7)
         records = team.server.role_script_results[role]
         save_evidence(team, 'partial-' + role, outcome=asdict(outcome), prior_checkpoint=str(before))
-        assert (outcome.day, outcome.reason) == (0, 'paused'), team.failure
-        assert team.failure == 'registered_script_transient_infrastructure'
-        assert [record['classification'] for record in records] == ['succeeded', 'transient_infrastructure']
+        assert (outcome.day, outcome.reason) == (0, 'failed'), team.failure
+        assert 'second script receipt could not be saved' in team.failure
+        assert [record['classification'] for record in records] == ['succeeded']
         assert all(record['facts']['boundary_closed'] for record in records)
         assert (team.roles[role].workspace / 'executions.txt').read_text() == 'first\n'
-        assert (Path(records[-1]['evidence']) / 'stdout.bin').read_text() == 'PARTIAL-SECOND\n'
+        receipt, = failed_receipts
+        assert not receipt.exists()
+        assert (receipt.parent / 'stdout.bin').read_text() == 'PARTIAL-SECOND\n'
         assert not any(executor.preserved_process for executor in team.server.role_executors.values())
         with pytest.raises(RuntimeError, match='recoverable handoff'):
             team.checkpoint()
@@ -139,24 +149,36 @@ def test_role_week_axes_survive_opening_questions_repeated_wakeups_and_new_week(
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_script_error_is_terminal_once_but_not_success(mode):
+@pytest.mark.parametrize('failure', ['nonzero', 'timeout'])
+def test_script_error_is_terminal_once_across_later_questions(mode, failure):
+    turns = Counter()
     def respond(team, role, body):
+        turns[role] += 1
         state = team.roles[role].week
         assert state.scripts_status == 'script_error'
         rendered = json.dumps(body['messages'])
         assert 'SCRIPT-PARTIAL-' + role in rendered
-        assert 'RuntimeError: expected script error' in rendered
+        assert ('timed out' if failure == 'timeout' else 'RuntimeError: expected script error') in rendered
         assert all('SCRIPT-PARTIAL-' + peer not in rendered for peer in ROLES if peer != role)
         assert team._automatic_scripts(role) == state.scripts_output
-        return calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final(role + ' repaired advice')
+        if role == 'ceo':
+            if turns[role] == 1:
+                return calls(('ask_analyst', dict(role='growth', message='Check the partial output once more.')))
+            return calls(('bash', dict(command=ADVANCE)))
+        return final(role + ' repaired advice')
 
     with make_team(mode, respond, 'script-known-error') as team:
         for role in ROLES:
-            register_cli(team, role, 'error.py', "with open('script-count.txt', 'a') as out: out.write('once\\n')\n"
-                + f"print('SCRIPT-PARTIAL-{role}')\nraise RuntimeError('expected script error')\n")
+            code = ("with open('script-count.txt', 'a') as out: out.write('once\\n')\n"
+                    + f"print('SCRIPT-PARTIAL-{role}', flush=True)\n")
+            code += "import time\ntime.sleep(60)\n" if failure == 'timeout' else "raise RuntimeError('expected script error')\n"
+            register_cli(team, role, 'error.py', code)
+            if failure == 'timeout':
+                team.server.role_executors[role].bash_timeout = .4
         outcome = team.run(stop_after_day=7)
         save_evidence(team, 'known-error', outcome=asdict(outcome))
         assert outcome.reason == 'observation_end', team.failure
+        assert turns == Counter(ceo=2, growth=2, ops_finance=1)
         for runtime in team.roles.values():
             assert runtime.week.scripts_status == 'script_error'
             assert runtime.week.weekly_status == 'completed'

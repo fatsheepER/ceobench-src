@@ -26,13 +26,20 @@ from .runtime_options import nonnegative_integer, nonnegative_number, runtime_va
 
 _CALL = ContextVar('model_call', default=None)
 _ATTEMPT = ContextVar('model_request_attempt', default=None)
-MODEL_REQUEST_ATTEMPTS = 5
+MODEL_REQUEST_ATTEMPTS = 0
 MODEL_RETRY_DELAYS = (10, 20, 40, 80)
 MODEL_ATTEMPT_SECONDS = 600
 _DEFAULT = object()
 FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
 _SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
             'aws_access_key', 'aws_secret_key', 'aws_session_token'}
+
+
+class InvalidModelResponse(Exception):
+    def __init__(self, reason, *, api, response, phase):
+        super().__init__(reason)
+        self.api, self.response, self.phase = api, response, phase
+        self.feedback = f'Your previous response was invalid: {reason}. Please return a complete, valid response.'
 
 
 def check_model_call():
@@ -97,8 +104,29 @@ def response_error(response, api=None):
         items = response.get(field)
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
             return f'Model response {field} must be a list of objects'
+        if not items:
+            return f'Model response {field} must not be empty'
         if api == 'chat' and (not items or not isinstance(items[0].get('message'), dict)):
             return 'Model response choices must contain an assistant message'
+        if api == 'chat':
+            for choice in items:
+                message = choice.get('message')
+                if not isinstance(message, dict) or (message.get('content') is not None and
+                                                     not isinstance(message['content'], str)):
+                    return 'Model response assistant content must be text or null'
+        else:
+            for item in items:
+                if not isinstance(item.get('type'), str) or not item['type']:
+                    return f'Model response {field} blocks require a type'
+                if api == 'messages' and item['type'] == 'text' and not isinstance(item.get('text'), str):
+                    return 'Model response text block must contain text'
+                if api == 'responses' and item['type'] == 'message':
+                    content = item.get('content')
+                    if not isinstance(content, list) or any(not isinstance(block, dict) for block in content):
+                        return 'Model response message content must be a list of objects'
+                    if any(block.get('type') == 'output_text' and not isinstance(block.get('text'), str)
+                           for block in content):
+                        return 'Model response output_text block must contain text'
     return None
 
 
@@ -557,6 +585,8 @@ class ModelUsage:
                                body=body, error=error)
                     if not error and response.status_code < 400:
                         recorder.last_http_attempt_id = attempt_id
+                        if http_state is not None:
+                            http_state['completed_response'] = reported if reported is not None else body
                 if response.is_stream_consumed:
                     if response.content and (attempt := _ATTEMPT.get()):
                         attempt.reply_started()
@@ -600,6 +630,8 @@ class ModelUsage:
                 self.lifecycle.watch_client(client)
             with self.lifecycle.model_call():
                 return self._call(api, request, invoke, **context)
+        except InvalidModelResponse:
+            raise
         except Exception as exc:
             raise RunCancelled('model_request_failed', exception_details(exc)) from exc
         finally:
@@ -658,7 +690,7 @@ class ModelUsage:
             self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
-        http_state = dict(failed_response=None)
+        http_state = dict(failed_response=None, completed_response=None)
         token = _CALL.set((self, call_id, http_state))
         response, error, model_attempts, last_model_error = None, None, 0, None
         retried_http_attempts = pending_retry_http_attempts = 0
@@ -677,13 +709,16 @@ class ModelUsage:
                     pending_retry_usage = None
                 response = None
                 http_state['failed_response'] = None
+                http_state['completed_response'] = None
                 failures_before = self.summary['failed_http_attempts']
                 try:
                     response = self._invoke_attempt(invoke)
                     self._check_deadline()
                     raw = plain(response)
-                    if message := response_error(raw, api):
+                    if message := response_error(raw):
                         raise ValueError(message)
+                    if message := response_error(raw, api):
+                        raise InvalidModelResponse(message, api=api, response=raw, phase='schema')
                     if self.expected_model is not None and raw.get('model') != self.expected_model:
                         logging.warning('Returned model differs from frozen configuration')
                     self.last_call_id = call_id
@@ -691,6 +726,12 @@ class ModelUsage:
                 except Exception as exc:
                     last_model_error = exception_details(exc)
                     self.lifecycle.check()
+                    if isinstance(exc, InvalidModelResponse):
+                        response = exc.response
+                        raise
+                    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) and http_state['completed_response'] is not None:
+                        response = http_state['completed_response']
+                        raise InvalidModelResponse(str(exc), api=api, response=response, phase='decode') from exc
                     if not is_network_error(exc) or model_attempts == self.model_request_attempts:
                         detail = (f'Model request stopped after {model_attempts} attempts. Last error {last_model_error}. '
                             'Continue with scripts/team_driver.py --policy <policy.json> --live --resume '
