@@ -1,7 +1,7 @@
 """Immutable, private snapshots at quiescent team handoffs."""
 
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -18,6 +18,61 @@ from .run_state import artifact_hashes, copy_workspace, file_hash, tree_hash, wr
 from .run_warnings import advisory, optional_hash
 from .run_lifecycle import BusinessOutcomeUnknown
 from .runtime_options import timeout_value
+
+
+class CheckpointDataError(ValueError):
+    pass
+
+
+def validate_runtime_data(snapshot, state):
+    from .multi_agent import RoleWeek, TeamMessage
+    from .role_policy import ROLES
+    required = ('source_root', 'configuration', 'benchmark_config', 'day', 'seed', 'shared_rng',
+        'stage', 'week', 'role_weeks', 'phase', 'world_state_id', 'roles', 'messages',
+        'scripts', 'script_results', 'dashboard', 'day_result', 'sources', 'live_customer')
+    missing = [f'team.json:{key}' for key in required if key not in state]
+    if missing:
+        raise CheckpointDataError(f'Selected checkpoint {snapshot} lacks ' + ', '.join(missing))
+    if state['stage'] not in ('boundary', 'ceo_opening', 'ceo'):
+        raise CheckpointDataError(f'Selected checkpoint {snapshot} has unfinished stage {state["stage"]!r}')
+    if state['stage'] != 'boundary':
+        required_week = ['observation', 'ceo_started']
+        if state['stage'] == 'ceo':
+            required_week.extend(['directions', 'weekly_request_ids'])
+        missing.extend(f'team.json:week.{name}' for name in required_week if name not in state['week'])
+    for role in ROLES:
+        for name in (f'roles/{role}', f'private/{role}/conversation.json'):
+            path = snapshot / name
+            if not (path.is_dir() if name.startswith('roles/') else path.is_file()):
+                missing.append(name)
+        if role not in state['roles']:
+            missing.append(f'team.json:roles.{role}')
+        if role not in state['role_weeks']:
+            missing.append(f'team.json:role_weeks.{role}')
+            continue
+        week = state['role_weeks'][role]
+        if week is None and state['stage'] == 'boundary':
+            continue
+        if not isinstance(week, dict):
+            missing.append(f'team.json:role_weeks.{role}')
+            continue
+        absent = {field.name for field in fields(RoleWeek)} - week.keys()
+        missing.extend(f'team.json:role_weeks.{role}.{name}' for name in sorted(absent))
+        if not absent:
+            RoleWeek(**week)
+    if not (snapshot / 'world.nmdb').is_file():
+        missing.append('world.nmdb')
+    if state['configuration']['mode'] == 'pf' and not (snapshot / 'private/evidence.sqlite').is_file():
+        missing.append('private/evidence.sqlite')
+    if missing:
+        raise CheckpointDataError(f'Selected checkpoint {snapshot} lacks ' + ', '.join(missing))
+    for saved in state['messages']:
+        absent = {field.name for field in fields(TeamMessage)} - saved.keys()
+        if absent:
+            raise CheckpointDataError(f'Selected checkpoint {snapshot} lacks message fields {sorted(absent)}')
+        message = TeamMessage(**saved)
+        if message.kind == 'question' and message.status not in ('delivered', 'rejected', 'failed', 'cancelled'):
+            raise CheckpointDataError(f'Selected checkpoint {snapshot} has unfinished request {message.request_id}')
 
 
 @contextmanager
@@ -294,6 +349,7 @@ def _freeze(runtime, directory):
         state['event_logger'] = dict(metadata=asdict(logger.metadata),
             counters={key: getattr(logger, key) for key in
                 ('current_day', '_event_count', '_total_llm_cost', '_missing_llm_cost')})
+    validate_runtime_data(directory, state)
     write_json(directory / 'team.json', state)
     write_json(directory / 'checkpoint.json', dict(version=1, files={
         'team.json': file_hash(directory / 'team.json'), 'world.nmdb': file_hash(directory / 'world.nmdb')},
@@ -331,6 +387,10 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .shocks import ShockManager
     from .tools import AgentTools
     snapshot, state = validate_snapshot(snapshot)
+    try:
+        validate_runtime_data(snapshot, state)
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        raise CheckpointDataError(f'Cannot restore selected checkpoint {snapshot}: {exc}') from exc
     root = Path(root).resolve()
     source = Path(state['source_root'])
     if root.is_relative_to(source) or source.is_relative_to(root) or root.is_relative_to(snapshot):
@@ -338,8 +398,8 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     if root.exists():
         logging.warning('Recovery target already exists; restoring into it')
     public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
-    source_changed = tree_hash(Path(__file__).parent) != state['source_sha256']
-    public_changed = artifact_hashes(public) != state['public_artifacts']
+    source_changed = tree_hash(Path(__file__).parent) != state.get('source_sha256')
+    public_changed = artifact_hashes(public) != state.get('public_artifacts')
     configuration = dict(state['configuration'])
     with advisory():
         validate_executor_settings(configuration, state['roles'])
@@ -399,7 +459,10 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     world = root / 'world.nmdb'
     if (snapshot / 'world.nmdb').resolve() != world.resolve():
         shutil.copy2(snapshot / 'world.nmdb', world)
-    conn = load_session_db(world)
+    try:
+        conn = load_session_db(world)
+    except Exception as exc:
+        raise CheckpointDataError(f'Cannot restore selected world {snapshot / "world.nmdb"}: {exc}') from exc
     try:
         for env, value in state.get('runtime_environment', {}).items():
             if env in environment_before and environment_before[env] is None:
@@ -505,8 +568,13 @@ def restore_runtime_state(runtime, state):
         regenerate_prompt = bool(state.get('_configuration_changes'))
         if not regenerate_prompt:
             role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
-        if not role.agent.load_conversation_snapshot(role.agent._snapshot_path):
-            logging.warning('Cannot restore %s role conversation; continuing with available conversation', name)
+        try:
+            role.agent.load_conversation_snapshot(role.agent._snapshot_path, required=True)
+            week = captured['role_weeks'][name]
+            if week is not None and week['initialized'] and not role.agent.conversation:
+                raise ValueError('Initialized role has an empty conversation')
+        except Exception as exc:
+            raise CheckpointDataError(f'Cannot restore {name} conversation: {exc}') from exc
         for message in role.agent.conversation:
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)
@@ -517,17 +585,6 @@ def restore_runtime_state(runtime, state):
         week = captured['role_weeks'].get(name)
         if week is not None:
             role.week = RoleWeek(**week)
-        elif runtime._stage != 'boundary':
-            logging.warning('Checkpoint has no explicit role week for %s; script history remains unknown', name)
-            request = next((message for message in reversed(runtime.messages)
-                if message.kind == 'weekly_task' and message.receiver == name and message.day == state['day']), None)
-            weekly_status = ('completed' if request and request.status in ('completed', 'delivered') else
-                'interrupted' if request and request.status in ('failed', 'cancelled') else
-                'in_progress' if name == 'ceo' or request else 'pending')
-            role.week = RoleWeek(state['day'], role.identity.session_id,
-                initialized=role.agent.current_day == state['day'],
-                scripts_status='pending' if runtime._stage == 'ceo_opening' else 'unknown',
-                weekly_status=weekly_status, weekly_request_id=request.request_id if request else None)
         if role.week is not None:
             runtime._update_role_week(name)
     customer = server.simulator.customer_simulator

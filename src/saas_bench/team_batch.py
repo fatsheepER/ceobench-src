@@ -35,7 +35,7 @@ from .run_state import file_hash, tree_hash, verify_build, write_json
 from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
-from .team_checkpoint import retention_lock
+from .team_checkpoint import CheckpointDataError, retention_lock
 from .run_lifecycle import BusinessOutcomeUnknown
 from .run_warnings import AttemptWarnings, advisory, optional_hash
 
@@ -54,6 +54,10 @@ PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     simulator_thinking='disabled', simulator_reasoning_effort='none',
     analyst_bash_timeout=480, analyst_bash_warn_after=120,
     analyst_bash_scope='growth_and_ops_finance_model_bash_initial_and_ceo_followup')
+
+
+class CheckpointPublicationError(RuntimeError):
+    pass
 
 
 def read(path):
@@ -199,29 +203,72 @@ def prompt_templates(runtime):
             for role, rr in runtime.roles.items()}
 
 
+TEAM_CLOSE_SECONDS = 30
+
+
 def close_team(runtime, record=None):
-    clients = [rr.agent.client for rr in runtime.roles.values()]
-    customer = getattr(runtime.server.simulator, 'customer_simulator', None)
-    if customer and customer.client:
-        clients.append(customer.client)
-    with ExitStack() as cleanup:
-        cleanup.callback(runtime.server.conn.close)
-        for client in clients:
-            cleanup.callback(client.close)
+    server = runtime.server
+    runtime.close()
+    path = runtime.root.parent / 'attempt.json'
+    marker = runtime.root / 'private/resource-cleanup.json'
+    deadline = time.monotonic() + TEAM_CLOSE_SECONDS
+
+    def persist(state):
+        nonlocal record
+        write_json(marker, state)
+        if not path.exists():
+            return
+        record = record if record is not None else read(path)
+        record['resource_cleanup'] = state
+        if state['status'] == 'pending':
+            record.update(status='paused', hold=True, hold_detail=state['detail'])
+            write_json(path, record)
+            notice = dict(reason='resource_cleanup_pending', detail=state['detail'],
+                checkpoint=record.get('checkpoint'), manual_resume_required=True, time=state['time'])
+            write_json(path.parent / 'HOLD', notice)
+            write_json(path.parent.parent / 'HOLD', notice)
+        if record.get('checkpoint'):
+            from .team_checkpoint import validate_runtime_data, validate_snapshot
+            try:
+                snapshot, state = validate_snapshot(record['checkpoint'])
+                validate_runtime_data(snapshot, state)
+                record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
+                    checkpoint_sha256=optional_hash(snapshot / 'checkpoint.json'),
+                    day=state['day'], stage=state['stage'], discard_post_checkpoint_operations=True)
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError) as exc:
+                record['recovery_validation'] = dict(eligible=False, error=str(exc))
+        write_json(path, record)
+
+    def pending(reason):
+        detail = 'Shared resources could not be closed: ' + reason
+        state = dict(status='pending', reason=reason, detail=detail, manual_resume_required=True,
+            time=datetime.now(timezone.utc).isoformat())
+        persist(state)
+        raise BusinessOutcomeUnknown(detail)
+
+    with server._request_lock:
+        def quiescent():
+            requests = server.public_request_state()
+            return not requests['active'] and not requests['queued']
+        if not server._request_lock.wait_for(quiescent, max(0, deadline - time.monotonic())):
+            pending('public HTTP requests did not finish within the cleanup allowance')
+    if not server._lock.acquire(timeout=max(0, deadline - time.monotonic())):
+        pending('world advancement did not finish within the cleanup allowance')
+    try:
         runtime.close()
-        path = runtime.root.parent / 'attempt.json'
-        if path.exists():
-            record = record if record is not None else read(path)
-            if record.get('checkpoint'):
-                from .team_checkpoint import validate_snapshot
-                try:
-                    snapshot, state = validate_snapshot(record['checkpoint'])
-                    record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
-                        checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
-                        day=state['day'], stage=state['stage'], discard_post_checkpoint_operations=True)
-                except (OSError, ValueError, RuntimeError, KeyError) as exc:
-                    record['recovery_validation'] = dict(eligible=False, error=str(exc))
-                write_json(path, record)
+        clients = [rr.agent.client for rr in runtime.roles.values()]
+        customer = getattr(server.simulator, 'customer_simulator', None)
+        if customer and customer.client:
+            clients.append(customer.client)
+        with ExitStack() as cleanup:
+            cleanup.callback(server.conn.close)
+            for client in clients:
+                cleanup.callback(client.close)
+    except Exception as exc:
+        pending(type(exc).__name__ + ': ' + str(exc))
+    finally:
+        server._lock.release()
+    persist(dict(status='closed', time=datetime.now(timezone.utc).isoformat()))
 
 
 def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=None, token_counter=None):
@@ -416,7 +463,8 @@ def wall_time(history, current=None):
             records[directory] = {}
             errors.append(dict(attempt=directory.name, error=str(exc)))
     records = {directory: record for directory, record in records.items()
-               if not (record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False)}
+               if not (record.get('reason') in ('missing_checkpoint', 'checkpoint_data_missing') and
+                       record.get('execution_started') is False)}
     history = [directory for directory in history if directory in records]
     def duration(directory, record):
         value = current[1] if current and directory == current[0] else record.get('wall_seconds')
@@ -459,7 +507,8 @@ def wall_time(history, current=None):
     known, missing, wasted, waste_missing, pending, pending_missing = 0.0, [], 0.0, [], 0.0, []
     for directory, record in records.items():
         elapsed = duration(directory, record)
-        inherited = bool(retained)
+        inherited = bool(retained) or (records[history[-1]].get('replay_week') == 1 and
+                                       not records[history[-1]].get('source_checkpoint'))
         kept = (retained.get(directory, 0.0) if inherited else elapsed)
         unresolved = directory == history[-1] and record.get('status') in ('failed', 'paused', 'preparing')
         if directory == history[-1]:
@@ -502,15 +551,67 @@ def read_attempt_record(directory):
         return None
 
 
+def checkpoint_usage_inventory(source, records, category):
+    ancestors, visited, gaps = [], set(), []
+    usage_names = {f'private/{role}/model-usage.jsonl' for role in ROLES}
+    usage_names.add('private/simulator-model-usage.jsonl')
+    while source and str(source) not in visited:
+        visited.add(str(source))
+        snapshot = Path(source)
+        try:
+            state = read(snapshot / 'team.json')
+            owner = Path(state['source_root']).parent
+            ancestors.append(Path(state['source_root']) / 'private')
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            gaps.append(dict(path=str(snapshot / 'team.json'), category=category,
+                reason='checkpoint_usage_lineage_unknown', error=str(exc)))
+            source = None
+            break
+        expected = {f'private/{role}/model-usage.jsonl': None
+            for role, saved in state.get('roles', {}).items() if saved.get('usage', {}).get('calls', 0)}
+        if state.get('simulator_usage', {}).get('summary', {}).get('calls', 0):
+            expected['private/simulator-model-usage.jsonl'] = None
+        try:
+            expected.update({name: size for name, size in read(snapshot / 'checkpoint.json').get('log_cutoffs', {}).items()
+                if name in usage_names})
+        except (OSError, ValueError, AttributeError):
+            pass
+        for name, size in expected.items():
+            path = snapshot / name
+            resource = 'simulator' if name == 'private/simulator-model-usage.jsonl' else category
+            try:
+                actual_size = path.stat().st_size
+            except OSError as exc:
+                gaps.append(dict(path=str(path), category=resource,
+                    reason='unreadable_usage_log', error=str(exc)))
+                continue
+            if isinstance(size, int) and actual_size < size:
+                gaps.append(dict(path=str(path), category=resource,
+                    reason='short_checkpoint_usage_log', expected_bytes=size, actual_bytes=actual_size))
+        record = records.get(owner) or read_attempt_record(owner)
+        if record is None:
+            gaps.append(dict(path=str(owner / 'attempt.json'), category=category,
+                reason='checkpoint_usage_lineage_unknown'))
+            source = None
+        else:
+            source = record.get('source_checkpoint')
+    if source:
+        gaps.append(dict(path=str(source), category=category,
+            reason='checkpoint_usage_lineage_unknown', error='Cyclic checkpoint usage ancestry'))
+    return ancestors, gaps
+
+
 def run_usage(entry, prices):
-    from .team_usage import aggregate
+    from .team_usage import aggregate as aggregate_receipts, LOG_GAPS, mark_truncated_totals, usage_gap_role
+    def aggregate(paths, prices, **kwargs):
+        return aggregate_receipts(paths, prices, tolerate_log_errors=True, **kwargs)
     history = attempts(entry)
     records = {}
     for directory in history[:]:
         record = read_attempt_record(directory)
         if record is None:
             continue
-        if record.get('reason') == 'missing_checkpoint' and record.get('execution_started') is False:
+        if record.get('reason') in ('missing_checkpoint', 'checkpoint_data_missing') and record.get('execution_started') is False:
             history.remove(directory)
             continue
         records[directory] = record
@@ -534,19 +635,44 @@ def run_usage(entry, prices):
     retained_logs = logs([valid_root] if valid_root else [])
     valid = aggregate(retained_logs, prices, category=entry['category'])
     valid['retained_logs'] = {key: [str(path) for path in paths] for key, paths in retained_logs.items()}
+    source = ((last.get('checkpoint') or last.get('source_checkpoint'))
+        if last.get('status') in ('failed', 'paused', 'preparing') else last.get('source_checkpoint'))
+    ancestors, inherited_gaps = checkpoint_usage_inventory(source, records, entry['category'])
+    valid['missing_receipts'].extend(gap for gap in inherited_gaps if gap not in valid['missing_receipts'])
+    gaps = [gap for gap in valid['missing_receipts'] if gap['reason'] in LOG_GAPS]
+    mark_truncated_totals(valid, gaps, category=entry['category'])
+    retained_calls = {record['call_id'] for record in valid['records']}
+    unclassified_calls = set()
+    if gaps:
+        def role_path(path):
+            return 'simulator' if Path(path).name == 'simulator-model-usage.jsonl' else Path(path).parent.name
+        scopes = {(gap['category'], usage_gap_role(gap)) for gap in gaps}
+        uncertain_paths = {resource: [path for path in paths if (resource, role_path(path)) in scopes or
+            (resource, None) in scopes or resource == 'simulator' and (entry['category'], None) in scopes]
+            for resource, paths in logs(ancestors).items()}
+        unclassified = aggregate(uncertain_paths, prices, category=entry['category'], exclude_calls=retained_calls)
+        unclassified['status'] = 'retained_membership_unknown'
+        valid['unclassified'] = unclassified
+        unclassified_calls = {record['call_id'] for record in unclassified['records']}
     pending = aggregate(logs(pending_roots),
-        prices, category=entry['category'], exclude_calls={record['call_id'] for record in valid['records']})
+        prices, category=entry['category'], exclude_calls=retained_calls | unclassified_calls)
     pending['status'] = 'awaiting_operator_selection'
     valid['pending'] = pending
+    waste_roots = [root for root in all_roots if root != valid_root and root not in pending_roots]
     try:
-        waste = aggregate(logs(all_roots), prices, category=entry['category'],
-                          exclude_calls={record['call_id'] for record in valid['records'] + pending['records']})
+        waste = aggregate(logs(waste_roots), prices, category=entry['category'],
+                          exclude_calls=unclassified_calls | {record['call_id'] for record in valid['records'] + pending['records']})
     except (OSError, ValueError) as exc:
         waste = aggregate([], prices, category=entry['category'])
         waste['missing_receipts'].append(dict(reason='discarded_log_unreadable', error=str(exc)))
         for summary in (waste['team'], waste['all_resources'], *waste['roles'].values(), *waste['resources'].values()):
             summary['missing'] = dict.fromkeys(summary['missing'], 1)
             summary['wall_seconds_missing_calls'] = ['discarded_log_unreadable']
+    for result, roots in ((pending, pending_roots), (waste, waste_roots)):
+        if not roots or not source:
+            continue
+        result['missing_receipts'].extend(gap for gap in gaps if gap not in result['missing_receipts'])
+        mark_truncated_totals(result, gaps, category=entry['category'])
     return valid, waste
 
 
@@ -649,8 +775,7 @@ def save_checkpoint(team, directory, record, boundary):
         raise
     except Exception as exc:
         record['checkpoint_error'] = str(exc)
-        logging.warning('Checkpoint publication deferred; execution continues: %s', exc)
-        return None
+        raise CheckpointPublicationError(f'Checkpoint {boundary} publication failed: {exc}') from exc
 
 
 def _save_checkpoint(team, directory, record, boundary):
@@ -662,8 +787,9 @@ def _save_checkpoint(team, directory, record, boundary):
         except Exception as exc:
             lock_error = exc
         snapshot = team.checkpoint()
+        published = dict(record, checkpoint=str(snapshot), boundary=boundary)
+        write_json(directory / 'attempt.json', published)
         record.update(checkpoint=str(snapshot), boundary=boundary)
-        write_json(directory / 'attempt.json', record)
         try:
             if lock_error:
                 raise lock_error
@@ -767,11 +893,20 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
                 customer.usage_recorder.expected_model = team.server.tools.config.social_post_llm_model
             write_json(team.root / 'private' / 'frozen-run.json', dict(entry=entry, manifest_sha256=file_hash(path)))
             record['status'] = 'ready'
-            with advisory():
-                save_checkpoint(team, directory, record, 'ready')
+            save_checkpoint(team, directory, record, 'ready')
             if not live:
                 return record
             return execute(team, manifest, entry, directory, record, directory / 'STOP')
+        except (CheckpointDataError, CheckpointPublicationError) as exc:
+            reason = 'checkpoint_data_missing' if isinstance(exc, CheckpointDataError) else 'checkpoint_save_failed'
+            record.update(status='paused', hold=True, reason=reason, hold_detail=str(exc),
+                error_type=type(exc).__name__, error=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
+            notice = dict(reason=reason, detail=str(exc), manual_resume_required=True,
+                checkpoint=record.get('checkpoint'), time=record['finished_at'])
+            write_json(directory / 'attempt.json', record)
+            write_json(directory / 'HOLD', notice)
+            write_json(output / 'HOLD', notice)
+            return record
         except BaseException as exc:
             record.update(status='failed', error_type=type(exc).__name__, error=str(exc),
                 finished_at=datetime.now(timezone.utc).isoformat())
@@ -818,8 +953,6 @@ def _execute(team, manifest, entry, directory, record, hold):
     def checkpoint(runtime, boundary):
         nonlocal last_boundary
         snapshot = save_checkpoint(runtime, directory, record, boundary)
-        if snapshot is None:
-            return
         last_boundary = dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json'),
             boundary=boundary, day=runtime.server.tools.current_day, stage=runtime._stage, failure=runtime.failure)
     team.checkpoint_callback = checkpoint
@@ -847,17 +980,10 @@ def _execute(team, manifest, entry, directory, record, hold):
             team.failure, team.failure_detail = 'business_operation_unknown', str(exc)
             record['checkpoint_error'] = str(exc)
             reason = hold_attempt(team, entry, directory, record, reason)
-        except (ValueError, RuntimeError) as exc:
+        except CheckpointPublicationError as exc:
+            team.failure, team.failure_detail = 'checkpoint_save_failed', str(exc)
             record['checkpoint_error'] = str(exc)
-            try:
-                from .team_checkpoint import validate_snapshot, validate_recovery_source
-                snapshot, state = validate_snapshot(record['checkpoint'])
-                validate_recovery_source(snapshot, state, current_root=team.root)
-                record['recovery_validation'] = dict(eligible=True, checkpoint=str(snapshot),
-                    checkpoint_sha256=file_hash(snapshot / 'checkpoint.json'),
-                    day=state['day'], stage=state['stage'], current_operation_coverage=True)
-            except (OSError, ValueError, RuntimeError, KeyError) as validation:
-                record['recovery_validation'] = dict(eligible=False, error=str(validation))
+            reason = hold_attempt(team, entry, directory, record, reason)
     record['checkpoint_reused_at_stop'] = reuse
     elapsed = time.monotonic() - start
     record.update(status='paused' if reason == 'paused' else 'failed' if reason == 'failed' else 'finished',
@@ -915,7 +1041,11 @@ def summarize(path, resource_paths=None):
         if category not in ('formal', 'simulator', 'shared_d0', 'engineering', 'abandoned'):
             raise ValueError('Unknown resource category')
         categorized.setdefault(category, []).extend(Path(p) for p in paths)
-    resources = aggregate(categorized, manifest['pricing'], category=manifest['category'])
+    resources = aggregate(categorized, manifest['pricing'], category=manifest['category'], tolerate_log_errors=True)
+    for row in rows:
+        resources['missing_receipts'].extend(gap for gap in row.get('usage', {}).get('missing_receipts', [])
+            if gap not in resources['missing_receipts'])
+    mark_truncated_totals(resources, resources['missing_receipts'], category=manifest['category'])
     for row in rows:
         tails = [gap for gap in resources['missing_receipts'] if gap['reason'] == 'unterminated_log_tail' and
                  Path(gap['path']).is_relative_to(Path(row['output_dir']))]

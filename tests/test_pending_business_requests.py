@@ -120,7 +120,7 @@ def test_successful_client_pending_write_pauses_real_attempt(managed_git, tmp_pa
     role.usage.attach(role.agent.client)
     team._rotate_sessions()
     team._stage = 'ceo'
-    team._week = dict(observation='Offline pending-write check.', ceo_started=False)
+    team._week = dict(observation='Offline pending-write check.', ceo_started=False, directions='', weekly_request_ids=[])
     team._set_phase('ceo')
     source = batch.save_checkpoint(team, directory, record, 'answers_ready')
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -213,7 +213,7 @@ def test_confirmed_late_business_write_survives_real_resume(managed_git, tmp_pat
     role.agent.client = role.usage.attach(batch.checked_client('ceo', 'confirmed-write-test', transport=httpx.MockTransport(transport)))
     team._rotate_sessions()
     team._stage = 'ceo'
-    team._week = dict(observation='Offline late-write check.', ceo_started=False)
+    team._week = dict(observation='Offline late-write check.', ceo_started=False, directions='', weekly_request_ids=[])
     team._set_phase('ceo')
     source = batch.save_checkpoint(team, directory, record, 'answers_ready')
     with ThreadPoolExecutor(max_workers=1) as pool:

@@ -655,7 +655,7 @@ class BashAgent(BaseAgent):
             # Per-turn best effort files are not published checkpoints.
             print(f"[snapshot] WARN failed to save conversation snapshot: {e}")
 
-    def load_conversation_snapshot(self, path: Path) -> bool:
+    def load_conversation_snapshot(self, path: Path, *, required: bool = False) -> bool:
         """Restore self.conversation + turn state from a snapshot file.
 
         Rejects unresolved tool calls. Completed tool results are kept and
@@ -663,17 +663,33 @@ class BashAgent(BaseAgent):
 
         Returns True if restoration succeeded, False otherwise.
         """
-        if not path.exists():
+        if not required and not path.exists():
             return False
         try:
             with open(path, "r") as f:
                 payload = json.load(f)
+            if required:
+                for key in ('conversation', 'pending_tool_calls', 'current_day', 'turns_today',
+                            'total_turns', 'last_observation', 'observation_recorded'):
+                    if key not in payload:
+                        raise ValueError('Missing conversation field ' + key)
+                if not isinstance(payload['conversation'], list):
+                    raise ValueError('Conversation must be a list')
+                for message in payload['conversation']:
+                    for key in ('role', 'content', 'message_id', 'tool_calls', 'tool_call_id', 'name'):
+                        if key not in message:
+                            raise ValueError('Missing conversation message field ' + key)
             if self.evidence_store:
                 from saas_bench.execution_capture import restore_sources
                 from saas_bench.sql_evidence import digest
                 state = self.evidence_store.load_state('agent_sources')
-                if not state or state['snapshot_sha256'] != digest(path.read_bytes()):
-                    raise ValueError('Missing or mismatched private source state')
+                if not state:
+                    raise ValueError('Missing private source state')
+                if state.get('snapshot_sha256') != digest(path.read_bytes()):
+                    if not required:
+                        raise ValueError('Mismatched private source state')
+                    import logging
+                    logging.warning('Conversation checksum differs from private source state: %s', path)
                 restore_sources(payload, state['sources'])
                 self.usage_recorder.context_id = state['context_id']
             raw_msgs = payload.get("conversation", [])
@@ -691,18 +707,26 @@ class BashAgent(BaseAgent):
 
             if payload.get('pending_tool_calls'):
                 raise ValueError('Snapshot has a tool with an unknown outcome')
+            current_day = int(payload.get("current_day", 0) or 0)
+            turns_today = int(payload.get("turns_today", 0) or 0)
+            last_observation = payload['last_observation']
+            observation_recorded = payload['observation_recorded']
+            if required and msgs and not any(message.role == 'system' for message in msgs):
+                raise ValueError('Conversation lacks its saved system prompt')
             self.conversation = msgs
             self._pending_tool_calls = []
-            self.current_day = int(payload.get("current_day", 0) or 0)
-            self.turns_today = int(payload.get("turns_today", 0) or 0)
+            self.current_day = current_day
+            self.turns_today = turns_today
             self._skip_next_refresh = False
-            self._last_observation = payload['last_observation']
-            self._observation_recorded = payload['observation_recorded']
-            if not any(message.role == 'system' for message in self.conversation):
+            self._last_observation = last_observation
+            self._observation_recorded = observation_recorded
+            if not required and not any(message.role == 'system' for message in self.conversation):
                 print('[snapshot] Legacy context has no system prompt; freezing current system/MEMORY once.')
                 self._context_system_prompt()
             return True
         except Exception as e:
+            if required:
+                raise ValueError(f'Cannot restore conversation {path}: {e}') from e
             print(f"[snapshot] WARN failed to load conversation snapshot: {e}")
             return False
 

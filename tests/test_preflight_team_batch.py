@@ -180,7 +180,7 @@ def test_summarize_cli_preserves_metrics_without_counting_capture_failure_as_com
             assert pending['calls'] == 1
             assert next(gap for gap in pending['missing_receipts']
                 if gap['reason'] == 'unterminated_log_tail')['bytes'] > 0
-            assert pf['waste']['missing_receipts'] == pending['missing_receipts']
+            assert not pf['waste']['missing_receipts']
         else:
             assert {key: value for key, value in pending.items() if key != 'status'} == results['pf']['usage']
             assert not pf['waste']['missing_receipts']
@@ -774,8 +774,9 @@ def test_checkpoint_history_keeps_every_boundary_and_ceo_snapshot(managed_team):
         team._close_week()
         return batch.save_checkpoint(team, directory, record, 'week_boundary')
     def ceo_checkpoints():
+        team._rotate_sessions()
         team._stage = 'ceo'
-        team._week = dict(observation='Continue the current week.', ceo_started=False)
+        team._week = dict(observation='Continue the current week.', ceo_started=False, directions='', weekly_request_ids=[])
         team._set_phase('ceo')
         return [batch.save_checkpoint(team, directory, record, 'answers_ready') for _ in range(3)]
     initial = Path(record['checkpoint'])
@@ -853,8 +854,10 @@ def test_checkpoint_publication_failure_preserves_previous_snapshots_and_origina
             raise OSError('injected publication failure')
         write(path, value)
     monkeypatch.setattr(module, 'write_json', failed_publish)
-    assert batch.save_checkpoint(team, directory, record, 'week_boundary') is None
+    with pytest.raises(batch.CheckpointPublicationError, match='injected publication failure'):
+        batch.save_checkpoint(team, directory, record, 'week_boundary')
     assert record['checkpoint_error'] == 'injected publication failure'
+    assert record['checkpoint'] == str(second)
     monkeypatch.undo()
     assert {p: tree_hash(p) for p in before} == before
     assert batch.read(first.parent / '.retention.json') == ledger

@@ -245,7 +245,11 @@ class MultiAgentRuntime:
                 from .team_checkpoint import restore_runtime_state
                 restore_runtime_state(self, _restored_state)
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            finally:
+                for runtime in self.roles.values():
+                    runtime.agent.client.close()
             raise
 
     def _git(self, runtime, *args, **kwargs):

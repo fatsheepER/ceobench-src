@@ -107,8 +107,9 @@ def test_readonly_wrapper_stop_resumes_real_attempt(managed_git, tmp_path, monke
     role.agent.client.close()
     role.agent.client = batch.checked_client('ceo', 'readonly-test', transport=httpx.MockTransport(transport))
     role.usage.attach(role.agent.client)
+    team._rotate_sessions()
     team._stage = 'ceo'
-    team._week = dict(observation='Offline recovery check.', ceo_started=False)
+    team._week = dict(observation='Offline recovery check.', ceo_started=False, directions='', weekly_request_ids=[])
     team._set_phase('ceo')
     if interruption == 'registered_write':
         (role.workspace / 'registered.py').write_text('print("registered calculation")\n')

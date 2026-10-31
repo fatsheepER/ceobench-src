@@ -110,20 +110,40 @@ def _summary(records):
                 no_response_requests=len({r['call_id'] for r in records if r['no_response']}))
 
 
+LOG_GAPS = frozenset(('unterminated_log_tail', 'unreadable_usage_log',
+    'malformed_usage_record', 'short_checkpoint_usage_log', 'checkpoint_usage_lineage_unknown'))
+
+
+def usage_gap_role(gap):
+    if gap['category'] == 'simulator':
+        return 'simulator'
+    parts = Path(gap['path']).parts
+    if len(parts) >= 3 and parts[-3] == 'private' and parts[-2] in ROLES and parts[-1] == 'model-usage.jsonl':
+        return parts[-2]
+    return None
+
+
 def mark_truncated_totals(usage, gaps, *, category):
-    """Mask only totals a truncated resource log could still change."""
-    affected = {gap['category'] for gap in gaps if gap['reason'] == 'unterminated_log_tail'}
-    if not affected:
+    """Keep known subtotals while masking totals missing log evidence could change."""
+    gaps = [gap for gap in gaps if gap['reason'] in LOG_GAPS]
+    if not gaps:
         return
-    if affected & {'formal', 'engineering'}:
-        affected.add('simulator')
-    summaries = [usage.get('all_resources', {}), usage.get('failed_attempt_usage', {})]
-    summaries.extend(summary for resource, summary in usage.get('resources', {}).items() if resource in affected)
-    if category in affected:
-        summaries.extend([usage.get('team', {}), *usage.get('roles', {}).values()])
-    for summary in summaries:
-        if 'complete' in summary:
+    summaries = [(usage.get('all_resources', {}), gaps), (usage.get('failed_attempt_usage', {}), gaps)]
+    for resource, summary in usage.get('resources', {}).items():
+        selected = [gap for gap in gaps if gap['category'] == resource or
+            resource == 'simulator' and gap['category'] in ('formal', 'engineering') and usage_gap_role(gap) is None]
+        summaries.append((summary, selected))
+    primary = [gap for gap in gaps if gap['category'] == category]
+    summaries.append((usage.get('team', {}), primary))
+    summaries.extend((summary, [gap for gap in primary if usage_gap_role(gap) in (None, role)])
+        for role, summary in usage.get('roles', {}).items())
+    for summary, selected in summaries:
+        if selected and 'complete' in summary:
             summary['complete'] = dict.fromkeys(summary['complete'])
+            summary['wall_seconds'] = None
+            summary['wall_seconds_missing_calls'] = list(dict.fromkeys([
+                *summary.get('wall_seconds_missing_calls', []),
+                *(gap['path'] + ':' + str(gap.get('line', '?')) for gap in selected)]))
 
 
 def _attempt_order(attempt):
@@ -136,11 +156,14 @@ def _attempt_order(attempt):
     return at, int(retry) if retry is not None else -1
 
 
-def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal', exclude_calls=()):
+def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal', exclude_calls=(),
+              tolerate_log_errors=False):
     """Read logs without changing them; categories map to paths when a resource ledger is supplied.
 
     An HTTP attempt is the billing unit. Its final logical receipt supplies parsed
     fields, never a second bill. Frozen prices use the served model and request time.
+    Opt-in log tolerance covers file opening and JSON/Unicode decoding only;
+    decoded receipt shape, event, identity and accounting validation remain strict.
     """
     if isinstance(prices, (str, Path)):
         prices = load_pricing(prices)
@@ -156,7 +179,15 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal', ex
         files = [files] if isinstance(files, (str, Path)) else files
         for path in files:
             path = Path(path).resolve()
-            with path.open('rb') as stream:
+            try:
+                stream = path.open('rb')
+            except OSError as exc:
+                if not tolerate_log_errors:
+                    raise
+                gaps.append(dict(path=str(path), category=resource,
+                    reason='unreadable_usage_log', error=str(exc)))
+                continue
+            with stream:
                 for line_number, line in enumerate(stream, 1):
                     try:
                         row = json.loads(line)
@@ -172,7 +203,12 @@ def aggregate(paths, prices, *, start_day=0, end_day=None, category='formal', ex
                                 exc.msg.startswith('Invalid \\uXXXX escape') and suffix.startswith('u') and
                                 len(suffix) < 5 and set(suffix[1:]) <= set('0123456789abcdefABCDEF'))
                         if line.endswith(b'\n') or not truncated:
-                            raise
+                            if not tolerate_log_errors:
+                                raise
+                            gaps.append(dict(path=str(path), line=line_number,
+                                offset=stream.tell() - len(line), bytes=len(line), category=resource,
+                                reason='malformed_usage_record', error=str(exc)))
+                            continue
                         gaps.append(dict(path=str(Path(path).resolve()), line=line_number,
                             offset=stream.tell() - len(line), bytes=len(line), category=resource,
                             reason='unterminated_log_tail'))

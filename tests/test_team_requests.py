@@ -432,7 +432,8 @@ def run_controller_stop_child(entry_json, stop_path):
     snapshot = batch.save_checkpoint(team, directory, record, 'ready')
     assert snapshot is not None
     def request_stop():
-        wait_until(lambda: blocked.is_set() and team._workers['growth'].waiting is not None, seconds=10)
+        wait_until(lambda: blocked.is_set() and team._workers['growth'].waiting is not None
+                   and team._workers['growth'].waiting.status == 'queued', seconds=10)
         write_json(directory / 'waiting-proof.json', dict(
             request=asdict(team._workers['growth'].waiting), model_blocked=True))
         Path(stop_path).write_text('operator stop after sender blocks')
@@ -519,23 +520,55 @@ def test_controller_stop_reaps_waiting_role_workers_and_preserves_initial_checkp
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_known_unstarted_advance_releases_reservation_preserving_existing_hold(mode, monkeypatch):
+def test_known_unstarted_advance_releases_reservation_and_agent_retries(mode, monkeypatch):
     import sqlite3
     from saas_bench import database
-    def fail(*args, **kwargs):
-        raise sqlite3.OperationalError('injected prediction persistence failure before advancement')
-    monkeypatch.setattr(database, 'save_predictions', fail)
+    from test_preflight_team_checkpoint import fast_simulator
+    save_predictions = database.save_predictions
+    saves = 0
+    turns = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal saves
+        saves += 1
+        if saves == 1:
+            raise sqlite3.OperationalError('injected prediction persistence failure before advancement')
+        return save_predictions(*args, **kwargs)
+
+    monkeypatch.setattr(database, 'save_predictions', fail_once)
+
     def respond(team, role, body):
-        return calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final('WEEKLY-' + role)
+        nonlocal turns
+        if role != 'ceo':
+            return final('WEEKLY-' + role)
+        turns += 1
+        assert turns <= 2, 'CEO repeated a known failed advance beyond the single retry'
+        if turns == 2:
+            result = body['messages'][-1]
+            assert result['role'] == 'tool' and 'prediction_save_failed' in result['content']
+            assert team.server.tools.current_day == 0 and not team.server._operation_failed
+            assert not team.server.conn.in_transaction
+            assert team.server.public_request_state()['active'] == []
+            assert not team._advancing, 'A known non-advance retained the admission reservation'
+            advances = [json.loads(path.read_text()) for path in
+                        (team.root / 'private/operations').glob('*.json')]
+            advances = [row for row in advances if row['kind'] == 'api:advance']
+            assert len(advances) == 1 and advances[0]['status'] == 'failed'
+            assert advances[0]['advance']['prediction_transaction'] == 'rolled_back'
+            assert advances[0]['advance']['progression'] == 'not_advanced'
+        return calls(('bash', dict(command=ADVANCE)))
+
     with make_team(mode, respond, 'request-known-advance-failure') as team:
+        team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
         result = team.run(stop_after_day=7)
         save_evidence(team, 'known-advance-failure')
-        assert result.reason == 'paused' and team.failure == 'business_operation_pending'
-        assert team.server.tools.current_day == 0 and not team.server._operation_failed
+        assert (result.day, result.reason) == (7, 'observation_end') and team.failure is None
+        assert turns == saves == 2
         assert team.server.public_request_state()['active'] == []
-        assert not team._advancing, 'A known non-advance retained the new admission reservation'
         operations = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
-        assert any(row['kind'] == 'api:advance' and row['status'] == 'running' for row in operations)
+        advances = [row for row in operations if row['kind'] == 'api:advance']
+        assert Counter(row['status'] for row in advances) == {'failed': 1, 'completed': 1}
+        assert all(row['status'] != 'running' for row in operations)
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])

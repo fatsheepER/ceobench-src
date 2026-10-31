@@ -80,7 +80,9 @@ def test_first_recovery_selects_independent_boundaries_without_approval(frozen, 
             team._set_phase('boundary')
             record['status'] = 'paused'
             snapshots[entry['run_id']] = batch.save_checkpoint(team, directory, record, 'week_boundary')
+            team._rotate_sessions()
             team._stage = 'ceo'
+            team._week = dict(observation='Continue from the selected boundary.', ceo_started=False, directions='', weekly_request_ids=[])
             team._set_phase('ceo')
             batch.save_checkpoint(team, directory, record, 'answers_ready')
             originals[directory / 'attempt.json'] = (directory / 'attempt.json').read_bytes()

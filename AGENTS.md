@@ -34,6 +34,7 @@
 - 职责写权完整入口矩阵、专家操作回执与互读路径从 `tests/test_responsibility_authority.py` 定位；跨角色历史与私有层隔离从 `tests/test_preflight_multi_agent.py`、`tests/test_preflight_team_evidence.py` 定位。
 - 企业协商的客户标识、拒绝与七天超时，以及公共 SDK 的定向 ops 四范围和 dev 组映射替换契约，从 `tests/test_enterprise_sdk_contracts.py` 定位。
 - 推进失败终态、客户端先退出及关闭交错从 `tests/test_advance_terminal.py` 定位。
+- 显式历史选点、初始周界、真实 driver 重复恢复与旧 attempt 保留从 `tests/test_checkpoint_driver.py` 定位；必要恢复数据、空会话、周状态及 checkpoint 发布失败从 `tests/test_checkpoint_recovery.py` 定位。晚完成推进的共享资源收尾、清理超时后 controller HOLD 接管和恢复作废记账从 `tests/test_checkpoint_close.py` 定位；缺失继承用量、角色范围及跨目录祖先链的未知值从 `tests/test_checkpoint_usage_gaps.py` 定位。
 - 自动周检、重放及状态传播已删除。周初看板、注册脚本、全文交接与检查点恢复的真实模型输入从 `tests/test_week_start_observation.py` 定位；主动来源查询不重放、不判断条件及旧 findings 不再投递从 `tests/test_pf_readonly_sources.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。
 - 三角色同步请求、FIFO、循环等待拒绝、整批工具后的模型投递、原会话唤醒与问答权限从 `tests/test_team_requests.py` 定位。

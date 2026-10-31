@@ -19,6 +19,7 @@ import time
 import uuid
 
 from saas_bench import team_batch as batch
+from saas_bench.team_recovery import requested_checkpoint
 from saas_bench.run_lifecycle import RunCancelled
 from saas_bench.run_state import write_json
 from saas_bench.run_warnings import AttemptWarnings, advisory
@@ -378,7 +379,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop)):
             return None
         history = batch.attempts(entry)
-        mode = 'resume' if history else 'run'
+        continuing = resume or bool(history) or week is not None or requested_checkpoint(entry, week=week) is not None
+        mode = 'resume' if continuing else 'run'
         launch_ordinal += 1
         launch_id = str(launch_ordinal) + '-' + uuid.uuid4().hex[:8]
         ready = host_logs / f'ready-{entry["run_id"]}-{launch_id}.json'
@@ -392,7 +394,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         streams.append(stream)
         command = [sys.executable, str(Path(__file__).resolve()), '--policy', str(policy),
             '--live', '--worker', entry['run_id'], '--parent-pid', str(os.getpid())]
-        if history:
+        if continuing:
             command.append('--resume')
         if force_resume:
             command.append('--force-resume')
@@ -448,8 +450,9 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             history = batch.attempts(entry)
             prior_attempt = history[-1].name if history else ''
             try:
-                if week is None and saved and saved.get('status') == 'finished':
-                    logging.warning('Skipping finished group %s; select --week explicitly to re-enter it', entry['run_id'])
+                explicit = week is not None or requested_checkpoint(entry, week=week) is not None
+                if not explicit and saved and saved.get('status') == 'finished':
+                    logging.warning('Skipping finished group %s; select a checkpoint or --week explicitly to re-enter it', entry['run_id'])
                     terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
                                                     attempt=saved.get('attempt'))
                     continue
@@ -536,7 +539,13 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                     child, entry = slot['child'], slot['entry']
                     child.poll()
                     own_stop = run_stopped(entry, after_attempt=slot['prior_attempt'])
-                    closed = cleanup(slot, requested=stopping or own_stop)
+                    current_history = batch.attempts(entry)
+                    cleanup_pending = False
+                    if current_history and current_history[-1].name != slot['prior_attempt']:
+                        marker = current_history[-1] / 'runtime/private/resource-cleanup.json'
+                        if marker.exists():
+                            cleanup_pending = batch.read(marker).get('status') == 'pending'
+                    closed = cleanup(slot, requested=stopping or own_stop or cleanup_pending)
                     if slot['closed']:
                         active[group] = None
                         continue

@@ -4,8 +4,6 @@ import logging
 import os
 from pathlib import Path
 
-from .run_warnings import advisory
-
 
 def execution_root(manifest_path, manifest):
     return Path(__file__).resolve().parents[2]
@@ -13,6 +11,23 @@ def execution_root(manifest_path, manifest):
 
 def hold_path(manifest_path):
     return Path(manifest_path).parent / 'HOLD'
+
+
+def requested_checkpoint(entry, *, week=None):
+    if week is not None:
+        return None
+    try:
+        requested = json.loads(os.environ.get('CEOBENCH_RECOVERY_CHECKPOINTS', '{}'))
+    except ValueError as exc:
+        raise ValueError('Invalid CEOBENCH_RECOVERY_CHECKPOINTS JSON: ' + str(exc)) from exc
+    if not isinstance(requested, dict):
+        raise ValueError('CEOBENCH_RECOVERY_CHECKPOINTS must map run IDs to checkpoint paths')
+    if entry['run_id'] not in requested:
+        return None
+    value = requested[entry['run_id']]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('Requested checkpoint for ' + entry['run_id'] + ' must be a nonempty path')
+    return Path(value).resolve()
 
 
 def latest_checkpoint(entry, previous=None, week=None):
@@ -31,23 +46,13 @@ def latest_checkpoint(entry, previous=None, week=None):
             state = json.loads(record.read_text())
             if not isinstance(state, dict):
                 raise ValueError('Attempt metadata is not a mapping')
-            if state.get('reason') == 'missing_checkpoint' and state.get('execution_started') is False:
+            if state.get('reason') in ('missing_checkpoint', 'checkpoint_data_missing') and state.get('execution_started') is False:
                 continue
             latest, lineage_attempt = state, attempt
         except (OSError, ValueError, AttributeError) as exc:
             logging.warning('Recovery could not read attempt metadata %s: %s', record, exc)
-    requested = {}
-    if week is None:
-        with advisory():
-            requested = json.loads(os.environ.get('CEOBENCH_RECOVERY_CHECKPOINTS', '{}'))
-    if not isinstance(requested, dict):
-        logging.warning('Recovery checkpoint selection is not a mapping; using saved checkpoints')
-        requested = {}
-    requested = requested.get(entry['run_id'])
-    if requested is not None and not isinstance(requested, str):
-        logging.warning('Requested checkpoint path is not text; using saved checkpoints')
-        requested = None
-    candidates = [Path(requested)] if requested else [
+    requested = requested_checkpoint(entry, week=week)
+    candidates = [requested] if requested else [
         snapshot for attempt in history for snapshot in (attempt / 'runtime/checkpoints').glob('*')
         if snapshot.is_dir() and not snapshot.name.startswith('.')]
     if not requested and week is None and history and (latest.get('source_checkpoint') or latest.get('replay_week') == 1):
@@ -61,7 +66,7 @@ def latest_checkpoint(entry, previous=None, week=None):
             snapshot, state = validate_snapshot(candidate)
             if not snapshot.is_relative_to(root):
                 logging.warning('Recovery checkpoint belongs to another run: %s', snapshot)
-            if (state['stage'] not in ('boundary', 'ceo') or
+            if (state['stage'] not in ('boundary', 'ceo_opening', 'ceo') or
                     set(state['roles']) != {'ceo', 'growth', 'ops_finance'} or
                     any(role['identity']['run_id'] != entry['run_id'] for role in state['roles'].values())):
                 logging.warning('Recovery checkpoint has invalid run identity or handoff: %s', snapshot)
