@@ -131,6 +131,7 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
     assert len(encoded) == 17
     assert saved_runtime_config(directory / 'world.nmdb') == encoded
     restored = offline_runner(clone(first, tmp_path / 'runtime-restored'))
+    assert business_references(restored) == business_references(first)
     for _ in range(2):
         assert advance(restored) == advance(first)
     for runner in (first, restored):
@@ -241,13 +242,36 @@ def business_state(runner):
     conn = load_session_db(directory / 'world.nmdb')
     tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
               if not row[0].startswith('sqlite_')]
+    references = dict(conn.execute('SELECT operation_ref, operation_seq FROM business_operations'))
     result = {}
     for table in tables:
         columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")') if row[1] != 'submitted_at']
         select = ','.join('"' + c + '"' for c in columns)
-        result[table] = sorted([list(row) for row in conn.execute(f'SELECT {select} FROM "{table}"')], key=str)
+        rows = []
+        for values in conn.execute(f'SELECT {select} FROM "{table}"'):
+            row = dict(zip(columns, values))
+            if table in ('business_operations', 'business_effects'):
+                reference = row['operation_ref']
+                row['operation_ref'] = references[reference]
+                if table == 'business_effects':
+                    owner, index = row['effect_ref'].rsplit('/effect:', 1)
+                    assert owner == reference
+                    row['effect_ref'] = f'{references[reference]}/effect:{index}'
+                    if json.loads(row['target_json']).get('table') == 'predictions':
+                        for column in ('before_json', 'after_json', 'applied_parameters_json'):
+                            value = json.loads(row[column])
+                            if isinstance(value, dict):
+                                value.pop('submitted_at', None)
+                            row[column] = json.dumps(value, sort_keys=True)
+            rows.append([row[column] for column in columns])
+        result[table] = sorted(rows, key=str)
     conn.close()
     return result
+
+
+def business_references(runner):
+    return runner._http_post('/query', {'sql':
+        'SELECT operation_ref FROM business_operations ORDER BY operation_seq'})['rows']
 
 
 def clone(source, destination):
@@ -291,6 +315,7 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
     assert len({r._server_proc.pid for r in (first, left, right)}) == 3
     assert len({r._server_port for r in (first, left, right)}) == 3
     for restored in (left, right):
+        assert business_references(restored) == business_references(first)
         assert restored.agent._last_observation == 'completed metric registration'
         assert restored.agent._observation_recorded
         assert (restored.agent_workspace / 'MEMORY.md').read_text() == 'retain the weekly metric'

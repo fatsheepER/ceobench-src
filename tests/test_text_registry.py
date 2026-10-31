@@ -331,8 +331,20 @@ def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(work
     public = prefix.path.read_bytes()
     prefix.path.unlink()
     baseline = TextRegistry(workspace, 'git', sim_day=lambda: 7)
-    assert baseline.execute('create', declaration({'path': 'evidence.json'})) == result
-    assert baseline.path.read_bytes() == public
+    baseline_result = baseline.execute('create', declaration({'path': 'evidence.json'}))
+    expected = json.loads(public)
+    actual = json.loads(baseline.path.read_bytes())
+    expected_evidence = expected['records']['r1'][0]['references'][0]['evidence']
+    actual_evidence = actual['records']['r1'][0]['references'][0]['evidence']
+    expected_commit, actual_commit = expected_evidence['commit'], actual_evidence['commit']
+    for evidence in (expected_evidence, actual_evidence):
+        assert evidence['path'] == 'evidence.json'
+        assert subprocess.check_output(['git', '-C', str(workspace), 'show',
+            evidence['commit'] + ':' + evidence['path']]) == b'{"n":7}'
+    assert expected_commit in result and actual_commit in baseline_result
+    assert baseline_result.replace(actual_commit, expected_commit) == result
+    actual_evidence['commit'] = expected_commit
+    assert actual == expected
     private = store.load_state('declaration:r1.1')['references'][0]
     assert private['status'] == ('resolved' if delivered else 'unknown')
     assert b'delivered_in' not in public and b'version_id' not in public

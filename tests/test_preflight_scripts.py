@@ -9,7 +9,7 @@ from saas_bench.api_server import NovaMindAPIServer
 def test_registered_versions_survive_database_backup(tmp_path):
     import sqlite3
     import pytest
-    tools = SimpleNamespace(workspace_path=tmp_path)
+    tools = SimpleNamespace(workspace_path=tmp_path, current_day=0)
     conn = sqlite3.connect(':memory:')
     server = NovaMindAPIServer(tools, conn=conn)
     server.set_daily_scripts({'first': "print('A')", 'second': "print('two')"})
@@ -24,6 +24,7 @@ def test_registered_versions_survive_database_backup(tmp_path):
     restored.set_daily_scripts({})
     assert NovaMindAPIServer(tools, conn=clone).get_daily_scripts() == {}
     conn.execute("UPDATE _registered_scripts SET content='corrupt' WHERE name='first'")
+    conn.commit()
     with pytest.raises(ValueError, match='checksum'):
         NovaMindAPIServer(tools, conn=conn)
 

@@ -66,7 +66,10 @@ def test_prediction_failure_rolls_back_before_any_world_change(make_initialized_
         raise OSError('injected failure after first row')
     monkeypatch.setattr('saas_bench.database.save_predictions', fail)
     result = server.advance_week({7: {'cash': 1}})
-    assert result == {'success': False, 'error': 'prediction_save_failed', 'day': 0}
+    assert result == dict(success=False, error='prediction_save_failed', day=0,
+        prediction_transaction='rolled_back', advance=dict(status='failed', old_day=0,
+            target_day=7, reached_day=0, last_completed_day=0, progression='not_advanced',
+            error='prediction_save_failed', prediction_transaction='rolled_back'))
     assert conn.execute('SELECT COUNT(*) FROM predictions').fetchone()[0] == 0
     assert simulator.current_day == 0 and simulator.rng.bit_generator.state == initial_rng
     assert not server._operation_failed
