@@ -58,11 +58,17 @@ def summarize_pairs(runs):
                     ('zero_git_denominator' if left == 0 else None))
         complete = bool(git and pf and git['status'] == pf['status'] == 'reached_d112' and
                         not any(run.get('evidence_fault') for run in pair.values()))
+        ends = {run.get('stop_after_day') for run in pair.values()}
+        observation_end = next(iter(ends)) if len(ends) == 1 else None
+        complete_observation = bool(git and pf and type(observation_end) is int and
+            all(run['status'] in ('reached_d112', 'reached_stop_day') and
+                run.get('day') == observation_end and not run.get('evidence_fault') for run in pair.values()))
         bankruptcy = bool(git and pf and 'natural_bankruptcy' in (git['status'], pf['status']))
         common_day = min(git['day'], pf['day']) // 7 * 7 if bankruptcy and all(
             run.get('day') is not None for run in (git, pf)) else None
         pairs.append(dict(seed=seed, repeat=repeat, run_ids={g: r['run_id'] for g, r in pair.items()},
             statuses={g: r['status'] for g, r in pair.items()}, complete_d112=complete,
+            observation_end=observation_end, complete_observation=complete_observation,
             cost_breakdown={group: (run.get('usage') or {}).get('team', {}).get('costs')
                             for group, run in pair.items()},
             waste={group: dict(wall_seconds=run.get('waste_wall_seconds'),
@@ -71,5 +77,6 @@ def summarize_pairs(runs):
             common_completed_week_end=common_day,
             comparison=comparison, missing_groups=[g for g in ('git', 'pf') if g not in pair]))
     return dict(runs=runs, pairs=pairs, allocated_runs=len(runs), complete_d112_pairs=sum(p['complete_d112'] for p in pairs),
+        complete_observation_pairs=sum(p['complete_observation'] for p in pairs),
         status_counts={status: sum(r['status'] == status for r in runs) for status in sorted({r['status'] for r in runs})},
         by_seed={str(seed): [p for p in pairs if p['seed'] == seed] for seed in sorted({key[0] for key in indexed})})

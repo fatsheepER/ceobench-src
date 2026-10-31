@@ -2,7 +2,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
 import errno
@@ -54,6 +54,24 @@ PARAMETERS = dict(provider='opencode', model=MODEL, reasoning_effort='high',
     simulator_thinking='disabled', simulator_reasoning_effort='none',
     analyst_bash_timeout=480, analyst_bash_warn_after=120,
     analyst_bash_scope='growth_and_ops_finance_model_bash_initial_and_ceo_followup')
+
+
+@dataclass(frozen=True)
+class BatchProfile:
+    category: str
+    seed_counts: tuple[int, ...]
+    repeats: int
+    groups: tuple[str, ...]
+    stop_after_day: int
+
+
+BATCH_PROFILES = {
+    'formal': BatchProfile('formal', (2, 3), 2, ('git', 'pf'), 112),
+    'engineering': BatchProfile('engineering', (1,), 1, ('git', 'pf'), 28),
+    'r2-git-exploration': BatchProfile('formal', (2,), 1, ('git',), 56),
+    'r2-paired-pilot': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
+}
+ROUND_TWO_PROFILES = ('r2-git-exploration', 'r2-paired-pilot')
 
 
 class CheckpointPublicationError(RuntimeError):
@@ -311,52 +329,89 @@ def explicit_bash_settings():
 
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
                  order_seed=0, excluded_seeds=(), selection_rule='',
-                 root=ROOT, public_dir=None, token_counter=None, scheduling='paired'):
+                 root=ROOT, public_dir=None, token_counter=None, scheduling=None,
+                 profile=None, exploration_manifest=None):
     root, destination = Path(root).resolve(), Path(destination).resolve()
     public = Path(public_dir or root / 'public').resolve()
     if category not in ('formal', 'engineering'):
         raise ValueError('Category must be formal or engineering')
+    if profile is not None and profile not in ROUND_TWO_PROFILES:
+        raise ValueError('Unknown round-two profile')
+    layout = BATCH_PROFILES[profile or category]
+    if category != layout.category:
+        raise ValueError('Category conflicts with the selected profile')
+    scheduling = scheduling or ('group_independent' if profile else 'paired')
     if scheduling not in ('paired', 'group_independent'):
         raise ValueError('Unknown frozen scheduling policy')
+    if profile and scheduling != 'group_independent':
+        raise ValueError('Round-two profiles use independent group queues')
+    exclusion_source = None
+    excluded_seeds = set(excluded_seeds)
+    if profile == 'r2-paired-pilot':
+        if exploration_manifest is None:
+            raise ValueError('Paired pilot requires --exploration-manifest for seed exclusions')
+        previous_path = Path(exploration_manifest).resolve()
+        previous = read(previous_path)
+        if previous.get('profile') != 'r2-git-exploration':
+            raise ValueError('Seed exclusions require a round-two Git exploration manifest')
+        exploration_seeds = sorted(set(previous['seeds']) | {entry['seed'] for entry in previous['runs']})
+        excluded_seeds.update(exploration_seeds)
+        excluded_seeds.update(previous['excluded_debug_seeds'])
+        exclusion_source = dict(manifest=str(previous_path), manifest_sha256=file_hash(previous_path),
+            batch_id=previous['batch_id'], seeds=exploration_seeds)
+    elif exploration_manifest is not None:
+        raise ValueError('--exploration-manifest applies only to the paired pilot')
     seeds = list(d0_sources)
     if any(type(seed) is not int or seed < 0 for seed in seeds) or len(seeds) != len(set(seeds)):
         raise ValueError('Seeds must be unique nonnegative integers')
-    if category == 'formal' and (len(seeds) not in (2, 3) or not selection_rule.strip() or set(seeds) & set(excluded_seeds)):
-        raise ValueError('Formal batches require two or three unused seeds and a recorded selection rule')
+    if len(seeds) not in layout.seed_counts:
+        raise ValueError(f'{profile or category} requires seed count in {layout.seed_counts}')
+    if category == 'formal' and (not selection_rule.strip() or set(seeds) & excluded_seeds):
+        raise ValueError('Batches require unused seeds and a recorded selection rule')
+    if profile:
+        seeds.sort()
     if category == 'engineering' and seeds != [42]:
         raise ValueError('D28 engineering verification uses seed 42')
     check_prices(prices, price_source)
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
     d0 = {str(seed): verify_d0(path, seed=seed) for seed, path in d0_sources.items()}
     destination.mkdir(parents=True, exist_ok=False)
-    pairs = [(seed, repeat) for seed in seeds for repeat in range(1, 3 if category == 'formal' else 2)]
+    batch_id = uuid.uuid4().hex
+    run_prefix = f'{profile}-{batch_id}' if profile else category
+    pairs = [(seed, repeat) for seed in seeds for repeat in range(1, layout.repeats + 1)]
     ordering = random.Random(order_seed)
     ordering.shuffle(pairs)
     runs = []
     for seed, repeat in pairs:
-        groups = ['git', 'pf']
+        groups = list(layout.groups)
         ordering.shuffle(groups)
         for group in groups:
-            run_id = f'{category}-s{seed}-r{repeat}-{group}'
+            run_id = f'{run_prefix}-s{seed}-r{repeat}-{group}'
             runs.append(dict(run_id=run_id, pair_id=f's{seed}-r{repeat}', seed=seed, repeat=repeat,
                 group=group, category=category, d0=d0[str(seed)]['path'],
-                output_dir=str(destination / 'runs' / run_id), stop_after_day=112 if category == 'formal' else 28))
+                output_dir=str(destination / 'runs' / run_id), stop_after_day=layout.stop_after_day))
     controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
-    manifest = dict(version=1, category=category, batch_id=uuid.uuid4().hex, seeds=seeds,
-        excluded_debug_seeds=list(excluded_seeds), seed_selection_rule=selection_rule,
+    manifest = dict(version=1, category=category, batch_id=batch_id, seeds=seeds,
+        excluded_debug_seeds=sorted(excluded_seeds), seed_selection_rule=selection_rule,
         order=dict(method='python.Random.shuffle pairs then groups', seed=order_seed),
         source_root=str(root), source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
         controller_sha256={name: file_hash(root / name) for name in controllers},
         public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
         price_source=price_source, attempt_policy='manual_checkpoint_resume', d0=d0, runs=runs)
+    if profile:
+        manifest['profile'] = profile
+        for entry in runs:
+            entry['profile'] = profile
+    if exclusion_source is not None:
+        manifest['exploration_source'] = exclusion_source
     if scheduling == 'group_independent':
         manifest['scheduling'] = dict(mode=scheduling, queues={group:
             [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
     counter = token_counter or load_counter('opencode', MODEL)
     manifest['tokenizer'] = counter.metadata if counter else None
     prompts = {}
-    for group in ('git', 'pf'):
+    for group in layout.groups:
         entry = next(run for run in runs if run['group'] == group)
         with tempfile.TemporaryDirectory(prefix='team-prompts-') as temporary:
             team = make_team(manifest, entry, Path(temporary), token_counter=counter)
@@ -384,10 +439,15 @@ def validate_manifest(path):
         category, seeds = manifest['category'], manifest['seeds']
         if any(type(seed) is not int or seed < 0 for seed in seeds):
             logging.warning('Frozen seeds must be nonnegative integers')
+        profile = manifest.get('profile')
+        layout = BATCH_PROFILES.get(profile or category)
+        if layout is None or layout.category != category:
+            logging.warning('Batch profile or resource category mismatch')
         if category == 'formal':
-            if len(seeds) not in (2, 3) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
+            if len(seeds) not in (layout.seed_counts if layout else (2, 3)) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
                 logging.warning('Formal batch seed selection mismatch')
-            expected = {(seed, repeat, group) for seed in seeds for repeat in (1, 2) for group in ('git', 'pf')}
+            expected = {(seed, repeat, group) for seed in seeds
+                for repeat in range(1, layout.repeats + 1) for group in layout.groups} if layout else set()
         elif category == 'engineering' and seeds == [42]:
             expected = {(42, 1, group) for group in ('git', 'pf')}
         else:
@@ -396,11 +456,12 @@ def validate_manifest(path):
         actual, ids, outputs = set(), set(), set()
         for entry in manifest['runs']:
             key = entry['seed'], entry['repeat'], entry['group']
-            run_id = f'{category}-s{entry["seed"]}-r{entry["repeat"]}-{entry["group"]}'
+            run_prefix = f'{profile}-{manifest["batch_id"]}' if profile else category
+            run_id = f'{run_prefix}-s{entry["seed"]}-r{entry["repeat"]}-{entry["group"]}'
             output = str(path.parent / 'runs' / run_id)
             if key not in expected or key in actual or entry['run_id'] != run_id or run_id in ids or entry['output_dir'] != output or output in outputs:
                 logging.warning('Duplicate or mismatched run group, seed, repeat or output')
-            if entry['category'] != category or entry['pair_id'] != f's{entry["seed"]}-r{entry["repeat"]}' or entry['stop_after_day'] != (112 if category == 'formal' else 28):
+            if entry['category'] != category or entry['pair_id'] != f's{entry["seed"]}-r{entry["repeat"]}' or entry['stop_after_day'] != (layout.stop_after_day if layout else None):
                 logging.warning('Run category, pair or observation stop mismatch')
             source = manifest['d0'][str(entry['seed'])]
             with advisory():
@@ -413,9 +474,34 @@ def validate_manifest(path):
         if actual != expected or len(manifest['runs']) != len(expected):
             logging.warning('Frozen run list is incomplete')
         scheduling_policy(manifest)
-        if set(manifest['prompts']) != {'git', 'pf'} or any(set(p) != set(ROLES) for p in manifest['prompts'].values()):
+        if set(manifest['prompts']) != {row['group'] for row in manifest['runs']} or any(set(p) != set(ROLES) for p in manifest['prompts'].values()):
             logging.warning('Frozen role prompts are incomplete')
     return manifest
+
+
+def create_policy(manifest_path, destination, *, run_ids=None, group=None):
+    manifest_path, destination = Path(manifest_path).resolve(), Path(destination).resolve()
+    manifest = validate_manifest(manifest_path)
+    if run_ids is not None and group is not None:
+        raise ValueError('Choose run IDs or a group, not both')
+    if group is not None and group not in ('git', 'pf'):
+        raise ValueError('Unknown experiment group')
+    ids = set(run_ids) if run_ids is not None else None
+    if ids is not None and (not ids or len(ids) != len(run_ids) or
+            ids - {entry['run_id'] for entry in manifest['runs']}):
+        raise ValueError('Policy run IDs must be unique assignments from the manifest')
+    runs = [entry for entry in manifest['runs'] if
+        (ids is None or entry['run_id'] in ids) and (group is None or entry['group'] == group)]
+    if not runs:
+        raise ValueError('Policy selection has no assigned runs')
+    identity = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
+    identity.update(manifest=str(manifest_path), manifest_sha256=file_hash(manifest_path),
+        host_logs=str(destination / 'host-logs'),
+        runs=[{key: entry[key] for key in ('run_id', 'output_dir')} for entry in runs])
+    destination.mkdir(parents=True, exist_ok=False)
+    policy = dict(identity=identity)
+    write_json(destination / 'policy.json', policy)
+    return dict(policy=str(destination / 'policy.json'), **policy)
 
 
 def scheduling_policy(manifest):
@@ -713,7 +799,8 @@ def register_attempt(path, manifest, entry, *, resume=False, week=None):
     temporary = Path(tempfile.mkdtemp(prefix='.registration-', dir=directory.parent))
     shutil.copyfile(path, temporary / 'manifest.json')
     (temporary / 'manifest.json').chmod(0o444)
-    record = dict(run_id=entry['run_id'], category=entry['category'], attempt=number,
+    record = dict(run_id=entry['run_id'], category=entry['category'], batch_id=manifest.get('batch_id'),
+        profile=manifest.get('profile'), attempt=number,
         attempt_id=uuid.uuid4().hex, status='preparing', execution_started=False, manifest_sha256=file_hash(path),
         source_checkpoint=str(source) if source else None, checkpoint=str(source) if source else None,
         replay_week=week,
@@ -1054,8 +1141,11 @@ def summarize(path, resource_paths=None):
             usage['missing_receipts'] = [gap for gap in usage.get('missing_receipts', [])
                 if gap['reason'] != 'unterminated_log_tail'] + tails
             mark_truncated_totals(usage, tails, category=row['category'])
-    return dict(category=manifest['category'], runs=rows,
-                pairs=summarize_pairs(rows), resources=resources)
+    single_group = manifest.get('profile') == 'r2-git-exploration'
+    return dict(category=manifest['category'], batch_id=manifest.get('batch_id'),
+        profile=manifest.get('profile'), runs=rows,
+        comparison_status='not_applicable_single_group' if single_group else 'paired',
+        pairs=None if single_group else summarize_pairs(rows), resources=resources)
 
 
 def main(argv=None):
@@ -1071,11 +1161,21 @@ def main(argv=None):
     frozen.add_argument('--output', type=Path, required=True)
     frozen.add_argument('--pricing', type=Path, required=True)
     frozen.add_argument('--price-source', required=True)
-    frozen.add_argument('--category', choices=('formal', 'engineering'), default='formal')
-    frozen.add_argument('--excluded-debug-seed', action='append', type=int, default=[])
+    shape = frozen.add_mutually_exclusive_group()
+    shape.add_argument('--category', choices=('formal', 'engineering'), default='formal')
+    shape.add_argument('--profile', choices=ROUND_TWO_PROFILES)
+    frozen.add_argument('--exploration-manifest', type=Path,
+        help='Prior Git exploration manifest, required for the paired pilot seed exclusions.')
+    frozen.add_argument('--excluded-debug-seed', '--excluded-seed', action='append', type=int, default=[])
     frozen.add_argument('--seed-selection-rule', default='')
     frozen.add_argument('--order-seed', type=int, default=0)
-    frozen.add_argument('--scheduling', choices=('paired', 'group_independent'), default='paired')
+    frozen.add_argument('--scheduling', choices=('paired', 'group_independent'))
+    policy = commands.add_parser('policy', help='Create a new control directory without starting workers.')
+    policy.add_argument('--manifest', type=Path, required=True)
+    policy.add_argument('--output', type=Path, required=True, help='New control directory containing policy.json.')
+    selection = policy.add_mutually_exclusive_group()
+    selection.add_argument('--run-id', action='append')
+    selection.add_argument('--group', choices=('git', 'pf'))
     for name in ('validate', 'start', 'run', 'resume', 'summarize'):
         sub = commands.add_parser(name)
         sub.add_argument('--manifest', type=Path, required=True)
@@ -1097,7 +1197,10 @@ def main(argv=None):
             sources[int(seed)] = Path(value)
         result = freeze_batch(args.output, sources, load_pricing(args.pricing), price_source=args.price_source,
             category=args.category, order_seed=args.order_seed, excluded_seeds=args.excluded_debug_seed,
-            selection_rule=args.seed_selection_rule, scheduling=args.scheduling)
+            selection_rule=args.seed_selection_rule, scheduling=args.scheduling,
+            profile=args.profile, exploration_manifest=args.exploration_manifest)
+    elif args.command == 'policy':
+        result = create_policy(args.manifest, args.output, run_ids=args.run_id, group=args.group)
     elif args.command == 'validate':
         result = validate_manifest(args.manifest)['runs']
     elif args.command == 'summarize':

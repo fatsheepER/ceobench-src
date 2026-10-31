@@ -93,6 +93,9 @@ def identity(path, expected):
     runs = [batch.selected(manifest, run['run_id']) for run in selection]
     if any(run['output_dir'] != anchor['output_dir'] for run, anchor in zip(runs, selection)):
         logging.warning('Wrong monitored run output path')
+    if manifest.get('profile') in batch.ROUND_TWO_PROFILES:
+        selected_ids = {run['run_id'] for run in runs}
+        runs = [run for run in manifest['runs'] if run['run_id'] in selected_ids]
     return dict(manifest, runs=runs)
 
 

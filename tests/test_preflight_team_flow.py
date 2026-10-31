@@ -338,7 +338,7 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-@pytest.mark.parametrize('stop', [28, 112])
+@pytest.mark.parametrize('stop', [28, 56, 112])
 def test_observation_stop_precedes_next_scripts_and_models(mode, stop):
     decision_days = {role: [] for role in ROLES}
 
@@ -365,7 +365,7 @@ def test_observation_stop_precedes_next_scripts_and_models(mode, stop):
         expected = list(range(0, stop, 7))
         assert team.server.tools.current_day == stop
         assert decision_days == dict.fromkeys(ROLES, expected)
-        assert len(expected) == (4 if stop == 28 else 16)
+        assert len(expected) == stop // 7
         for runtime in team.roles.values():
             assert list(map(int, (runtime.workspace / 'script-days.txt').read_text().splitlines())) == expected
         assert not (team.roles['ceo'].workspace / 'after-advance').exists()

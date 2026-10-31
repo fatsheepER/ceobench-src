@@ -59,7 +59,8 @@ def _main(argv, warnings):
         manifest = dict(manifest, runs=[batch.selected(manifest, args.run_id)])
     if args.check:
         print(json.dumps(dict(status='validated', batch_id=manifest['batch_id'],
-            scheduling='group_independent', runs=[row['run_id'] for row in manifest['runs']],
+            scheduling='group_independent', profile=manifest.get('profile'),
+            runs=[row['run_id'] for row in manifest['runs']], assignments=manifest['runs'],
             memory_high=args.memory_high, memory_max=args.memory_max,
             runtime_limits=runtime_environment(args),
             model_requests=0, credential_read=False, new_attempts=0)))

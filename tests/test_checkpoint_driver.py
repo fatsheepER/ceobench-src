@@ -65,6 +65,16 @@ def _worker(spec_path, argv):
     def local_world(conn, config, rng):
         simulator = fast_simulator(conn, config, rng)
         simulator.shock_manager = batch.simulator(conn, config, rng).shock_manager
+        if spec.get('bankrupt_day') is not None:
+            step = simulator.step_week
+            def settle():
+                result = step()
+                if result.day == spec['bankrupt_day']:
+                    conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES(?,?,-2000000,?)",
+                                 (result.day, 'operations', 'offline natural termination'))
+                    conn.commit()
+                return result
+            simulator.step_week = settle
         return simulator
 
     def prepare_with_local_world(*args, **kwargs):
@@ -158,11 +168,16 @@ def _worker(spec_path, argv):
                 with lock:
                     proof['wire'].append(dict(role=role, day=team.server.tools.current_day,
                                               phase=team.phase, body=body))
-                    if len(proof['wire']) > 16:
+                    if len(proof['wire']) > spec.get('max_requests', 16):
                         raise AssertionError('Unexpected repeated model turns in one-week fixture')
-                reply = completion(response(team, role, body), body.get('stream', False))
-                payload, content_type = reply.content, reply.headers['content-type']
-                status = 200
+                if spec.get('stop_on_day') == team.server.tools.current_day:
+                    (Path(argv[argv.index('--policy') + 1]).parent / 'STOP').touch()
+                if spec.get('reject_run') == argv[argv.index('--worker') + 1]:
+                    payload, content_type, status = b'{"error":{"message":"offline permanent rejection"}}', 'application/json', 400
+                else:
+                    reply = completion(response(team, role, body), body.get('stream', False))
+                    payload, content_type = reply.content, reply.headers['content-type']
+                    status = 200
             except BaseException as exc:
                 proof['errors'].append(type(exc).__name__ + ': ' + str(exc))
                 payload, content_type, status = b'{"error":{"message":"offline fixture rejected request"}}', 'application/json', 400
@@ -190,8 +205,10 @@ def _worker(spec_path, argv):
 
 
 class Driver:
-    def __init__(self, frozen, root, monkeypatch):
+    def __init__(self, frozen, root, monkeypatch, *, worker_options=None, budget_seconds=240):
         self.frozen, self.root, self.monkeypatch = frozen, root, monkeypatch
+        self.worker_options = worker_options or {}
+        self.budget_seconds = budget_seconds
         self.children, self.units, self.samples = [], [], []
         self.finished, self.expired = threading.Event(), threading.Event()
         self.policies = []
@@ -214,7 +231,7 @@ class Driver:
             self.units.append(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--unit=')))
             index = command.index(sys.executable)
             spec = root / f'worker-{len(self.children) + 1}.json'
-            write_json(spec, dict(proof=str(spec.with_suffix('.proof.json'))))
+            write_json(spec, dict(self.worker_options, proof=str(spec.with_suffix('.proof.json'))))
             child = popen([*command[:index], sys.executable, str(Path(__file__).resolve()),
                            str(spec), *command[index + 2:]], **kwargs)
             self.children.append((child, spec))
@@ -227,7 +244,7 @@ class Driver:
         self.watchdog.start()
 
     def _timeout(self):
-        if not self.finished.wait(240):
+        if not self.finished.wait(self.budget_seconds):
             self.expired.set()
             for policy in self.policies:
                 (policy.parent / 'STOP').touch()
@@ -278,7 +295,7 @@ class Driver:
         sample = dict(selection=str(checkpoint) if checkpoint is not None else None, week=week,
                       resume=resume, code=code, controller=controller, workers=proofs)
         self.samples.append(sample)
-        assert not self.expired.is_set(), 'Real driver regression exceeded its 240-second test budget'
+        assert not self.expired.is_set(), f'Real driver regression exceeded its {self.budget_seconds}-second test budget'
         assert controller['children_reaped'] and controller['memory_sampler']['closed']
         assert all(unit['scope_empty'] for unit in controller['units'].values())
         assert all(child.poll() is not None for child, _ in self.children[start:])
