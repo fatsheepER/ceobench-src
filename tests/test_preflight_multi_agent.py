@@ -234,19 +234,18 @@ def test_owned_registration_memory_and_registered_scripts(team, role):
     for key, value in r.identity.fields().items():
         assert saved[key] == value
     script = "from novamind_api import _client\nprint('OWNER-" + role + "')\n"
-    if role != 'ceo':
-        script += "\nfor tool,args in " + repr(MUTATIONS) + ":\n try: _client.call(tool,args)\n except _client.NovaMindAPIError: print('DENIED',tool)\n else: raise AssertionError(tool)\n"
-        script += "try: _client.next_week(" + repr(PREDICTIONS) + ", 'forecast')\nexcept _client.NovaMindAPIError: print('DENIED advance')\nelse: raise AssertionError('advance')\n"
-    else:
-        script += "print(_client.call('set_prices',{'B':31}))\n"
+    script += "\nfor tool,args in " + repr(MUTATIONS) + ":\n try: _client.call(tool,args)\n except _client.NovaMindAPIError: print('DENIED',tool)\n else: raise AssertionError(tool)\n"
+    script += "try: _client.next_week(" + repr(PREDICTIONS) + ", 'forecast')\nexcept _client.NovaMindAPIError: print('DENIED advance')\nelse: raise AssertionError('advance')\n"
     assert raw(team, role, '/daily-scripts', dict(name='same.py', content=script))[0] == 200
     (r.workspace / 'same.py').write_text("raise AssertionError('unregistered changed source')")
     before = snapshot(team)
     outputs = team.server._run_daily_scripts_internal(role)
     assert 'OWNER-' + role in outputs['same.py'] and '[exit code:' not in outputs['same.py'], outputs
-    if role != 'ceo':
-        assert outputs['same.py'].count('DENIED') == 5
-        assert snapshot(team) == before
+    assert outputs['same.py'].count('DENIED') == 5
+    assert snapshot(team) == before
+    if role == 'ceo':
+        assert raw(team, role, '/call', dict(tool='set_prices', args={'B': 31}))[0] == 200
+        assert snapshot(team) != before
     listed = raw(team, role, '/daily-scripts')[1]['data']['scripts']
     assert [item['name'] for item in listed] == ['same.py']
     for owner in ROLES:

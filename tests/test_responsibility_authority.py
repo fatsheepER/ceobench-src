@@ -117,7 +117,11 @@ for name,(args,module,allowed) in ACTIONS.items():
     try:
         result=getattr(importlib.import_module('novamind_api.'+module),name)(**args)
     except _client.NovaMindAPIError as exc:
-        assert role not in allowed and ('403' in str(exc) or 'Only CEO' in str(exc)), (name,str(exc))
+        assert role not in allowed, (name,str(exc))
+        if gateway == 'registered':
+            assert 'observation-only' in str(exc), (name,str(exc))
+        else:
+            assert '403' in str(exc) or 'Only CEO' in str(exc), (name,str(exc))
         assert _client.query('SELECT * FROM config_history')['rows'] == before
     else:
         assert role in allowed, name
@@ -125,10 +129,10 @@ for name,(args,module,allowed) in ACTIONS.items():
 try:
     advance = _client.next_week(PREDICTION_DATA,'matrix forecast')
 except _client.NovaMindAPIError as exc:
-    if role == 'ceo':
-        assert gateway == 'registered' and 'observation-only' in str(exc), str(exc)
+    if gateway == 'registered':
+        assert 'observation-only' in str(exc), str(exc)
     else:
-        assert '403' in str(exc) or 'Only CEO' in str(exc), str(exc)
+        assert role != 'ceo' and ('403' in str(exc) or 'Only CEO' in str(exc)), str(exc)
 else:
     assert role == 'ceo' and gateway != 'registered' and advance['day'] == 7, advance
 print('MATRIX-COMPLETE')

@@ -104,7 +104,7 @@ def _worker(spec_path, argv):
                     register_cli(team, role, 'once.py',
                         "import novamind_api as n\n"
                         "with open('script-count.txt', 'a') as out: out.write('once\\n')\n"
-                        "n.infrastructure.set_capacity_tier(2)\n"
+                        "print(n.infrastructure.get_cost_info())\n"
                         + f"print('SAVED-SCRIPT-{role}')\n")
             proof['ready'] = ready
         snapshot = save(team, attempt, record, boundary)
@@ -151,7 +151,7 @@ def _worker(spec_path, argv):
         if team._workers[role].question:
             if not any('MODEL-WRITE-DONE' in str(message.get('content', ''))
                        for message in body['messages'] if message['role'] == 'tool'):
-                code = "import novamind_api as n; n.marketing.set_daily_spend(operations=123); print('MODEL-WRITE-DONE')"
+                code = "import novamind_api as n; n.marketing.set_daily_spend(operations=123); n.infrastructure.set_capacity_tier(2); print('MODEL-WRITE-DONE')"
                 return calls(('bash', dict(command='./novamind-operation python-c ' + shlex.quote(code))))
             return final('SAVED-OPENING-ANSWER')
         return final('SAVED-WEEKLY-REPORT-' + role)
@@ -371,7 +371,7 @@ def _finished(record, proof, *, source=None):
     operations = [row for row in finished['operations'] if row['tool'] in ('set_daily_spend', 'set_capacity_tier')]
     assert Counter((row['actor'], row['initiator'], row['tool'], row['outcome']) for row in operations) == Counter(
         [('growth', 'model', 'set_daily_spend', 'succeeded'),
-         *((role, 'registered_script', 'set_capacity_tier', 'succeeded') for role in ROLES)])
+         ('growth', 'model', 'set_capacity_tier', 'succeeded')])
     for role in ROLES:
         sent = [row['body']['messages'] for row in proof['wire'] if row['role'] == role]
         if sent:
