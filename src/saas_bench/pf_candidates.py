@@ -48,7 +48,7 @@ class CandidateQuery:
             raise ValueError('Invalid candidate cursor selection')
         if detail:
             selected = [dict(item, **snapshot['events'][item['event_ref']]) for item in snapshot['items'][start:stop]]
-            content = json.dumps(selected, ensure_ascii=True, indent=2)
+            content = json.dumps(selected, ensure_ascii=True, indent=2, sort_keys=True)
             end = min(len(content), offset + DETAIL_CHARS)
             if not 0 <= offset <= len(content):
                 raise ValueError('Invalid candidate detail cursor offset')

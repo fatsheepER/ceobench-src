@@ -336,12 +336,14 @@ def test_ceo_copy_traversal_exposes_both_business_sources_to_every_reader():
             write(team, role, role + '-ORIGINAL-SOURCE')
             declare(team, role, role + '-ORIGINAL-CLAIM', [role + ':same.txt@v1'])
         declare(team, 'ceo', 'CEO composite decision', ['growth:r1.1', 'ops_finance:r1.1'])
-        result = pf(team, 'growth', 'pf depend ceo:r1 --history --detail')
-        assert 'inaccessible' not in result.lower(), result
-        assert 'ops_finance-ORIGINAL-CLAIM' in result
-        assert 'growth' in result and 'CEO composite decision' in result
-        result = pf(team, 'ceo', 'pf depend ceo:r1 --history --detail')
-        assert 'growth-ORIGINAL-CLAIM' in result and 'ops_finance-ORIGINAL-CLAIM' in result
+        from test_pf_queries import relation_details
+        for reader in ('growth', 'ceo'):
+            result = relation_details(team.roles[reader].executor,
+                                      'pf depend ceo:r1 --history --depth 2 --detail')
+            assert {row['source']['ref'].get('cite') for row in result['items']} >= {
+                'growth:r1.1', 'ops_finance:r1.1', 'growth:same.txt@v1', 'ops_finance:same.txt@v1'}
+            assert 'growth-ORIGINAL-CLAIM' in json.dumps(result)
+            assert 'ops_finance-ORIGINAL-CLAIM' in json.dumps(result)
         for runtime in team.roles.values():
             runtime.store.assert_healthy()
 
@@ -362,14 +364,14 @@ def test_source_navigation_and_lists_keep_role_identity():
         assert any(item['version'] == 'growth:r1.1' for item in searched['items'])
         for target in ({'record': 'growth:r1.1'}, {'version': 'growth:r1.1'}):
             peer = ceo.executor.execute('pf_dependencies', dict(target=target, detail=True))
-            assert peer.startswith('growth:r1.1 · day 0 · text growth:r1.1'), peer
-            assert 'growth:same.txt@v1' in peer and 'Saved source relationships.' in peer
+            assert 'Root: growth:r1.1' in peer, peer
+            assert 'growth:same.txt@v1' in peer and 'legacy_text_reference' in peer
         declare(team, 'ceo', 'ceo follows growth', ['growth:r1.1'])
         listed = json.loads(ceo.executor.execute('text_list', {'raw': True}))
         assert [r['version'] for r in listed['records']] == ['r1.1', 'r2.1']
         assert 'checks' not in listed
         for command in ('pf depend ceo:r1', 'pf depend ceo:r2'):
-            assert pf(team, 'ceo', command).startswith(command.split()[-1] + '.1 ·')
+            assert 'Root: ' + command.split()[-1] + '.1' in pf(team, 'ceo', command)
         peer = pf(team, 'growth', 'pf depend ops_finance:r1 --detail')
         assert 'inaccessible' not in peer.lower() and 'ops_finance:same.txt@v1' in peer
         for runtime in team.roles.values():

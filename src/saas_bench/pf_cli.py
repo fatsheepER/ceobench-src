@@ -12,8 +12,10 @@ USAGE = '''usage: pf <command> ...
   pf show <output> --captures         latest execution: responses, output and files
   pf diff <object> | <old> [<new>]     what changed; one object compares its last two versions
   pf blame <file>                      the version and day each line was written
-  pf depend <object> [--detail] [--history]   saved source relationships
-  pf rdepend <object> [--detail] [--all]      registered texts that cite it
+  pf depend <object> [--detail]        saved sources of this exact target
+  pf rdepend <object> [--detail]       saved declarations citing this source
+      [--all-revisions] [--include-candidates] [--depth N]
+      depend --history excludes candidates; rdepend --all includes old revisions
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about an object
   pf search --text "KEYWORD"           literal text in public captured history, newest first
   pf candidates [--role ROLE|all] [--history] [--day-from N] [--day-to N]
@@ -54,7 +56,26 @@ pf depend r1.1 --detail --history
 depend reads captured versions and relationships. It does not replay SQL or APIs,
 evaluate conditions, or decide whether a judgment is valid. Read the source dates
 and coverage. Run new public queries or your calculations when current evidence is
-needed. --detail expands the recorded paths, subject to the reported depth limit.
+needed. Both directions default to one hop and the latest active declaration
+revision across visible roles and all saved days. A forward path to an exact old
+text follows that revision's saved references; reverse historical paths require
+--all-revisions. --detail expands complete saved fields, not depth. Use --depth N
+for more hops. --all-revisions includes old and
+withdrawn revisions; a current revision does not certify current validity.
+--history keeps its original meaning: follow declarations without automatic
+capture relationships. It does not select old revisions.
+
+Files, outputs, exact text revisions and concrete op: operation references can
+be targets or sources. Copy the complete operation_ref from its business receipt.
+Git file references keep their exact commit and storage role. Author declarations,
+other authors' inferences and automatic execution observations remain separate.
+--include-candidates adds saved derivation/range links and execution membership.
+Membership names a captured object and its execution, stops at that event, and
+provides a candidates command for its recorded members. It does not connect every
+co-occurring input and output or prove source use. Missing materials retain their descriptions without a
+fabricated readable version. Each declaration keeps its author, record and revision.
+Use pf more to continue the frozen page or read its full details. Known sources
+can be registered directly with relation_batch, without a candidates query.
 
 3. Find versions and revise references
 When evidence changed, inspect its history and compare versions of the same object:
@@ -130,7 +151,7 @@ private model bodies are excluded from candidates.
 No query replay or validity judgment occurs. Known sources can be registered directly.
 
 Other boundaries: blame locates the version and day each saved file line was written.
-rdepend follows declared references, not every consumer or inferred business impact.
+rdepend navigates saved declarations and inferences, not inferred business impact.
 more takes the actual cursor returned by a paginated result and continues that frozen
 snapshot. Preserve scope headers when reading results;
 pipes and redirection can leave only a partial view.
@@ -153,6 +174,8 @@ def mentions_pf(command):
 
 
 def target(token):
+    if re.fullmatch(r'op:[0-9a-f]{32}', token):
+        return {'operation_ref': token}
     if RECORD.fullmatch(token):
         return {'record': token}
     if RAW_VERSION.fullmatch(token):
@@ -239,8 +262,8 @@ def parse_argv(words):
     verb, words = words[0], words[1:]
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}')
-    options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False},
-                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': True},
+    options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False, 'all-revisions': False, 'include-candidates': False, 'depth': True},
+                   rdepend={'detail': False, 'all': False, 'all-revisions': False, 'include-candidates': False, 'depth': True}, search={'all': False, 'kind': True, 'text': True},
                    candidates={'role': True, 'history': False, 'day-from': True, 'day-to': True,
                                'kind': True, 'text': True, 'event': True, 'detail': False}).get(verb, {})
     flags, rest = _flags(words, dict(options, help=False))
@@ -282,11 +305,20 @@ def parse_argv(words):
         if len(rest) == 2:
             return 'pf_read', {'target': target(rest[1]), 'mode': 'diff', 'baseline': target(first)}
         return 'pf_diff', {'target': target(first)}
+    if flags.get('history') and flags.get('include-candidates'):
+        raise Usage('pf depend: --history excludes candidates; omit --include-candidates')
+    if 'depth' in flags and not re.fullmatch(r'(?:[1-9]|10)', flags['depth']):
+        raise Usage('pf: --depth requires an integer from 1 to 10')
+    options = dict(target=target(first), detail=bool(flags.get('detail')))
+    if 'depth' in flags:
+        options['depth'] = int(flags['depth'])
+    if flags.get('all-revisions'):
+        options['all_revisions'] = True
+    if flags.get('include-candidates'):
+        options['include_candidates'] = True
     if verb == 'depend':
-        return 'pf_dependencies', {'target': target(first), 'detail': bool(flags.get('detail')),
-                                   'purpose': 'historical_only' if flags.get('history') else 'current'}
-    return 'pf_dependents', {'target': target(first), 'detail': bool(flags.get('detail')),
-                             'current_only': not flags.get('all')}
+        return 'pf_dependencies', dict(options, purpose='historical_only' if flags.get('history') else 'current')
+    return 'pf_dependents', dict(options, current_only=not flags.get('all'))
 
 
 def apply_view(text, view):

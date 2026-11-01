@@ -8,6 +8,7 @@ import pytest
 
 from saas_bench.pf_queries import PFQueries
 from pf_fixtures import chain
+from test_pf_queries import relation_details
 from test_preflight_integration import offline_runner, packed_public
 from test_public_sql import server
 from test_text_registry import workspace, call, declaration, send
@@ -36,8 +37,8 @@ def test_cli_source_navigation_preserves_capture_without_replay(workspace, tmp_p
         assert 'PREDICATE FAILS' not in output and 'predicate holds' not in output
         assert 'Checked day' not in output and 'Pending review' not in output
     assert registry.resolver.content(binding)[1] == raw
-    page = executor.pf_queries.answer('pf_dependencies', {'target': {'record': 'r2'}, 'detail': True})
-    assert any(row['target'] and row['target']['version'] == handle for row in page['items'])
+    page = relation_details(executor, 'pf depend r2 --depth 2 --detail')
+    assert any(row['source'] and row['source']['ref'].get('cite') == handle for row in page['items'])
     assert all('check' not in row for row in page['items'])
     assert not store.load_state('pf_review')
     send(store, executor.execute('text_list', {'raw': True}))
@@ -49,25 +50,30 @@ def test_cli_source_navigation_preserves_capture_without_replay(workspace, tmp_p
 
 def test_legacy_findings_and_cursor_checks_are_not_delivered(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server)
-    page = executor.pf_queries.answer('pf_dependencies',
-        {'target': {'record': 'r2'}, 'detail': True, 'limit': 1, 'purpose': 'historical_only'})
-    cursor = page['next_cursor']
-    assert cursor
+    with closing(store.connect()) as conn:
+        cutoff = conn.execute('SELECT coalesce(max(rowid), 0) FROM versions').fetchone()[0]
+    cursor = 'c999'
+    cursors = store.load_state('pf_cursors') or {}
+    cursors[cursor] = dict(operation='pf_dependencies', values=dict(
+        target={'record': 'r2'}, detail=True, limit=1, depth=2,
+        include_execution=False, purpose='historical_only'), offset=1, cutoff=cutoff,
+        check_state='pf_check:legacy')
+    store.save_state('pf_cursors', cursors)
     version = store.load_state('declaration:r1.1')['version_id']
     store.save_state('pf_review', {'pending': {version: dict(first_day=7, last_day=7,
         reason={'target': None, 'reason': 'OLD_FINDING', 'check': None})}, 'ended': []})
-    cursors = store.load_state('pf_cursors')
-    cursors[cursor]['check_state'] = 'pf_check:legacy'
-    store.save_state('pf_cursors', cursors)
     store.save_state('pf_check:legacy', [{'stale': 'OLD_FINDING'}])
     executor.pf_queries = PFQueries(registry)
     listed = json.loads(executor.execute('text_list', {'raw': True}))
     assert len(listed['records']) == 2
     assert 'checks' not in listed and 'OLD_FINDING' not in json.dumps(listed)
     continued = executor.execute('bash', {'command': f'pf more {cursor}'})
-    assert not continued.startswith('Error:'), continued
+    assert not continued.startswith('Error:') and '[exit code:' not in continued, continued
     assert 'OLD_FINDING' not in continued
+    assert executor.pf_queries.last_answer['items']
     assert 'check' not in executor.pf_queries.last_answer['items'][0]
+    assert executor.pf_queries.last_answer['items'][0]['target']['version'] == registry.resolver.handle(
+        store.load_state('declaration:r1.1')['references'][0]['version_id'])
 
 
 def test_packed_public_reads_remain_explicit_and_refresh_endpoint_is_gone(offline_runner):

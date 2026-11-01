@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 
 import pytest
 
@@ -25,6 +26,22 @@ def query(executor, name, **args):
             args.setdefault('purpose', 'historical_only')
     return executor.pf_queries.answer(name, args)
 
+
+
+def relation_details(executor, command):
+    fragments = []
+    while True:
+        output = executor.execute('bash', {'command': command})
+        match = re.search(r'Detail characters (\d+):(\d+)/(\d+)\.\n', output)
+        assert match, output
+        start, end, total = map(int, match.groups())
+        assert start == sum(map(len, fragments))
+        fragments.append(output[match.end():match.end() + end - start])
+        if end == total:
+            return json.loads(''.join(fragments))
+        cursor = re.search(r'More from the same snapshot: pf more (c\d+)', output)
+        assert cursor, output
+        command = 'pf more ' + cursor.group(1)
 
 def read(executor, **args):
     text = executor.execute('pf_read', args)
@@ -57,41 +74,39 @@ def test_two_layers_revisions_unknown_history_and_reverse_paths(workspace, tmp_p
     call(registry, 'create', **declaration(references=[dict(evidence={'record': 'r1.1'}, purpose='historical_only')]))
     call(registry, 'create', **declaration())
     call(registry, 'revise', record='r1', text='Corrected assumption', reason='Changed interpretation')
-    page = query(executor, 'pf_dependencies', target={'record': 'r2'})
+    page = relation_details(executor, 'pf depend r2 --depth 2 --detail')
     assert len(page['items']) == 2 and all('check' not in row for row in page['items'])
-    assert page['items'][0]['target']['record'] == 'r1.1'
-    assert page['items'][1]['note'] == 'retain baseline'
-    assert page['items'][1]['predicate']['value'] == 5
-    assert all(i['origin'] == 'agent_declaration' for i in page['items'])
-    assert page['items'][0]['target']['current_revision'] is False
-    assert len(page['items'][1]['path']) == 3
-    missing = query(executor, 'pf_dependencies', target={'record': 'r4'})['items'][0]
-    assert missing['target'] is None and missing['unexpanded'] == 'missing'
-    assert missing['reason'] == 'No saved evidence'
-    reverse = query(executor, 'pf_dependents', target={'record': 'r1.1'})
-    assert {i['source']['record'] for i in reverse['items']} == {'r2.1', 'r3.1'}
-    assert [i['historical_only'] for i in reverse['items']] == [False, True]
+    direct, nested = page['items']
+    assert direct['source']['ref']['cite'] == 'r1.1' and direct['target']['ref']['cite'] == 'r2.1'
+    assert nested['note'] == 'retain baseline' and nested['reference']['predicate']['value'] == 5
+    assert all(i['origin'] == 'legacy_text_reference' for i in page['items'])
+    assert nested['target']['ref']['cite'] == 'r1.1' and nested['depth'] == 2
+    missing = relation_details(executor, 'pf depend r4 --detail')['items'][0]
+    assert missing['source']['source_state'] == 'missing'
+    assert 'No saved evidence' in json.dumps(missing)
+    reverse = relation_details(executor, 'pf rdepend r1.1 --detail')
+    assert {i['target']['ref']['cite'] for i in reverse['items']} == {'r2.1', 'r3.1'}
+    assert {i['purpose'] for i in reverse['items']} == {'current', 'historical_only'}
     evidence = registry.resolver.handle(store.load_state('declaration:r1.1')['references'][0]['version_id'])
-    impact = query(executor, 'pf_dependents', target={'version': evidence})
-    assert {i['source']['record'] for i in impact['items']} == {'r1.2', 'r2.1', 'r3.1'}
-    assert all(len(i['path']) == 3 for i in impact['items'] if i['source']['record'] != 'r1.2')
-    frontier = query(executor, 'pf_dependents', target={'version': evidence}, depth=1)['items']
-    assert frontier[0]['source']['record'] == 'r1.1'
-    assert frontier[0]['traversal_only'] and frontier[0]['unexpanded'] == 'depth_limit'
+    impact = relation_details(executor, f'pf rdepend {shlex.quote(evidence)} --depth 2 --detail')
+    assert {i['target']['ref']['cite'] for i in impact['items']} == {'r1.2'}
+    historical = relation_details(executor, f'pf rdepend {shlex.quote(evidence)} --all-revisions --depth 2 --detail')
+    assert {i['target']['ref']['cite'] for i in historical['items']} == {'r1.1', 'r1.2', 'r2.1', 'r3.1'}
+    frontier = relation_details(executor, f'pf rdepend {shlex.quote(evidence)} --detail')['items']
+    assert frontier[0]['target']['ref']['cite'] == 'r1.2'
+    assert frontier[0]['unexpanded'] is None
     call(registry, 'retire', record='r2', reason='Forecast withdrawn')
-    assert len(query(executor, 'pf_dependents', target={'record': 'r1.1'})['items']) == 1
-    all_refs = query(executor, 'pf_dependents', target={'record': 'r1.1'}, current_only=False)
-    assert {i['source']['record'] for i in all_refs['items']} == {'r2.1', 'r2.2', 'r3.1'}
+    assert len(relation_details(executor, 'pf rdepend r1.1 --detail')['items']) == 1
+    all_refs = relation_details(executor, 'pf rdepend r1.1 --all-revisions --detail')
+    assert {i['target']['ref']['cite'] for i in all_refs['items']} == {'r2.1', 'r2.2', 'r3.1'}
     history = query(executor, 'pf_read', mode='history', target={'record': 'r1'})
     assert [i['record'] for i in history['items']] == ['r1.2', 'r1.1']  # newest first
     assert history['items'][0]['reason'] == 'Changed interpretation'
-    assert not re.search(r'\b[0-9a-f]{8,64}\b', json.dumps(page))
-    assert store.identity['run_id'] not in json.dumps(page)
     # The graph is reconstructible without mutable declaration lookup state.
-    before_rebuild = query(executor, 'pf_dependencies', target={'record': 'r2.1'})
+    before_rebuild = relation_details(executor, 'pf depend r2.1 --detail')['items']
     with closing(store.connect()) as conn, conn:
         conn.execute("DELETE FROM private_state WHERE name LIKE 'declaration:%'")
-    assert query(executor, 'pf_dependencies', target={'record': 'r2.1'}) == before_rebuild
+    assert relation_details(executor, 'pf depend r2.1 --detail')['items'] == before_rebuild
     if destination := os.environ.get('CEOBENCH_PF_ARTIFACTS'):
         folder = Path(destination)
         folder.mkdir(parents=True, exist_ok=True)
@@ -258,17 +273,22 @@ def test_capture_relations_no_invented_reads_and_cycles(workspace, tmp_path):
     output = store.version(parent, 'file_1_after', '{"n":1}', layer='file_bytes', object_id='derived.json')
     store.version(parent, 'workspace_after', encoded({'derived.json': dict(type='file', version=output)}), layer='workspace_boundary')
     store.complete(parent, changed_paths=['derived.json'], capture_gaps=['unobserved_internal_file_reads'])
-    assert query(executor, 'pf_dependencies', target={'path': 'derived.json'})['items'] == []
-    automatic = query(executor, 'pf_dependencies', target={'path': 'derived.json'}, include_execution=True)
-    assert {i['target']['layer'] for i in automatic['items']} == {'executed_code', 'server_public_response'}
-    assert {i['kind'] for i in automatic['items']} == {'same_execution', 'executed_by'}
-    assert automatic['root']['capture_gaps'] == ['unobserved_internal_file_reads']
+    assert relation_details(executor, 'pf depend derived.json --detail')['items'] == []
+    automatic = relation_details(executor, 'pf depend derived.json --include-candidates --depth 10 --detail')
+    membership = [row for row in automatic['items'] if row.get('basis') == 'execution_membership']
+    assert membership and all(row['unexpanded'] == 'execution_membership' for row in membership)
+    for row in membership:
+        candidates = executor.execute('bash', {'command': row['navigation']})
+        assert not candidates.startswith('Error:') and '[exit code:' not in candidates, candidates
+        assert 'event=' + row['event_ref'] in candidates
+    assert not any(row.get('kind') == 'same_execution' for row in automatic['items'])
     event = store.begin_event('fixture')
     a = store.version(event, 'a', 'A', layer='stdout', derived_from=event + ':b')
     store.version(event, 'b', 'B', layer='stdout', derived_from=a)
     store.complete(event)
-    cyclic = query(executor, 'pf_dependencies', target={'version': registry.resolver.handle(a)}, include_execution=True, depth=10)
+    cyclic = relation_details(executor, f'pf depend {registry.resolver.handle(a)} --include-candidates --depth 10 --detail')
     assert len(cyclic['items']) == 2 and cyclic['items'][-1]['unexpanded'] == 'cycle'
+
 
 
 @pytest.mark.parametrize('mode', ['git', 'prefix'])
@@ -372,9 +392,14 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert 'SELECT' not in output.rsplit('\n', 1)[1]
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
-        traced = query(child.tool_executor, 'pf_dependencies', target={'path': 'query.json'},
-                       include_execution=True, depth=4, purpose='historical_only')
-        assert any(item['target'].get('sql') == 'SELECT COUNT(*) AS n FROM ledger' for item in traced['items'])
+        traced = relation_details(child.tool_executor, 'pf depend query.json --include-candidates --depth 4 --detail')
+        members = [item for item in traced['items'] if item.get('basis') == 'execution_membership']
+        assert members and all(item['unexpanded'] == 'execution_membership' for item in members)
+        for item in members:
+            candidates = child._execute_tool('bash', {'command': item['navigation']})
+            assert not candidates.startswith('Error:') and '[exit code:' not in candidates, candidates
+            assert 'event=' + item['event_ref'] in candidates
+            assert 'SELECT COUNT(*) AS n FROM ledger' in candidates
         with closing(child.evidence_store.connect()) as conn:
             assert conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0] == count
         child._save_checkpoint(7)
@@ -438,19 +463,19 @@ def test_path_dependents_survive_boundary_snapshots_of_unchanged_bytes(workspace
     store, registry, executor = captured(workspace, tmp_path)
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
-    before = query(executor, 'pf_dependents', target={'path': 'evidence.json'})
-    assert [r['source']['record'] for r in before['items']] == ['r1.1']
+    before = relation_details(executor, 'pf rdepend evidence.json --detail')
+    assert [r['target']['ref']['cite'] for r in before['items']] == ['r1.1']
     # Each Bash boundary stores new versions of unchanged files; the reference still matches.
     executor.execute('bash', {'command': 'echo hi'})
     executor.execute('bash', {'command': 'echo again'})
-    for extra in ({}, {'include_execution': True}):
-        after = query(executor, 'pf_dependents', target={'path': 'evidence.json'}, **extra)
-        assert 'r1.1' in [r['source'].get('record') for r in after['items']]
+    for flags in ('', ' --include-candidates'):
+        after = relation_details(executor, 'pf rdepend evidence.json --detail' + flags)
+        assert 'r1.1' in [r['target']['ref'].get('cite') for r in after['items']]
         assert not any('observed_as' in r for r in after['items'])
     # Changed bytes are a different node: the old reference is not a referrer of the new content.
     (workspace / 'evidence.json').write_text('{"n":8}')
     executor.execute('bash', {'command': 'true'})
-    assert query(executor, 'pf_dependents', target={'path': 'evidence.json'})['items'] == []
+    assert relation_details(executor, 'pf rdepend evidence.json --detail')['items'] == []
 
 
 def test_script_output_handle_cites_printed_result_without_replaying_queries(offline_runner):
@@ -482,13 +507,16 @@ def test_script_output_handle_cites_printed_result_without_replaying_queries(off
     assert runner.tool_executor.text_registry.last_result['evidence'][0]['version'] == footer.group(1)
     with closing(store.connect()) as conn:
         queries_before = conn.execute('SELECT event_id FROM requests WHERE query_id IS NOT NULL').fetchall()
-    traced = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'}, purpose='current', depth=4)
+    traced = relation_details(runner.tool_executor, 'pf depend r1 --include-candidates --depth 4 --detail')
     assert all('check' not in row for row in traced['items'])
     with closing(store.connect()) as conn:
         assert conn.execute('SELECT event_id FROM requests WHERE query_id IS NOT NULL').fetchall() == queries_before
-    upstream = [i for i in traced['items'] if (i['target'] or {}).get('sql') == 'SELECT COUNT(*) AS n FROM ledger']
-    assert upstream and upstream[0]['kind'] == 'same_execution' and upstream[0]['path'][1] == footer.group(1)
-    handle = upstream[0]['target']['version']
+    upstream = [i for i in traced['items'] if i.get('basis') == 'execution_membership']
+    assert upstream and all(i['unexpanded'] == 'execution_membership' for i in upstream)
+    navigation = upstream[0]['navigation']
+    candidates = runner.tool_executor.execute('bash', {'command': navigation})
+    assert 'SELECT COUNT(*) AS n FROM ledger' in candidates
+    handle = re.search(r'(query\d+@v\d+)', candidates).group(1)
     history = query(runner.tool_executor, 'pf_read', mode='history', target={'version': handle})['items']
     assert len(history) == 1 and history[0]['version'] == handle
     # Running the same script again with the same printed output keeps the handle; a

@@ -22,12 +22,13 @@ from .sql_evidence import PUBLIC_LAYERS, encoded
 class Target(Input):
     path: Text | None = None
     sql: Text | None = None
+    operation_ref: Annotated[str, Field(pattern=r"^op:[0-9a-f]{32}$")] | None = None
     record: Annotated[str, Field(pattern=r'^(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
     version: Annotated[str, Field(pattern=evidence_handles.HANDLE_PATTERN)] | None = None
 
     @model_validator(mode='after')
     def captured_target(self):
-        if sum(v is not None for v in (self.path, self.sql, self.record, self.version)) != 1:
+        if sum(v is not None for v in (self.path, self.sql, self.record, self.version, self.operation_ref)) != 1:
             raise ValueError('Specify exactly one captured path, SQL, registered text, or version handle')
         if self.path is not None:
             path = PurePosixPath(self.path)
@@ -93,8 +94,10 @@ class More(Input):
 
 class Trace(Page):
     target: Target | None = None
-    depth: Annotated[int, Field(ge=1, le=10)] = 2
+    depth: Annotated[int, Field(ge=1, le=10)] = 1
     include_execution: bool = False
+    include_candidates: bool = False
+    all_revisions: bool = False
 
 
 class Dependents(Trace):
@@ -295,6 +298,9 @@ class PFQueries:
             page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
             if isinstance(page, str):
                 return page  # pf_read content and diff keep their header line and exact body
+            if page.get('format') == 'pf.relations.v1':
+                from .pf_relations import render
+                return render(page)
             if operation == 'pf_candidates':
                 from .pf_candidates import render
                 return render(page)
@@ -336,6 +342,13 @@ class PFQueries:
                 raise ValueError('Continue with cursor only, or start a new candidates query')
             from .pf_candidates import CandidateQuery
             return CandidateQuery(self.registry).answer(values)
+        if operation in ('pf_dependencies', 'pf_dependents'):
+            saved = (self.store.load_state('pf_cursors') or {}).get(values.get('cursor'))
+            if 'cursor' not in values or saved and saved.get('relation_snapshot'):
+                if 'cursor' in values and set(args) != {'cursor'}:
+                    raise ValueError('Continue with cursor only, or start a new relationship query')
+                from .pf_relations import RelationQuery
+                return RelationQuery(self.registry).answer(operation, values)
         offset, cutoff = 0, None
         self.cursor_name = 'pf_cursors'
         self.cursors = self.store.load_state(self.cursor_name) or {}

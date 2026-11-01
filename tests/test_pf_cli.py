@@ -348,11 +348,13 @@ def test_reverse_detail_hint_matches_declared_reference_traversal(workspace, tmp
     executor.execute('write_file', {'path': 'source.json', 'content': '{"n": 1}'})
     call(registry, 'create', **declaration({'path': 'source.json'}))
     call(registry, 'create', **declaration({'record': 'r1'}))
-    compact = executor.execute('bash', {'command': 'pf rdepend source.json'})
-    detail = executor.execute('bash', {'command': 'pf rdepend source.json --detail'})
-    assert '--detail lists expanded declared-reference paths.' in compact
-    assert 'scripts, files and outputs derived from it' not in compact
-    assert 'text r1.1' in detail and 'text r2.1' in detail and 'via r1.1' in detail
+    from test_pf_queries import relation_details
+    compact = relation_details(executor, 'pf rdepend source.json --detail')
+    assert [row['target']['ref']['cite'] for row in compact['items']] == ['r1.1']
+    expanded = relation_details(executor, 'pf rdepend source.json --depth 2 --detail')
+    assert [row['target']['ref']['cite'] for row in expanded['items']] == ['r1.1', 'r2.1']
+    assert expanded['items'][1]['path'] == ['source.json@v1', 'r1.1', 'r2.1']
+
 
 
 def test_reverse_detail_does_not_follow_automatic_query_output_edges(workspace, tmp_path):
@@ -365,10 +367,12 @@ def test_reverse_detail_does_not_follow_automatic_query_output_edges(workspace, 
     store.complete(event)
     cite(store, registry, executor, output)
     handle = registry.resolver.handle(source)
-    for flags in ('', ' --detail', ' --detail --all'):
-        result = executor.execute('bash', {'command': f'pf rdepend {handle}{flags}'})
-        assert 'No active registered text cites it.' in result
-        assert 'text r1.1' not in result
+    from test_pf_queries import relation_details
+    compact = executor.execute('bash', {'command': f'pf rdepend {handle}'})
+    assert 'No saved relationships in this scope.' in compact
+    for flags in ('', ' --all'):
+        page = relation_details(executor, f'pf rdepend {handle} --detail{flags}')
+        assert page['items'] == []
     cite(store, registry, executor, source)
-    result = executor.execute('bash', {'command': f'pf rdepend {handle} --detail'})
-    assert 'text r2.1' in result and 'text r1.1' not in result
+    page = relation_details(executor, f'pf rdepend {handle} --detail')
+    assert [row['target']['ref']['cite'] for row in page['items']] == ['r2.1']

@@ -132,7 +132,8 @@ def test_candidate_checkpoint_copy_preserves_cursor_and_drops_later_history(work
     assert 'discarded.txt' in executor.execute('bash', {'command': 'pf candidates --kind file --text discarded.txt'})
 
 
-def test_candidate_detail_pages_keep_long_request_and_current_capture_unknown(workspace, tmp_path):
+@pytest.mark.parametrize('direct_detail', [False, True])
+def test_candidate_detail_pages_keep_long_request_and_current_capture_unknown(workspace, tmp_path, direct_detail):
     store, registry, executor = captured(workspace, tmp_path)
     day(store, 7)
     body = 'LONG_DETAIL ' * 6500
@@ -141,7 +142,7 @@ def test_candidate_detail_pages_keep_long_request_and_current_capture_unknown(wo
     assert 'LONG_DETAIL' not in output
     assert len(output) < 4000
     assert page['items'][0]['model_delivery']['historical']['status'] == 'unknown'
-    first, detail = query(executor, 'pf more ' + page['detail_cursor'])
+    first, detail = query(executor, 'pf candidates --kind file --text long.txt --detail' if direct_detail else 'pf more ' + page['detail_cursor'])
     fragments = [detail['detail_text']]
     assert len(first) < 25000 and detail['has_more']
     while detail['next_cursor']:

@@ -32,6 +32,7 @@
 - Git 文件登记即时快照、来源与存放角色、覆写后读取、Git 回收保留及 checkpoint 恢复从 `tests/test_git_registration_snapshot.py` 定位；prefix 登记时捕获匹配从 `tests/test_prefix_week_binding.py` 定位。
 - Git/PF 共享业务流水、实际提交段、同值设置、公开列、旧世界补表与恢复引用从 `tests/test_business_ledger.py`、`tests/test_business_ledger_public.py`、`tests/test_business_ledger_faults.py` 定位。公共来源分类来自角色的模型与注册脚本独立监听器。
 - PF 跨调用/跨周候选、同内容多事件、稳定分页、详情、权限复核、模型投递范围与选点恢复从 `tests/test_pf_candidates.py`、`tests/test_pf_candidates_team.py` 定位。
+- 只读双向关系、旧文本与 Git 精确版本、操作目标、声明/推断/执行成员候选、稳定分页/实时权限/完整详情和模型投递/恢复从 `tests/test_pf_relations.py`、`tests/test_pf_relations_team.py` 定位。
 - 高频回执的摘要、完整捕获清单、设置差异与实际模型输入从 `tests/test_receipt_outputs.py` 定位；SQL 极小结果上限下的错误发送及公共客户端继续从 `tests/test_public_sql.py`、`tests/test_sql_capture_residuals.py` 定位。
 - 职责写权完整入口矩阵、专家操作回执与互读路径从 `tests/test_responsibility_authority.py` 定位；跨角色历史与私有层隔离从 `tests/test_preflight_multi_agent.py`、`tests/test_preflight_team_evidence.py` 定位。
 - 企业协商的客户标识、拒绝与七天超时，以及公共 SDK 的定向 ops 四范围和 dev 组映射替换契约，从 `tests/test_enterprise_sdk_contracts.py` 定位。

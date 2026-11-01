@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "source_commit": "07e617bbf640b46ad22e242dfba5942d90ab1101",
-  "patch_sha256": "e66fd6bdea1068b075cc17959d7ac17b68ca3b30dfad5195c91cf20441f49aea",
-  "source_sha256": "20c5a2655f58aafe1041b65f8e79bd36e1f1ba14ed5ad9f208930a92c17cab8a",
+  "source_commit": "d457c709aa6163a6bed0edb8d19e3668a157d97d",
+  "patch_sha256": "257c26db5d3a7eae6c7685c2d0b2d55bc19adad1806562a94ca188d016167439",
+  "source_sha256": "b9b7f80227c2bf9011e421d4d4c8b3ab4b0c1a1326b927076b7affbb3b55991c",
   "builder_sha256": "8dc38972234267b809befa876d21f5504bc856b1469d2ec8f20655a9708f3c45",
   "python": "3.13.15",
   "runtime": {
