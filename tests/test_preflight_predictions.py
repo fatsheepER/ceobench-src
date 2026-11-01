@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 from saas_bench.api_server import NovaMindAPIServer
 from saas_bench.database import save_predictions
@@ -66,10 +67,19 @@ def test_prediction_failure_rolls_back_before_any_world_change(make_initialized_
         raise OSError('injected failure after first row')
     monkeypatch.setattr('saas_bench.database.save_predictions', fail)
     result = server.advance_week({7: {'cash': 1}})
-    assert result == dict(success=False, error='prediction_save_failed', day=0,
+    receipt = result['operation']
+    assert {key: value for key, value in result.items() if key != 'operation'} == dict(success=False, error='prediction_save_failed', day=0,
         prediction_transaction='rolled_back', advance=dict(status='failed', old_day=0,
             target_day=7, reached_day=0, last_completed_day=0, progression='not_advanced',
             error='prediction_save_failed', prediction_transaction='rolled_back'))
+    operation = conn.execute(
+        'SELECT outcome,result_json FROM business_operations WHERE operation_ref=?',
+        (receipt['operation_ref'],)).fetchone()
+    assert receipt['outcome'] == operation['outcome'] == 'rejected'
+    assert receipt['effect_seqs'] == []
+    assert json.loads(operation['result_json']) == {key: value for key, value in result.items() if key != 'operation'}
+    assert conn.execute('SELECT COUNT(*) FROM business_effects WHERE operation_ref=?',
+                        (receipt['operation_ref'],)).fetchone()[0] == 0
     assert conn.execute('SELECT COUNT(*) FROM predictions').fetchone()[0] == 0
     assert simulator.current_day == 0 and simulator.rng.bit_generator.state == initial_rng
     assert not server._operation_failed

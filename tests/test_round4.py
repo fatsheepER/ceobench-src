@@ -1,6 +1,7 @@
 """Round-four regressions: real shell programs and all provider tool batches, offline."""
 import json
 from pathlib import Path
+from contextlib import closing
 import re
 
 import httpx
@@ -19,7 +20,7 @@ from test_public_sql import server
     './novamind-operation query "SELECT * FROM config_overrides" | head -c 80; pf log settings.py',
 ])
 def test_mixed_pf_output_can_be_cited_and_traced(offline_runner, command):
-    from test_pf_queries import query
+    from test_pf_queries import relation_details
     runner = offline_runner(text_registration='pf')
     runner._execute_tool('write_file', dict(path='settings.py', content='# settings\n'))
     runner._execute_tool('write_file', dict(path='report.py', content=(
@@ -37,9 +38,25 @@ def test_mixed_pf_output_can_be_cited_and_traced(offline_runner, command):
     assert receipt.startswith('Registered r1.1'), receipt
     shown = runner._execute_tool('bash', dict(command=f'pf show {handle} --full'))
     assert shown.split('\n', 1)[1] == output
-    graph = query(runner.tool_executor, 'pf_dependencies', target={'record': 'r1'},
-                  include_execution=True, depth=4)
-    assert any('config_overrides' in (row['target'] or {}).get('sql', '') for row in graph['items'])
+    with closing(runner.evidence_store.connect()) as conn:
+        sql_count = conn.execute("SELECT count(*) FROM requests WHERE json_extract(request, '$.kind')='sql_query'").fetchone()[0]
+    graph = relation_details(runner.tool_executor, 'pf depend r1 --detail')
+    row, = graph['items']
+    assert row['source']['ref']['cite'] == handle and row['target']['ref']['cite'] == 'r1.1'
+    assert row['origin'] == 'legacy_text_reference'
+    candidates = relation_details(runner.tool_executor, f'pf rdepend {handle} --include-candidates --detail')
+    members = [row for row in candidates['items'] if row.get('basis') == 'execution_membership']
+    member, = members
+    assert member['assertion'] == 'execution_observation' and member['unexpanded'] == 'execution_membership'
+    inventory = runner._execute_tool('bash', dict(command=member['navigation'] + ' --kind sql'))
+    assert 'config_overrides' in inventory
+    source, = runner.tool_executor.pf_queries.last_answer['items']
+    expected_sql = 'SELECT * FROM config_overrides' + (' ORDER BY day DESC LIMIT 40' if 'LIMIT 40' in command else '')
+    assert source['name'] == expected_sql
+    exact = runner._execute_tool('bash', dict(command='pf show ' + source['version'] + ' --full'))
+    assert exact.split('\n', 1)[1].encode() == runner.evidence_store.get_content(source['content_ref'])[1]
+    with closing(runner.evidence_store.connect()) as conn:
+        assert conn.execute("SELECT count(*) FROM requests WHERE json_extract(request, '$.kind')='sql_query'").fetchone()[0] == sql_count
     retrieved = runner._execute_tool('bash', dict(command='pf depend r1 --detail'))
     assert not re.search(r'\[pf: cmd\d+@v\d+', retrieved)
     version = retrieved.origins[0]['version_id']

@@ -52,6 +52,7 @@ def original_prompt(days):
     sim = sim.replace('''- Per-group targeting via `set_targeted_dev_spend`: ACCUMULATES a group-specific quality bonus that persists after spending stops
 ''', '''- `set_targeted_dev_spend` replaces the whole group mapping; {} clears it. Per-group spend ACCUMULATES a group-specific quality bonus that persists after spending stops
 ''')
+    # The shared snapshot contract now binds workspace-relative paths (4582b19).
     template = ORIGINAL['system_template'].replace('''# Daily script management
 novamind register-daily-script setup.py  # Register a script to run automatically at start of each week
 novamind list-daily-scripts              # List all registered weekly scripts
@@ -62,7 +63,7 @@ novamind remove-daily-script setup.py    # Remove a registered weekly script
 ./novamind-operation remove-daily-script setup.py    # Remove a registered weekly script
 ```
 
-Registration snapshots the source file under its filename. Re-register after edits.
+Registration snapshots the source under its workspace-relative path. Re-register after edits.
 Scripts run in insertion order at the start of each week and must explicitly
 `import novamind_api as nm`. Print results for your weekly input.''')
     years = days / 365
@@ -273,15 +274,46 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
         ('list', {}),
     ]
     outputs = []
-    head = git(workspace, 'rev-parse', 'HEAD')
-    index = (workspace / '.git/index').read_bytes()
+    expected_blob = git(workspace, 'hash-object', 'evidence.json')
+    expected_content = (workspace / 'evidence.json').read_text().strip()
+    initial = {registry.workspace: (git(registry.workspace, 'rev-parse', 'HEAD'),
+               (registry.workspace / '.git/index').read_bytes()) for registry in (prefix, control)}
+
+    def comparable_snapshot(output, registry):
+        stored = registry.path.read_text()
+        commits = set()
+        for history in json.loads(stored)['records'].values():
+            for record in history:
+                for ref in record['references']:
+                    if 'snapshot_source' not in ref:
+                        continue
+                    assert registry.role == 'ceo'
+                    assert ref['snapshot_source'] == {'path': 'evidence.json'}
+                    evidence = ref['evidence']
+                    assert set(evidence) == {'path', 'commit'}
+                    assert evidence['path'] == ref['snapshot_source']['path']
+                    commit = evidence['commit']
+                    assert re.fullmatch('[0-9a-f]{40}', commit)
+                    assert git(registry.workspace, 'rev-parse', commit + ':evidence.json') == expected_blob
+                    assert git(registry.workspace, 'show', commit + ':evidence.json') == expected_content
+                    commits.add(commit)
+        # Independent commit-tree calls may cross a second. Only verified snapshot
+        # IDs vary; every other receipt and persisted byte must remain identical.
+        marker = '<snapshot:ceo:evidence.json:' + expected_blob + '>'
+        for commit in commits:
+            output = output.replace(commit, marker)
+            stored = stored.replace(commit, marker)
+        return output.encode(), stored.encode()
+
     for op, args in operations:
         left, right = prefix.execute(op, args), control.execute(op, args)
-        assert left.encode() == right.encode()
-        assert prefix.path.read_bytes() == control.path.read_bytes()
+        assert comparable_snapshot(left, prefix) == comparable_snapshot(right, control)
         outputs.append(dict(operation=op, output=left))
-    assert git(workspace, 'rev-parse', 'HEAD') == head
-    assert (workspace / '.git/index').read_bytes() == index
+    for registry in (prefix, control):
+        head, index = initial[registry.workspace]
+        assert git(registry.workspace, 'rev-parse', 'HEAD') == head
+        assert (registry.workspace / '.git/index').read_bytes() == index
+    head, index = initial[workspace]
     binding = store.load_state('declaration:r1.1')['references'][0]
     assert binding['status'] == ('unknown' if delivery == 'missing' else 'resolved')
     if delivery == 'partial':

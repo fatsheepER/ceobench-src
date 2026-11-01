@@ -54,6 +54,23 @@ print(json.dumps(result))
     return server
 
 
+
+def assert_enterprise_result(api, result, expected, tool, outcome='succeeded'):
+    assert result['results'] == expected
+    receipt = result['operation']
+    operation = api.conn.execute(
+        'SELECT tool,outcome,operation_seq,result_json FROM business_operations WHERE operation_ref=?',
+        (receipt['operation_ref'],)).fetchone()
+    assert operation is not None
+    assert (operation['tool'], operation['outcome']) == (tool, outcome)
+    assert receipt['outcome'] == outcome and receipt['operation_seq'] == operation['operation_seq']
+    assert json.loads(operation['result_json'])['data']['results'] == expected
+    effects = [row[0] for row in api.conn.execute(
+        'SELECT DISTINCT effect_seq FROM business_effects WHERE operation_ref=? ORDER BY effect_seq',
+        (receipt['operation_ref'],))]
+    assert receipt['effect_seqs'] == effects and effects
+
+
 def ops_state(api):
     return {scope: deepcopy(getattr(api.tools.config, field))
             for scope, (field, _, _) in SCOPES.items()}
@@ -139,12 +156,12 @@ def test_generated_reject_sdk_closes_thread_preserves_subscriber(sdk, thread_typ
     wrong = sdk.sdk_call('enterprise', 'reject_enterprise_deal', [{'customer_id': mid}])
     assert wrong['error_type'] == 'NovaMindAPIError'
     rejected = sdk.sdk_call('enterprise', 'reject_enterprise_deal', [{'customer_id': 312}])
-    assert rejected == {'results': [{'customer_id': 312, 'success': True}]}
+    assert_enterprise_result(sdk, rejected, [{'customer_id': 312, 'success': True}], 'reject_enterprise_deal')
     latest = sdk.conn.execute('SELECT * FROM enterprise_turns WHERE thread_id=? ORDER BY message_id DESC', (tid,)).fetchone()
     assert latest['closed'] == 1 and latest['close_reason'] == 'agent_rejected'
     assert dict(sdk.conn.execute('SELECT * FROM subscriptions WHERE customer_id=312').fetchone()) == before
     requoted = sdk.sdk_call('enterprise', 'send_enterprise_deal', [[312, [['A', 9]]]])
-    assert requoted == {'results': [{'customer_id': 312, 'success': True}]}
+    assert_enterprise_result(sdk, requoted, [{'customer_id': 312, 'success': True}], 'send_enterprise_deal')
     new_thread = sdk.conn.execute('SELECT thread_id,thread_type FROM enterprise_turns WHERE customer_id=312 ORDER BY message_id DESC').fetchone()
     assert new_thread['thread_id'] != tid and new_thread['thread_type'] == 'renegotiation'
 
@@ -152,8 +169,8 @@ def test_generated_reject_sdk_closes_thread_preserves_subscriber(sdk, thread_typ
 def test_generated_reject_sdk_loses_pending_lead(sdk):
     tid, mid = customer(sdk, 312, status='lead', thread_type='new_lead')
     assert mid != 312
-    assert sdk.sdk_call('enterprise', 'reject_enterprise_deal', [{'customer_id': 312}]) == {
-        'results': [{'customer_id': 312, 'success': True}]}
+    result = sdk.sdk_call('enterprise', 'reject_enterprise_deal', [{'customer_id': 312}])
+    assert_enterprise_result(sdk, result, [{'customer_id': 312, 'success': True}], 'reject_enterprise_deal')
     assert tuple(sdk.conn.execute('SELECT status,end_day FROM subscriptions WHERE customer_id=312').fetchone()) == ('lost', 0)
     assert sdk.conn.execute('SELECT close_reason FROM enterprise_turns WHERE thread_id=? ORDER BY message_id DESC', (tid,)).fetchone()[0] == 'agent_rejected'
 
@@ -165,7 +182,7 @@ def test_generated_quote_sdk_requires_active_subscriber_without_open_thread(sdk,
     sdk.conn.execute('UPDATE subscriptions SET end_day=? WHERE customer_id=88', (0 if ended else None,))
     sdk.conn.commit()
     sent = sdk.sdk_call('enterprise', 'send_enterprise_deal', [[312, [['A', 9]]]])
-    assert sent == {'results': [{'customer_id': 312, 'success': True}]}
+    assert_enterprise_result(sdk, sent, [{'customer_id': 312, 'success': True}], 'send_enterprise_deal')
     latest = sdk.conn.execute('SELECT * FROM enterprise_turns WHERE customer_id=312 ORDER BY message_id DESC').fetchone()
     assert latest['thread_type'] == 'renegotiation' and latest['sender'] == 'agent'
     assert json.loads(latest['offer_json']) == [{'plan': 'A', 'price_per_seat': 9, 'contract_months': 1}]
@@ -180,7 +197,7 @@ def test_generated_quote_sdk_replies_using_customer_id(sdk):
     wrong = sdk.sdk_call('enterprise', 'send_enterprise_deal', [[mid, [['A', 9]]]])
     assert wrong['error_type'] == 'NovaMindAPIError'
     sent = sdk.sdk_call('enterprise', 'send_enterprise_deal', [[312, [['A', 9], ['B', 12]]]])
-    assert sent == {'results': [{'customer_id': 312, 'success': True}]}
+    assert_enterprise_result(sdk, sent, [{'customer_id': 312, 'success': True}], 'send_enterprise_deal')
     latest = sdk.conn.execute('SELECT * FROM enterprise_turns WHERE thread_id=? ORDER BY message_id DESC', (tid,)).fetchone()
     assert latest['sender'] == 'agent' and latest['turn_number'] == 1
     assert all(offer['contract_months'] == 1 for offer in json.loads(latest['offer_json']))
@@ -197,8 +214,8 @@ def test_generated_enterprise_sdk_returns_success_and_error_in_mixed_batch(sdk, 
         deals = [{'customer_id': 312}, {'customer_id': 88}]
         error = 'no active thread'
     result = sdk.sdk_call('enterprise', tool, deals)
-    assert result == {'results': [
-        {'customer_id': 312, 'success': True}, {'customer_id': 88, 'error': error}]}
+    assert_enterprise_result(sdk, result, [
+        {'customer_id': 312, 'success': True}, {'customer_id': 88, 'error': error}], tool, 'partial')
     latest = sdk.conn.execute('SELECT * FROM enterprise_turns WHERE thread_id=? ORDER BY message_id DESC', (tid,)).fetchone()
     assert latest['sender'] == 'agent' and latest['turn_number'] == 1
     assert latest['closed'] == int(tool == 'reject_enterprise_deal')

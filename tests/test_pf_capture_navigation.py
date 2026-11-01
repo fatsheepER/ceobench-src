@@ -8,22 +8,32 @@ from saas_bench.execution_capture import finish_http
 from saas_bench.pf_queries import PFQueries
 from saas_bench.public_sql import execute_query
 from saas_bench.sql_evidence import encoded
-from pf_fixtures import chain, cite, forward, record_sql
+from pf_fixtures import chain, cite, record_sql
 from test_text_registry import workspace, captured, call, declaration, send
-from test_pf_queries import query, read
+from test_pf_queries import query, read, relation_details
 from test_public_sql import server
 
 
 def test_pagination_keeps_saved_graph_and_versions_after_world_changes(workspace, tmp_path, server):
     store, registry, executor = chain(workspace, tmp_path, server)
-    first = forward(executor, limit=1)
+    output = executor.execute('pf_dependencies', {'target': {'record': 'r2'}, 'depth': 2, 'limit': 1})
+    assert not output.startswith('Error:') and '[exit code:' not in output
+    first = executor.pf_queries.last_answer
+    assert first['next_cursor'] and first['items'][0]['source']['ref']['cite'] == 'r1.1'
     server.conn.execute('UPDATE ledger SET amount=1')
     server.conn.commit()
     executor.pf_queries = PFQueries(registry)
-    page = query(executor, 'pf_dependencies', cursor=first['next_cursor'])
-    assert page['items'][0]['target']['version'] == 'query1@v1'
-    assert page['items'][0]['target']['sql'] == 'SELECT amount FROM ledger'
-    assert query(executor, 'pf_dependencies', cursor=first['next_cursor']) == page
+    output = executor.execute('bash', {'command': 'pf more ' + first['next_cursor']})
+    assert not output.startswith('Error:') and '[exit code:' not in output
+    page = executor.pf_queries.last_answer
+    assert page['cutoff'] == first['cutoff'] and page['next_cursor'] is None
+    source = page['items'][0]['source']['ref']['cite']
+    assert source == 'query1@v1' and page['items'][0]['target']['ref']['cite'] == 'r1.1'
+    header, body, _ = read(executor, target={'version': source})
+    assert header['target']['what'] == 'SQL: SELECT amount FROM ledger'
+    assert json.loads(body)['rows'] == [{'amount': 42.0}]
+    repeated = executor.execute('bash', {'command': 'pf more ' + first['next_cursor']})
+    assert repeated == output and executor.pf_queries.last_answer == page
     assert first['root'] == page['root']
     assert not {'stale_check', 'checked_day', 'check_state'} & page.keys()
     assert all('check' not in row for row in first['items'] + page['items'])
@@ -56,21 +66,36 @@ def test_derived_file_traces_captured_upstream_queries_and_exact_bytes(workspace
     server.conn.commit()
     (workspace / 'derived.json').write_text('{"n":264}')
     before = server.conn.serialize()
-    rows = forward(executor, 'r1')['items']
-    assert rows[0]['select'] == ref['select'] and rows[0]['predicate'] == ref['predicate']
-    assert rows[0]['target']['version'] == 'derived.json@v1'
-    sql_rows = [row for row in rows if row['target'].get('sql')]
-    assert {row['target']['sql'] for row in sql_rows} == set(sqls)
-    assert {row['target']['version'] for row in sql_rows} == {registry.resolver.handle(v) for v in versions}
-    assert all(row['origin'] == 'automatic_capture' for row in sql_rows)
+    rows = relation_details(executor, 'pf depend r1 --detail')['items']
+    assert len(rows) == 1 and rows[0]['origin'] == 'legacy_text_reference'
+    assert rows[0]['reference']['select'] == ref['select'] and rows[0]['reference']['predicate'] == ref['predicate']
+    assert rows[0]['source']['ref']['cite'] == 'derived.json@v1'
+    assert rows[0]['target']['ref']['cite'] == 'r1.1'
+    expanded = relation_details(executor, 'pf depend r1 --include-candidates --depth 2 --detail')['items']
+    members = [row for row in expanded if row.get('basis') == 'execution_membership' and row['content_ref'] == version]
+    member, = members
+    assert member['source']['ref']['cite'] == 'derived.json@v1'
+    assert member['target']['ref']['event_ref'] == parent
+    assert member['assertion'] == 'execution_observation' and member['unexpanded'] == 'execution_membership'
+    inventory = executor.execute('bash', {'command': member['navigation'] + ' --kind sql'})
+    assert not inventory.startswith('Error:') and '[exit code:' not in inventory
+    sql_rows = executor.pf_queries.last_answer['items']
+    assert {row['name'] for row in sql_rows} == set(sqls)
+    assert {row['version'] for row in sql_rows} == {registry.resolver.handle(v) for v in versions}
+    assert {row['content_ref'] for row in sql_rows} == set(versions)
+    for row in sql_rows:
+        _, saved, _ = read(executor, target={'version': row['version']})
+        assert saved.encode() == store.get_content(row['content_ref'])[1]
     header, body, _ = read(executor, target={'version': 'derived.json@v1'})
     assert body == '{"n":42}' and header['target']['day'] == 56
     assert server.conn.serialize() == before
     with closing(store.connect()) as conn:
         assert conn.execute("SELECT count(*) FROM requests WHERE json_extract(request, '$.kind')='sql_query'").fetchone()[0] == 2
-    limited = forward(executor, 'r1', depth=1)
-    assert limited['unexpanded'] == ['derived.json@v1']
-    assert 'depth limit' in executor.execute('pf_dependencies', {'target': {'record': 'r1'}, 'depth': 1})
+    limited = relation_details(executor, 'pf depend r1 --include-candidates --detail')['items']
+    assert len(limited) == 1 and limited[0]['unexpanded'] == 'depth_limit'
+    assert limited[0]['source']['ref']['cite'] == 'derived.json@v1'
+    historical = relation_details(executor, 'pf depend r1 --history --depth 2 --detail')['items']
+    assert len(historical) == 1 and historical[0]['origin'] == 'legacy_text_reference'
 
 
 def test_saved_receipts_dashboard_and_files_keep_their_captured_identity(workspace, tmp_path):
@@ -79,9 +104,13 @@ def test_saved_receipts_dashboard_and_files_keep_their_captured_identity(workspa
         parsed=dict(tool='set_prices', args={'B': 99})))
     finish_http(store, event, 200, '', encoded(dict(success=True, data={'B': 99})), {})
     cite(store, registry, executor, event + ':public_response')
-    row = forward(executor, 'r1')['items'][0]
-    assert row['target']['classification'] == 'write_receipt'
-    assert row['target']['version'] == registry.resolver.handle(event + ':public_response')
+    row, = relation_details(executor, 'pf depend r1 --detail')['items']
+    source = row['source']['ref']['cite']
+    assert source == registry.resolver.handle(event + ':public_response')
+    metadata = query(executor, 'pf_read', mode='history', target={'version': source})['items'][0]
+    assert metadata['classification'] == 'write_receipt'
+    _, body, _ = read(executor, target={'version': source})
+    assert json.loads(body) == dict(success=True, data={'B': 99})
     for value in ('old summary', 'new summary'):
         event = store.begin_event('dashboard_generation')
         version = store.version(event, 'dashboard', value, layer='dashboard')
@@ -89,14 +118,17 @@ def test_saved_receipts_dashboard_and_files_keep_their_captured_identity(workspa
         if value == 'old summary':
             saved = version
             cite(store, registry, executor, saved)
-    assert forward(executor)['items'][0]['target']['version'] == registry.resolver.handle(saved)
+    row, = relation_details(executor, 'pf depend r2 --detail')['items']
+    assert row['source']['ref']['cite'] == registry.resolver.handle(saved)
+    assert read(executor, target={'version': row['source']['ref']['cite']})[1] == 'old summary'
     send(store, executor.execute('read_file', {'path': 'evidence.json'}))
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
     (workspace / 'evidence.json').unlink()
     secret = tmp_path / 'private-secret'
     secret.write_text('NEVER_CAPTURE_PRIVATE_SECRET')
     (workspace / 'evidence.json').symlink_to(secret)
-    assert forward(executor, 'r3')['items'][0]['target']['version'] == 'evidence.json@v1'
+    row, = relation_details(executor, 'pf depend r3 --detail')['items']
+    assert row['source']['ref']['cite'] == 'evidence.json@v1'
     _, body, _ = read(executor, target={'version': 'evidence.json@v1'})
     assert body == '{"n":7}'
     with closing(store.connect()) as conn:
@@ -112,9 +144,10 @@ def test_cited_dates_follow_the_saved_version_group(workspace, tmp_path):
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))
     call(registry, 'create', **declaration({'path': 'evidence.json'}))
     registry.sim_day = lambda: None
-    row = forward(executor, 'r1')['items'][0]
-    assert row['target']['version'] == 'evidence.json@v3'
-    assert row['target']['day'] == 70
+    row, = relation_details(executor, 'pf depend r1 --detail')['items']
+    assert row['source']['ref']['cite'] == 'evidence.json@v3'
+    header, body, _ = read(executor, target={'version': row['source']['ref']['cite']})
+    assert header['target']['day'] == 70 and json.loads(body) == {'n': 7}
 
 
 def test_script_before_dashboard_uses_host_day_not_previous_dashboard(workspace, tmp_path):
@@ -133,10 +166,11 @@ def test_script_before_dashboard_uses_host_day_not_previous_dashboard(workspace,
         evidence={'path': 'evidence.json'}, purpose='current', select={'path': '/n'},
         predicate={'type': 'threshold', 'op': '>', 'value': 0})]))
     registry.sim_day = lambda: 14
-    row = forward(executor, 'r1')['items'][0]
-    assert row['target']['day'] == 7
-    assert row['select'] == {'path': '/n'}
-    assert row['predicate'] == {'type': 'threshold', 'op': '>', 'value': 0}
+    row, = relation_details(executor, 'pf depend r1 --detail')['items']
+    header, body, _ = read(executor, target={'version': row['source']['ref']['cite']})
+    assert header['target']['day'] == 7 and body == '{"n":7}'
+    assert row['reference']['select'] == {'path': '/n'}
+    assert row['reference']['predicate'] == {'type': 'threshold', 'op': '>', 'value': 0}
     assert query(executor, 'pf_log', target={'path': 'evidence.json'})['items'][0]['day'] == 7
     assert 'evidence.json@v1 · day 7' in executor.execute('bash', {'command': 'pf log evidence.json'})
     shown = executor.execute('bash', {'command': 'pf show evidence.json'})

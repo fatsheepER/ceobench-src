@@ -8,6 +8,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 
 import httpx
 from openai import OpenAI
@@ -59,9 +60,27 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
             output = tool(name, **args)
             return json.loads(output) if name == 'text_list' else executor.text_registry.last_result
         if name in ('pf_dependencies', 'pf_dependents') and 'cursor' not in args:
-            args['detail'] = True
-        tool(name, **args)  # the agent-facing text goes into the request
-        return executor.pf_queries.last_answer
+            args.setdefault('detail', True)
+        output = tool(name, **args)
+        page = executor.pf_queries.last_answer
+        if not isinstance(page, dict) or page.get('format') != 'pf.relations.v1' or not page['detail']:
+            return page
+        fragments = []
+        while True:
+            match = re.search(r'Detail characters (\d+):(\d+)/(\d+)\.\n', output)
+            assert match, output
+            start, end, total = map(int, match.groups())
+            assert start == sum(map(len, fragments))
+            fragments.append(output[match.end():match.end() + end - start])
+            if end == total:
+                assert page['next_cursor'] is None
+                data = json.loads(''.join(fragments))
+                assert len(data['items']) == page['returned']
+                return data
+            cursor = re.search(r'More from the same snapshot: pf more (c\d+)', output)
+            assert cursor and cursor[1] == page['next_cursor'], output
+            output = tool('pf_more', cursor=cursor[1])
+            page = executor.pf_queries.last_answer
 
     def read(**args):
         return tool('pf_read', **args)
@@ -153,13 +172,24 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
                 before = server.conn.serialize()
                 declarations = registry.path.read_bytes()
                 count = refresh_count()
-                rows = query('pf_dependencies', target={'record': record}, purpose='current')['items']
+                page = query('pf_dependencies', target={'record': record}, purpose='current', depth=2)
+                assert page['scope']['depth'] == 2 and not page['scope']['include_candidates']
+                assert page['scope']['time'] == 'all_saved_days'
+                rows = page['items']
                 assert refresh_count() == count
                 assert server.conn.serialize() == before
                 assert registry.path.read_bytes() == declarations
                 upstream, leaf = rows
-                assert leaf['target']['version'] == reference['evidence']['version']
-                assert all('check' not in row for row in rows)
+                assumption = 'r1.1' if record == 'r2' else 'r3.1'
+                assert upstream['source']['ref']['cite'] == leaf['target']['ref']['cite'] == assumption
+                assert upstream['target']['ref']['cite'] == record + '.1'
+                assert leaf['source']['ref']['cite'] == reference['evidence']['version']
+                expected = reference if record == 'r2' else compare_ref
+                assert leaf['reference']['predicate'] == expected['predicate']
+                assert leaf['reference'].get('select') == expected.get('select')
+                assert leaf['note'] == expected.get('note')
+                assert all(row['reason'] == 'Initial observation' and 'check' not in row for row in rows)
+                assert store.get_content(version)[1] == original_sql
 
         server.conn.execute('UPDATE ledger SET amount=43')
         server.conn.commit()
@@ -184,23 +214,33 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
             inspect_forecasts()
 
         # A saved page remains stable after the world changes, and history never refreshes.
-        page = query('pf_dependencies', target={'record': 'r2'}, purpose='current', limit=1)
+        page = query('pf_dependencies', target={'record': 'r2'}, purpose='current',
+                     limit=1, depth=2, detail=False)
+        assert len(page['items']) == 1 and page['has_more'] and page['next_cursor']
         count = refresh_count()
         server.conn.execute('UPDATE ledger SET amount=42')
         server.conn.commit()
         tail = query('pf_dependencies', cursor=page['next_cursor'])
-        assert tail['items'][0]['target']['version'] == reference['evidence']['version']
+        leaf, = tail['items']
+        assert leaf['source']['ref']['cite'] == reference['evidence']['version']
+        assert not tail['has_more'] and tail['next_cursor'] is None
         assert query('pf_dependencies', cursor=page['next_cursor']) == tail
-        assert query('pf_dependencies', target={'record': 'r5'})['items'][1]['historical_only']
-        missing = query('pf_dependencies', target={'record': 'r6'})['items'][0]
-        assert missing['target'] is None and missing['unexpanded'] == 'missing'
-        assert missing['reason'] == 'No saved evidence'
+        past = query('pf_dependencies', target={'record': 'r5'}, depth=2)['items']
+        assert len(past) == 2 and all(row['historical_only'] for row in past)
+        missing, = query('pf_dependencies', target={'record': 'r6'})['items']
+        assert missing['source']['source_state'] == 'missing' and missing['unexpanded'] == 'missing'
+        assert missing['source']['ref']['missing'] == dict(
+            description='No saved evidence', reason='No saved evidence')
         query('text_revise', record='r1', text='A revised', reason='Constructed correction')
         history = query('pf_read', target={'record': 'r1'}, mode='history')
         assert [r['record'] for r in history['items']] == ['r1.2', 'r1.1']
-        reverse = query('pf_dependents', target={'version': reference['evidence']['version']})
-        assert {'r2.1', 'r5.1'} <= {r['source']['record'] for r in reverse['items']}
-        assert next(r for r in reverse['items'] if r['source']['record'] == 'r5.1')['historical_only']
+        reverse = query('pf_dependents', target={'version': reference['evidence']['version']},
+                        depth=2, all_revisions=True)
+        assert reverse['scope']['all_revisions'] and reverse['scope']['depth'] == 2
+        assert {'r1.1', 'r1.2', 'r2.1', 'r3.1', 'r4.1', 'r5.1'} == {
+            row['target']['ref']['cite'] for row in reverse['items']}
+        assert next(row for row in reverse['items']
+                    if row['target']['ref']['cite'] == 'r5.1')['historical_only']
         page = query('pf_search', object={'kind': 'plan', 'id': 'B'}, limit=1, all=True)
         records = [page['items'][0]['record']]
         while page['next_cursor']:
@@ -208,7 +248,11 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
             records.extend(r['record'] for r in page['items'])
         assert set(records) == {f'r{i}.1' for i in range(1, 7)} | {'r1.2'}
         query('text_list')
-        query('pf_dependencies', target={'record': 'r2'}, purpose='historical_only')
+        saved = query('pf_dependencies', target={'record': 'r2'}, purpose='historical_only', depth=2)
+        upstream, leaf = saved['items']
+        assert upstream['source']['ref']['cite'] == leaf['target']['ref']['cite'] == 'r1.1'
+        assert leaf['source']['ref']['cite'] == reference['evidence']['version']
+        assert not saved['scope']['include_candidates']
         assert refresh_count() == count
         # Deliberately malformed capture graph, not a claimed real execution history.
         event = store.begin_event('constructed_cycle')

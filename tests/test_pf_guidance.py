@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import re
 
@@ -181,17 +182,55 @@ def test_published_condition_and_review_examples(workspace, tmp_path, server, te
     assert executor.execute('text_create', args).startswith('Registered r1.1')
     show_text, check, history = commands(2)
     assert args['text'] in executor.execute('bash', {'command': show_text})
+
+    def detail(text):
+        fragments = []
+        while True:
+            match = re.search(r'Detail characters (\d+):(\d+)/(\d+)\.\n', text)
+            assert match, text
+            start, end, total = map(int, match.groups())
+            assert start == sum(map(len, fragments))
+            fragments.append(text[match.end():match.end() + end - start])
+            if end == total:
+                return json.loads(''.join(fragments))
+            cursor = re.search(r'More from the same snapshot: pf more (c\d+)', text)
+            assert cursor, text
+            text = executor.execute('bash', {'command': 'pf more ' + cursor[1]})
+
+    def source_events():
+        with closing(store.connect()) as conn:
+            return conn.execute('SELECT event_id FROM requests WHERE query_id IS NOT NULL ORDER BY rowid').fetchall()
+
+    original = store.get_content(version)[1]
+    sources = source_events()
+    declarations = registry.path.read_bytes()
     for amount in (60, 40, -1):
         server.conn.execute('UPDATE ledger SET amount=?', (amount,))
         server.conn.commit()
         before = server.conn.serialize()
         result = executor.execute('bash', {'command': check})
-        assert server.conn.serialize() == before
-        assert 'Saved source relationships.' in result and 'query1@v1' in result
+        assert result.startswith('PF relations: saved records only; no replay or validity judgment.')
+        page = detail(result)
+        row, = page['items']
+        assert row['source']['ref']['cite'] == args['references'][0]['cite'] == 'query1@v1'
+        assert row['target']['ref']['cite'] == 'r1.1'
+        assert row['reference']['select'] == args['references'][0]['select']
+        assert row['reference']['predicate'] == args['references'][0]['predicate']
+        assert 'check' not in row
+        assert page['scope']['depth'] == 1 and not page['scope']['include_candidates']
+        assert page['scope']['time'] == 'all_saved_days'
         assert 'predicate holds' not in result and 'PREDICATE FAILS' not in result
-        assert all('check' not in row for row in executor.pf_queries.last_answer['items'])
+        assert server.conn.serialize() == before
+        assert source_events() == sources and store.get_content(version)[1] == original
+        assert registry.path.read_bytes() == declarations
     result = executor.execute('bash', {'command': history})
-    assert 'Saved source relationships.' in result
+    assert result.startswith('PF relations: saved records only; no replay or validity judgment.')
+    page = detail(result)
+    row, = page['items']
+    assert row['source']['ref']['cite'] == 'query1@v1' and row['target']['ref']['cite'] == 'r1.1'
+    assert page['scope']['purpose'] == 'historical_only' and not page['scope']['include_candidates']
+    assert source_events() == sources and store.get_content(version)[1] == original
+    assert registry.path.read_bytes() == declarations
     partial = executor.execute('bash', {'command': show_query + ' | head -1'})
     assert 'PF final delivery: partial' in partial
     send(store, partial)

@@ -6,6 +6,7 @@ from pf_fixtures import chain, cite, record_sql
 from saas_bench.public_sql import execute_query
 from test_text_registry import workspace, captured, call, declaration, send
 from test_public_sql import server
+from test_pf_queries import relation_details
 
 CLOCK = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d')
 
@@ -15,15 +16,32 @@ def test_compact_lines_carry_day_source_and_declaration_metadata(workspace, tmp_
         predicate={'type': 'threshold', 'op': '>=', 'value': 40}, note='Keep at least forty')
     compact = executor.execute('pf_dependencies', {'target': {'record': 'r2'}})
     lines = compact.splitlines()
-    assert lines[0].startswith('r2.1 · day 7 · text r2.1 (active): "Keep the plan"')
-    assert len([line for line in lines if re.match(r'\d+\. ', line)]) == 1
-    assert 'cites' in lines[2] and 'text r1.1' in lines[2]
-    detail = executor.execute('pf_dependencies', {'target': {'record': 'r2'}, 'detail': True})
-    assert 'SQL (1 rows): SELECT amount FROM ledger' in detail
-    assert 'declared select {"col":"amount"}' in detail
-    assert 'declared predicate {"op":">=","type":"threshold","value":40}' in detail
-    assert 'note: Keep at least forty' in detail
-    for text in (compact, detail, executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True}),
+    assert lines[0] == 'PF relations: saved records only; no replay or validity judgment.'
+    scope = json.loads(next(line.removeprefix('Scope: ') for line in lines if line.startswith('Scope: ')))
+    assert scope['depth'] == 1 and not scope['all_revisions'] and not scope['include_candidates']
+    assert scope['time'] == 'all_saved_days'
+    assert scope['current_means'] == 'latest saved revision; no validity judgment'
+    counts = json.loads(next(line.removeprefix('Counts: ') for line in lines if line.startswith('Counts: ')))
+    assert counts['endpoint_rows'] == counts['declaration_revisions'] == 1
+    assert 'Root: r2.1' in lines and 'returned=1; total_in_scope=1; has_more=false.' in lines
+    assert 'r1.1 -> r2.1 | author=ceo; revision_status=active; depth=1' in compact
+    assert compact.count(' | author_declared | ') == 1
+    detail = relation_details(executor, 'pf depend r2 --depth 2 --detail')
+    assert detail['scope']['depth'] == 2 and detail['scope']['time'] == 'all_saved_days'
+    assert detail['root']['record']['sim_day'] == 7
+    assert CLOCK.search(detail['cutoff']['captured_at'])
+    direct, leaf = detail['items']
+    assert direct['source']['ref']['cite'] == leaf['target']['ref']['cite'] == 'r1.1'
+    assert direct['target']['ref']['cite'] == 'r2.1'
+    binding = store.load_state('declaration:r1.1')['references'][0]
+    assert leaf['source']['ref']['cite'] == registry.resolver.handle(binding['version_id'])
+    assert leaf['reference']['select'] == {'col': 'amount'}
+    assert leaf['reference']['predicate'] == {'op': '>=', 'type': 'threshold', 'value': 40}
+    assert leaf['note'] == 'Keep at least forty'
+    assert all(row['sim_day'] == 7 and row['author_role'] == 'ceo'
+               and row['reason'] == 'Initial observation' and 'check' not in row
+               for row in detail['items'])
+    for text in (executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True}),
                  executor.execute('pf_read', {'target': {'record': 'r1'}, 'mode': 'history', 'detail': True}),
                  executor.execute('pf_read', {'target': {'record': 'r1'}}), executor.execute('text_list', {}),
                  registry.path.read_text()):
@@ -87,5 +105,11 @@ def test_search_and_history_are_newest_first_with_one_optional_detail_line(works
 def test_saved_dependency_keeps_detail_hint(workspace, tmp_path, server):
     _, _, executor = chain(workspace, tmp_path, server)
     result = executor.execute('bash', {'command': 'pf depend r2'})
-    assert 'pf depend r2.1 --detail' in result
+    cursor = re.search(r'Complete reasons[^\n]+: pf more (c\d+)', result)
+    assert cursor, result
+    detail = relation_details(executor, 'pf more ' + cursor[1])
+    row, = detail['items']
+    assert row['source']['ref']['cite'] == 'r1.1' and row['target']['ref']['cite'] == 'r2.1'
+    assert row['reason'] == 'Initial observation'
+    assert detail['scope']['depth'] == 1
     assert 'See what changed' not in result

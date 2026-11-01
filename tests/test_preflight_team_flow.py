@@ -236,7 +236,7 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
                 assert "Each week resets your conversation" in system
                 assert 'All roles can set model tiers' in system
                 assert 'Only CEO can' in system
-                assert 'same permissions as their owner' in system
+                assert 'Registered scripts are observation-only' in system
                 assert '## Weekly Workflow' not in system
                 if role == 'growth':
                     assert 'by customer group and channel' in system
@@ -254,7 +254,7 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
                     "import novamind_api as nm; print(nm.query('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1')['rows'])"))),
                     ('text_list', {}))
             if n == 2:
-                assert any('31' in m['content'] for m in messages if m['role'] == 'tool' and m.get('name') == 'bash')
+                assert any("'price_A': 0.0" in m['content'] for m in messages if m['role'] == 'tool' and m.get('name') == 'bash')
                 assert 'r1' in messages[-1]['content'] and not messages[-1]['content'].startswith('Error:')
                 with lock:
                     completed[key] = True
@@ -297,7 +297,7 @@ def test_two_weeks_parallel_reports_followups_scripts_and_reset(mode, monkeypatc
                 applies='0-', reason='offline session ownership'))
             assert record.startswith(f'Registered {role}:r1.1'), record
         (team.roles['ceo'].workspace / 'marker.txt').write_text('stable')
-        ceo_code = "import novamind_api as nm\nnm.pricing.set_prices(A=31)\nprint('PRIVATE-SCRIPT-ceo')\n"
+        ceo_code = "print('PRIVATE-SCRIPT-ceo')\n"
         script_hashes['ceo'] = register(team, 'ceo', 'same.py', ceo_code)
         for role in ROLES[1:]:
             foreign = str(team.roles['ceo'].workspace / 'marker.txt')
@@ -358,8 +358,6 @@ def test_observation_stop_precedes_next_scripts_and_models(mode, stop):
             code = (
                 "import novamind_api as nm\n"
                 "with open('script-days.txt','a') as stream: stream.write(str(nm.vars.current_day)+'\\n')\n")
-            if role == 'ceo':
-                code += "nm.pricing.set_prices(A=31)\n"
             register(team, role, 'same.py', code)
         team.run(stop_after_day=stop)
         expected = list(range(0, stop, 7))
@@ -370,7 +368,7 @@ def test_observation_stop_precedes_next_scripts_and_models(mode, stop):
             assert list(map(int, (runtime.workspace / 'script-days.txt').read_text().splitlines())) == expected
         assert not (team.roles['ceo'].workspace / 'after-advance').exists()
         price = team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0]
-        assert price == 31
+        assert price == team.server.tools.config.default_price_A
         assert len([e for e in team.test_timeline if e['kind'] == 'settlement']) == len(expected)
         count = len(team.test_wire)
         team.run(stop_after_day=stop)
@@ -468,16 +466,30 @@ def test_bankruptcy_during_week_stops_remaining_scripts_and_tools(mode, trigger,
             return result
 
         monkeypatch.setattr(team.server.tools, 'set_prices', bankrupting_price)
+        injected = []
         if trigger == 'ceo_script':
-            register(team, 'ceo', 'first.py', 'import novamind_api as nm; nm.pricing.set_prices(A=99)')
+            original_read = team.server.tools.get_cost_info
+
+            def bankrupting_read():
+                result = original_read()
+                injected.append(True)
+                team.server.conn.execute("INSERT INTO ledger(day,category,amount,note) VALUES(0,'initial_funding',-2000000,'injected bankruptcy')")
+                team.server.conn.commit()
+                return result
+
+            monkeypatch.setattr(team.server.tools, 'get_cost_info', bankrupting_read)
+            register(team, 'ceo', 'first.py', 'import novamind_api as nm; nm.infrastructure.get_cost_info()')
             register(team, 'ceo', 'second.py', "open('after-bankruptcy','w').write('must cancel')")
         outcome = team.run(stop_after_day=112)
         assert outcome.reason == 'natural_end' and outcome.day == 0
         assert not (team.roles['ceo'].workspace / 'after-bankruptcy').exists()
         if trigger == 'ceo_script':
+            assert injected == [True]
             assert [w['role'] for w in team.test_wire] == ['ceo']
             records = [json.loads(line) for line in team.roles['ceo'].audit.path.read_text().splitlines()]
             executions = [r for r in records if r['kind'] == 'registered_script_execution']
+            first, = [r for r in team.server.role_script_results['ceo'] if r['name'] == 'first.py']
+            assert first['facts']['boundary_closed']
             assert not any(r['name'] == 'second.py' and r['status'] == 'succeeded' for r in executions)
         else:
             assert len([w for w in team.test_wire if w['role'] == 'ceo']) == 2

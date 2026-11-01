@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -14,8 +15,6 @@ def script(role):
             f"print(f'AUTO-{role}-D{{day}}')\n"
             "with open('auto-days.txt', 'a') as stream: stream.write(str(day) + '\\n')\n"
             "with open('auto-result.json', 'w') as stream: json.dump({'day': day}, stream)\n")
-    if role == 'ceo':
-        return body + "nm.pricing.set_prices(A=31)\n"
     return body + ("try: nm.pricing.set_prices(A=900)\n"
                    "except nm.NovaMindAPIError: print('WRITE-DENIED')\n"
                    "else: raise AssertionError('analyst changed the world')\n")
@@ -33,8 +32,7 @@ def test_deployed_cli_snapshot_runs_next_week_and_reaches_owner_input(mode):
             rendered = json.dumps(body['messages'], ensure_ascii=False)
             assert f'AUTO-{role}-D7' in rendered
             assert all(f'AUTO-{peer}-D7' not in rendered for peer in ROLES if peer != role)
-            if role != 'ceo':
-                assert 'WRITE-DENIED' in rendered
+            assert 'WRITE-DENIED' in rendered
             assert (team.roles[role].workspace / 'auto-days.txt').read_text() == '7\n'
         if day == 0 and turn == 1:
             return calls(
@@ -56,9 +54,15 @@ def test_deployed_cli_snapshot_runs_next_week_and_reaches_owner_input(mode):
                 if turn == 4:
                     receipt = next(message['content'] for message in reversed(body['messages'])
                                    if message.get('role') == 'tool' and message.get('name') == 'bash')
-                    assert 'Saved source relationships.' in receipt
-                    assert 'declared select {"path":"/day"}' in receipt
-                    assert 'declared predicate' in receipt
+                    assert 'saved records only; no replay or validity judgment' in receipt
+                    match = re.search(r'Detail characters 0:(\d+)/(\d+)\.\n', receipt)
+                    assert match and match[1] == match[2]
+                    detail, _ = json.JSONDecoder().raw_decode(receipt[match.end():])
+                    item, = detail['items']
+                    assert item['assertion'] == 'author_declared'
+                    assert item['path'] == [f'{role}:r1.1', f'{role}:auto-result.json@v1']
+                    assert item['reference']['select'] == {'path': '/day'}
+                    assert item['reference']['predicate'] == {'type': 'threshold', 'op': '>=', 'value': 7}
                     assert f'{role}:auto-result.json@v1 · day 7' in receipt
                     assert 'checked day' not in receipt.lower()
                     assert 'predicate holds' not in receipt and 'PREDICATE FAILS' not in receipt
@@ -86,7 +90,7 @@ def test_deployed_cli_snapshot_runs_next_week_and_reaches_owner_input(mode):
         state = json.loads((saved[0] / 'team.json').read_text())
         assert state['scripts'] == {role: {'weekly.py': script(role)} for role in ROLES}
         price = team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0]
-        assert price == 31
+        assert price == team.server.tools.config.default_price_A
         for role in ROLES:
             assert (team.roles[role].workspace / 'auto-days.txt').read_text() == '7\n'
             assert team.server.get_daily_scripts(role) == {}

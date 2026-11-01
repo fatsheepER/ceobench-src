@@ -8,6 +8,7 @@ from saas_bench.pf_queries import PFQueries
 from saas_bench.text_registry import TextRegistry
 from test_text_registry import workspace, captured, declaration, send, git, call
 from test_preflight_integration import offline_runner, packed_public, advance
+from test_pf_queries import relation_details
 
 
 def close_week(workspace, registry):
@@ -112,7 +113,13 @@ def test_prefix_forks_share_registration_time_public_bytes_and_exact_evidence(of
         if mode == 'pf':
             b = child.evidence_store.load_state('declaration:r1.1')['references'][0]
             assert child.evidence_store.get_content(b['version_id'])[1] == b'{"n":1}'
-            graph = child.tool_executor.pf_queries.answer('pf_dependencies', dict(target={'record': 'r1'}))
-            assert graph['items'][0]['target']['version'] == child.tool_executor.text_registry.resolver.handle(b['version_id'])
+            graph = relation_details(child.tool_executor, 'pf depend r1 --detail')
+            source = graph['items'][0]['source']
+            assert graph['items'][0]['target']['ref']['cite'] == 'r1.1'
+            assert source['binding'] == b
+            assert source['ref']['cite'] == 'ceo:facts.json@' + b['git_commit']
+            assert child._execute_tool('bash', {'command': 'git show ' + b['git_commit'] + ':facts.json'}) == '{"n":1}'
+            assert child.evidence_store.load_state('declaration:r1.1')['references'][0] == b
+            assert child.tool_executor.text_registry.path.read_bytes() == public
         else:
             assert child.evidence_store is None

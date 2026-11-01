@@ -138,9 +138,9 @@ def test_closed_registered_failure_returns_to_owner_and_preserves_partner(mode, 
 
     with make_team(mode, respond, 'closed-script-failure') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
-        code = ("import time, os, signal\nimport novamind_api as n\n"
+        code = ("import time, os, signal\n"
                 "with open('executions.txt', 'a') as out: out.write('once\\n')\n"
-                "n.infrastructure.set_capacity_tier(2)\n" + f"print('PARTIAL-{role}', flush=True)\n")
+                + f"print('PARTIAL-{role}', flush=True)\n")
         code += "time.sleep(60)\n" if failure == 'timeout' else "os.kill(os.getpid(), signal.SIGKILL)\n"
         register_cli(team, role, 'first.py', code)
         register_cli(team, role, 'second.py', "print('FOLLOWING-SCRIPT')\n")
@@ -151,6 +151,9 @@ def test_closed_registered_failure_returns_to_owner_and_preserves_partner(mode, 
         assert received and team.failure is None
         records = team.server.role_script_results[role]
         assert len(records) == 2 and records[0]['classification'] != 'succeeded'
+        assert records[0]['facts']['timed_out'] is (failure == 'timeout')
+        if failure == 'killed':
+            assert records[0]['facts']['exit_code'] == 137
         assert all(record['facts']['boundary_closed'] for record in records)
         assert (Path(records[0]['evidence']) / 'stdout.bin').read_bytes() == f'PARTIAL-{role}\n'.encode()
         assert (team.roles[role].workspace / 'executions.txt').read_text() == 'once\n'
