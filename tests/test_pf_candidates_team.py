@@ -198,15 +198,20 @@ def test_candidate_repeated_peer_file_reads_keep_acquisition_and_storage_roles()
     with make_team('pf', lambda *args: final('done'), 'candidate-peer-file') as team:
         for runtime in team.roles.values():
             day(runtime.store, 0)
-        write(team, 'growth', 'peer saved bytes\n', 'peer.txt')
+        write(team, 'growth', 'peer saved bytes\r\n', 'peer.txt')
         ceo = team.roles['ceo']
         for _ in range(2):
             result = ceo.executor.execute('read_file', {'path': str(team.roles['growth'].workspace / 'peer.txt')})
             assert 'peer saved bytes' in result
         _, page = query(ceo.executor, 'pf candidates --kind file --text peer.txt')
+        artifact('candidate-peer-file.json', page)
         assert len(page['items']) == 2
         assert len({item['event_ref'] for item in page['items']}) == 2
         assert len({item['version'] for item in page['items']}) == 1
         assert all(item['source_role'] == item['producer_role'] == 'growth' for item in page['items'])
         assert all(item['initiator_role'] == item['storage_role'] == 'ceo' for item in page['items'])
         assert all(item['capture']['derived_from'] and item['capture']['transformation'] == 'decode_universal_newlines' for item in page['items'])
+
+        for item in page['items']:
+            assert ceo.store.get_content(item['content_ref'], public=True)[1] == b'peer saved bytes\n'
+            assert ceo.store.get_content(item['capture']['derived_from'], public=True)[1] == b'peer saved bytes\r\n'

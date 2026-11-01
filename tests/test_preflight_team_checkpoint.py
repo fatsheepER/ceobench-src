@@ -22,6 +22,7 @@ from saas_bench.run_state import write_json
 from saas_bench.simulation import DayResult, Simulator
 from saas_bench.tools import AgentTools
 from test_preflight_team_flow import ADVANCE, calls, completion, final, opening_response, raw
+from test_receipt_outputs import artifact
 
 
 PRICING = dict(source='offline fixed table', basis='USD per 1000 tokens',
@@ -157,9 +158,19 @@ def behavior(runtime):
         assert (sender, receiver, int(day)) == (request.sender, request.receiver, request.day)
         return f'Team request | request_id=request-{index} | from={sender} | to={receiver} | day={day}'
 
+    def normalize_operation(match):
+        receipt = json.loads(match[1])
+        sequence = references[receipt['operation_ref']]
+        assert receipt['operation_seq'] == sequence
+        receipt['operation_ref'] = 'operation-' + str(sequence)
+        return '[operation: ' + json.dumps(receipt, separators=(',', ':')) + ']'
+
     def normalize_content(text):
+        if not isinstance(text, str):
+            return text
+        text = re.sub(r'\[operation: (\{[^\n]+\})\]', normalize_operation, text)
         return question_header.sub(normalize_question, reply_header.sub(normalize_reply,
-            header.sub(normalize_handoff, text))) if isinstance(text, str) else text
+            header.sub(normalize_handoff, text)))
 
     for role, item in runtime.roles.items():
         conversation = [dict(role=message.role, content=message.content,
@@ -243,6 +254,7 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             assert set(original_refs[len(prefix):]).isdisjoint(resumed_refs[len(prefix):])
             write_json(tmp_path / 'comparison.json', dict(mode=mode, boundary=boundary,
                 continuous=expected, recovered=actual, equal=actual == expected))
+            artifact('checkpoint-comparison.json', dict(continuous=expected, recovered=actual))
             assert actual == expected
             for role in ROLES:
                 assert (restored.roles[role].workspace / 'script-days.txt').read_text() == '0\n7\n'

@@ -655,7 +655,8 @@ class BashAgentToolExecutor:
         if self.capture and raw_version is None:
             raw_version = self.capture.file(self._file_name(path), raw, owner=self._file_owner(path))
         text = decoded(raw)
-        version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version, owner_role=self._file_owner(path)) if self.capture else None
+        version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version,
+                                    transformation='decode_universal_newlines', owner_role=self._file_owner(path)) if self.capture else None
         return text, version
 
     def _source(self, version, text, start, end, target):
