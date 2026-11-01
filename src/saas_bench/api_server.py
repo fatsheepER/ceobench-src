@@ -1236,6 +1236,7 @@ class NovaMindAPIServer:
                     with operation.bind(self.tools):
                         result = dispatch_fn(self.tools, args)
                     operation.finish(result)
+                    result.operation = operation.receipt()
                 except BaseException:
                     self._operation_failed = True
                     if operation is not None:
@@ -1382,11 +1383,12 @@ class NovaMindAPIServer:
                         if on_settled:
                             on_settled(outcome)
                         self._advance_outcome = outcome
-                return result
+                return dict(result, **({'operation': business_operation.receipt()} if business_operation else {}))
             if self._advance_outcome is None and result.get('error') != 'step_week_timeout':
                 self._operation_failed = True
                 settle(error=RuntimeError(result.get('error', 'Advance did not complete')))
-            return dict(result, advance=self._advance_outcome)
+            return dict(result, advance=self._advance_outcome,
+                        **({'operation': business_operation.receipt()} if business_operation else {}))
         except PermissionError:
             raise
         except Exception as exc:
@@ -1396,7 +1398,8 @@ class NovaMindAPIServer:
                 settle(error=exc)
             return dict(success=False, error='step_week_failed' if step_failed else 'advance_week_failed',
                 message=type(exc).__name__ + ': ' + str(exc), day=self.tools.current_day,
-                advance=self._advance_outcome)
+                advance=self._advance_outcome,
+                **({'operation': business_operation.receipt()} if business_operation else {}))
         finally:
             self._advance_lock.release()
 

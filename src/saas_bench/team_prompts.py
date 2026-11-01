@@ -273,5 +273,7 @@ CEO may also use ask_analyst for the same mechanism with an expert recipient.
 Do not advance time while answering a request. If next-week reports pending team
 requests, finish the current batch and answer them before retrying advancement.
 '''
+    from .registration_prompt import RELATIONS
+    prompt += '\n' + RELATIONS
     history = '' if role == 'ceo' else (PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
     return with_registered_script_contract(prompt + HANDOFF + '\n' + history)

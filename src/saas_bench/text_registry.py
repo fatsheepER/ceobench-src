@@ -31,6 +31,8 @@ class TextRegistry:
         if store and store.path.resolve().is_relative_to(self.workspace):
             raise ValueError('PF evidence storage must be outside the agent workspace')
         self.resolver = EvidenceResolver(store) if store else None
+        from .relation_registry import RelationRegistry
+        self.relations = RelationRegistry(self)
 
     def _load(self):
         if self.path.is_symlink() or self.path.with_suffix('.json.tmp').is_symlink():

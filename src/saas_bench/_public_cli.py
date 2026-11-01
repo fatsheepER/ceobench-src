@@ -254,6 +254,8 @@ def cmd_next_week(args):
         }
     }
     result = _api_call(port, "POST", "/next-week", body)
+    if result.get('operation') is not None:
+        print('[operation: ' + json.dumps(result['operation'], separators=(',', ':')) + ']')
     if result.get("success"):
         dashboard = result.get("dashboard", "")
         print(dashboard)

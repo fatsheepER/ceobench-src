@@ -220,6 +220,27 @@ class MultiAgentRuntime:
         self.server = NovaMindAPIServer(tools, simulator=simulator, conn=conn,
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
             role_sockets=sockets, script_role_sockets=script_sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
+        def operation_lookup(reference):
+            from .business_ledger import read_operation
+            from .relation_registry import Rejected
+            deadline = time.monotonic() + self.server.QUERY_TIMEOUT_SECONDS
+            while True:
+                self._lifecycle.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Rejected('operation_unavailable', 'The public ledger is busy; retry the reference later')
+                if self.server._lock.acquire(timeout=min(.1, remaining)):
+                    break
+            try:
+                self._lifecycle.check()
+                return read_operation(self.server.conn, reference)
+            finally:
+                self.server._lock.release()
+
+        attempt_id = uuid.uuid4().hex
+        for runtime in self.roles.values():
+            runtime.registry.relations.operation_lookup = operation_lookup
+            runtime.registry.relations.attempt_id = attempt_id
         self.server.team_permission = self._team_permission
         self.server.script_check = self._check_model_send
         for role, runtime in self.roles.items():
@@ -969,7 +990,8 @@ class MultiAgentRuntime:
                         try:
                             result = runtime.executor.execute(action.tool, action.arguments,
                                 model_request_event=runtime.usage.last_request_event,
-                                model_context_id=runtime.usage.context_id)
+                                model_context_id=runtime.usage.context_id,
+                                tool_call_id=runtime.agent._pending_tool_calls[0]['id'] if runtime.agent._pending_tool_calls else None)
                             runtime.agent.record_tool_result(result)
                         finally:
                             if operation is not None:

@@ -1879,6 +1879,7 @@ class ToolResult:
     success: bool
     message: str
     data: Optional[Dict] = None
+    operation: Optional[Dict] = None
 
     def __post_init__(self):
         import sys as _sys
@@ -1897,6 +1898,8 @@ class ToolResult:
         else:
             result["error"] = self.message
             result["data"] = None
+        if self.operation is not None:
+            result["operation"] = self.operation
         return result
 
     def to_stdout(self) -> str:

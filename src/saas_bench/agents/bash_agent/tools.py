@@ -18,6 +18,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+from saas_bench.relation_registry import RelationHold
+
 from typing import Any, Dict, List, Optional
 
 from saas_bench.runtime_options import runtime_environment_snapshot, runtime_value, timeout_value
@@ -435,7 +437,7 @@ class BashAgentToolExecutor:
         """The interpreter path valid inside the agent's command environment."""
         return GUEST_PYTHON if self._bwrap() else sys.executable
 
-    def execute(self, tool_name: str, args: Dict[str, Any], *, model_request_event=None, model_context_id=None) -> str:
+    def execute(self, tool_name: str, args: Dict[str, Any], *, model_request_event=None, model_context_id=None, tool_call_id=None) -> str:
         """Execute a tool and return the result string."""
         with self._execute_lock:
             if self.authorize:
@@ -453,9 +455,9 @@ class BashAgentToolExecutor:
                 self._pf_service = None
             if self.preserved_process:
                 raise ProcessBoundaryError('Previous process boundary remains open')
-            return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id)
+            return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
 
-    def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None):
+    def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None, tool_call_id=None):
         dispatch = {
             'bash': self._exec_bash,
             'read_file': self._exec_read_file,
@@ -469,6 +471,7 @@ class BashAgentToolExecutor:
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
+            dispatch['relation_batch'] = lambda args: self.text_registry.relations.execute(args, tool_call_id=tool_call_id)
         facts = {}
         self._exit_code = None
         self._timed_out = False
@@ -502,6 +505,7 @@ class BashAgentToolExecutor:
             if capture:
                 capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root),
                               model_request_event=model_request_event, model_context_id=model_context_id,
+                              tool_call_id=tool_call_id,
                               **{k: v for k, v in facts.items() if k == 'command'})
                 capture.facts.update(facts)
                 token = CURRENT_EVENT.set(capture.event)
@@ -533,6 +537,14 @@ class BashAgentToolExecutor:
                             **(self.identity.fields() if self.identity else {}))
                 with open_file(self.workspace_path, self.workspace_path / '.tool-notes.jsonl', 'ab') as stream:
                     stream.write((json.dumps(note, ensure_ascii=False) + '\n').encode())
+        except RelationHold as exc:
+            if lifecycle := getattr(self, 'lifecycle', None):
+                lifecycle.cancel(exc.reason)
+            result = json.dumps(exc.receipt, ensure_ascii=False)
+            status = 'result_unknown'
+            if self.audit:
+                self.audit.record('relation_batch_hold', tool_call_id=tool_call_id, receipt=exc.receipt)
+            raise
         except NextDayTimeoutError:
             result = None
             status = 'result_unknown'
@@ -604,7 +616,7 @@ class BashAgentToolExecutor:
             self.capture = None
             self.last_status = status
             if self.audit:
-                self.audit.record('tool_execution', tool=tool_name, status=status,
+                self.audit.record('tool_execution', tool=tool_name, status=status, tool_call_id=tool_call_id,
                     model_request_event=model_request_event, context_id=model_context_id, **self._bash_facts,
                     **({key: capture.facts[key] for key in ('host_accounting_seconds', 'capture_finish_seconds',
                         'stream_capture_seconds', 'before_scan_seconds', 'after_scan_seconds') if key in capture.facts} if capture else {}))

@@ -972,6 +972,7 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
             record['prompt_templates_changed'] = canonical(prompt_templates(team)) != manifest['prompts'][entry['group']]
             team._lifecycle.parent_pid = parent_pid
             for runtime in team.roles.values():
+                runtime.registry.relations.attempt_id = record['attempt_id']
                 runtime.usage.expected_model = runtime.agent.model
                 runtime.usage.lifecycle = team._lifecycle
             customer = team.server.simulator.customer_simulator

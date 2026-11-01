@@ -385,5 +385,6 @@ def tool_definitions(pf=False, team=False):
                 'after. shareable_references gives exact role-qualified citations.'
             ),
         }
+    from .relation_schema import tool_definition
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
-            for name, model in models.items()]
+            for name, model in models.items()] + ([tool_definition()] if team else [])

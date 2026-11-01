@@ -252,7 +252,7 @@ print('ALL-MUTATORS-COMPLETE')
 '''.replace('ACTIONS', repr(ACTIONS))
         output = team.roles['ceo'].executor.execute('bash', {'command': './novamind-operation python-c ' + shlex.quote(program)})
         assert 'ALL-MUTATORS-COMPLETE' in output and '[exit code:' not in output, output
-        assert 'op:' not in output
+        assert all(row['operation_ref'] in output for row in records(team))
         assert_business(team)
         assert_role_business(team, 'ceo', initial_price)
         rows, changed = records(team), effects(team)

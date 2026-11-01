@@ -70,6 +70,19 @@ def ensure_schema(conn, day):
     conn.commit()
 
 
+def read_operation(conn, operation_ref):
+    """Read only the public ledger projection; callers own the world lock."""
+    cursor = conn.execute('SELECT ' + ','.join(OPERATION_COLUMNS) +
+        ' FROM business_operations WHERE operation_ref=?', (operation_ref,))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    operation = dict(zip(OPERATION_COLUMNS, row))
+    cursor = conn.execute('SELECT ' + ','.join(EFFECT_COLUMNS) +
+        ' FROM business_effects WHERE operation_ref=? ORDER BY effect_seq,item_index', (operation_ref,))
+    return dict(operation=operation, effects=[dict(zip(EFFECT_COLUMNS, row)) for row in cursor])
+
+
 class BusinessOperation:
     def __init__(self, conn, *, actor, initiator, tool, day, parameters):
         if conn.in_transaction:
@@ -86,6 +99,14 @@ class BusinessOperation:
             VALUES(?,(SELECT COALESCE(MAX(operation_seq),0)+1 FROM business_operations),?,?,?,?,?,'unfinished',NULL)''',
             (self.ref, actor, initiator, tool, day, encode(parameters)))
         conn.commit()
+        sequence = conn.execute('SELECT operation_seq FROM business_operations WHERE operation_ref=?',
+                                (self.ref,)).fetchone()[0]
+        self._receipt = dict(operation_ref=self.ref, operation_seq=sequence,
+                             outcome='unfinished', effect_seqs=None)
+
+    def receipt(self):
+        # A timed-out caller must not reacquire the world lock held by late work.
+        return deepcopy(self._receipt)
 
     @contextmanager
     def bind(self, tools, simulator=None, *, tables=None, advance=False, extra_owners=()):
@@ -111,6 +132,8 @@ class BusinessOperation:
             if unknown:
                 return
             raise RuntimeError('Business operation returned with an uncommitted transaction')
+        effect_seqs = [row[0] for row in self.conn.execute(
+            'SELECT DISTINCT effect_seq FROM business_effects WHERE operation_ref=? ORDER BY effect_seq', (self.ref,))]
         if unknown:
             outcome, public = 'unknown', {'success': False, 'error': 'Business operation outcome is unknown; manual checkpoint resume required'}
         else:
@@ -120,8 +143,7 @@ class BusinessOperation:
             success = bool(public.get('success'))
             items = (public.get('data') or {}).get('results', []) if isinstance(public.get('data'), dict) else []
             partial = any(isinstance(item, dict) and (item.get('success') is False or bool(item.get('error'))) for item in items)
-            effects = self.conn.execute('SELECT 1 FROM business_effects WHERE operation_ref=? LIMIT 1', (self.ref,)).fetchone()
-            outcome = 'partial' if effects and (not success or partial) else 'succeeded' if success else 'rejected'
+            outcome = 'partial' if effect_seqs and (not success or partial) else 'succeeded' if success else 'rejected'
         serialized = encode(public)
         previous = tuple(self.conn.execute(
             'SELECT outcome,result_json FROM business_operations WHERE operation_ref=?', (self.ref,)).fetchone())
@@ -132,6 +154,7 @@ class BusinessOperation:
         self.conn.execute('UPDATE business_operations SET outcome=?,result_json=? WHERE operation_ref=?',
                           (outcome, serialized, self.ref))
         self.conn.commit()
+        self._receipt = dict(self._receipt, outcome=outcome, effect_seqs=effect_seqs)
 
 
 class CommitConnection:

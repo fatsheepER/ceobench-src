@@ -11,7 +11,11 @@ from ._capture import observed, urlopen, print
 
 class NovaMindAPIError(Exception):
     """Raised when an API call fails."""
-    pass
+    def __init__(self, message, *, operation=None):
+        self.operation = operation
+        if operation is not None:
+            message += f" [operation_ref={operation['operation_ref']}; outcome={operation['outcome']}]"
+        super().__init__(message)
 
 
 def _http_error(error):
@@ -21,7 +25,8 @@ def _http_error(error):
         result = json.loads(body)
     except (ValueError, UnicodeError):
         return NovaMindAPIError(f"HTTP {error.code}: {body.decode('utf-8', errors='replace')[:500]}")
-    return NovaMindAPIError(result.get('error', f'HTTP {error.code}') if isinstance(result, dict) else f'HTTP {error.code}')
+    return (NovaMindAPIError(result.get('error', f'HTTP {error.code}'), operation=result.get('operation'))
+            if isinstance(result, dict) else NovaMindAPIError(f'HTTP {error.code}'))
 
 
 class _Vars:
@@ -60,6 +65,9 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     Returns:
         Dict with the structured result data. Setting updates include changes as
         {field: {before, after}}; an empty changes dict means unchanged.
+        Business calls include operation metadata with an exact operation_ref,
+        admission operation_seq, outcome and committed effect_seqs. Read the
+        public business_operations/business_effects tables for full details.
 
     Raises:
         NovaMindAPIError: On failure
@@ -86,9 +94,14 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 
     if not result.get('success', False):
         error_msg = result.get('error', 'Unknown error')
-        raise NovaMindAPIError(error_msg)
+        raise NovaMindAPIError(error_msg, operation=result.get('operation'))
 
-    return result.get('data', {})
+    data = result.get('data', {})
+    if result.get('operation') is not None:
+        if isinstance(data, dict):
+            return dict(data, operation=result['operation'])
+        print(json.dumps({'operation': result['operation']}), file=sys.stderr)
+    return data
 
 
 @observed
@@ -158,7 +171,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
 
     if not result.get('success', False):
         error_msg = result.get('error', 'Unknown error')
-        raise NovaMindAPIError(error_msg)
+        raise NovaMindAPIError(error_msg, operation=result.get('operation'))
 
     return result
 

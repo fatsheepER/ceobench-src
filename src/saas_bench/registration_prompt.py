@@ -6,6 +6,27 @@ original prompt, so a change to the original template fails loudly instead of si
 dropping an edit. The original group never passes through here.
 """
 
+RELATIONS = '''Use full handoffs and focused questions to coordinate work. When a shared setting
+may be changed by more than one role, agree who will make the final change and
+check its current value before replacing it. Your normal write permissions remain.
+
+In your handoff, distinguish actions actually completed, proposals, withdrawals,
+observed facts and estimates. Give the relevant day, coverage, units, assumptions,
+locatable evidence and unresolved questions. Brief free prose is enough.
+
+Register sources selectively for important judgments, files or actions that will
+be reused or handed off. Use relation_batch for several targets at once. Known
+sources can be submitted directly; no candidate lookup or predicate is required.
+Copy exact versions and operation references from receipts. Describe missing
+material explicitly. A saved relation is your declaration, not proof of validity.
+Review each item result. Revisions preserve history; a supplied sources list
+replaces the whole list. Registration never blocks handoff or business progress.
+Relations and revisions are readable in relations.json; use ordinary file tools
+or your own scripts to search them. Use author_declared only for your own target;
+use inferred for another or unknown author. Revise with the returned relation ID
+and expected_revision. Missing unsaved output stays missing.
+'''
+
 REGISTERED_TEXTS = '''## Registered Texts
 
 Use `text_create` to register a hypothesis, forecast, plan, conclusion or
