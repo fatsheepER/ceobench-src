@@ -556,7 +556,8 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     assert restored.text_registration == 'prefix'
     assert restored._execute_tool('text_list', {}) == page
     # Group forks start at a completed week boundary (design 4.3).
-    assert advance(restored)['success']
+    advanced = advance(restored)
+    assert advanced['success'], advanced
     restored._commit_weeks_up_to(7)
     restored._save_checkpoint(7)
     children = [offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / mode, mode,

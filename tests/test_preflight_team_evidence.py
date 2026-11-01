@@ -6,7 +6,7 @@ import pytest
 
 from saas_bench import evidence_handles
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
-from saas_bench.execution_capture import CapturedText, restore_sources, text_sources
+from saas_bench.execution_capture import CapturedText, at_pointer, restore_sources, text_sources
 from saas_bench.pf_read import apply_delta
 from saas_bench.role_policy import READABLE_ROLES, ROLES
 from saas_bench.sql_evidence import SQLEvidenceStore
@@ -201,11 +201,27 @@ def test_automatic_inputs_retain_sources_reads_and_exact_ranges_in_provider_wire
             assert (read['reader'], read['session_id'], read['context_id']) == (
                 role, runtime.identity.session_id, runtime.usage.context_id)
             next_reads = json.loads(runtime.store.get_content(events[offset + 1] + ':pf_reads')[1])
-            assert next_reads[0]['mode'] == 'FULL' and next_reads[-1]['mode'] in ('UNCHANGED', 'DELTA')
-            assert next_reads[-1]['chain'][0]['range'] == [a, b]
-            original = runtime.store.get_content(read['target'])[1].decode()
-            repeated = runtime.store.get_content(next_reads[-1]['target'])[1].decode()
-            assert apply_delta(original, next_reads[-1]['edits']) == repeated
+            assert next_reads[0]['read_id'] == read['read_id']
+            assert next_reads[0]['request_range'] == [a, b]
+            direct = next_reads[-1]
+            assert direct['key'] != read['key']
+            assert direct['mode'] == 'FULL'
+            next_wire = json.loads(runtime.store.get_content(events[offset + 1] + ':wire')[1])
+            assert next_wire == [r['body'] for r in team.test_wire if r['role'] == role][offset + 1]
+            assert at_pointer(next_wire, direct['json_pointer']) == expected
+            assert runtime.store.get_content(direct['actual_version'])[1].decode() == expected
+            assert runtime.store.get_content(direct['target'])[1].decode() == expected
+            assert len(next_reads) == 2
+            next_occurrences = json.loads(runtime.store.get_content(events[offset + 1] + ':occurrences')[1])
+            for delivered in next_reads:
+                content = at_pointer(next_wire, delivered['json_pointer'])
+                span = delivered.get('request_range', [0, len(content)])
+                assert content[span[0]:span[1]] == expected
+                assert runtime.store.get_content(delivered['actual_version'])[1].decode() == expected
+                assert any(item['json_pointer'] == delivered['json_pointer']
+                           and item['version_id'] == delivered['target']
+                           and item['source_range'] == [0, len(expected)]
+                           and item['request_range'] == span for item in next_occurrences)
             saved = text_sources({'observation': runtime.agent._last_observation})
             restored = json.loads(json.dumps({'observation': runtime.agent._last_observation}))
             restore_sources(restored, saved)

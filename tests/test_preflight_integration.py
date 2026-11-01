@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -80,6 +81,17 @@ def advance(runner):
                         for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}, timeout=120)
 
 
+def assert_equivalent_advance(actual, expected):
+    actual, expected = dict(actual), dict(expected)
+    left, right = dict(actual['operation']), dict(expected['operation'])
+    left_ref, right_ref = left.pop('operation_ref'), right.pop('operation_ref')
+    assert re.fullmatch(r'op:[0-9a-f]{32}', left_ref)
+    assert re.fullmatch(r'op:[0-9a-f]{32}', right_ref)
+    assert left_ref != right_ref
+    actual['operation'], expected['operation'] = left, right
+    assert actual == expected
+
+
 def set_runtime_config(runner, values):
     calls = [
         ('set_targeted_ad_spend', {'targeted_spend': values['targeted_ad_spend']}),
@@ -133,7 +145,7 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
     restored = offline_runner(clone(first, tmp_path / 'runtime-restored'))
     assert business_references(restored) == business_references(first)
     for _ in range(2):
-        assert advance(restored) == advance(first)
+        assert_equivalent_advance(advance(restored), advance(first))
     for runner in (first, restored):
         runner._save_checkpoint(14)
         directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
@@ -325,7 +337,7 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
     for _ in range((42 - split_day) // 7):
         expected = advance(first)
         for restored in (left, right):
-            assert advance(restored) == expected
+            assert_equivalent_advance(advance(restored), expected)
     for runner in (first, left, right):
         runner._save_checkpoint(42)
     expected = business_state(first)
@@ -710,7 +722,11 @@ def test_six_week_execution_capture_matches_uncaptured_run(offline_runner, tmp_p
             traces[index].append(advance(runner))
             traces[index].append(runner._get_dashboard())
             traces[index].append(runner._get_dashboard())
-        assert traces[0] == traces[1]
+        for actual, expected in zip(traces[0], traces[1], strict=True):
+            if isinstance(actual, dict) and 'operation' in actual:
+                assert_equivalent_advance(actual, expected)
+            else:
+                assert actual == expected
         assert runners[0]._get_game_status() == runners[1]._get_game_status()
         if week in (2, 4):
             day = (week + 1) * 7
