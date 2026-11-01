@@ -305,6 +305,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                                    isinstance(exc, RequestDeadlineExceeded) else 'query')
         self._sql_event, self._sql_capture_failed = None, False
         self._generic_capture = self.path != '/query'
+        if self.path == '/query':
+            from .sql_access import new_record
+            self._sql_execution['sql_access'] = new_record()
         store = self.evidence
         if store and self.path != '/_capture':
             try:
@@ -678,6 +681,8 @@ class _APIHandler(BaseHTTPRequestHandler):
                 api._sql_lock.notify_all()
 
     def _handle_query_request(self):
+        from .sql_access import new_record
+        self._sql_execution['sql_access'] = new_record()
         sql = ''
         try:
             raw = self._read_request_bytes()

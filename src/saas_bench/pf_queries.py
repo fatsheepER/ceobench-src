@@ -52,12 +52,28 @@ class Candidates(Input):
     kind: Literal['file', 'sql', 'api', 'stdout', 'stderr', 'output', 'code', 'text', 'script', 'dashboard', 'execution'] | None = None
     text: Annotated[str, Field(min_length=1, max_length=2000)] | None = None
     event: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    table: Text | None = None
+    column: Text | None = None
+    sql_accesses: bool = False
     detail: bool = False
 
     @model_validator(mode='after')
     def ordered_days(self):
         if self.day_from is not None and self.day_to is not None and self.day_from > self.day_to:
             raise ValueError('day_from must not exceed day_to')
+        from .sql_access import PUBLIC_COLUMNS
+        if self.column and not self.table:
+            raise ValueError('SQL column filters require a public table')
+        if self.table is not None:
+            self.table = self.table.casefold()
+            if self.table not in PUBLIC_COLUMNS:
+                raise ValueError('Unknown public SQL table; read docs/tables/')
+            if self.column is not None:
+                self.column = self.column.casefold()
+                if self.column not in PUBLIC_COLUMNS[self.table]:
+                    raise ValueError('Unknown public SQL column; read docs/tables/')
+        if (self.table or self.sql_accesses) and self.kind not in (None, 'sql'):
+            raise ValueError('SQL access filters and directory require kind sql')
         return self
 
 

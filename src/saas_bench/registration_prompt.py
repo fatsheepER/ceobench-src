@@ -74,6 +74,8 @@ capture details report gaps. `pf candidates` finds sources across calls, default
 to your role and current simulated week, 20 per page. Its header states the scope
 and cutoff. Use `--history`, `--role all` or explicit day/kind/text/event filters to
 broaden or narrow it, and the returned `pf more` cursors for continuation or details.
+SQL `--table TABLE --column COLUMN` filters authorization observations, including
+possible view expansion; `--sql-accesses` lists observed pairs, not adopted columns.
 Content versions and execution events are separate. Saved, delivered and declared
 used are different; candidates are observations, not proof of use. After a command, a line such as
 `[pf: scripts/an_w7d.py.out@v1 | wrote scripts/an_w7d.py@v1]` names them:

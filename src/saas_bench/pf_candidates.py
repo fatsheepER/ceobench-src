@@ -1,10 +1,11 @@
 """Frozen, event-preserving discovery of public captures, without building a graph."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import closing
 import json
+import shlex
 import uuid
 
-from . import evidence_handles, pf_render
+from . import evidence_handles, pf_render, sql_access
 from .execution_capture import CURRENT_EVENT
 from .pf_deadline import check
 from .sql_evidence import now
@@ -43,11 +44,15 @@ class CandidateQuery:
         self._authorize(snapshot)
         common = dict(scope=snapshot['scope'], cutoff=snapshot['cutoff'], total_in_scope=len(snapshot['items']),
                       detail=detail, model_delivery_scope=snapshot['model_delivery_scope'])
+        for field in ('view', 'sql_access_coverage'):
+            if field in snapshot and snapshot[field] is not None:
+                common[field] = snapshot[field]
         start, stop = selection
         if not 0 <= start <= stop <= len(snapshot['items']):
             raise ValueError('Invalid candidate cursor selection')
         if detail:
-            selected = [dict(item, **snapshot['events'][item['event_ref']]) for item in snapshot['items'][start:stop]]
+            selected = snapshot['items'][start:stop] if snapshot.get('view') == 'sql_accesses' else [
+                dict(item, **snapshot['events'][item['event_ref']]) for item in snapshot['items'][start:stop]]
             content = json.dumps(selected, ensure_ascii=True, indent=2, sort_keys=True)
             end = min(len(content), offset + DETAIL_CHARS)
             if not 0 <= offset <= len(content):
@@ -85,8 +90,11 @@ class CandidateQuery:
 
     def _authorize(self, snapshot):
         with closing(self.store.connect()) as conn:
-            for item in snapshot['items']:
+            items = snapshot.get('sql_authorization_items', []) + (
+                [] if snapshot.get('view') == 'sql_accesses' else snapshot['items'])
+            for item in items:
                 check()
+                sql_access.authorize_projection(item.get('sql_access'))
                 if item['content_ref']:
                     row = conn.execute('SELECT event_id,content_hash,metadata FROM versions WHERE version_id=?',
                                        (item['content_ref'],)).fetchone()
@@ -107,7 +115,9 @@ class CandidateQuery:
             raise ValueError('Current simulated day is unknown; specify --history or a day range')
         start = values.get('day_from') if explicit_days or values['history'] else today // 7 * 7
         end = values.get('day_to') if explicit_days or values['history'] else start + 6
-        scope = dict(role=role, role_basis='execution_initiator', day_from=start, day_to=end, kind=values.get('kind'), text=values.get('text'),
+        scope = dict(role=role, role_basis='execution_initiator', day_from=start, day_to=end,
+                     kind=values.get('kind') or ('sql' if values.get('table') or values.get('sql_accesses') else None),
+                     table=values.get('table'), column=values.get('column'), text=values.get('text'),
                      event=values.get('event'), time='explicit_days' if explicit_days else
                      'all_history' if values['history'] else 'current_simulated_week')
         with closing(self.store.connect()) as conn:
@@ -218,9 +228,68 @@ class CandidateQuery:
                 if self._matches(item, scope, descendants) and (not scope['text'] or self._text_match(item, scope['text'], conn)):
                     items.append((event['row'], 0, item))
         items.sort(key=lambda value: (value[0], value[1]), reverse=True)
-        details = {item['event_ref']: dict(request=item.pop('request'), receipt=item.pop('receipt')) for _, _, item in items}
-        return dict(format=FORMAT, scope=scope, cutoff=cutoff, items=[item for _, _, item in items], events=details,
-                    model_delivery_scope=delivery_scope)
+        candidates = [item for _, _, item in items]
+        sql_items = {item['event_ref']: item for item in candidates if item['kind'] == 'sql'}
+        access_counts = Counter(item['sql_access']['status'] for item in sql_items.values())
+        coverage = dict(query_events=len(sql_items), unknown_events=access_counts['unknown'],
+                        not_started_events=access_counts['not_started'], recorded_events=access_counts['recorded'],
+                        recorded_empty_events=sum(item['sql_access']['status'] == 'recorded' and
+                            not item['sql_access']['public_reads'] for item in sql_items.values()),
+                        basis='role/day/kind/event/text scope before table/column matching; no match does not prove no access')
+        authorization = [{key: item[key] for key in ('event_ref', 'content_ref', 'sha256', 'sql_access')}
+                         for item in sql_items.values()]
+        candidates = [item for item in candidates if not scope['table'] or
+                      item['kind'] == 'sql' and sql_access.matches(item['sql_access'], scope['table'], scope['column'])]
+        for item in candidates:
+            if item['kind'] == 'sql':
+                item['access_match_bases'] = sorted({row['basis'] for row in item['sql_access']['public_reads']
+                    if (scope['table'] is None or row['table'] == scope['table']) and
+                       (scope['column'] is None or row['column'] == scope['column'])})
+        if values.get('sql_accesses'):
+            candidates = self._directory(candidates, scope)
+            details = {}
+        else:
+            details = {item['event_ref']: dict(request=item.pop('request'), receipt=item.pop('receipt')) for item in candidates}
+        return dict(format=FORMAT, scope=scope, cutoff=cutoff, items=candidates, events=details,
+                    model_delivery_scope=delivery_scope, view='sql_accesses' if values.get('sql_accesses') else 'candidates',
+                    sql_access_coverage=coverage if sql_items or scope['kind'] == 'sql' else None,
+                    sql_authorization_items=authorization)
+
+    @staticmethod
+    def _directory(candidates, scope):
+        pairs = defaultdict(dict)
+        for item in candidates:
+            check()
+            for read in item['sql_access']['public_reads']:
+                if (scope['table'] is None or read['table'] == scope['table']) and (
+                        scope['column'] is None or read['column'] == scope['column']):
+                    key = read['table'], read['column']
+                    event = pairs[key].setdefault(item['event_ref'], dict(item=item, bases=set()))
+                    event['bases'].add(read['basis'])
+        rows = []
+        for (table, column), events in sorted(pairs.items(), key=lambda pair: (pair[0][0], pair[0][1] or '')):
+            check()
+            command = ['pf', 'candidates', '--role', scope['role'], '--kind', 'sql', '--table', table]
+            if column is not None:
+                command += ['--column', column]
+            if scope['day_from'] is None and scope['day_to'] is None:
+                command += ['--history']
+            for key in ('day_from', 'day_to', 'text', 'event'):
+                if scope[key] is not None:
+                    command += ['--' + key.replace('_', '-'), str(scope[key])]
+            items = [entry['item'] for entry in events.values()]
+            rows.append(dict(table=table, column=column, query_events=len(events),
+                outcomes=dict(Counter(item['status'] for item in items)),
+                truncated_events=sum(item['receipt'].get('result_coverage') == 'truncated' for item in items),
+                observation_bases=dict(Counter(basis for entry in events.values() for basis in entry['bases'])),
+                navigation=shlex.join(command),
+                navigation_scope='table_and_column' if column is not None else 'all_columns_for_table',
+                executions=[dict(event_ref=item['event_ref'], content_ref=item['content_ref'], version=item['version'],
+                                 status=item['status'], result_coverage=item['receipt'].get('result_coverage', 'unknown'),
+                                 details=shlex.join(['pf', 'candidates', '--history', '--role', 'all', '--event', item['event_ref'], '--detail']),
+                                 show=shlex.join(['pf', 'show', item['content_ref'], '--full']) if item['content_ref'] else None)
+                            for item in items]))
+        return rows
 
     @staticmethod
     def _matches(item, scope, descendants):
@@ -272,10 +341,11 @@ class CandidateQuery:
                               parent_event_ref=request.get('parent_event_id'), started_at=request.get('started_at'))
         receipt = {k: result[k] for k in ('status', 'completion', 'completed_at', 'exit_code', 'classification',
                    'capture_status', 'capture_gaps', 'result_coverage', 'error', 'error_kind', 'http_status',
-                   'changed_paths', 'written_paths', 'deleted_paths', 'boundary_closed') if k in result}
+                   'changed_paths', 'written_paths', 'deleted_paths', 'boundary_closed', 'snapshot_status',
+                   'failure_stage', 'error_type') if k in result}
         status = 'unfinished' if result.get('completion') == 'unfinished' else result.get('status', 'result_unknown')
         receipt.update(status=status, transport=event['transport'])
-        return dict(event_ref=event_id, content_ref=version, version=self.resolver.handle(version) if version else None,
+        item = dict(event_ref=event_id, content_ref=version, version=self.resolver.handle(version) if version else None,
                     kind=kind, name=name, day=event['day'], status=status, initiator_role=actor,
                     initiator='registered_script' if request['kind'] == 'registered_script_execution' or any(
                         events[parent]['request']['kind'] == 'registered_script_execution' for parent in visited) else
@@ -290,6 +360,10 @@ class CandidateQuery:
                     model_delivery=deliveries.get(version, dict(historical=dict(status='unknown', occurrences=[]),
                                                                current=dict(status='unknown', occurrences=[]))),
                     association='execution_observation', request=detail_request, receipt=receipt)
+        if kind == 'sql':
+            item['sql_access'] = sql_access.projection(result.get('sql_access'))
+            item['access_match_bases'] = sorted({read['basis'] for read in item['sql_access']['public_reads']})
+        return item
 
     def _deliveries(self, conn, events):
         eligible = [(event_id, event) for event_id, event in events.items()
@@ -351,16 +425,33 @@ def render(page):
              'Snapshot cutoff: ' + json.dumps(page['cutoff'], sort_keys=True),
              f"returned={page['returned']}; total_in_scope={page['total_in_scope']}; has_more={str(page['has_more']).lower()}.",
              'Model delivery: this reader only; historical/current request before query; unknown is not unread.']
+    directory = page.get('view') == 'sql_accesses'
+    if directory:
+        lines[0] = 'PF SQL access directory: authorization observations, not proof of use.'
+        lines.append('Counts are distinct query events per pair; observation basis counts overlap. Column-free reads name only a table.')
+        lines.append('Navigation starts a fresh query in the same scope and may include later captures; these frozen counts do not change.')
+    if 'sql_access_coverage' in page:
+        lines.append('SQL access coverage: ' + json.dumps(page['sql_access_coverage'], sort_keys=True))
+        lines.append(sql_access.SEMANTICS)
     if page['detail']:
         lines.append(f"Detail characters {page['range'][0]}:{page['range'][1]}/{page['total_chars']}; requests and receipt metadata, not source bodies.")
         lines.append(page['detail_text'])
     for item in page['items']:
+        if directory:
+            lines.append(f"{item['table']}.{item['column'] or '<column-free>'} | query_events={item['query_events']} | "
+                         f"outcomes={json.dumps(item['outcomes'], sort_keys=True)} | truncated={item['truncated_events']} | "
+                         f"bases={json.dumps(item['observation_bases'], sort_keys=True)}\n  {item['navigation']}")
+            if item['navigation_scope'] == 'all_columns_for_table':
+                lines.append('  Table-wide navigation includes other column observations; exact events are in details.')
+            continue
         capture, delivery = item['capture'], item['model_delivery']
         extent = 'missing' if capture['state'] == 'missing' else 'truncated' if capture['source_truncated'] else capture['extent']
         lines.append(f"{pf_render.short(item['version'], 220) if item['version'] else 'No content handle'} | event={item['event_ref']} | day={item['day']} | {item['kind']} "
                      f"{pf_render.short(item['name'], 100)} | {item['status']} | capture={extent} | "
                      f"delivery history={delivery['historical']['status']}, current={delivery['current']['status']} | "
                      f"source={item['source_role']}, producer={item['producer_role']}, storage={item['storage_role']}")
+        if 'sql_access' in item:
+            lines.append('  authorization=' + item['sql_access']['status'] + '; match_bases=' + ','.join(item['access_match_bases']))
     if not page['items'] and not page['detail']:
         lines.append('No candidates in this scope. Use --history or --role all explicitly to broaden it.')
     if page.get('detail_cursor'):

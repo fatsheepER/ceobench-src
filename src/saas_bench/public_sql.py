@@ -6,12 +6,13 @@ import sys
 import time
 import uuid
 
-from .database import TABLE_DOCS, SharedMemoryConnection
+from .database import SharedMemoryConnection
+from . import sql_access
+from .sql_access import PUBLIC_COLUMNS
 from .runtime_options import runtime_value
 
 
 PUBLIC_POLICY_VERSION = 'public-sql-v2'
-PUBLIC_COLUMNS = {table: tuple(doc['columns']) for table, doc in TABLE_DOCS.items()}
 ROW_LIMIT = 20000
 CELL_LIMIT_BYTES = 8 * 1024 * 1024
 RESULT_LIMIT_BYTES = 32 * 1024 * 1024
@@ -83,7 +84,7 @@ def log_query(metadata):
         pass  # A closed diagnostic stream must not override the query result.
 
 
-def install_authorizer(conn, *, oracle=False):
+def install_authorizer(conn, *, oracle=False, access=None):
     """Install a fail-closed policy on a fresh connection with no application UDFs."""
     denied = []
     def authorize(action, table, column, database, source):
@@ -92,18 +93,20 @@ def install_authorizer(conn, *, oracle=False):
         if action == sqlite3.SQLITE_FUNCTION and column in FUNCTIONS:
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_READ:
-            if oracle and database in ('main', 'temp', None):
-                return sqlite3.SQLITE_OK
-            # SQLite reports database=None for some column-free COUNT(*) reads.
-            if table in PUBLIC_COLUMNS and (
+            allowed = (oracle and database in ('main', 'temp', None)) or (table in PUBLIC_COLUMNS and (
                 (column == '' and database in ('main', 'temp', None)) or
-                (database in ('main', 'temp') and column in PUBLIC_COLUMNS[table])
-            ):
-                return sqlite3.SQLITE_OK
+                (database in ('main', 'temp') and column in PUBLIC_COLUMNS[table])))
+            decision = sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
+            if access is not None:
+                sql_access.observe(access, action, table, column, database, source, decision)
+            if allowed:
+                return decision
         denied.append(action)
         return sqlite3.SQLITE_DENY
 
     conn.set_authorizer(authorize)
+    if access is not None:
+        access['status'] = 'recorded'
     return denied
 
 
@@ -113,7 +116,7 @@ def query_snapshot(server, deadline, metadata=None):
     started = time.monotonic()
     metadata = metadata if metadata is not None else {}
     metadata.update(snapshot_ref=uuid.uuid4().hex, public_policy_version=PUBLIC_POLICY_VERSION,
-                    oracle=server.oracle_mode, snapshot_status='failed')
+                    oracle=server.oracle_mode, snapshot_status='failed', sql_access=sql_access.new_record())
     environment = getattr(server, 'runtime_environment', None)
     metadata['limits'] = dict(rows=runtime_value('sql_row_limit', ROW_LIMIT, environment=environment),
         result_bytes=runtime_value('sql_result_limit_bytes', RESULT_LIMIT_BYTES, environment=environment),
@@ -191,7 +194,7 @@ def query_snapshot(server, deadline, metadata=None):
                         names = ', '.join('"' + c + '"' for c in schema if c in columns)
                         conn.execute(f'CREATE TEMP VIEW "{table}" AS SELECT {names} FROM main."{table}"')
                 conn.execute('PRAGMA query_only=ON')
-                denied = install_authorizer(conn, oracle=server.oracle_mode)
+                denied = install_authorizer(conn, oracle=server.oracle_mode, access=metadata['sql_access'])
                 conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                 check_deadline(deadline)
                 metadata['snapshot_seconds'] = time.monotonic() - before

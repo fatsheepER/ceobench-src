@@ -20,6 +20,7 @@ USAGE = '''usage: pf <command> ...
   pf search --text "KEYWORD"           literal text in public captured history, newest first
   pf candidates [--role ROLE|all] [--history] [--day-from N] [--day-to N]
                 [--kind KIND] [--text TEXT] [--event EVENT] [--detail]
+                [--table TABLE [--column COLUMN]] [--sql-accesses]
                                       captured objects across calls, 20 per page
   pf more <cursor>                     the next page of an earlier result
 Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
@@ -148,7 +149,23 @@ File reads that reuse saved bytes keep their own acquisition event and text
 representation; same-event byte/text duplicates and SQL display projections are
 represented by their source version. Interpreter cache files, session logs and
 private model bodies are excluded from candidates.
-No query replay or validity judgment occurs. Known sources can be registered directly.
+SQL access discovery uses saved SQLite authorization observations:
+```bash
+pf candidates --history --sql-accesses
+pf candidates --history --table ledger --column amount
+```
+--sql-accesses lists observed public table/column pairs and distinct query-event
+counts in this scope, with commands to find their saved queries. It is not a schema
+list or adoption count. --column requires --table. Both match the same saved read.
+Authorization happens during prepare/reprepare and is an upper bound: view
+expansion and unused projections can appear. named_source_authorization may be
+view expansion or a named CTE; public_view_reference is still not row/output use.
+A column-free read names only a table. Query outcome, truncation, capture and model
+delivery stay separate. Unknown historical access records are counted before table
+and column filtering; no match does not prove no access. Details show the public
+mapping, never private raw callbacks. Use show to read a result, then depend or
+rdepend for saved declarations. No query replay or validity judgment occurs.
+Known sources can be registered directly.
 
 Other boundaries: blame locates the version and day each saved file line was written.
 rdepend navigates saved declarations and inferences, not inferred business impact.
@@ -265,7 +282,8 @@ def parse_argv(words):
     options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False, 'all-revisions': False, 'include-candidates': False, 'depth': True},
                    rdepend={'detail': False, 'all': False, 'all-revisions': False, 'include-candidates': False, 'depth': True}, search={'all': False, 'kind': True, 'text': True},
                    candidates={'role': True, 'history': False, 'day-from': True, 'day-to': True,
-                               'kind': True, 'text': True, 'event': True, 'detail': False}).get(verb, {})
+                               'kind': True, 'text': True, 'event': True, 'detail': False,
+                               'table': True, 'column': True, 'sql-accesses': False}).get(verb, {})
     flags, rest = _flags(words, dict(options, help=False))
     if flags.get('help'):
         return 'pf_help', {}
