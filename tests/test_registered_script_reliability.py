@@ -1,5 +1,6 @@
 import errno
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -70,7 +71,7 @@ def test_prestart_enospc_reaches_owner_and_all_roles_continue(mode, monkeypatch)
         team.checkpoint_callback = checkpoint
         original = Boundary.__init__
         def fail_at_week(self, *args, **kwargs):
-            if team.server.tools.current_day == 7 and 'read-only' in args[0]:
+            if team.server.tools.current_day == 7 and '/.registered-' in args[0]:
                 raise OSError(errno.ENOSPC, 'No space left on device')
             return original(self, *args, **kwargs)
         monkeypatch.setattr(Boundary, '__init__', fail_at_week)
@@ -150,16 +151,26 @@ def test_closed_resource_failure_reaches_owner_and_partner_models(mode, role, fa
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_failed_script_retains_partial_business_write_and_error(mode):
-    with make_team(mode, lambda team, role, body: final('unused'), 'registered-write') as team:
+def test_model_script_retains_partial_business_write_and_error(mode):
+    turns = []
+    code = "import novamind_api as nm\nnm.pricing.set_prices(A=37)\nprint('WRITE-DONE')\nraise ValueError('repair me')\n"
+
+    def respond(team, role, body):
+        if role != 'ceo':
+            return final(role + ' report')
+        turns.append(body)
+        if len(turns) == 1:
+            return calls(('bash', dict(command='python weekly.py')))
+        rendered = json.dumps(body['messages'])
+        assert 'WRITE-DONE' in rendered and 'ValueError: repair me' in rendered
+        return calls(('bash', dict(command=ADVANCE)))
+
+    with make_team(mode, respond, 'model-script-write') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
-        code = "import novamind_api as nm\nnm.pricing.set_prices(A=37)\nprint('WRITE-DONE')\nraise ValueError('repair me')\n"
-        executor = team.roles['ceo'].executor
-        executor.execute('write_file', dict(path='weekly.py', content=code))
-        assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
-        output = team._script_output('ceo')
-        assert 'WRITE-DONE' in output and 'ValueError: repair me' in output
-        assert team.server.role_script_results['ceo'][0]['classification'] == 'script_error'
+        team.roles['ceo'].executor.execute('write_file', dict(path='weekly.py', content=code))
+        assert team.run(stop_after_day=7).reason == 'observation_end', team.failure
+        assert len(turns) == 2
+        assert not team.server._operation_failed
         assert team.server.conn.execute('SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 37
 
 
@@ -277,44 +288,56 @@ def test_real_launcher_pre_auth_failure_retains_stderr_and_closes_resources(mode
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_unknown_registered_business_write_retains_receipt_and_skips_model(mode, monkeypatch):
+def test_unknown_model_script_write_retains_evidence_and_skips_followup(mode, monkeypatch):
     from saas_bench import api_server
-    with make_team(mode, lambda team, role, body: final('unused'), 'registered-unknown') as team:
+    code = "import novamind_api as nm\nprint('WRITE-BEGIN', flush=True)\nnm.pricing.set_prices(A=42)\n"
+
+    def respond(team, role, body):
+        if role == 'ceo':
+            return calls(('bash', dict(command='python -c ' + shlex.quote(code))))
+        return final(role + ' report')
+
+    with make_team(mode, respond, 'model-script-unknown') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
-        executor = team.roles['ceo'].executor
-        code = "import novamind_api as nm\nprint('WRITE-BEGIN', flush=True)\nnm.pricing.set_prices(A=42)\n"
-        executor.execute('write_file', dict(path='weekly.py', content=code))
-        assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
         original = api_server._TOOL_DISPATCH['set_prices']
+
         def fail_after_write(tools, args):
             original(tools, args)
             raise OSError(errno.EIO, 'write completion lost')
+
         monkeypatch.setitem(api_server._TOOL_DISPATCH, 'set_prices', fail_after_write)
         outcome = team.run(stop_after_day=7)
         assert (outcome.day, outcome.reason, team.failure) == (0, 'paused', 'business_operation_unknown')
         assert team.server._operation_failed is True
-        record = team.server.role_script_results['ceo'][0]
-        assert record['classification'] == 'unknown'
-        assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'WRITE-BEGIN\n'
+        executor = team.roles['ceo'].executor
+        assert executor._raw_streams[0] == b'WRITE-BEGIN\n'
+        assert executor._bash_facts['boundary_closed'] is True
+        assert not executor.preserved_process
         operations = [json.loads(path.read_text()) for path in (team.root / 'private/operations').glob('*.json')]
         assert any(row['kind'] == 'api:set_prices' and row['status'] == 'running' for row in operations)
-        assert [item['role'] for item in team.test_wire] == ['ceo']
+        assert [item['role'] for item in team.test_wire].count('ceo') == 2
+        assert team.server.role_script_results['ceo'] == []
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_unknown_partner_write_cancels_script_and_retains_closed_partial_streams(mode, monkeypatch):
+def test_unknown_model_partner_write_cancels_script_and_retains_closed_partial_streams(mode, monkeypatch):
     import time
     from saas_bench import api_server
-    with make_team(mode, lambda team, role, body: final('unused'), 'registered-partner') as team:
+    model_code = "print('growth-BEGIN', flush=True)\nimport novamind_api as n\nn.infrastructure.set_capacity_tier(2)\n"
+
+    def respond(team, role, body):
+        assert role == 'growth'
+        return calls(('bash', dict(command='python -c ' + shlex.quote(model_code))))
+
+    with make_team(mode, respond, 'registered-partner') as team:
         team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
-        for role in ROLES[1:]:
-            executor = team.roles[role].executor
-            code = f"print('{role}-BEGIN', flush=True)\n"
-            code += ("import novamind_api as n\nn.infrastructure.set_capacity_tier(2)\n" if role == 'growth' else
-                     "import time\nfrom pathlib import Path\nPath('partner-started').touch()\ntime.sleep(60)\n")
-            executor.execute('write_file', dict(path='weekly.py', content=code))
-            assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
+        executor = team.roles['ops_finance'].executor
+        code = ("print('ops_finance-BEGIN', flush=True)\nimport time\nfrom pathlib import Path\n"
+                "Path('partner-started').touch()\ntime.sleep(60)\n")
+        executor.execute('write_file', dict(path='weekly.py', content=code))
+        assert 'registered' in executor.execute('bash', dict(command='./novamind-operation register-daily-script weekly.py')).lower()
         write = api_server._TOOL_DISPATCH['set_capacity_tier']
+
         def lose_write_completion(tools, args):
             deadline = time.monotonic() + 5
             while not (team.roles['ops_finance'].workspace / 'partner-started').exists():
@@ -322,20 +345,24 @@ def test_unknown_partner_write_cancels_script_and_retains_closed_partial_streams
                 time.sleep(.01)
             write(tools, args)
             raise OSError(errno.EIO, 'partner write completion lost')
+
         monkeypatch.setitem(api_server._TOOL_DISPATCH, 'set_capacity_tier', lose_write_completion)
         outcome = team.run(stop_after_day=7)
         assert outcome.reason in ('paused', 'failed'), team.failure
         assert 'unknown' in team.failure.lower()
         assert team.server._operation_failed is True
-        assert team.server.role_script_results['growth'][0]['classification'] == 'unknown'
-        assert team.server.role_script_results['growth'][0]['facts']['business_operation_unknown'] is True
-        for role in ROLES[1:]:
-            record = team.server.role_script_results[role][0]
-            assert record['facts']['boundary_closed'] is True
-            assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == f'{role}-BEGIN\n'.encode()
-            assert not team.server.role_executors[role].preserved_process
-        assert team.server.role_script_results['ops_finance'][0]['status'] == 'cancelled'
-        assert [item['role'] for item in team.test_wire] == ['ceo']
+        growth = team.roles['growth'].executor
+        assert growth._raw_streams[0] == b'growth-BEGIN\n'
+        assert growth._bash_facts['boundary_closed'] is True
+        assert not growth.preserved_process
+        record, = team.server.role_script_results['ops_finance']
+        assert record['classification'] == 'unknown'
+        assert record['facts']['business_operation_unknown'] is True
+        assert record['facts']['boundary_closed'] is True
+        assert (Path(record['evidence']) / 'stdout.bin').read_bytes() == b'ops_finance-BEGIN\n'
+        assert not team.server.role_executors['ops_finance'].preserved_process
+        assert record['status'] == 'cancelled'
+        assert [item['role'] for item in team.test_wire] == ['ceo', 'growth']
         with pytest.raises(RuntimeError, match='recoverable handoff'):
             team.checkpoint()
         if mode == 'pf':

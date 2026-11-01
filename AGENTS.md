@@ -39,6 +39,7 @@
 - 自动周检、重放及状态传播已删除。周初看板、注册脚本、全文交接与检查点恢复的真实模型输入从 `tests/test_week_start_observation.py` 定位；主动来源查询不重放、不判断条件及旧 findings 不再投递从 `tests/test_pf_readonly_sources.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。
 - 三角色同步请求、FIFO、循环等待拒绝、整批工具后的模型投递、原会话唤醒与问答权限从 `tests/test_team_requests.py` 定位。
+- 登记脚本的工作区相对路径、真实源码快照文件、`__file__`、相邻数据与模块、完整输出及关闭后清理从 `tests/test_registered_script_environment.py` 定位；自动批次只读经营接口、正常角色保留写权、拒绝回执入模和恢复不重放从 `tests/test_registered_script_observation.py` 定位。 旧客户端及帮助更新、真实旧 checkpoint 的嵌套登记和安全文件替换从 `tests/test_registered_script_legacy.py` 定位。
 - 注册脚本每周一次、会话初始化与周任务/临时问答独立状态、脚本故障现场不得伪装周界，以及现有静止点恢复从 `tests/test_team_script_state.py` 定位；脚本执行、分类和关闭契约仍从 `tests/test_registered_script_reliability.py` 定位。
 - 故障后该组进入 HOLD，记录原因并等待人工从 checkpoint 续跑。controller 每次启动对每个运行只启动一次 worker；正常完成后继续该组队列中的下一项，不自动回滚或重启，也不累计同位置失败次数。
 - 人工续跑可以反复指定任意历史 checkpoint 或 `--week N`，含第 1 周的初始周界。历史 HOLD、STOP、审批与哈希信息只作提醒。snapshot、manifest、D0、环境、工作区、RNG、Bash 策略与 scope 校验只记日志及 attempt 提示；`--force-resume` 记录操作者明确选择继续。

@@ -42,7 +42,7 @@ def test_partial_script_batch_receipt_failure_does_not_become_new_week_boundary(
         register_cli(team, role, 'first.py',
             "from pathlib import Path\nimport novamind_api as n\n"
             "with open('executions.txt', 'a') as out: out.write('first\\n')\n"
-            "n.infrastructure.set_capacity_tier(2)\nprint('FIRST-COMPLETED', flush=True)\n")
+            "print(n.query('SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1'))\nprint('FIRST-COMPLETED', flush=True)\n")
         register_cli(team, role, 'second.py', "print('PARTIAL-SECOND', flush=True)\nraise ValueError('ordinary script error')\n")
         before = team.checkpoint()
         failed_receipts = []
@@ -126,7 +126,7 @@ def test_role_week_axes_survive_opening_questions_repeated_wakeups_and_new_week(
         for role in ROLES:
             code = ("import novamind_api as n\n"
                     "with open('auto-days.txt', 'a') as out: out.write(str(n.vars.current_day) + '\\n')\n"
-                    "n.infrastructure.set_capacity_tier(2)\n" + f"print('OWNER-{role}')\n")
+                    "print(n.query('SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1'))\n" + f"print('OWNER-{role}')\n")
             if role != 'ceo':
                 code += ("try: n.pricing.set_prices(A=999)\n"
                          "except n.NovaMindAPIError: print('DENIED-PRICE')\n"

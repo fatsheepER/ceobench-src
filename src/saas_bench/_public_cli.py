@@ -505,24 +505,37 @@ def cmd_register_daily_script(args):
     Usage: ./novamind-operation register-daily-script <script_path> [--session ID]
 
     The legacy command name says daily; execution is weekly, in insertion order.
-    Registration uses the source filename. Re-register that filename to replace
-    its snapshot; editing the local file alone does not update it.
+    Registration uses the source path relative to your owner workspace.
+    Re-register that path to replace its snapshot; editing or deleting the local
+    source alone does not update it. Existing filename registrations still work.
+    Each run executes a temporary Python snapshot beside that source path, with
+    cwd at your workspace root. __file__ and sys.argv[0] name the real snapshot;
+    its generated basename changes between runs. Adjacent data and imports use
+    the source directory and remain live workspace files, not frozen snapshots.
+    The execution receipt records the registered name, execution path and cwd.
     Scripts must explicitly import novamind_api, for example
     `import novamind_api as nm`. Print the results you need in your weekly input.
-    In teams, scripts and outputs belong to their registering role. CEO scripts
-    and analyst scripts use their owner's business permissions. Only CEO can
-    set prices, purchase research, manage enterprise deals or advance time.
-    ask_analyst follow-ups do not rerun scripts.
+    In teams, scripts and outputs belong to their registering role. Automatic
+    scripts are observation-only: public reads and owner-workspace files are
+    allowed, but business changes, paid research, time advancement and changing
+    the script registry are rejected. Use normal role tools for permitted business
+    actions after reading the current CEO directions. Questions and checkpoint
+    recovery do not replay a completed automatic batch.
+    A new nested path is a different registry name from an old basename-only
+    entry. Use list-daily-scripts and remove the old entry if you are replacing it.
     The server receipt includes name, registered and sha256. Exit code 0 requires
     server success; file, connection and server errors exit nonzero.
     """
-    source = Path(args.script_path)
+    source = Path(args.script_path).resolve()
     try:
+        if not source.is_relative_to(_base_dir()):
+            raise ValueError('Script must be inside your owner workspace')
+        name = source.relative_to(_base_dir()).as_posix()
         content = source.read_text()
-    except (OSError, UnicodeError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
-    _script_request(args, "POST", {"name": source.name, "content": content})
+    _script_request(args, "POST", {"name": name, "content": content})
 
 
 @observed
@@ -540,11 +553,11 @@ def cmd_list_daily_scripts(args):
 
 @observed
 def cmd_remove_daily_script(args):
-    """Remove a registered server snapshot by filename, preserving local files.
+    """Remove a registered server snapshot by its returned name, preserving local files.
 
     Usage: ./novamind-operation remove-daily-script <script_name> [--session ID]
 
-    Returns the server's removed filename. In teams, only your role's registry
+    Returns the removed registry name, including its directory. In teams, only your role's registry
     is affected. Exit code 0 requires server success; missing registrations,
     connection failures and rejected removals exit nonzero.
     """

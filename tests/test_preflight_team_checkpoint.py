@@ -77,7 +77,7 @@ def make_team(root, mode, **options):
     for role in ROLES:
         code = "import novamind_api as nm\nwith open('script-days.txt','a') as stream: stream.write(str(nm.vars.current_day)+'\\n')\n"
         if role == 'ceo':
-            code += "nm.market.research_market()\n"
+            code += "print(nm.market.get_market_overview())\n"
         status, result = raw(runtime, role, '/daily-scripts', dict(name='same.py', content=code))
         assert status == 200 and result['success'], result
         (runtime.roles[role].workspace / 'MEMORY.md').write_text(role + ' memory')

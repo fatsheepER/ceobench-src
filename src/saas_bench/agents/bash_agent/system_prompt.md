@@ -111,7 +111,7 @@ All interaction goes through the `./novamind-operation` CLI:
 ./novamind-operation remove-daily-script setup.py    # Remove a registered weekly script
 ```
 
-Registration snapshots the source file under its filename. Re-register after edits.
+Registration snapshots the source under its workspace-relative path. Re-register after edits.
 Scripts run in insertion order at the start of each week and must explicitly
 `import novamind_api as nm`. Print results for your weekly input.
 

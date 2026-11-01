@@ -150,10 +150,12 @@ print('SCRIPT-CLIENT-EXITED')
             output = running.result(timeout=10)
             assert 'SCRIPT-CLIENT-EXITED' in output['late.py']
         wait_until(lambda: not team.server.public_request_state()['active'])
+        assert records(team) == [] and effects(team) == []
+        assert not team.server._operation_failed
         assert raw(team, 'growth', '/call', {'tool': 'set_capacity_tier', 'args': {'tier': 4}, 'initiator': 'registered_script'})[0] == 200
         rows = records(team)
         assert [(r['actor'], r['initiator'], r['outcome']) for r in rows] == [
-            ('growth', 'registered_script', 'succeeded'), ('growth', 'model', 'succeeded')]
+            ('growth', 'model', 'succeeded')]
         assert query(team, 'SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1')[0]['capacity_tier'] == 4
         sample('script-late-' + mode, {'operations': rows, 'effects': effects(team),
             'script_output': str(output['late.py']), 'script_execution': script})

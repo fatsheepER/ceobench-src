@@ -378,6 +378,59 @@ def validate_snapshot(snapshot):
     return snapshot, json.loads((snapshot / 'team.json').read_text())
 
 
+def refresh_registered_script_client(root, public):
+    import hashlib
+    import stat
+    from .role_policy import ROLES
+    from .workspace_io import parent_fd
+    updates = []
+    for role in ROLES:
+        for source, relative in ((public / 'novamind-client', 'novamind-operation'),
+                                 (public / 'docs/cli.md', 'docs/cli.md')):
+            content = source.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            mode = stat.S_IMODE(source.stat().st_mode)
+            target = root / 'roles' / role / relative
+            try:
+                with parent_fd(root, target, create=True) as (directory, name):
+                    try:
+                        previous = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        previous = None
+                    before = dict(kind='missing', sha256=None)
+                    if previous is not None and stat.S_ISLNK(previous.st_mode):
+                        before = dict(kind='symlink', target=os.readlink(name, dir_fd=directory), sha256=None)
+                    elif previous is not None and stat.S_ISREG(previous.st_mode):
+                        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                        with os.fdopen(descriptor, 'rb') as stream:
+                            before = dict(kind='file', sha256=hashlib.file_digest(stream, 'sha256').hexdigest(),
+                                          mode=stat.S_IMODE(previous.st_mode))
+                        if before['sha256'] == digest and before['mode'] == mode:
+                            continue
+                    elif previous is not None:
+                        raise OSError('Expected a file or symlink for ' + str(target))
+                    temporary = '.runtime-client-' + uuid.uuid4().hex
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=directory)
+                    try:
+                        with os.fdopen(descriptor, 'wb') as stream:
+                            stream.write(content)
+                            stream.flush()
+                            os.fchmod(stream.fileno(), mode)
+                            os.fsync(stream.fileno())
+                        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+                        os.fsync(directory)
+                    finally:
+                        try:
+                            os.unlink(temporary, dir_fd=directory)
+                        except FileNotFoundError:
+                            pass
+                    updates.append(dict(role=role, path=relative, previous=before, sha256=digest, mode=mode))
+            except OSError as error:
+                raise CheckpointDataError(f'Cannot refresh restored public client file {target}: {error}') from error
+    return updates
+
+
 def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_counter=None,
             simulator_factory=None, force_resume=False, **options):
     from numpy.random import default_rng
@@ -448,10 +501,12 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     except BaseException:
         logging.exception('Checkpoint workspace copy failed')
         raise
+    client_updates = refresh_registered_script_client(root, public)
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
         checkpoint_sha256=optional_hash(snapshot / 'checkpoint.json'),
         source_revision_changed=source_changed, public_build_changed=public_changed,
+        workspace_runtime_updates=client_updates,
         discard_post_checkpoint_operations=True, force_resume=force_resume, configuration_overrides=changes,
         runtime_environment_overrides={env: dict(old=value, new=environment_before[env], effective_at='new_attempt')
             for env, value in state.get('runtime_environment', {}).items()
@@ -538,6 +593,7 @@ def restore_runtime_state(runtime, state):
     from .execution_capture import restore_sources
     from .multi_agent import RoleWeek, TeamMessage
     from .simulation import DayResult
+    from .team_prompts import with_registered_script_contract
     server = runtime.server
     original = state['source_root']
     old_workspace, new_workspace = 'Workspace: ' + original + '/roles/', 'Workspace: ' + str(runtime.root) + '/roles/'
@@ -567,7 +623,8 @@ def restore_runtime_state(runtime, state):
         role.usage.expected_model = role.agent.model if 'model' in state.get('_configuration_changes', {}) else saved['expected_model']
         regenerate_prompt = bool(state.get('_configuration_changes'))
         if not regenerate_prompt:
-            role.agent.system_prompt = saved['system_prompt'].replace(original, str(runtime.root))
+            role.agent.system_prompt = with_registered_script_contract(
+                saved['system_prompt'].replace(original, str(runtime.root)))
         try:
             role.agent.load_conversation_snapshot(role.agent._snapshot_path, required=True)
             week = captured['role_weeks'][name]
@@ -578,8 +635,9 @@ def restore_runtime_state(runtime, state):
         for message in role.agent.conversation:
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)
-            if regenerate_prompt and message.role == 'system':
-                message.content = role.agent._get_system_prompt_with_memory()
+            if message.role == 'system':
+                message.content = (role.agent._get_system_prompt_with_memory() if regenerate_prompt
+                    else with_registered_script_contract(message.content))
         role.agent._last_observation = _relocate_prompt(role.agent._last_observation, old_workspace, new_workspace)
         role.agent.total_turns = saved['total_turns']
         week = captured['role_weeks'].get(name)

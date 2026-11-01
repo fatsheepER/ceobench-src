@@ -18,7 +18,7 @@ from .agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_
 from .api_server import NovaMindAPIServer
 from .execution_capture import join_text
 from .model_usage import ModelUsage
-from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit, require_call
+from .role_policy import AgentIdentity, CALL_POLICY, READABLE_ROLES, ROLES, RoleAudit, require_call, require_advance
 from .run_state import tree_hash, write_json
 from .run_lifecycle import BusinessOutcomeUnknown, RunCancelled, WorkerLifecycle
 from .sql_evidence import FORMAT, SQLEvidenceStore
@@ -432,7 +432,7 @@ class MultiAgentRuntime:
         server = self.server
         execute, advance = server.execute_tool, server.advance_week
         def guarded_execute(tool, args, *, role='ceo', initiator='host'):
-            require_call(role, tool)
+            require_call(role, tool, initiator=initiator)
             if CALL_POLICY[tool] == 'read':
                 return execute(tool, args, role=role, initiator=initiator)
             with server._lock:
@@ -446,13 +446,12 @@ class MultiAgentRuntime:
                     raise
                 self._finish_operation(operation)
                 return result
-        def guarded_advance(*args, role='ceo', **kwargs):
-            if role != 'ceo':
-                return advance(*args, role=role, **kwargs)
+        def guarded_advance(*args, role='ceo', initiator='host', **kwargs):
+            require_advance(role, initiator=initiator)
             with server._lock:
                 server.authorize_team(role, 'advance')
                 if server._operation_failed or server._step_day_timed_out:
-                    return advance(*args, role=role, **kwargs)
+                    return advance(*args, role=role, initiator=initiator, **kwargs)
                 with self._team_condition:
                     if self._questions_pending():
                         raise PermissionError('Team requests are pending. Finish this tool batch, answer them, then retry next-week.')
@@ -467,7 +466,7 @@ class MultiAgentRuntime:
                 self._settle_pending_operations()
 
             try:
-                result = advance(*args, role=role, on_settled=settled, **kwargs)
+                result = advance(*args, role=role, initiator=initiator, on_settled=settled, **kwargs)
                 if (result.get('error') == 'prediction_save_failed' and settlement is not None
                         and settlement.get('progression') == 'not_advanced'
                         and not server._operation_failed and not server._step_day_timed_out):

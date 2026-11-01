@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import ExitStack, contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +30,7 @@ READ_ONLY_TASK_TOOLS = frozenset(('get_social_posts', 'get_cost_info', 'get_mark
     'get_group_insights', 'list_research_projects', 'list_all_tables', 'describe_tables',
     'get_tool_documentation', 'list_daily_calculations', 'list_scripts'))
 
-from .role_policy import CALL_POLICY, ROLES, require_call, require_advance, require_role
+from .role_policy import CALL_POLICY, ROLES, require_call, require_advance, require_role, require_script_observation
 from .tools import AgentTools, ToolResult
 from .database import TABLE_DOCS
 from .environment import build_weekly_dashboard
@@ -574,7 +575,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         try:
             server: NovaMindAPIServer = self.server._api_server
             try:
-                require_advance(self.role)
+                require_advance(self.role, initiator=self.server._initiator)
                 with server._lock:
                     server.authorize_team(self.role, 'advance')
             except PermissionError as e:
@@ -783,14 +784,14 @@ class _APIHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             name = body.get('name', '')
             content = body.get('content', '')
-            if not isinstance(name, str) or not name or not isinstance(content, str):
-                self._send_json({"success": False, "error": "name and content must be strings; name cannot be empty"}, 400)
+            if not valid_registered_script_name(name) or not isinstance(content, str):
+                self._send_json({"success": False, "error": "content must be a string; name must be a relative file path inside the owner workspace"}, 400)
                 return
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
                 scripts = server.get_daily_scripts(self.role)
                 scripts[name] = content
-                server.set_daily_scripts(scripts, registration=name, role=self.role)
+                server.set_daily_scripts(scripts, registration=name, role=self.role, initiator=self.server._initiator)
             import hashlib
             self._send_json({"success": True, "data": {"name": name, "registered": True,
                 "sha256": hashlib.sha256(content.encode()).hexdigest()}})
@@ -815,13 +816,14 @@ class _APIHandler(BaseHTTPRequestHandler):
             name = body.get('name', '')
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
+                require_script_observation(self.server._initiator, 'scripts')
                 server.authorize_team(self.role, 'scripts')
                 if name not in server.get_daily_scripts(self.role):
                     self._send_json({"success": False, "error": f"Script not found: {name}"}, 404)
                     return
                 scripts = server.get_daily_scripts(self.role)
                 del scripts[name]
-                server.set_daily_scripts(scripts, role=self.role)
+                server.set_daily_scripts(scripts, role=self.role, initiator=self.server._initiator)
             self._send_json({"success": True, "data": {"removed": name}})
         except PermissionError as e:
             self._send_json({'success': False, 'error': str(e)}, 403)
@@ -948,6 +950,51 @@ class _TrackedHTTPServer(ThreadingHTTPServer):
                 api._request_lock.notify_all()
             if api.request_finished_callback:
                 api.request_finished_callback()
+
+
+def valid_registered_script_name(name):
+    from pathlib import PurePosixPath
+    if not isinstance(name, str) or not name or '\x00' in name:
+        return False
+    path = PurePosixPath(name)
+    return bool(path.parts) and not path.is_absolute() and '..' not in path.parts and str(path) == name
+
+
+class RegisteredScriptPreparationError(Exception):
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+@contextmanager
+def registered_script_source(executor, name, code):
+    from pathlib import Path
+    from .workspace_io import parent_fd
+    if not valid_registered_script_name(name):
+        raise ValueError('Registered script name must be a relative file path inside the owner workspace')
+    source = executor.workspace_path / name
+    snapshot = source.with_name('.registered-' + uuid.uuid4().hex + '.py')
+    with ExitStack() as resources:
+        try:
+            directory, filename = resources.enter_context(parent_fd(executor.workspace_path, snapshot, create=True))
+            descriptor = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+        except OSError as error:
+            raise RegisteredScriptPreparationError(error) from error
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                try:
+                    stream.write(code)
+                    stream.flush()
+                except OSError as error:
+                    raise RegisteredScriptPreparationError(error) from error
+            yield Path(executor.guest_root) / snapshot.relative_to(executor.workspace_path)
+        finally:
+            if executor._bash_facts.get('boundary_closed') is True:
+                try:
+                    os.unlink(filename, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
 
 
 def registered_script_classification(facts, error=None):
@@ -1171,7 +1218,7 @@ class NovaMindAPIServer:
 
     def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo', initiator='host') -> Any:
         """Execute a tool call with thread safety."""
-        require_call(role, tool_name)
+        require_call(role, tool_name, initiator=initiator)
         with self._lock:
             self.authorize_team(role, CALL_POLICY[tool_name])
             dispatch_fn = _TOOL_DISPATCH[tool_name]
@@ -1265,7 +1312,7 @@ class NovaMindAPIServer:
             self._advance_lock.release()
 
     def advance_week(self, predictions=None, rationale=None, *, role="ceo", on_settled=None, initiator="host"):
-        require_advance(role)
+        require_advance(role, initiator=initiator)
         with self._lock:
             self.authorize_team(role, 'advance')
             with self._request_lock:
@@ -1602,6 +1649,7 @@ class NovaMindAPIServer:
             capture = ExecutionCapture(executor.evidence_store) if executor.evidence_store else None
             token = None
             output, error = '', None
+            execution_path = None
             executor.last_status = 'not_started'
             executor._bash_facts = dict(process_started=False, target_started=False, boundary_closed=True)
             executor._raw_streams = (b'', b'')
@@ -1624,9 +1672,18 @@ class NovaMindAPIServer:
                             CURRENT_EVENT.reset(parent_token)
                     capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
                     token = CURRENT_EVENT.set(capture.event)
-                command = shlex.quote(executor.python) + ' -c ' + shlex.quote(code)
-                output = executor.execute('bash', {'command': command})
-                if capture and capture.event:
+                try:
+                    with registered_script_source(executor, name, code) as execution_path:
+                        command = shlex.join((executor.python, str(execution_path)))
+                        output = executor.execute('bash', {'command': command})
+                except RegisteredScriptPreparationError as failure:
+                    executor._bash_error = failure.error
+                    executor.last_status = 'failed'
+                    output = f'Error: {failure.error}'
+                    if capture and capture.event:
+                        capture.safe(capture.store.complete, capture.event, 'failed',
+                                     source_preparation_error=str(failure.error))
+                if capture and capture.event and execution_path is not None:
                     child = output.origins[0]['version_id'].rsplit(':', 1)[0] if getattr(output, 'origins', []) else None
                     child_record = capture.safe(capture.store.read_event, child) if child else None
                     status = child_record['result']['status'] if child_record else 'result_unknown'
@@ -1669,6 +1726,7 @@ class NovaMindAPIServer:
                     classification = 'unknown'
                     facts['capture_fault'] = executor.evidence_store.fault
                 record = dict(name=name, role=role, day=getattr(self.tools, 'current_day', None),
+                    execution_path=str(execution_path) if execution_path is not None else None, cwd=root,
                     sha256=hashlib.sha256(code.encode()).hexdigest(), output=str(output),
                     status=executor.last_status, classification=classification, facts=facts,
                     error=str(failure) if failure else None, evidence=str(evidence))
@@ -1689,13 +1747,14 @@ class NovaMindAPIServer:
             executor.evidence_store.assert_healthy(quiescent=False)
         return results
 
-    def set_daily_scripts(self, scripts: Dict[str, str], registration=None, *, role="ceo"):
+    def set_daily_scripts(self, scripts: Dict[str, str], registration=None, *, role="ceo", initiator="host"):
         require_role(role)
         """Restore daily scripts from checkpoint."""
+        require_script_observation(initiator, 'scripts')
         with self._lock:
             self.authorize_team(role, 'scripts')
             import hashlib
-            if not isinstance(scripts, dict) or any(not isinstance(n, str) or not n or not isinstance(c, str)
+            if not isinstance(scripts, dict) or any(not valid_registered_script_name(n) or not isinstance(c, str)
                                                     for n, c in scripts.items()):
                 raise ValueError('Invalid registered script snapshots')
             with self._request_lock:

@@ -49,18 +49,26 @@ def require_role(role):
         raise PermissionError('A host-bound role is required')
 
 
-def require_call(role, tool):
+def require_script_observation(initiator, operation):
+    if initiator == 'registered_script' and operation != 'read':
+        raise PermissionError('Registered scripts are observation-only. Use an ordinary role action '
+                              'after reviewing the current instructions to change business settings or scripts.')
+
+
+def require_call(role, tool, *, initiator='host'):
     require_role(role)
     spec = CALL_SPECS.get(tool)
     if spec is None:
         raise PermissionError(f'Unknown tool: {tool}')
+    require_script_observation(initiator, spec.category)
     if role not in spec.roles:
         permitted = 'CEO' if spec.roles == frozenset(('ceo',)) else 'CEO and Growth'
         raise PermissionError(f'Only {permitted} can call {tool}')
 
 
-def require_advance(role):
+def require_advance(role, *, initiator='host'):
     require_role(role)
+    require_script_observation(initiator, 'advance')
     if role != 'ceo':
         raise PermissionError('Only CEO can advance time')
 

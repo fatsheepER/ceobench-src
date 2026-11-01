@@ -105,6 +105,8 @@ def test_complete_responsibility_matrix(mode, gateway):
                         assert (world(team) != before) == (name not in READS), (role, name, receipt)
                     assert not team.server._operation_failed
             else:
+                actions = {name: (args, module, allowed if gateway != 'registered' or name in READS else ())
+                           for name, (args, module, allowed) in ACTIONS.items()}
                 program = '''import importlib,json
 from novamind_api import _client
 ACTIONS = ACTION_DATA
@@ -124,17 +126,19 @@ try:
     advance = _client.next_week(PREDICTION_DATA,'matrix forecast')
 except _client.NovaMindAPIError as exc:
     if role == 'ceo':
-        assert gateway == 'registered' and 'frozen during ceo_scripts' in str(exc), str(exc)
+        assert gateway == 'registered' and 'observation-only' in str(exc), str(exc)
     else:
         assert '403' in str(exc) or 'Only CEO' in str(exc), str(exc)
 else:
     assert role == 'ceo' and gateway != 'registered' and advance['day'] == 7, advance
 print('MATRIX-COMPLETE')
-'''.replace('ACTION_DATA', repr(ACTIONS)).replace('ROLE_DATA', repr(role)).replace('GATEWAY_DATA', repr(gateway)).replace('PREDICTION_DATA', repr(PREDICTIONS))
+'''.replace('ACTION_DATA', repr(actions)).replace('ROLE_DATA', repr(role)).replace('GATEWAY_DATA', repr(gateway)).replace('PREDICTION_DATA', repr(PREDICTIONS))
                 runtime = team.roles[role]
                 if gateway == 'registered':
                     assert raw(team, role, '/daily-scripts', dict(name='matrix.py', content=program))[0] == 200
+                    before_registered = world(team)
                     output = team.server._run_daily_scripts_internal(role)['matrix.py']
+                    assert world(team) == before_registered
                 else:
                     path = runtime.workspace / 'matrix.py'
                     path.write_text(program)
@@ -147,8 +151,9 @@ print('MATRIX-COMPLETE')
                     output = runtime.executor.execute('bash', dict(command=command))
                 assert 'MATRIX-COMPLETE' in output and '[exit code:' not in output, (role, gateway, output)
                 assert output.count('ACTION ') == 22
-            assert_business(team)
-            assert_role_business(team, role, initial_price)
+            if gateway != 'registered':
+                assert_business(team)
+                assert_role_business(team, role, initial_price)
             created = [r for r in operations(team) if r.get('role') == role and r['kind'] != 'api:advance']
             advanced = role == 'ceo' and gateway not in ('http', 'registered')
             assert team.server.tools.current_day == (7 if advanced else 0)
@@ -156,7 +161,7 @@ print('MATRIX-COMPLETE')
             assert len(advances) == int(advanced)
             assert all(r['role'] == 'ceo' and r['status'] == 'completed' for r in advances)
             assert team.server.conn.execute('SELECT COUNT(*) FROM predictions').fetchone()[0] == (4 if advanced else 0)
-            expected = {name for name, (_, _, allowed) in ACTIONS.items() if role in allowed and name not in READS}
+            expected = {name for name, (_, _, allowed) in ACTIONS.items() if role in allowed and name not in READS and gateway != 'registered'}
             assert {r['kind'] for r in created} == {'api:' + name for name in expected}, (role, created)
             assert len(created) == len(expected)
             assert all(r['status'] == 'completed' for r in created)
@@ -403,8 +408,8 @@ def test_unknown_and_frozen_requests_leave_next_valid_call_and_model_usable(mode
 
 
 @pytest.mark.parametrize('mode', ('git', 'pf'))
-def test_registered_expert_writes_run_in_analysis_and_enter_owner_model(mode, monkeypatch):
-    phases, holder = [], {}
+def test_registered_expert_refusals_reach_owner_before_normal_business_actions(mode, monkeypatch):
+    phases, holder, turns = [], {}, {}
     for name in ('set_ads_strength', 'set_capacity_tier'):
         original = _TOOL_DISPATCH[name]
 
@@ -413,46 +418,55 @@ def test_registered_expert_writes_run_in_analysis_and_enter_owner_model(mode, mo
             return original(tools, args)
 
         monkeypatch.setitem(_TOOL_DISPATCH, name, observe)
+    actions = {'growth': 'n.marketing.set_ads_strength(global_strength=0.6)',
+               'ops_finance': 'n.infrastructure.set_capacity_tier(2)'}
 
     def responder(team, role, body):
-        return calls(('bash', dict(command=ADVANCE))) if role == 'ceo' else final(role + ' registered business action completed.')
+        if role == 'ceo':
+            return calls(('bash', dict(command=ADVANCE)))
+        turns[role] = turns.get(role, 0) + 1
+        rendered = json.dumps(body['messages'])
+        assert 'observation-only' in rendered
+        assert role + '-REGISTERED-DENIED' in rendered
+        peer = 'ops_finance' if role == 'growth' else 'growth'
+        assert peer + '-REGISTERED-DENIED' not in rendered
+        if turns[role] == 1:
+            return calls(('bash', dict(command='python -c ' + shlex.quote(
+                'import novamind_api as n; print(' + actions[role] + ')'))))
+        return final(role + ' current business action completed.')
 
     with make_team(mode, responder, 'expert-registered') as team:
         holder['team'] = team
-        for role in ('growth', 'ops_finance'):
-            call = "n.marketing.set_ads_strength(global_strength=0.6)" if role == 'growth' else "n.infrastructure.set_capacity_tier(2)"
-            script = "import novamind_api as n\nprint(" + call + ")\nprint(" + repr(role + '-REGISTERED-BUSINESS') + ")\n"
+        for role, action in actions.items():
+            script = ("import novamind_api as n\ntry:\n    " + action +
+                      "\nexcept n.NovaMindAPIError as error:\n    print(" + repr(role + '-REGISTERED-DENIED') +
+                      ", error)\nelse:\n    raise AssertionError('unattended write was allowed')\n")
             assert raw(team, role, '/daily-scripts', dict(name='owner-script.py', content=script))[1]['success']
         assert team.run(stop_after_day=7).reason == 'observation_end', (team.failure, team.failure_detail)
+        assert turns == {'growth': 2, 'ops_finance': 2}
+        ceo_requests = [row['body']['messages'] for row in team.test_wire if row['role'] == 'ceo']
+        assert len(ceo_requests) == 2 and len(team.messages) == 2
+        opening, closing = (json.dumps(messages) for messages in ceo_requests)
+        assert 'request_world_state_id=' not in opening
+        for message in team.messages:
+            assert message.reply not in opening
+            assert closing.count(message.reply) == 1
+            assert message.world_state_id != team.server.world_state_id
+            assert 'request_world_state_id=' + message.world_state_id in closing
+            assert ' | world_state_id=' not in closing
+        for role in actions:
+            messages = [row['body']['messages'] for row in team.test_wire if row['role'] == role][-1]
+            rendered = json.dumps(messages)
+            assert 'owner-script.py' in rendered
+            assert ("'global': 0.6" if role == 'growth' else "'tier': 2") in rendered
         assert sorted(phases) == [('set_ads_strength', 'analysis'), ('set_capacity_tier', 'analysis')]
-        ceo_requests = 0
-        for item in team.test_wire:
-            role, body = item['role'], item['body']
-            rendered = '\n'.join(m.get('content') or '' for m in body['messages'])
-            if role == 'ceo':
-                ceo_requests += 1
-                assert len(team.messages) == 2
-                if ceo_requests == 1:
-                    assert 'request_world_state_id=' not in rendered
-                    assert all(message.reply not in rendered for message in team.messages)
-                    continue
-                for message in team.messages:
-                    assert message.world_state_id != team.server.world_state_id
-                    assert 'request_world_state_id=' + message.world_state_id in rendered
-                    assert ' | world_state_id=' not in rendered
-            else:
-                assert role + '-REGISTERED-BUSINESS' in rendered
-                peer = 'ops_finance' if role == 'growth' else 'growth'
-                assert peer + '-REGISTERED-BUSINESS' not in rendered
-                assert 'owner-script.py' in rendered
-                assert ("'global': 0.6" if role == 'growth' else "'tier': 2") in rendered
-        assert ceo_requests == 2
         assert team.server.tools.config.ads_strength_global == 0.6
         assert team.server.conn.execute('SELECT capacity_tier FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 2
         receipts = [r for r in operations(team) if r['kind'] in ('api:set_ads_strength', 'api:set_capacity_tier')]
         assert {(r['kind'], r['role'], r['status']) for r in receipts} == {
             ('api:set_ads_strength', 'growth', 'completed'), ('api:set_capacity_tier', 'ops_finance', 'completed')}
-        for role in ('growth', 'ops_finance'):
+        assert team.server.conn.execute("SELECT COUNT(*) FROM business_operations WHERE initiator='registered_script'").fetchone()[0] == 0
+        for role in actions:
             executor = team.server.role_executors[role]
             assert executor._bash_facts['process_boundary']['descendants_closed'] is True
             assert not executor.preserved_process and getattr(executor, '_pf_service', None) is None

@@ -33,6 +33,34 @@ Do not advance time during opening.'''
 CEO_CLOSING = '''Continue your opening conversation with the updated dashboard and both full analyst handoffs below.
 Resolve material gaps or disagreements, coordinate final actions and cash forecasts, then advance through next-week.'''
 
+REGISTERED_SCRIPT_CONTRACT = '''## Automatic registered scripts
+
+Registered scripts are observation-only. The host rejects business changes, paid
+research, time advancement and registration changes from automatic scripts.
+Public reads and files in your own workspace remain available. Read the current
+CEO directions before taking permitted business actions through your normal tools.
+Each role has one automatic batch per week. Questions and checkpoint recovery do
+not replay a completed batch. Failures and printed output return to the owner.
+
+Registration freezes the Python source, not adjacent data or imported modules.
+Registry names are paths relative to your workspace; older filename-only names
+refer to the workspace root. Execution keeps that root as cwd. __file__ and
+sys.argv[0] name a temporary snapshot file beside the registered path. Its basename
+can change between runs. Use its parent for adjacent files; those files stay live.
+Editing the original source does not update the snapshot. Re-register to replace
+it and use the name returned by the receipt to list or remove it.
+'''
+
+
+def with_registered_script_contract(prompt):
+    prompt = prompt.replace('Registered scripts\nhave the same permissions as their owner.', '')
+    prompt = prompt.replace('Registered scripts have the same permissions as their owner.', '')
+    prompt = prompt.replace("Scripts have their owner's business permissions.", '')
+    prompt = prompt.replace('Registration snapshots the source file under its filename. Re-register after edits.',
+                            'Registration snapshots the source under its workspace-relative path. Re-register after edits.')
+    return prompt if REGISTERED_SCRIPT_CONTRACT in prompt else prompt + '\n' + REGISTERED_SCRIPT_CONTRACT
+
+
 HANDOFF = '''For conclusions that affect a decision, distinguish observed facts from estimates.
 Include data coverage and units, assumptions, specific recommendations and their
 conditions, locatable supporting evidence, and missing information. Use concise
@@ -152,7 +180,6 @@ Use ask_analyst(role, message) for focused questions. Include relevant reference
 candidate actions and settings already changed this week. All roles can read
 each other's business workspaces and history; coordinate changes to shared settings.
 Registered scripts and their printed output belong to their registering role.
-Scripts have their owner's business permissions.
 After your opening directions, your scripts run first. Each analyst then runs their scripts before their weekly task; the two analysts run in parallel.
 Coordinate budgets as needed; there are no fixed departmental allocations.
 ask_analyst follow-ups do not rerun registered scripts.
@@ -187,7 +214,7 @@ each week. Manage your registered snapshots with:
 
 - ./novamind-operation register-daily-script <path>
 - ./novamind-operation list-daily-scripts
-- ./novamind-operation remove-daily-script <filename>
+- ./novamind-operation remove-daily-script <registered-name>
 
 The legacy daily names mean weekly execution. Registration snapshots the source;
 re-register after editing.
@@ -230,8 +257,7 @@ def system_prompt(base, role, mode, total_days, effective_end, workspace, readab
 advertising, capacity, quotas, targeted operations/development spend, ad strength,
 lead promotion and promotion. CEO and Growth can post social media. Only CEO can
 set prices, buy market/group research, start research projects, send or reject
-enterprise deals, submit final forecasts and advance time. Registered scripts
-have the same permissions as their owner. Shared settings use each API's stated
+enterprise deals, submit final forecasts and advance time. Shared settings use each API's stated
 partial-update or replacement rules.
 All roles can read business MEMORY.md, scripts, reports, saved outputs,
 registrations and history in the listed workspaces. Write only your own workspace.
@@ -248,4 +274,4 @@ Do not advance time while answering a request. If next-week reports pending team
 requests, finish the current batch and answer them before retrying advancement.
 '''
     history = '' if role == 'ceo' else (PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
-    return prompt + HANDOFF + '\n' + history
+    return with_registered_script_contract(prompt + HANDOFF + '\n' + history)
