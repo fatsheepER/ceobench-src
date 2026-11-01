@@ -29,6 +29,7 @@
 - 回归从真实公共客户端和运行包装层进入。涉及模型发送时覆盖 `ModelUsage`，涉及停止时覆盖 controller；用本地 HTTP、真实子进程和假模型响应验证客户端先退出、服务端晚完成、断连、重复收尾及伙伴失败。断言下一次调用实际继续或按预期暂停、资源终态、attempt 状态与检查点恢复资格。
 - SQL 收尾与 PF 期限从 `tests/test_sql_capture_residuals.py`、`tests/test_pf_deadline.py` 定位；停止与资源隔离从 `tests/test_team_stop_residuals.py`、`tests/test_preflight_memory_guards.py` 定位。新增故障测试须证明修复前会失败，再验证修复后的完整路径。
 - 两组批量来源声明、精确文本/文件/产物/操作目标、缺失与修订、跨角色来源及存放身份从 `tests/test_relation_batch.py`、`tests/test_relation_contracts.py` 定位；真实公共操作引用、同值/部分结果与晚完成从 `tests/test_relation_operation_receipts.py` 定位；逐项回执入模、同调用去重、持久化未知 HOLD 与选点恢复从 `tests/test_relation_recovery.py` 定位。
+- 双组公共来源完整闭环、跨周 Q0 恢复、后次 Bash 从实际查询文件生成 F1/F2、CEO 追问驱动修订、双向查询及旧版本读取、覆写后的跨角色采用与真实 ModelUsage 输入从 `tests/test_source_workflow.py` 定位。
 - Git 文件登记即时快照、来源与存放角色、覆写后读取、Git 回收保留及 checkpoint 恢复从 `tests/test_git_registration_snapshot.py` 定位；prefix 登记时捕获匹配从 `tests/test_prefix_week_binding.py` 定位。
 - Git/PF 共享业务流水、实际提交段、同值设置、公开列、旧世界补表与恢复引用从 `tests/test_business_ledger.py`、`tests/test_business_ledger_public.py`、`tests/test_business_ledger_faults.py` 定位。公共来源分类来自角色的模型与注册脚本独立监听器。
 - PF 跨调用/跨周候选、同内容多事件、稳定分页、详情、权限复核、模型投递范围与选点恢复从 `tests/test_pf_candidates.py`、`tests/test_pf_candidates_team.py` 定位。
