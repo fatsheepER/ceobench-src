@@ -68,8 +68,14 @@ last rewrites removed.
 
 PF_HISTORY = '''## File and Output History (pf)
 
-PF records every version of your workspace files and every command output,
-including outputs you never saved. After a command, a line such as
+PF saves captured workspace file versions and command outputs, including outputs
+you never saved. Internal reads, intermediate writes and pipe streams may be missing;
+capture details report gaps. `pf candidates` finds sources across calls, defaulting
+to your role and current simulated week, 20 per page. Its header states the scope
+and cutoff. Use `--history`, `--role all` or explicit day/kind/text/event filters to
+broaden or narrow it, and the returned `pf more` cursors for continuation or details.
+Content versions and execution events are separate. Saved, delivered and declared
+used are different; candidates are observations, not proof of use. After a command, a line such as
 `[pf: scripts/an_w7d.py.out@v1 | wrote scripts/an_w7d.py@v1]` names them:
 NAME@vK is version K of that file or output, and K rises only when the content
 changes. In `text_create`, cite such a handle, a file path (the version you last

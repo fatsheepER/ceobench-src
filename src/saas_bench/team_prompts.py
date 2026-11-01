@@ -93,6 +93,7 @@ All handles and cursors below illustrate formats only. Replace them with actual 
 - depend: To trace a judgment's saved sources, use `pf depend growth:r4.2 --detail` after reading that revision. Read each source's date and coverage. Obtain current evidence with public queries or your own calculations when needed.
 - search: If you cannot locate a past rationale, try `pf search --text "KEYWORD"`. For a known business object, use `pf search ACTUAL_ID`, replacing ACTUAL_ID with its real ID. Open the relevant returned versions.
 - blame: If a disputed assumption appears in a saved file, use `pf blame MEMORY.md` once captured to locate its introducing version and day, then inspect that evidence.
+- candidates: Use `pf candidates` to find captured sources across calls, initially your role and current simulated week, 20 per page. Broaden with `--history` or `--role all`; filter by day, kind, text or event. The header and cursors preserve scope and cutoff. Content versions and execution events differ. Saved, model-delivered and declared-used are different; candidate summaries do not deliver the full source. Use the returned detail cursor for capture gaps, ranges, requests and receipt metadata.
 - more: If a needed result continues, use `pf more c2` with its returned cursor. This continues the same snapshot.
 - help: At startup or when syntax is unclear, run `pf help` for examples.
 
@@ -114,6 +115,7 @@ All handles and cursors below illustrate formats only. Replace them with actual 
 - log: To find a missing output version, use `pf log notes.md` after that file has been captured, or log the output name from its receipt. Use an already supplied exact handle directly.
 - diff: To see whether new evidence changes the finding, use `pf diff notes.md` after two content versions exist, or `pf diff notes.md@v1 notes.md@v2` using actual versions returned by log.
 - rdepend: Before replacing an analysis source, use `pf rdepend query1@v1 --detail` on that existing source to find registered judgments that need review. It follows declared references, not every affected conclusion.
+- candidates: Use `pf candidates` to find captured sources across calls, initially your role and current simulated week, 20 per page. Broaden with `--history` or `--role all`; filter by day, kind, text or event. The header and cursors preserve scope and cutoff. Content versions and execution events differ. Saved, model-delivered and declared-used are different; candidate summaries do not deliver the full source. Use the returned detail cursor for capture gaps, ranges, requests and receipt metadata.
 - more: If a needed result continues, use `pf more c2` with its returned cursor. This continues the same snapshot.
 - help: At startup or when syntax is unclear, run `pf help` for examples.
 

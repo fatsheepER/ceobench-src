@@ -16,6 +16,9 @@ USAGE = '''usage: pf <command> ...
   pf rdepend <object> [--detail] [--all]      registered texts that cite it
   pf search <id> [--kind KIND] [--all]        texts, business writes and outputs about an object
   pf search --text "KEYWORD"           literal text in public captured history, newest first
+  pf candidates [--role ROLE|all] [--history] [--day-from N] [--day-to N]
+                [--kind KIND] [--text TEXT] [--event EVENT] [--detail]
+                                      captured objects across calls, 20 per page
   pf more <cursor>                     the next page of an earlier result
 Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
 version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.
@@ -96,6 +99,36 @@ pf search ACTUAL_ID
 Literal search scans captured content; object search uses recorded object IDs.
 Read the relevant returned version with show.
 
+6. Find sources across calls and weeks
+```bash
+pf candidates
+pf candidates --role all --history --kind sql --text "KEYWORD"
+pf candidates --day-from 7 --day-to 13 --kind file
+```
+The default is executions initiated by your role in the current simulated week,
+20 captured objects per page. The header labels this role basis explicitly.
+--role all includes currently visible business material; --history removes the week
+filter. Explicit day bounds replace the week filter (an omitted bound is open).
+Kinds: file, sql, api, stdout, stderr, output, code, text, script, dashboard, execution.
+Each row keeps its execution event even when content has the same version handle.
+Use the returned pf more cursor to continue the frozen snapshot or expand this
+page's details. For a copied EVENT, --event EVENT includes its captured children;
+--detail pages exact requests and receipt metadata. Source bodies use pf show.
+Details include content_ref, an exact acquisition accepted by pf show, separately
+from the reusable content handle. Use the content handle in relation_batch.
+Captured, delivered to a model, and declared used are different. Model delivery
+is shown for your reader role and the originating request before the query. Unknown
+does not mean unread. Candidate summaries do not deliver the full source body.
+Text filters are case-insensitive literals in source names, captured UTF-8 content,
+and non-file requests (up to 2,000 characters). Details retain exact long handles.
+Capture gaps include unobserved internal reads, intermediate writes and pipe streams.
+Binary script streams without a public text representation are marked explicitly.
+File reads that reuse saved bytes keep their own acquisition event and text
+representation; same-event byte/text duplicates and SQL display projections are
+represented by their source version. Interpreter cache files, session logs and
+private model bodies are excluded from candidates.
+No query replay or validity judgment occurs. Known sources can be registered directly.
+
 Other boundaries: blame locates the version and day each saved file line was written.
 rdepend follows declared references, not every consumer or inferred business impact.
 more takes the actual cursor returned by a paginated result and continues that frozen
@@ -103,7 +136,7 @@ snapshot. Preserve scope headers when reading results;
 pipes and redirection can leave only a partial view.
 '''
 
-VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'more', 'help')
+VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'candidates', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS + ('--help', '-h')) + r')\b|\s*$)', re.M)
 
 
@@ -207,10 +240,21 @@ def parse_argv(words):
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}')
     options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False},
-                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': True}).get(verb, {})
+                   rdepend={'detail': False, 'all': False}, search={'all': False, 'kind': True, 'text': True},
+                   candidates={'role': True, 'history': False, 'day-from': True, 'day-to': True,
+                               'kind': True, 'text': True, 'event': True, 'detail': False}).get(verb, {})
     flags, rest = _flags(words, dict(options, help=False))
     if flags.get('help'):
         return 'pf_help', {}
+    if verb == 'candidates':
+        if rest:
+            raise Usage('pf candidates: use filters, not positional arguments')
+        for name in ('day-from', 'day-to'):
+            if name in flags:
+                if not re.fullmatch(r'[0-9]+', flags[name]):
+                    raise Usage('pf candidates: --' + name + ' requires a nonnegative simulated day')
+                flags[name] = int(flags[name])
+        return 'pf_candidates', {name.replace('-', '_'): value for name, value in flags.items()}
     expected = (0, 0) if 'text' in flags else dict(diff=(1, 2)).get(verb, (1, 1))
     if not expected[0] <= len(rest) <= expected[1]:
         raise Usage(f'pf {verb}: wrong number of arguments')

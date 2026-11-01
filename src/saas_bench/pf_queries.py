@@ -42,6 +42,24 @@ class Page(Input):
     detail: bool = False
 
 
+class Candidates(Input):
+    cursor: Annotated[str, Field(pattern=r'^c[1-9][0-9]*$')] | None = None
+    role: Literal['ceo', 'growth', 'ops_finance', 'all'] | None = None
+    history: bool = False
+    day_from: Annotated[int, Field(ge=0)] | None = None
+    day_to: Annotated[int, Field(ge=0)] | None = None
+    kind: Literal['file', 'sql', 'api', 'stdout', 'stderr', 'output', 'code', 'text', 'script', 'dashboard', 'execution'] | None = None
+    text: Annotated[str, Field(min_length=1, max_length=2000)] | None = None
+    event: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    detail: bool = False
+
+    @model_validator(mode='after')
+    def ordered_days(self):
+        if self.day_from is not None and self.day_to is not None and self.day_from > self.day_to:
+            raise ValueError('day_from must not exceed day_to')
+        return self
+
+
 class SearchObject(Input):
     id: Text
     kind: Text | None = None
@@ -95,7 +113,7 @@ class Read(Page):
 
 
 MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Dependents, pf_read=Read,
-              pf_log=Versions, pf_diff=Single, pf_blame=Single, pf_more=More)
+              pf_log=Versions, pf_diff=Single, pf_blame=Single, pf_more=More, pf_candidates=Candidates)
 
 
 RELATION = dict(reference='cites', same_execution='observed in same execution as', returned_range='printed from',
@@ -277,6 +295,9 @@ class PFQueries:
             page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
             if isinstance(page, str):
                 return page  # pf_read content and diff keep their header line and exact body
+            if operation == 'pf_candidates':
+                from .pf_candidates import render
+                return render(page)
             if operation == 'pf_search':
                 if 'text' in self.values:
                     return self._render_text_search(page)
@@ -310,6 +331,11 @@ class PFQueries:
         except ValidationError as exc:
             raise ValueError('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg']
                                       for e in exc.errors(include_input=False))) from exc
+        if operation == 'pf_candidates':
+            if 'cursor' in values and set(args) != {'cursor'}:
+                raise ValueError('Continue with cursor only, or start a new candidates query')
+            from .pf_candidates import CandidateQuery
+            return CandidateQuery(self.registry).answer(values)
         offset, cutoff = 0, None
         self.cursor_name = 'pf_cursors'
         self.cursors = self.store.load_state(self.cursor_name) or {}

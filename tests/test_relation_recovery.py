@@ -85,7 +85,7 @@ def test_model_receives_each_item_replays_same_call_and_corrects_new_call(mode):
         from saas_bench.registration_prompt import RELATIONS
         for body in sent:
             assert RELATIONS in body['messages'][0]['content']
-            assert 'pf candidates' not in body['messages'][0]['content']
+            assert ('pf candidates' in body['messages'][0]['content']) == (mode == 'pf')
             assert any(tool['function']['name'] == 'relation_batch' for tool in body['tools'])
         assert sum(len([m for m in body['messages'] if m.get('name') == 'relation_batch']) for body in sent) == 6
         save_sample(mode + '-model', wire=wire, usage=usage, receipts=receipts, state=state)
