@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from saas_bench.agents.bash_agent.agent import BashAgent
+from saas_bench.evidence_handles import resolve_ref
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from test_text_registry import workspace, captured, send
 from test_preflight_integration import offline_runner, packed_public
@@ -54,7 +55,7 @@ def test_mixed_pf_output_can_be_cited_and_traced(offline_runner, command):
     expected_sql = 'SELECT * FROM config_overrides' + (' ORDER BY day DESC LIMIT 40' if 'LIMIT 40' in command else '')
     assert source['name'] == expected_sql
     exact = runner._execute_tool('bash', dict(command='pf show ' + source['version'] + ' --full'))
-    assert exact.split('\n', 1)[1].encode() == runner.evidence_store.get_content(source['content_ref'])[1]
+    assert exact.split('\n', 1)[1].encode() == runner.evidence_store.get_content(resolve_ref(runner.evidence_store, 'capture', source['content_ref']))[1]
     with closing(runner.evidence_store.connect()) as conn:
         assert conn.execute("SELECT count(*) FROM requests WHERE json_extract(request, '$.kind')='sql_query'").fetchone()[0] == sql_count
     retrieved = runner._execute_tool('bash', dict(command='pf depend r1 --detail'))

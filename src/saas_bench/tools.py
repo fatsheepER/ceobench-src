@@ -3700,23 +3700,12 @@ os.chdir('{self.workspace_path}')
 
         content = full_path.read_text()
 
-        # Store name -> content snapshot in JSON file
-        jobs_file = self.workspace_path / '.daily_jobs.json'
-        jobs = {}
-        if jobs_file.exists():
-            raw = json.loads(jobs_file.read_text())
-            # Backwards compat: old format was a list of paths
-            if isinstance(raw, list):
-                jobs = {}
-                for p in raw:
-                    fp = self.workspace_path / p
-                    if fp.exists():
-                        jobs[p] = fp.read_text()
-            else:
-                jobs = raw
-
+        from .private_storage import private_root, publish_json
+        private = private_root(self.workspace_path)
+        jobs_file = private / 'daily-jobs.json'
+        jobs = json.loads(jobs_file.read_text()) if jobs_file.exists() else {}
         jobs[script_path] = content
-        jobs_file.write_text(json.dumps(jobs))
+        publish_json(private, jobs_file, jobs, prefix='.daily-job-')
 
         return ToolResult(True, f"Registered daily job: {script_path}",
                           data={'script_path': script_path, 'total_jobs': len(jobs)})

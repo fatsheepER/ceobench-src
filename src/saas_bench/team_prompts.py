@@ -1,5 +1,7 @@
 """Role instructions and weekly tasks for the Git and PF teams."""
 
+from . import registration_prompt
+
 ROLE_BRIEFS = {
     'growth': '''Investigate acquisition, conversion, retention and revenue by customer group and channel.
 Evaluate prices, promotions, advertising and pending enterprise deals. Recommend
@@ -72,7 +74,7 @@ the latest revision. Keep local IDs for text_revise and text_retire.
 When revising, omitted references keep the old list; supplied references replace
 the whole list, and [] clears it. After changing a conclusion, decide which exact
 evidence versions it still needs and supply that complete list if it changes.
-Analyst handoffs include a host header with author, day, request-time world state, request ID,
+Analyst handoffs include a host header with author, day, request ID,
 workspace and snapshot commit. The host creates that commit after the analyst's
 final answer. Report relative file paths; do not guess the commit.
 Analyst follow-ups address new questions, needed evidence or corrections without
@@ -104,6 +106,8 @@ When registering selected fields, run `pf show HANDLE --full` alone, without a p
 Optional select/predicate fields store your declared condition without evaluating it.
 '''
 
+PF_CEO_HISTORY += registration_prompt.PF_CAPTURE_BOUNDARY
+
 PF_ANALYST_HISTORY = '''## PF evidence work
 
 Use PF to recover evidence, check reused assumptions, and support a handoff; run new public queries or your own read-only calculations when current evidence is missing. Run `pf` directly in Bash, never `novamind-operation pf`. PF captures files and command outputs, even unsaved output.
@@ -126,15 +130,17 @@ When registering selected fields, run `pf show HANDLE --full` alone, without a p
 Optional select/predicate fields store your declared condition without evaluating it.
 '''
 
+PF_ANALYST_HISTORY += registration_prompt.PF_CAPTURE_BOUNDARY
+
 GIT_CEO_HISTORY = '''## Git evidence review
 
 Use the handoffs first. Use Git when a missing fact, conflicting recommendation, source change, or reused decision needs evidence. Run Git in Bash. Use the actual readable workspace from the handoff for `git -C`.
 Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace them with returned workspaces, commits, and saved paths. All commands stay within the readable workspaces listed above.
 
-- show: To inspect evidence behind advice, use `git -C WORKSPACE show COMMIT:PATH` after the host has published that handoff snapshot. Use text_list for your active latest texts; read a readable role's registrations.json for an exact older or peer revision.
+- show: To inspect evidence behind advice, use `git -C WORKSPACE show COMMIT:PATH` after the host has published that handoff snapshot. Use text_list for your active latest texts; read a readable role's documents/registrations.json for an exact older or peer revision.
 - log: To locate an earlier assumption or receipt, use `git log --oneline -- MEMORY.md` once MEMORY has been committed. For a peer, use `git -C WORKSPACE log --oneline -- PATH`. Use an already supplied exact snapshot directly.
 - diff: To review a changed plan or reconcile revisions, use `git -C WORKSPACE diff OLD NEW -- PATH` after both commits exist. `git diff -- MEMORY.md` instead compares current edits with the index.
-- Find affected judgments: Before changing a budget, price, or source assumption, inspect references in accessible registrations.json files. Use `grep -nF -- 'ACTUAL_SOURCE' registrations.json` to locate candidates, then read their complete references. Replace ACTUAL_SOURCE with the cited path or text ID. Text matches do not enumerate a dependency graph.
+- Find affected judgments: Before changing a budget, price, or source assumption, inspect references in accessible documents/registrations.json files. Use `grep -nF -- 'ACTUAL_SOURCE' documents/registrations.json` to locate candidates, then read their complete references. Replace ACTUAL_SOURCE with the cited path or text ID. Text matches do not enumerate a dependency graph.
 - Check dependencies: Before reusing a stale judgment, read its cited snapshots and inspect current sources. Rerun the relevant public read-only query or ask its author to recompute a saved calculation. Git comparison does not execute queries. Keep fixed-date windows explicit and inspect each result.
 - search: If you cannot locate a past rationale, use `git log -S'KEYWORD' -p -- MEMORY.md` once history exists. Use `grep -nF -- 'ACTUAL_ID' MEMORY.md` for current notes, replacing ACTUAL_ID with the real business ID. Search the relevant saved files, then open the matching snapshots.
 - blame: If a disputed assumption appears in a committed file, use `git blame -- MEMORY.md`, or `git -C WORKSPACE blame COMMIT -- PATH`, then inspect the introducing commit.
@@ -151,12 +157,12 @@ Use Git to recover evidence, check reused assumptions, and support a handoff; ru
 Below, WORKSPACE, COMMIT, OLD, NEW, and PATH illustrate formats only; replace them with returned workspaces, commits, and saved paths. Read only the workspaces listed above.
 
 - show: To reuse a saved result or inspect a CEO citation, use `git show COMMIT:PATH` for your committed evidence, or `git -C WORKSPACE show COMMIT:PATH` for a published readable snapshot. Saved output retains its original date and coverage.
-- Check dependencies: Before carrying an old judgment into a new report, use text_list for your active latest text, or read a readable role's registrations.json for an exact older or CEO revision, inspect their committed versions, and rerun the relevant public read-only queries or your calculations. Git does not refresh sources. Keep fixed-date windows explicit and inspect each result.
+- Check dependencies: Before carrying an old judgment into a new report, use text_list for your active latest text, or read a readable role's documents/registrations.json for an exact older or CEO revision, inspect their committed versions, and rerun the relevant public read-only queries or your calculations. Git does not refresh sources. Keep fixed-date windows explicit and inspect each result.
 - search: To recover prior analysis without its filename, use `git log -S'KEYWORD' -p -- MEMORY.md` once history exists. For a real group, deal, or project ID, use `grep -nF -- 'ACTUAL_ID' MEMORY.md` and search the relevant saved files, then open matching snapshots.
 - blame: To trace a carried-forward assumption or changed calculation, use `git blame -- MEMORY.md` once committed, then inspect its introducing commit and saved evidence.
 - log: To find a missing output version, use `git log --oneline -- PATH` once the output file has been committed. Use an already supplied exact snapshot directly. Shell output is available later only if saved to a file.
 - diff: To see whether new evidence changes the finding, use `git diff OLD NEW -- PATH` after both commits exist. `git diff -- PATH` instead compares current edits with the index.
-- Find affected judgments: Before replacing an analysis source, inspect references in your accessible registrations.json files. Use `grep -nF -- 'ACTUAL_SOURCE' registrations.json` to locate candidates, then read their complete references. Replace ACTUAL_SOURCE with the cited path or text ID. Text matches do not enumerate a dependency graph.
+- Find affected judgments: Before replacing an analysis source, inspect references in your accessible documents/registrations.json files. Use `grep -nF -- 'ACTUAL_SOURCE' documents/registrations.json` to locate candidates, then read their complete references. Replace ACTUAL_SOURCE with the cited path or text ID. Text matches do not enumerate a dependency graph.
 - Continue reading: If a needed result was truncated, request the missing read_file range or read a narrower git show range with `sed -n '1,120p'`. Preserve the commit and path while paging.
 - help: At startup or when syntax is unclear, run `git help -a` or `git log -h`.
 
@@ -235,9 +241,11 @@ days such as 49, 49-55 or 49-. Registration is optional.
 '''
 
 
+GIT_CEO_HISTORY += registration_prompt.GIT_CALL_NOTES
+GIT_ANALYST_HISTORY += registration_prompt.GIT_CALL_NOTES
+
 def system_prompt(base, role, mode, total_days, effective_end, workspace, readable):
     if role == 'ceo':
-        from . import registration_prompt
         old_history = registration_prompt.PF_HISTORY if mode == 'pf' else registration_prompt.GIT_HISTORY
         history = PF_CEO_HISTORY if mode == 'pf' else GIT_CEO_HISTORY
         if base.count(old_history) != 1:

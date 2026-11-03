@@ -307,6 +307,7 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             shock_manager=sim.shock_manager,
             client_factory=factory, public_dir=manifest['public_dir'], mode=entry['group'],
             run_id=entry['run_id'], world_id=manifest['d0'][str(entry['seed'])]['world_id'],
+            public_refs_path=Path(entry['output_dir']) / 'private' / 'public-refs.sqlite',
             model=MODEL, reasoning_effort='high', total_days=500,
             model_pricing=manifest['pricing'], token_counter=token_counter,
             **(analyst_bash_settings(manifest) | explicit_bash_settings()))
@@ -961,7 +962,9 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
             if source:
                 team = MultiAgentRuntime.restore(source, directory / 'runtime', client_factory=factory,
                     public_dir=ROOT / 'public', token_counter=counter, simulator_factory=sim_factory,
-                    force_resume=force_resume, **explicit_bash_settings())
+                    force_resume=force_resume,
+                    public_refs_path=Path(entry['output_dir']) / 'private' / 'public-refs.sqlite',
+                    **explicit_bash_settings())
             else:
                 team = make_team(manifest, entry, directory, client_factory=factory,
                                  simulator_factory=sim_factory, token_counter=counter)

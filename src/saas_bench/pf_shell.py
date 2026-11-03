@@ -1,5 +1,6 @@
 """A per-Bash PF service. The sandbox receives only a client and this socket."""
 import json
+import logging
 import os
 import re
 from pathlib import Path, PurePosixPath
@@ -13,6 +14,7 @@ from . import pf_cli
 from .evidence_handles import RAW_VERSION
 from .execution_capture import CapturedText, CURRENT_EVENT, ExecutionCapture
 from .pf_deadline import Budget, budget_scope
+from .public_errors import PublicPFError, PublicPFPermissionError, public_exception_message
 
 
 CLIENT = '''import json, os, socket, sys
@@ -78,10 +80,11 @@ class ShellService:
                                 break
                             data.extend(chunk)
                         if len(data) > 65536:
-                            raise ValueError('PF request too large')
+                            raise PublicPFError('PF request too large')
                         response = service.call(json.loads(bytes(data)), budget)
                 except Exception as exc:
-                    response = dict(stdout='', stderr='pf: ' + str(exc) + '\n',
+                    logging.getLogger(__name__).exception('PF request failed')
+                    response = dict(stdout='', stderr='pf: ' + public_exception_message(exc) + '\n',
                                     code=124 if isinstance(exc, TimeoutError) else 2)
                 try:
                     self.wfile.write(json.dumps(response).encode())
@@ -118,9 +121,9 @@ class ShellService:
     def call(self, request, budget=None):
         argv, cwd = request.get('argv'), request.get('cwd')
         if not isinstance(argv, list) or any(not isinstance(v, str) for v in argv):
-            raise ValueError('PF argv must be strings')
+            raise PublicPFError('PF argv must be strings')
         if not isinstance(cwd, str):
-            raise ValueError('PF working directory is required')
+            raise PublicPFError('PF working directory is required')
         root = PurePosixPath(self.executor.guest_root)
         directory = PurePosixPath(os.path.normpath(cwd))
         relative = PurePosixPath(os.path.relpath(directory, root))
@@ -128,7 +131,7 @@ class ShellService:
         try:
             operation, args = pf_cli.parse_argv(argv)
             if not directory.is_relative_to(root) and operation != 'pf_help':
-                raise ValueError('PF working directory must be inside the workspace')
+                raise PublicPFError('PF working directory must be inside the workspace')
             for key in ('target', 'baseline'):
                 target = args.get(key, {})
                 field = next((f for f in ('path', 'version') if f in target), None)
@@ -137,7 +140,7 @@ class ShellService:
                     # Numbered outputs/texts are global; file and script names follow cwd.
                     if not re.fullmatch(r'(?:r\d+(?:\.\d+)?|(?:cmd|query|read|receipt)\d+(?:@v\d+)?)', value):
                         target[field] = os.path.normpath(str(relative / value))
-        except ValueError as exc:
+        except (pf_cli.Usage, PublicPFError) as exc:
             error = str(exc)
         capture = ExecutionCapture(self.executor.evidence_store)
         parent_args = self.capture.store.read_event(self.capture.event)['request']['request']
@@ -159,12 +162,12 @@ class ShellService:
                     result = self.executor.pf_queries.execute(operation, args)
                     if budget:
                         budget.check()
-                except TimeoutError as exc:
-                    result, code, outcome = 'Error: ' + str(exc), 124, 'timed_out'
-                except (ValueError, KeyError, PermissionError) as exc:
-                    result, code, outcome = 'Error: ' + str(exc), 1, 'execution_error'
                 except Exception as exc:
-                    result, code, outcome = 'Error: ' + str(exc), 1, 'execution_error'
+                    capture.facts['private_error'] = dict(type=type(exc).__name__, message=str(exc))
+                    if not isinstance(exc, (PublicPFError, PublicPFPermissionError, TimeoutError)):
+                        logging.getLogger(__name__).exception('PF execution failed')
+                    result = 'Error: ' + public_exception_message(exc)
+                    code, outcome = (124, 'timed_out') if isinstance(exc, TimeoutError) else (1, 'execution_error')
             capture.origins.extend(getattr(result, 'origins', []))
             result = capture.finish(result, 'timed_out' if outcome == 'timed_out' else
                                     'succeeded' if code == 0 else 'failed',

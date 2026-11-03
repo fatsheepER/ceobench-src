@@ -83,7 +83,8 @@ def sql_client_interruption(conn, event):
 def excluded(rel):
     """Only harness-owned paths at the workspace root; nested business names are legal."""
     from .agents.bash_agent.tools import HIDDEN_WORKSPACE_DIRS
-    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS or rel.split('/')[0] == '.git'
+    from .public_records import private_framework_path
+    return rel.split('/')[0] in HIDDEN_WORKSPACE_DIRS or rel.split('/')[0] == '.git' or private_framework_path(rel)
 
 
 class CapturedText(str):
@@ -153,12 +154,14 @@ class ExecutionCapture:
         return self.safe(self.store.version, self.event, slot, value, layer=layer, **metadata)
 
     def file(self, path, raw, text=None, phase='read', owner=None):
+        from .public_records import private_framework_path
+        visibility = {'public_visibility': 'private'} if private_framework_path(path) else {}
         self.slots += 1
-        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **({'owner_role': owner} if owner else {}))
+        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **visibility, **({'owner_role': owner} if owner else {}))
         if text is None:
             return raw_version
         version = self.blob(f'file_{self.slots}_text', text, 'file_text', derived_from=raw_version,
-                            transformation='decode_universal_newlines', **({'owner_role': owner} if owner else {}))
+                            transformation='decode_universal_newlines', **visibility, **({'owner_role': owner} if owner else {}))
         return version
 
     def snapshot(self, workspace, phase):

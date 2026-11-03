@@ -81,13 +81,14 @@ def advance(runner):
                         for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}, timeout=120)
 
 
-def assert_equivalent_advance(actual, expected):
+def assert_equivalent_advance(actual, expected, *, same_run=False):
     actual, expected = dict(actual), dict(expected)
     left, right = dict(actual['operation']), dict(expected['operation'])
     left_ref, right_ref = left.pop('operation_ref'), right.pop('operation_ref')
-    assert re.fullmatch(r'op:[0-9a-f]{32}', left_ref)
-    assert re.fullmatch(r'op:[0-9a-f]{32}', right_ref)
-    assert left_ref != right_ref
+    assert re.fullmatch(r'ceo:[1-9][0-9]*', left_ref)
+    assert re.fullmatch(r'ceo:[1-9][0-9]*', right_ref)
+    if same_run:
+        assert left_ref != right_ref
     actual['operation'], expected['operation'] = left, right
     assert actual == expected
 
@@ -145,7 +146,7 @@ def test_packed_runtime_config_continuous_equals_restore(offline_runner, tmp_pat
     restored = offline_runner(clone(first, tmp_path / 'runtime-restored'))
     assert business_references(restored) == business_references(first)
     for _ in range(2):
-        assert_equivalent_advance(advance(restored), advance(first))
+        assert_equivalent_advance(advance(restored), advance(first), same_run=True)
     for runner in (first, restored):
         runner._save_checkpoint(14)
         directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
@@ -337,7 +338,7 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
     for _ in range((42 - split_day) // 7):
         expected = advance(first)
         for restored in (left, right):
-            assert_equivalent_advance(advance(restored), expected)
+            assert_equivalent_advance(advance(restored), expected, same_run=True)
     for runner in (first, left, right):
         runner._save_checkpoint(42)
     expected = business_state(first)

@@ -7,6 +7,7 @@ import pytest
 from test_preflight_team_evidence import write
 from test_preflight_team_flow import final, make_team, raw
 from test_relation_batch import batch, create, prepare
+from test_text_registry import git
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -82,7 +83,13 @@ def test_explicit_peer_commit_survives_gc_without_writing_peer_repository():
         source = receipt['items'][0]['sources'][0]['ref']
         after = {str(p.relative_to(peer.workspace)): p.read_bytes() for p in peer.workspace.rglob('*') if p.is_file()}
         assert before == after
-        assert source['snapshot_source']['cite'] == 'growth:source.txt@' + commit
+        original_path, original_short = source['snapshot_source']['cite'].rsplit('@', 1)
+        assert original_path == 'growth:source.txt'
+        assert original_short == git(peer.workspace, 'rev-parse', '--short=7', commit)
+        assert git(peer.workspace, 'rev-parse', original_short) == commit
+        record_id = receipt['items'][0]['relation'].split(':', 1)[1]
+        private = team.roles['ceo'].registry.relations._load()['records'][record_id][-1]
+        assert private['sources'][0]['ref']['snapshot_source']['cite'] == 'growth:source.txt@' + commit
         assert source['storage_role'] == 'ceo'
         assert source['source_role'] == 'growth'
         assert source['producer_role'] is None

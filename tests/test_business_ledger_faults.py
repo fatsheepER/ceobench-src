@@ -1,3 +1,4 @@
+from saas_bench.public_refs import PublicRefs
 import http.client
 import json
 import socket
@@ -180,12 +181,12 @@ def test_customer_model_cost_commit_records_its_business_segment(mode):
             client.close()
 
 
-def test_terminal_result_is_idempotent_and_rejects_conflicts():
+def test_terminal_result_is_idempotent_and_rejects_conflicts(tmp_path):
     from saas_bench.business_ledger import BusinessOperation
     from saas_bench.database import init_database
     conn = init_database(':memory:')
     try:
-        operation = BusinessOperation(conn, actor='ceo', initiator='model', tool='next_week', day=0, parameters={})
+        operation = BusinessOperation(conn, public_refs=PublicRefs(tmp_path / 'refs.sqlite'), actor='ceo', initiator='model', tool='next_week', day=0, parameters={})
         terminal = {'success': True, 'day': 7, 'advance': {'status': 'completed'}}
         operation.finish(terminal)
         before = conn.serialize()
@@ -194,7 +195,7 @@ def test_terminal_result_is_idempotent_and_rejects_conflicts():
         with pytest.raises(RuntimeError, match='Conflicting business operation finalization'):
             operation.finish(dict(terminal, day=14))
         assert conn.serialize() == before
-        mapped = BusinessOperation(conn, actor='ceo', initiator='model', tool='set_targeted_ops_spend', day=0, parameters={})
+        mapped = BusinessOperation(conn, public_refs=PublicRefs(tmp_path / 'refs.sqlite'), actor='ceo', initiator='model', tool='set_targeted_ops_spend', day=0, parameters={})
         result = {'success': True, 'data': {1: (1, 2)}}
         mapped.finish(result)
         frozen = conn.serialize()

@@ -214,5 +214,6 @@ def test_candidate_repeated_peer_file_reads_keep_acquisition_and_storage_roles()
         assert all(item['capture']['derived_from'] and item['capture']['transformation'] == 'decode_universal_newlines' for item in page['items'])
 
         for item in page['items']:
-            assert ceo.store.get_content(item['content_ref'], public=True)[1] == b'peer saved bytes\n'
-            assert ceo.store.get_content(item['capture']['derived_from'], public=True)[1] == b'peer saved bytes\r\n'
+            from saas_bench.evidence_handles import resolve_ref
+            assert ceo.store.get_content(resolve_ref(ceo.store, 'capture', item['content_ref']), public=True)[1] == b'peer saved bytes\n'
+            assert ceo.store.get_content(resolve_ref(ceo.store, 'capture', item['capture']['derived_from']), public=True)[1] == b'peer saved bytes\r\n'

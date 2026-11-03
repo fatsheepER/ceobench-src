@@ -123,37 +123,37 @@ def behavior(runtime):
     (runtime.root / 'private' / 'final-world.json').write_text(business)
     root = str(runtime.root)
     state = {}
-    worlds = list(dict.fromkeys(message.world_state_id for message in runtime.messages))
-    header = re.compile(r'Analyst handoff \| role=(\w+) \| day=(\d+) \| request_world_state_id=(\w+) \| request_id=(\w+)\n'
+    header = re.compile(r'Analyst handoff \| role=(\w+) \| day=(\d+) \| request_id=([\w:]+)\n'
                         r'Workspace: ([^\n]+)\nSnapshot commit: ([0-9a-f]+)\n')
 
     def normalize_handoff(match):
-        role, day, world, request_id, workspace, commit = match.groups()
-        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
-        assert (role, int(day), world, commit) == (request.receiver, request.day, request.world_state_id, request.handoff_commit)
+        role, day, request_id, workspace, commit = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if runtime._request_ref(r) == request_id)
+        assert (role, int(day)) == (request.receiver, request.day)
+        assert runtime._git(runtime.roles[role], 'rev-parse', commit) == request.handoff_commit
         assert workspace == '<ROOT>/roles/' + role
         tree = runtime._git(runtime.roles[role], 'rev-parse', commit + '^{tree}')
-        return (f'Analyst handoff | role={role} | day={day} | request_world_state_id=state-{worlds.index(world)} | request_id=request-{index}\n'
+        return (f'Analyst handoff | role={role} | day={day} | request_id=request-{index}\n'
                 f'Workspace: {workspace}\nSnapshot commit: tree-{tree}\n')
 
-    reply_header = re.compile(r'Team reply \| from=(\w+) \| to=(\w+) \| day=(\d+) \| request_id=(\w+) \| request_world_state_id=(\w+)\n'
+    reply_header = re.compile(r'Team reply \| from=(\w+) \| to=(\w+) \| day=(\d+) \| request_id=([\w:]+)\n'
                               r'Workspace: ([^\n]+)\nSnapshot commit: ([0-9a-f]+)\n')
-    question_header = re.compile(r'Team request \| request_id=([0-9a-f]+) \| from=(\w+) \| to=(\w+) \| day=(\d+)')
+    question_header = re.compile(r'Team request \| request_id=([\w:]+) \| from=(\w+) \| to=(\w+) \| day=(\d+)')
 
     def normalize_reply(match):
-        role, sender, day, request_id, world, workspace, commit = match.groups()
-        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
+        role, sender, day, request_id, workspace, commit = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if runtime._request_ref(r) == request_id)
         assert request.kind == 'question'
-        assert (role, sender, int(day), world, commit) == (request.receiver, request.sender,
-            request.day, request.world_state_id, request.handoff_commit)
+        assert (role, sender, int(day)) == (request.receiver, request.sender, request.day)
+        assert runtime._git(runtime.roles[role], 'rev-parse', commit) == request.handoff_commit
         assert workspace == '<ROOT>/roles/' + role
         tree = runtime._git(runtime.roles[role], 'rev-parse', commit + '^{tree}')
-        return (f'Team reply | from={role} | to={sender} | day={day} | request_id=request-{index} | '
-                f'request_world_state_id=state-{worlds.index(world)}\nWorkspace: {workspace}\nSnapshot commit: tree-{tree}\n')
+        return (f'Team reply | from={role} | to={sender} | day={day} | request_id=request-{index}\n'
+                f'Workspace: {workspace}\nSnapshot commit: tree-{tree}\n')
 
     def normalize_question(match):
         request_id, sender, receiver, day = match.groups()
-        index, request = next((i, r) for i, r in enumerate(runtime.messages) if r.request_id == request_id)
+        index, request = next((i, r) for i, r in enumerate(runtime.messages) if runtime._request_ref(r) == request_id)
         assert request.kind == 'question'
         assert (sender, receiver, int(day)) == (request.sender, request.receiver, request.day)
         return f'Team request | request_id=request-{index} | from={sender} | to={receiver} | day={day}'
@@ -172,6 +172,15 @@ def behavior(runtime):
         return question_header.sub(normalize_question, reply_header.sub(normalize_reply,
             header.sub(normalize_handoff, text)))
 
+    def normalize_history(match):
+        label, reference, day = match.groups()
+        index, request = next((i, r) for i, r in enumerate(runtime.messages)
+                              if runtime._request_ref(r) == reference)
+        assert (request.receiver, request.day) == (role, int(day))
+        assert reference.split(':', 1)[0] == request.sender
+        assert request.kind == ('weekly_task' if label == 'Analyst handoff' else 'question')
+        return f'{label} request-{index} (day {day})'
+
     for role, item in runtime.roles.items():
         conversation = [dict(role=message.role, content=message.content,
             name=message.name, reasoning_content=message.reasoning_content)
@@ -186,7 +195,8 @@ def behavior(runtime):
         state[role] = dict(conversation=conversation,
             files={str(path.relative_to(item.workspace)): path.read_text() for path in item.workspace.glob('*.txt')},
             memory=(item.workspace / 'MEMORY.md').read_text(),
-            history=re.sub(r'(Analyst handoff|Team reply) [0-9a-f]{7}', r'\1 <ID>', runtime._git(item, 'log', '--format=%s')),
+            history=re.sub(r'^(Analyst handoff|Team reply) ((?:ceo|growth|ops_finance):request[1-9][0-9]*) \(day ([0-9]+)\)$',
+                normalize_history, runtime._git(item, 'log', '--format=%s'), flags=re.MULTILINE),
             trees=runtime._git(item, 'log', '--format=%T'), usage=item.usage.summary)
     ledger = [tuple(row) for row in runtime.server.conn.execute('SELECT day,category,amount,note FROM ledger ORDER BY rowid')]
     state['world'] = dict(day=runtime.server.tools.current_day, ledger=ledger,
@@ -202,7 +212,7 @@ def behavior(runtime):
 @pytest.mark.parametrize('boundary', ['answers_ready', 'ask_completed', 'week_boundary'])
 def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boundary):
     continuous = make_team(tmp_path / 'continuous', mode)
-    snapshots, forks, ledger_prefixes = [], [], []
+    snapshots, forks, ledger_prefixes, request_prefixes = [], [], [], []
     def save(runtime, current):
         if current == boundary and not snapshots:
             snapshots.append(runtime.checkpoint())
@@ -212,6 +222,10 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             prefix = list(runtime.server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq'))
             assert [tuple(r) for r in forks[-1].server.conn.execute('SELECT operation_ref FROM business_operations ORDER BY operation_seq')] == [tuple(r) for r in prefix]
             ledger_prefixes.append([r[0] for r in prefix])
+            request_prefix = {request.request_id: runtime._request_ref(request) for request in runtime.messages}
+            assert {request.request_id: forks[-1]._request_ref(request)
+                    for request in forks[-1].messages} == request_prefix
+            request_prefixes.append(request_prefix)
     continuous.checkpoint_callback = save
     try:
         outcome = continuous.run(stop_after_day=14)
@@ -252,6 +266,14 @@ def test_continuous_and_recovered_team_match_all_boundaries(tmp_path, mode, boun
             prefix = ledger_prefixes[0]
             assert original_refs[:len(prefix)] == resumed_refs[:len(prefix)] == prefix
             assert set(original_refs[len(prefix):]).isdisjoint(resumed_refs[len(prefix):])
+            original_requests = {request.request_id: continuous._request_ref(request) for request in continuous.messages}
+            resumed_requests = {request.request_id: restored._request_ref(request) for request in restored.messages}
+            request_prefix = request_prefixes[0]
+            assert {key: original_requests[key] for key in request_prefix} == request_prefix
+            assert {key: resumed_requests[key] for key in request_prefix} == request_prefix
+            original_tail = {ref for key, ref in original_requests.items() if key not in request_prefix}
+            resumed_tail = {ref for key, ref in resumed_requests.items() if key not in request_prefix}
+            assert original_tail and resumed_tail and original_tail.isdisjoint(resumed_tail)
             write_json(tmp_path / 'comparison.json', dict(mode=mode, boundary=boundary,
                 continuous=expected, recovered=actual, equal=actual == expected))
             artifact('checkpoint-comparison.json', dict(continuous=expected, recovered=actual))

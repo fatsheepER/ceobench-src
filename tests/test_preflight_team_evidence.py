@@ -323,8 +323,9 @@ def test_pf_owner_every_reader_equal_bytes_private_layers_and_cursor_reopen():
         page = growth.executor.pf_queries.answer('pf_log', dict(target={'path': 'ceo:same.txt'}, limit=1))
         assert page['next_cursor']
         reopened = SQLEvidenceStore(growth.store.path, dict(growth.store.identity))
+        reopened.public_refs = team.public_refs
         from saas_bench.pf_queries import PFQueries
-        q = PFQueries(TextRegistry(growth.workspace, 'pf', reopened, identity=growth.identity))
+        q = PFQueries(TextRegistry(growth.workspace, 'pf', reopened, identity=growth.identity, private_root=growth.registry.private_root))
         rest = q.answer('pf_log', dict(cursor=page['next_cursor']))
         assert rest['items'] and all(item['owner'] == 'ceo' for item in rest['items'])
         assert team.roles['ops_finance'].executor.execute('pf_more', dict(cursor=page['next_cursor'])).startswith('Error:')
@@ -395,27 +396,29 @@ def test_notes_schema_unicode_boundaries_links_reopen_and_symlink_protection(mod
             assert 'tool output' in runtime.executor.execute('bash', dict(command="printf 'bash-owned' > bash.txt; printf 'tool output'", note='bash reason'))
             for tool, args in [('bash', dict(command='true')), ('write_file', dict(path='same.txt', content='x')), ('edit_file', dict(path='same.txt', old_string=role, new_string='x'))]:
                 assert runtime.executor.execute(tool, dict(args, note=123)) == 'Error: note must be a string'
-            entries = [json.loads(line) for line in (runtime.workspace / '.tool-notes.jsonl').read_text().splitlines()]
+            entries = [json.loads(line) for line in (runtime.executor.private_root / 'tool-notes.jsonl').read_text().splitlines()]
             assert [len(row['note']) for row in entries[:3]] == [199, 200, 200]
             assert all(row['author'] == row['role'] == role for row in entries)
             assert entries[-2]['files'] == ['same.txt'] and entries[-1]['files'] == ['bash.txt']
             assert len(entries[-1]['output_sha256']) == 64 and 'output' not in entries[-1]
             write(team, role, 'omitted', 'without-note.txt')
-            assert len((runtime.workspace / '.tool-notes.jsonl').read_text().splitlines()) == len(entries)
+            assert len((runtime.executor.private_root / 'tool-notes.jsonl').read_text().splitlines()) == len(entries)
             runtime.executor.execute('bash', dict(command='exit 2', note='failed command'))
             runtime.executor.execute('bash', dict(command='rm bash.txt', note='remove file'))
-            added = [json.loads(line) for line in (runtime.workspace / '.tool-notes.jsonl').read_text().splitlines()][-2:]
+            added = [json.loads(line) for line in (runtime.executor.private_root / 'tool-notes.jsonl').read_text().splitlines()][-2:]
             assert added[0]['status'] == 'failed' and added[1]['files'] == ['bash.txt']
             for viewer in ROLES:
                 read_log = team.roles[viewer].executor.execute('read_file', dict(path=str(runtime.workspace / '.tool-notes.jsonl')))
-                assert (not read_log.startswith('Error:')) == (role in READABLE_ROLES[viewer])
+                assert read_log.startswith('Error:')
             read = runtime.executor.execute('read_file', dict(path='.tool-notes.jsonl'))
-            assert 'bash reason' in read and 'edit reason' in read
+            assert read.startswith('Error:')
+            assert not (runtime.workspace / '.tool-notes.jsonl').exists()
             if mode == 'pf':
                 reopened = SQLEvidenceStore(runtime.store.path, dict(runtime.store.identity))
+                reopened.public_refs = team.public_refs
                 handles = evidence_handles.index(reopened)
                 assert handles.note(version(team, role))[1] == 'edit reason'
-            log = runtime.workspace / '.tool-notes.jsonl'
+            log = runtime.executor.private_root / 'tool-notes.jsonl'
             log.unlink()
             log.symlink_to(team.root / 'private' / role / 'identity.json')
             original = (team.root / 'private' / role / 'identity.json').read_bytes()
@@ -471,18 +474,21 @@ def test_git_role_same_name_scripts_registrations_current_files_and_reopened_ref
         for role, runtime in team.roles.items():
             team._snapshot_history(runtime, 'Week 1 (day 7) [week-1]')
             assert role in team._git(runtime, 'show', 'HEAD:analysis.py')
-            committed = json.loads(team._git(runtime, 'show', 'HEAD:registrations.json'))
+            committed = json.loads(team._git(runtime, 'show', 'HEAD:documents/registrations.json'))
             assert committed['records']['r1'][0]['author'] == role
         receipt = declare(team, 'ceo', 'compare analyst recommendations', ['growth:same.txt@week-1', 'ops_finance:same.txt@week-1'])
-        assert 'growth:same.txt@week-1' in receipt and 'ops_finance:same.txt@week-1' in receipt
-        reopened = TextRegistry(ceo.workspace, 'git', identity=ceo.identity)
+        for peer in ('growth', 'ops_finance'):
+            short = team._git(team.roles[peer], 'rev-parse', '--short=7', 'HEAD')
+            assert peer + ':same.txt@' + short in receipt
+            assert team._git(team.roles[peer], 'show', short + ':same.txt') == peer + '-CURRENT'
+        reopened = TextRegistry(ceo.workspace, 'git', identity=ceo.identity, private_root=ceo.registry.private_root)
         reopened.git_run = ceo.executor.run_private
         refs = reopened._load()['records']['r2'][0]['references']
         assert [r['evidence']['owner'] for r in refs] == ['growth', 'ops_finance']
         write(team, 'growth', 'growth-CHANGED')
         assert reopened._load()['records']['r2'][0]['references'] == refs
         assert 'growth-CURRENT' == team._git(team.roles['growth'], 'show', 'HEAD:same.txt')
-        assert not list((team.root / 'private').rglob('*.sqlite'))
+        assert not list((team.root / 'private').rglob('*evidence.sqlite'))
 
 
 def test_public_observations_canonical_numbered_nested_handles_and_late_capture():
@@ -517,8 +523,8 @@ def test_public_observations_canonical_numbered_nested_handles_and_late_capture(
         note_hits = growth.executor.pf_queries.answer('pf_search', dict(text='OPS-BUSINESS-NOTE'))
         assert note_hits['total'] > 0
         note_sources = [growth.store.get_content(item['source_version'])[0] for item in note_hits['items']]
-        assert any(meta['layer'] == 'file_bytes' and meta['object_id'] == '.tool-notes.jsonl' and
-                   meta['owner_role'] == 'ops_finance' for meta in note_sources)
+        assert all(meta.get('object_id') != '.tool-notes.jsonl' for meta in note_sources)
+        assert any(meta['layer'] in ('stdout', 'tool_return', 'server_public_response') for meta in note_sources)
         assert ceo.executor.pf_queries.answer('pf_search', dict(text='OPS-BUSINESS-NOTE'))['total'] > 0
         shared_name = evidence_handles.index(team.roles['ops_finance'].store).name(ops_public)
         assert 'SHARED_PUBLIC' in pf(team, 'growth', 'pf show ' + shared_name.split('@')[0])

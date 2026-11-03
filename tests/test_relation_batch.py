@@ -1,5 +1,6 @@
 """Shared relation declarations through the role's public model tools."""
 from copy import deepcopy
+import hashlib
 import json
 import re
 import shlex
@@ -9,6 +10,7 @@ import pytest
 from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 from test_preflight_team_evidence import declare, write
 from test_preflight_team_flow import final, make_team
+from test_text_registry import git
 
 
 def batch(team, role, items, call_id):
@@ -120,7 +122,7 @@ def test_revision_replaces_whole_sources_and_keeps_exact_old_target(mode):
         assert len(history[0]['sources']) == 1
         assert history[-1]['target']['ref']['cite'] == 'ceo:r1.2'
         assert history[-1]['sources'] == []
-        assert retired['history']['path'] == 'relations.json' and retired['history']['role'] == 'ceo'
+        assert retired['history']['path'] == 'documents/relations.json' and retired['history']['role'] == 'ceo'
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
@@ -184,13 +186,19 @@ def test_git_same_named_peer_snapshots_preserve_source_and_storage_roles():
         request = create('sources', 'ceo:r1.1', ['growth:source.txt', 'ops_finance:source.txt'])
         saved = batch(team, 'ceo', [request], 'snapshots')['items'][0]
         sources = [source['ref'] for source in saved['sources']]
+        record_id = saved['relation'].split(':', 1)[1]
+        private = team.roles['ceo'].registry.relations._load()['records'][record_id][-1]
         assert [source['source_role'] for source in sources] == ['growth', 'ops_finance']
         assert all(source['storage_role'] == 'ceo' for source in sources)
         assert sources[0]['ref']['cite'] != sources[1]['ref']['cite']
-        for source, original in zip(sources, ('growth source', 'ops first')):
+        for source, stored, original in zip(sources, private['sources'], ('growth source', 'ops first')):
             owner, path_commit = source['ref']['cite'].split(':', 1)
             path, commit = path_commit.rsplit('@', 1)
-            assert len(commit) == 40 and re.fullmatch('[0-9a-f]{40}', commit)
+            full = stored['ref']['ref']['cite'].rsplit('@', 1)[1]
+            assert re.fullmatch('[0-9a-f]{40}', full)
+            assert commit == git(team.roles[owner].workspace, 'rev-parse', '--short=7', full)
+            assert git(team.roles[owner].workspace, 'rev-parse', commit) == full
+            assert 'sha256' not in source
             assert source['snapshot_source']['cite'].startswith(source['source_role'] + ':')
             write(team, source['source_role'], 'overwritten later', path=path)
             command = shlex.join(['git', '-C', str(team.roles[owner].workspace), 'show', commit + ':' + path])
@@ -218,7 +226,12 @@ def test_pf_saved_output_is_a_target_and_unread_peer_capture_stays_unread():
         assert saved['target']['ref']['cite'] == cite
         assert saved['target']['readable'] is True
         assert saved['target']['capture']['reading_scope'] == 'not_in_request'
-        assert len(saved['target']['sha256']) == 64
+        assert 'sha256' not in saved['target']
+        record_id = saved['relation'].split(':', 1)[1]
+        private = team.roles['ceo'].registry.relations._load()['records'][record_id][-1]
+        raw = team.roles['ceo'].registry.resolver.content(
+            team.roles['ceo'].registry.resolver.lookup(cite)[-1])[1]
+        assert private['target']['sha256'] == hashlib.sha256(raw).hexdigest()
         read = team.roles['ops_finance'].executor.execute('bash',
             {'command': shlex.join(['pf', 'show', cite, '--full'])})
         assert 'marker' in read and '17' in read and '[exit code: 1]' not in read

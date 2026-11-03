@@ -6,17 +6,16 @@ stdout of that script) or cmd5@v1 (a command's return). The version number rises
 when the object's content differs from its previous version; every execution is still
 recorded, and repeated acquisitions of the same content share one handle.
 
-Version numbers follow the chronological order of the versions visible in this branch,
-so they are deterministic and never change once assigned. Objects without a natural
-name (queries, reads, commands, receipts) are numbered in the order first shown; that
-table lives in private state and is copied with the evidence database at a fork.
+Object and version ordinals are allocated durably outside rollback state. Exact event
+and capture references preserve individual executions even when content is identical.
 """
 from collections import defaultdict
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import re
 import threading
 
+from .public_errors import PublicPFError
 from .sql_evidence import digest, encoded
 from .role_policy import READABLE_ROLES
 from .pf_deadline import check
@@ -36,6 +35,7 @@ RAW_VERSION = re.compile(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*:.+')
 SINGLE = re.compile(r'([a-z_]+?)([1-9][0-9]*)')
 # Accepted wherever the agent may write a handle; registered texts keep rN / rN.M.
 HANDLE_PATTERN = r'^((?:(?:ceo|growth|ops_finance):)?(?:.+@v[1-9][0-9]*|[a-z_]+[1-9][0-9]*|r[1-9][0-9]*(\.[1-9][0-9]*)?)|[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*:.+)$'
+EXACT = re.compile(r'(ceo|growth|ops_finance):(event|capture)([1-9][0-9]*)')
 RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 
 
@@ -56,6 +56,46 @@ def index(store):
     return value
 
 
+def authority(store):
+    from .public_refs import PublicRefs
+    if not hasattr(store, 'public_refs'):
+        store.public_refs = PublicRefs(store.path.parent / 'public-refs.sqlite')
+    return store.public_refs
+
+
+@contextmanager
+def allocation(store):
+    from .public_refs import PublicReferenceUnavailable
+    try:
+        yield authority(store)
+    except PublicReferenceUnavailable as exc:
+        store.fail(exc, failure_stage='public_reference_allocation')
+        raise
+
+
+def public_ref(store, kind, private_key):
+    if private_key is None:
+        return None
+    event = private_key.split(':', 1)[0] if kind == 'capture' else private_key
+    with closing(store.connect()) as conn:
+        row = conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()
+    if row is None:
+        raise PublicPFError('Captured reference is unavailable')
+    request = json.loads(row[0])
+    role = request.get('role', request.get('author', store.identity.get('role', 'ceo')))
+    with allocation(store) as refs:
+        return refs.assign(kind, role, private_key)
+
+
+def resolve_ref(store, kind, ref):
+    if not EXACT.fullmatch(ref):
+        return ref
+    value = authority(store).resolve(kind, ref)
+    if value is None:
+        raise PublicPFError('Captured reference is unavailable')
+    return value
+
+
 class HandleIndex:
     def __init__(self, store):
         self.store = store
@@ -65,10 +105,13 @@ class HandleIndex:
         self.events = {}                    # visible event -> (kind, request record, day)
         self.model_requests = []            # visible model sends, in acquisition order
         self.notes = {}                     # visible event -> (day, note) the agent attached to that call
+        self.note_sources = {}
         self.info = {}                      # version -> (object key, group)
         self.groups = defaultdict(list)     # object key -> [group], oldest first
         self.code = {}                      # cli_python event -> executed code hash
         self.chain = None
+        self.ordinals = {}
+        self.bases = {}
 
     # --- incremental build ----------------------------------------------------
 
@@ -141,6 +184,7 @@ class HandleIndex:
             # Projections are named by the version they project.
             if meta.get('derived_from') in self.info:
                 self.info[version] = self.info[meta['derived_from']]
+                self.note_sources[version] = self.note_sources.get(meta['derived_from'])
             return
         key = self._object(version, event_id, kind, record, layer, meta, row['definition'])
         if self.store.identity.get('role'):
@@ -148,18 +192,21 @@ class HandleIndex:
         signature = (comparisons.get(event_id) or row['content_hash'] if key[0] == 'query' else
                      meta.get('body_sha256') or row['content_hash'])
         groups = self.groups[key]
+        previous = groups[-1]['members'][-1] if groups and groups[-1]['signature'] == signature else None
         if groups and groups[-1]['signature'] == signature:
             group = groups[-1]
             group['members'].append(version)
         else:
-            group = dict(key=key, k=len(groups) + 1, signature=signature, members=[version], day=day)
+            group = dict(key=key, k=self._version_number(key, version), signature=signature, members=[version], day=day)
             groups.append(group)
         self.info[version] = (key, group)
+        self.bases[self.base(key)] = key
         # The note of the call that produced this content: its outputs and the files it wrote,
         # not versions it merely observed (a read, or the before-snapshot of a later command).
         produced = layer != 'file_bytes' or version.endswith('_after')
+        self.note_sources[version] = version if produced else self.note_sources.get(previous)
         if produced and event_id in self.notes:
-            group['note'] = self.notes[event_id]
+            group.setdefault('note', self.notes[event_id])
 
     def _object(self, version, event_id, kind, record, layer, meta, definition):
         args = record.get('request') or {}
@@ -197,24 +244,17 @@ class HandleIndex:
 
     # --- names ----------------------------------------------------------------
 
-    def _numbers(self, owner=None):
-        name = (owner or self.store.identity['role']) + ':' + HANDLES if self.store.identity.get('role') else HANDLES
-        with closing(self.store.connect()) as conn:
-            row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
-        return json.loads(row[0]) if row else {}
-
     def _number(self, kind, key, allocate, owner=None):
-        name = (owner or self.store.identity['role']) + ':' + HANDLES if self.store.identity.get('role') else HANDLES
-        with self.store._writer() as conn:
-            row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
-            table = json.loads(row[0]) if row else {}
-            numbers = table.setdefault(kind, {})
-            if key not in numbers:
-                if not allocate:
-                    return len(numbers) + 1
-                numbers[key] = len(numbers) + 1
-                conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(table)))
-            return numbers[key]
+        identity = (kind, owner or self.store.identity.get('role', 'ceo'), key)
+        if identity not in self.ordinals:
+            with allocation(self.store) as refs:
+                self.ordinals[identity] = refs.ordinal('object:' + kind, identity[1], key)
+        return self.ordinals[identity]
+
+    def _version_number(self, key, version):
+        owner = key[-1] if self.store.identity.get('role') else 'ceo'
+        with allocation(self.store) as refs:
+            return refs.ordinal('version:' + encoded(key).decode(), owner, version)
 
     def object_key(self, kind, name, owner=None):
         key = (kind, name)
@@ -260,7 +300,7 @@ class HandleIndex:
                 return self.base(key, allocate)  # A single immutable observation.
             return f"{self.base(key, allocate)}@v{group['k']}"
 
-    def pending(self, kind, call, signature, allocate=True):
+    def pending(self, kind, call, signature, version, allocate=True):
         """Handle the next return of this call will receive before it is stored, and the day
         its identical content was first returned (None if the content is new)."""
         with self.lock:
@@ -268,7 +308,7 @@ class HandleIndex:
             key = self.object_key(kind, encoded(call).decode())
             groups = self.groups.get(key, [])
             same = bool(groups) and groups[-1]['signature'] == signature
-            k = groups[-1]['k'] if same else len(groups) + 1
+            k = groups[-1]['k'] if same else self._version_number(key, version)
             return f'{self.base(key, allocate)}@v{k}', groups[-1]['day'] if same else None
 
     # --- facts used in agent-facing text --------------------------------------
@@ -297,14 +337,22 @@ class HandleIndex:
         group = self.group(version)
         if not group or group['key'][0] in ('record', 'receipt', 'node'):
             return None
-        earlier = next((g for g in self.groups[group['key']][:group['k'] - 1]
+        earlier = next((g for g in self.groups[group['key']][:self.groups[group['key']].index(group)]
                         if g['signature'] == group['signature']), None)
         return self.name(earlier['members'][0]) if earlier else None
 
     def note(self, version):
-        """(day, text) of the latest note on a call that produced this version's content."""
-        group = self.group(version)
-        return group.get('note') if group else None
+        self.refresh()
+        source = self.note_sources.get(version)
+        return self.notes.get(source.split(':', 1)[0]) if source else None
+
+    def note_context(self, version):
+        if not self.note(version):
+            return None
+        event = self.store.read_event(self.note_sources[version].split(':', 1)[0], evidence=True)
+        request = event['request']
+        return dict(role=request.get('role', request.get('author', 'ceo')),
+                    day=self.note(version)[0], status=event['result'].get('status', 'result_unknown'))
 
     def latest(self, base):
         """Versions (oldest first) of an object's newest version, named without @vK, or None."""
@@ -320,56 +368,45 @@ class HandleIndex:
 
     def previous(self, version):
         group = self.group(version)
-        if not group or group['k'] == 1 or group['key'][0] in ('record', 'receipt', 'node'):
+        if not group or self.groups[group['key']].index(group) == 0 or group['key'][0] in ('record', 'receipt', 'node'):
             return None
-        return self.name(self.groups[group['key']][group['k'] - 2]['members'][-1])
+        return self.name(self.groups[group['key']][self.groups[group['key']].index(group) - 1]['members'][-1])
 
     # --- resolution -----------------------------------------------------------
 
     def _key_for(self, base):
-        owner = self.store.identity.get('role')
-        if owner and ':' in base and base.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance'):
-            owner, base = base.split(':', 1)
-        numbers = self._numbers(owner)
-        def numbered(kind, n, *rest):
-            key = next((k for k, v in numbers.get(kind, {}).items() if v == int(n)), None)
-            return (kind if not rest else rest[0], key, *rest[1:]) if key is not None else None
-        candidates = []
-        if m := re.fullmatch(r'(query|read|cmd|call)([1-9][0-9]*)', base):
-            candidates.append(numbered(m.group(1), m.group(2)))
-        if m := re.fullmatch(r'cmd([1-9][0-9]*)\.(out|err)', base):
-            candidates.append(numbered('cmd', m.group(1), 'cmd_stream', m.group(2)))
-        if m := re.fullmatch(r'inline([1-9][0-9]*)\.(out|err|code)', base):
-            candidates.append(numbered('inline', m.group(1), 'inline', m.group(2)))
-        if base == 'dashboard':
-            candidates.append(('dashboard',))
-        if base.startswith('weekly:'):
-            name = base[len('weekly:'):]
-            if name.endswith('.code'):
-                candidates.append(('weekly_code', name[:-len('.code')]))
-            candidates.append(('weekly', name))
-        if m := re.fullmatch(r'(.+)\.(out|err|code)', base):
-            candidates.append(('script', m.group(1), m.group(2)))
-        candidates.append(('file', base))
-        if owner:
-            candidates = [(*k, owner) if k else None for k in candidates]
-        return next((k for k in candidates if k and k in self.groups), None)
+        role = self.store.identity.get('role')
+        if role and base.split(':', 1)[0] not in READABLE_ROLES:
+            base = role + ':' + base
+        return self.bases.get(base)
 
     def lookup(self, handle):
-        """Versions (oldest first) that a handle denotes, or None if it denotes nothing."""
         with self.lock:
             self.refresh()
+            if match := EXACT.fullmatch(handle):
+                kind = match.group(2)
+                raw = resolve_ref(self.store, kind, handle)
+                with closing(self.store.connect()) as conn:
+                    if kind == 'event':
+                        self.store.readable_event(conn, raw)
+                        rows = conn.execute('SELECT version_id,metadata FROM versions WHERE event_id=? ORDER BY rowid', (raw,))
+                    else:
+                        rows = conn.execute('SELECT version_id,metadata FROM versions WHERE version_id=?', (raw,))
+                    found = []
+                    for row in rows:
+                        event = row['version_id'].split(':', 1)[0]
+                        try:
+                            self.store.authorize_version(conn, event, json.loads(row['metadata']), public=True)
+                        except PermissionError:
+                            if kind == 'capture':
+                                raise
+                            continue
+                        if row['version_id'] in self.info:
+                            found.append(row['version_id'])
+                    return found or None
             if m := VERSIONED.fullmatch(handle):
                 key = self._key_for(m.group(1))
-                groups = self.groups.get(key, []) if key else []
-                k = int(m.group(2))
-                return list(groups[k - 1]['members']) if k <= len(groups) else None
-            single = handle.split(':', 1)[-1] if self.store.identity.get('role') else handle
-            if m := SINGLE.fullmatch(single):
-                owner = handle.split(':', 1)[0] if ':' in handle and self.store.identity.get('role') else None
-                numbers = self._numbers(owner)
-                for kind in ('receipt', 'node'):
-                    version = next((k for k, v in numbers.get(kind, {}).items() if v == int(m.group(2))), None)
-                    if version in self.info and self.name(version, allocate=False) == handle:
-                        return [version]
-            return None
+                group = next((g for g in self.groups.get(key, []) if g['k'] == int(m.group(2))), None)
+                return list(group['members']) if group else None
+            return next(([version] for version in self.info
+                         if self.info[version][0][0] in ('receipt', 'node') and self.name(version) == handle), None)

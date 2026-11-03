@@ -78,7 +78,7 @@ def reader_command(mode, cite, body):
         return 'pf show ' + shlex.quote(cite) + ' --full'
     owner, rest = cite.split(':', 1)
     path, commit = rest.rsplit('@', 1)
-    assert re.fullmatch('[0-9a-f]{40}', commit), cite
+    assert re.fullmatch('[0-9a-f]{7,40}', commit), cite
     line = re.search(r'Readable workspaces: ([^\n]+)', body['messages'][0]['content'])
     workspaces = line[1].split(', ')
     workspace, = [workspace for workspace in workspaces if Path(workspace).name == owner]
@@ -233,7 +233,7 @@ def test_public_sources_survive_revision_overwrite_and_next_week_handoff(mode):
         else:
             line = re.search(r'Readable workspaces: ([^\n]+)', body['messages'][0]['content'])[1]
             peer, = [path for path in line.split(', ') if Path(path).name == 'growth']
-            code = 'import json; from pathlib import Path; history=json.loads(Path(' + repr(peer + '/relations.json') + ').read_text())["records"]; '
+            code = 'import json; from pathlib import Path; history=json.loads(Path(' + repr(peer + '/documents/relations.json') + ').read_text())["records"]; '
             code += 'current=[versions[-1] for versions in history.values()]; refs=' + repr(refs) + '; '
             code += 'print(json.dumps(dict(history=history,forward={name:[r for r in current if r["target"]["ref"]["cite"]==refs[name]] for name in ["F1","F2"]},'
             code += 'reverse={name:[r for r in current if any(s["ref"]["ref"].get("cite")==refs[name] for s in r["sources"]) ] for name in ["Q1","Q2"]})))'

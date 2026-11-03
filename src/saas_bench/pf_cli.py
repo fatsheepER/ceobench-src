@@ -4,6 +4,7 @@ import shlex
 
 from .evidence_handles import RAW_VERSION, RECORD, SINGLE, VERSIONED
 from .pf_render import _HEREDOC
+from .registration_prompt import PF_CAPTURE_BOUNDARY
 
 USAGE = '''usage: pf <command> ...
   pf help | pf --help | pf -h          complete command help and examples
@@ -24,7 +25,8 @@ USAGE = '''usage: pf <command> ...
                                       captured objects across calls, 20 per page
   pf more <cursor>                     the next page of an earlier result
 Objects: exact handles (MEMORY.md@v8, query7@v1, growth:r4.2), or names for the latest
-version (MEMORY.md, query7, growth:r4). Bare r4 is local. Copy returned role/version handles.
+version (MEMORY.md, query7, growth:r4). Exact acquisitions use growth:capture12;
+executions use growth:event8 with candidates --event. Bare r4 is local. Copy returned role/version handles.
 Bare pf also shows help. Every subcommand accepts --help or -h.
 Use -- before an object name beginning with a dash, e.g. pf show -- -h.'''
 
@@ -60,14 +62,17 @@ and coverage. Run new public queries or your calculations when current evidence 
 needed. Both directions default to one hop and the latest active declaration
 revision across visible roles and all saved days. A forward path to an exact old
 text follows that revision's saved references; reverse historical paths require
---all-revisions. --detail expands complete saved fields, not depth. Use --depth N
+--all-revisions. --detail expands public request, receipt, source, scope and status fields, not depth.
+Private archive identities and checksums remain private. Use --depth N
 for more hops. --all-revisions includes old and
 withdrawn revisions; a current revision does not certify current validity.
 --history keeps its original meaning: follow declarations without automatic
 capture relationships. It does not select old revisions.
 
-Files, outputs, exact text revisions and concrete op: operation references can
-be targets or sources. Copy the complete operation_ref from its business receipt.
+Files, outputs, exact text revisions and concrete role:number operation references (growth:1) can
+be relation targets or sources. Copy operation_ref from its business receipt.
+Text references[].cite accepts saved file/output handles and exact text revisions;
+use relation_batch with {operation_ref: "growth:1"} for an operation.
 Git file references keep their exact commit and storage role. Author declarations,
 other authors' inferences and automatic execution observations remain separate.
 --include-candidates adds saved derivation/range links and execution membership.
@@ -75,7 +80,8 @@ Membership names a captured object and its execution, stops at that event, and
 provides a candidates command for its recorded members. It does not connect every
 co-occurring input and output or prove source use. Missing materials retain their descriptions without a
 fabricated readable version. Each declaration keeps its author, record and revision.
-Use pf more to continue the frozen page or read its full details. Known sources
+The header gives returned/total counts and the next pf more command before results.
+Use pf more to continue the frozen page or read its public details. Known sources
 can be registered directly with relation_batch, without a candidates query.
 
 3. Find versions and revise references
@@ -174,6 +180,8 @@ snapshot. Preserve scope headers when reading results;
 pipes and redirection can leave only a partial view.
 '''
 
+HELP += '\n' + PF_CAPTURE_BOUNDARY
+
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'candidates', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS + ('--help', '-h')) + r')\b|\s*$)', re.M)
 
@@ -191,7 +199,7 @@ def mentions_pf(command):
 
 
 def target(token):
-    if re.fullmatch(r'op:[0-9a-f]{32}', token):
+    if re.fullmatch(r'(ceo|growth|ops_finance):[1-9][0-9]*', token):
         return {'operation_ref': token}
     if RECORD.fullmatch(token):
         return {'record': token}

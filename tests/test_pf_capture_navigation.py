@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from saas_bench.evidence_handles import resolve_ref
 from saas_bench.execution_capture import finish_http
 from saas_bench.pf_queries import PFQueries
 from saas_bench.public_sql import execute_query
@@ -72,20 +73,20 @@ def test_derived_file_traces_captured_upstream_queries_and_exact_bytes(workspace
     assert rows[0]['source']['ref']['cite'] == 'derived.json@v1'
     assert rows[0]['target']['ref']['cite'] == 'r1.1'
     expanded = relation_details(executor, 'pf depend r1 --include-candidates --depth 2 --detail')['items']
-    members = [row for row in expanded if row.get('basis') == 'execution_membership' and row['content_ref'] == version]
+    members = [row for row in expanded if row.get('basis') == 'execution_membership' and resolve_ref(store, 'capture', row['content_ref']) == version]
     member, = members
     assert member['source']['ref']['cite'] == 'derived.json@v1'
-    assert member['target']['ref']['event_ref'] == parent
+    assert resolve_ref(store, 'event', member['target']['ref']['event_ref']) == parent
     assert member['assertion'] == 'execution_observation' and member['unexpanded'] == 'execution_membership'
     inventory = executor.execute('bash', {'command': member['navigation'] + ' --kind sql'})
     assert not inventory.startswith('Error:') and '[exit code:' not in inventory
     sql_rows = executor.pf_queries.last_answer['items']
     assert {row['name'] for row in sql_rows} == set(sqls)
     assert {row['version'] for row in sql_rows} == {registry.resolver.handle(v) for v in versions}
-    assert {row['content_ref'] for row in sql_rows} == set(versions)
+    assert {resolve_ref(store, 'capture', row['content_ref']) for row in sql_rows} == set(versions)
     for row in sql_rows:
         _, saved, _ = read(executor, target={'version': row['version']})
-        assert saved.encode() == store.get_content(row['content_ref'])[1]
+        assert saved.encode() == store.get_content(resolve_ref(store, 'capture', row['content_ref']))[1]
     header, body, _ = read(executor, target={'version': 'derived.json@v1'})
     assert body == '{"n":42}' and header['target']['day'] == 56
     assert server.conn.serialize() == before
@@ -197,7 +198,11 @@ def test_undated_handles_remain_unknown_in_cli_returns_and_notes(workspace, tmp_
     assert query(executor, 'pf_log', target={'path': 'MEMORY.md'})['items'][0]['day'] is None
     shown = executor.execute('bash', {'command': 'pf show MEMORY.md'})
     assert json.loads(shown.split('\n', 1)[0])['target']['day'] is None
-    assert 'MEMORY.md@v1 · day unknown' in executor.execute('bash', {'command': 'pf search --text 7'})
+    search = executor.execute('bash', {'command': 'pf search --text 7'})
+    matched, = [item for item in executor.pf_queries.last_answer['items'] if item['version'] == 'MEMORY.md@v1']
+    assert matched['day'] is None
+    assert f"MEMORY.md@v1 · {matched['content_ref']} · day unknown" in search
+    assert store.get_content(resolve_ref(store, 'capture', matched['content_ref']))[1] == b'7'
     assert 'note (day unknown): "Undated snapshot"' in executor.execute('bash', {'command': 'cat MEMORY.md'})
     again = executor.execute('bash', command)
     assert 'same as day' not in again

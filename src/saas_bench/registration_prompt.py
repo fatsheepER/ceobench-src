@@ -19,9 +19,12 @@ be reused or handed off. Use relation_batch for several targets at once. Known
 sources can be submitted directly; no candidate lookup or predicate is required.
 Copy exact versions and operation references from receipts. Describe missing
 material explicitly. A saved relation is your declaration, not proof of validity.
+Operation references use the executing role and a number, such as growth:12.
+Use them in relation_batch operation_ref endpoints or business ledger SQL.
+Text references[].cite accepts files, outputs and texts, not operations.
 Review each item result. Revisions preserve history; a supplied sources list
 replaces the whole list. Registration never blocks handoff or business progress.
-Relations and revisions are readable in relations.json; use ordinary file tools
+Public relations and revisions are readable in documents/relations.json; use ordinary file tools
 or your own scripts to search them. Use author_declared only for your own target;
 use inferred for another or unknown author. Revise with the returned relation ID
 and expected_revision. Missing unsaved output stays missing.
@@ -32,7 +35,7 @@ REGISTERED_TEXTS = '''## Registered Texts
 Use `text_create` to register a hypothesis, forecast, plan, conclusion or
 counterevidence you expect to rely on in later weeks, citing the evidence it
 rests on. Texts get IDs r1, r2, ...; revisions are r4.1, r4.2. They persist in
-`registrations.json` but are not loaded automatically: keep useful IDs in
+the public view `documents/registrations.json` but are not loaded automatically: keep useful IDs in
 MEMORY.md and review texts with `text_list`. Registering is optional and never
 blocks business actions.
 
@@ -43,9 +46,20 @@ simulated days the text is about: "49", "49-55", "49-" (from day 49 until
 revised or retired) or "unknown: <reason>". Review your judgments using current
 evidence when needed.
 
+`references[].cite` accepts the evidence forms listed below. To link a concrete
+business operation, copy its `operation_ref` into a `relation_batch` endpoint;
+operation references are not text citations.
+
 The dashboard reflects the last weekly advance; after changing settings within
 a week, query the current settings instead.
 
+'''
+
+GIT_CALL_NOTES = '''
+A call with a note saves its full output and changed-file snapshots in the returned
+`tool-outputs/callN.txt` artifact. Use ordinary file search to find its note, and
+`git show --abbrev-commit COMMIT` to inspect the note and saved file changes.
+Use `git show COMMIT:PATH` for exact file bytes.
 '''
 
 GIT_HISTORY = '''## File History (git)
@@ -60,10 +74,24 @@ the receipt names the source. Read `PATH@COMMIT` with `git show COMMIT:PATH`,
 or `git -C ROLE_WORKSPACE show COMMIT:PATH` for another role's repository.
 Only named saved files are snapshotted; save SQL or command output before citing it.
 
+
 Example: MEMORY.md is rewritten almost every week. Before relying on something
 you remember from earlier weeks, `git log -p -2 -- MEMORY.md` shows what the
 last rewrites removed.
 
+'''
+
+GIT_HISTORY += GIT_CALL_NOTES
+
+PF_CAPTURE_BOUNDARY = '''Workspace files are captured before and after the outer Bash call. Files created
+or changed inside that call are not refreshed in PF until it ends. Finish the
+writing call, then use its returned file handles in a later Bash call. To inspect
+current bytes inside the same Bash call, use ordinary file commands.
+
+First Bash call: run your script to write `reports/w4_calc.out`, then wait for the
+call to finish and return its PF receipt. Second Bash call: run
+`pf log reports/w4_calc.out`, or `pf show HANDLE --full` with the returned handle.
+These are two separate tool calls.
 '''
 
 PF_HISTORY = '''## File and Output History (pf)
@@ -120,7 +148,7 @@ Example: MEMORY.md is rewritten almost every week. Before relying on something
 you remember from earlier weeks, `pf diff MEMORY.md` shows what the last rewrite
 removed.
 
-'''
+''' + PF_CAPTURE_BOUNDARY
 
 GLOB_ROW = '| `glob_files` | Find files by pattern (like `*.py`, `docs/**/*.json`) |'
 WEEKLY_SCRIPTS = '3. **Weekly scripts** — registered via `./novamind-operation register-daily-script`'
@@ -136,7 +164,7 @@ def edits(pf):
                    ('\n\n`bash` also runs `pf`, which shows the history of your files and command outputs '
                     '(see File and Output History).' if pf else '')),
         (WEEKLY_SCRIPTS, WEEKLY_SCRIPTS + '\n4. **Registered texts** — saved by `text_create` in '
-                         '`registrations.json`; not loaded automatically (use `text_list`)\n' +
+                         '`documents/registrations.json`; not loaded automatically (use `text_list`)\n' +
                          ('5. **PF history** — every version of your files and command outputs, with your '
                           'notes (use `pf`)' if pf else
                           '5. **Git history** — the harness commits your working directory at the end of '

@@ -41,7 +41,9 @@ class RelationRegistry:
     def __init__(self, texts):
         self.texts = texts
         self.workspace, self.role = texts.workspace, texts.role
-        self.path = self.workspace / 'relations.json'
+        self.private_root = texts.private_root
+        self.path = self.private_root / 'relations.json'
+        self.public_path = self.workspace / 'documents/relations.json'
         self.operation_lookup = None
         self.attempt_id = None
         self.failed = None
@@ -52,7 +54,7 @@ class RelationRegistry:
             raise ValueError('Relation storage must not be a symlink')
         if not self.path.exists():
             return dict(format=FORMAT, records={}, calls={})
-        with open_file(self.workspace, self.path) as stream:
+        with open_file(self.private_root, self.path) as stream:
             state = json.load(stream)
         if state.get('format') != FORMAT or not isinstance(state.get('records'), dict) or not isinstance(state.get('calls'), dict):
             raise ValueError('Invalid relation storage')
@@ -67,21 +69,10 @@ class RelationRegistry:
         return state
 
     def _publish(self, state):
-        with parent_fd(self.workspace, self.path) as (directory, name):
-            temp = '.relation-' + uuid.uuid4().hex
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-            try:
-                with os.fdopen(fd, 'w') as stream:
-                    stream.write(encode(state))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp, name, src_dir_fd=directory, dst_dir_fd=directory)
-                os.fsync(directory)
-            finally:
-                try:
-                    os.unlink(temp, dir_fd=directory)
-                except FileNotFoundError:
-                    pass
+        from .private_storage import publish_json
+        from .public_records import public_relation_state
+        publish_json(self.private_root, self.path, state, prefix='.relation-')
+        publish_json(self.workspace, self.public_path, public_relation_state(state, self.texts.public_commit), prefix='.public-relation-')
 
     def _summary(self, items, results, status=None):
         counts = Counter(item['status'] for item in results)
@@ -169,8 +160,8 @@ class RelationRegistry:
     def _prepare(self, item, state):
         previous = None
         if item['op'] == 'create':
-            record_id = 'l' + str(max((int(k[1:]) for k in state['records']), default=0) + 1)
-            record = dict(id=record_id, revision=1, status='active')
+            record_id = None
+            record = dict(status='active')
         else:
             owner, record_id = (item['relation'].split(':', 1) if ':' in item['relation'] else (self.role, item['relation']))
             if owner != self.role:
@@ -184,7 +175,7 @@ class RelationRegistry:
                 raise Rejected('revision_conflict', 'Expected revision differs from the latest saved revision: ' + previous['relation_revision'])
             if previous['status'] == 'retired':
                 raise Rejected('retired', 'This relation is retired; create a new relation')
-            record = dict(deepcopy(previous), revision=previous['revision'] + 1)
+            record = deepcopy(previous)
         retained = []
         if 'target' in item:
             target, commits = self._bind(item['target'])
@@ -204,6 +195,9 @@ class RelationRegistry:
             raise Rejected('author_mismatch', 'The target producer is another role or unknown; use inferred')
         if item['op'] == 'retire':
             record['status'] = 'retired'
+        if record_id is None:
+            record_id = 'l' + str(self.texts.allocate('relation'))
+        record.update(id=record_id, revision=self.texts.allocate('relation_revision:' + record_id))
         record.update(author_role=self.role, sim_day=self.texts.sim_day(), attempt_id=self.attempt_id,
                       relation=self.role + ':' + record_id,
                       relation_revision=f"{self.role}:{record_id}.{record['revision']}")
@@ -212,10 +206,12 @@ class RelationRegistry:
         return record, list(dict.fromkeys(retained))
 
     def _receipt(self, label, record):
+        from .public_records import public_relation
+        record = public_relation(record, self.texts.public_commit)
         fields = ('relation', 'relation_revision', 'revision', 'target', 'sources', 'author_role', 'assertion', 'reason')
         return dict(item_id=label, status='saved', **{k: record[k] for k in fields}, record_status=record['status'],
                     source_state='missing' if any(s['ref']['source_state'] == 'missing' for s in record['sources']) else 'available',
-                    history=dict(path='relations.json', role=self.role, relation=record['relation'], revision=record['revision']))
+                    history=dict(path='documents/relations.json', role=self.role, relation=record['relation'], revision=record['revision']))
 
     def _bind(self, endpoint):
         if 'missing' in endpoint:
@@ -252,8 +248,8 @@ class RelationRegistry:
         evidence = ref['evidence']
         if 'record' in evidence:
             owner, version = evidence['record'].split(':', 1) if ':' in evidence['record'] else (self.role, evidence['record'])
-            path = self.texts.repository(owner) / 'registrations.json'
-            with open_file(self.texts.repository(owner), path) as stream:
+            path = self.texts.authority_path(owner, 'registrations.json')
+            with open_file(path.parent, path) as stream:
                 history = json.load(stream)['records'][version.split('.')[0]]
             record = next(r for r in history if r['version'] == version)
             producer = owner if record.get('author') == owner else None
@@ -300,9 +296,9 @@ class RelationRegistry:
     def _git_producer(self, owner, path, commit):
         workspace = self.texts.repository(owner)
         producers = set()
-        registry = workspace / 'registrations.json'
+        registry = self.texts.authority_path(owner, 'registrations.json')
         if registry.exists():
-            with open_file(workspace, registry) as stream:
+            with open_file(registry.parent, registry) as stream:
                 texts = json.load(stream)
             for history in texts['records'].values():
                 for record in history:
@@ -311,9 +307,9 @@ class RelationRegistry:
                         if evidence.get('path') == path and evidence.get('owner', owner) == owner and commit.startswith(evidence.get('commit', '!')):
                             if 'snapshot_source' in ref:
                                 producers.add(ref['snapshot_source'].get('owner', owner))
-        relation_path = workspace / 'relations.json'
+        relation_path = self.texts.authority_path(owner, 'relations.json')
         if relation_path.exists():
-            with open_file(workspace, relation_path) as stream:
+            with open_file(relation_path.parent, relation_path) as stream:
                 relations = json.load(stream)
             wanted = owner + ':' + path + '@' + commit
             for history in relations['records'].values():

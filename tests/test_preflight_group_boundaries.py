@@ -302,6 +302,7 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
         marker = '<snapshot:ceo:evidence.json:' + expected_blob + '>'
         for commit in commits:
             output = output.replace(commit, marker)
+            output = output.replace(git(registry.workspace, 'rev-parse', '--short=7', commit), marker)
             stored = stored.replace(commit, marker)
         return output.encode(), stored.encode()
 
@@ -349,11 +350,14 @@ def test_explicit_git_references_do_not_copy_and_bare_files_snapshot_without_eva
         registry.execute('create', declaration(references=[ref]))
     listing = json.loads(registry.execute('list', {'raw': True}))
     assert all(r['references'][0]['evidence']['commit'] == head[:7] for r in listing['records'])
-    assert set(workspace.rglob('*')) - before == {registry.path}
+    assert set(workspace.rglob('*')) - before == {workspace / 'documents', registry.public_path}
+    assert registry.path.is_file() and not registry.path.is_relative_to(workspace)
     assert (workspace / '.git/index').read_bytes() == index
     assert git(workspace, 'rev-parse', 'HEAD') == head
     assert '{"n":7}' not in registry.path.read_text()
-    assert not re.search(r'\b[0-9a-f]{8,64}\b', registry.path.read_text())
+    assert all(record['references'][0]['evidence']['commit'] == head
+               for history in registry._load()['records'].values() for record in history)
+    assert head not in registry.public_path.read_text()
     original = registry.path.read_bytes()
     for evidence in ({'path': 'new.json'}, {'sql': 'SELECT 1'}, {'version': 'v1'},
                      {'path': 'evidence.json', 'commit': 'f' * 40}, {'path': 'new.json@week-1'}):
@@ -388,7 +392,7 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
     checkpoint = prefix._load_checkpoint()
     assert checkpoint['context_boundary'] == 'new_week'
     snapshot = checkpoint_directory(prefix.workspace_dir, checkpoint)
-    public_json = (snapshot / 'agent_workspace/registrations.json').read_bytes()
+    public_json = (snapshot / 'agent_workspace/documents/registrations.json').read_bytes()
     saved_head = prefix._git('rev-parse', 'HEAD').stdout
     binding = prefix.evidence_store.load_state('declaration:r1.1')['references'][0]
     outputs = {}
@@ -397,7 +401,7 @@ def test_packed_forks_keep_private_material_out_of_agent_access(offline_runner, 
         assert not child.agent.conversation
         assert child.agent.current_day == -1
         assert child._git('rev-parse', 'HEAD').stdout == saved_head
-        assert (child.agent_workspace / 'registrations.json').read_bytes() == public_json
+        assert (child.agent_workspace / 'documents/registrations.json').read_bytes() == public_json
         assert not list(child.agent_workspace.rglob('*.sqlite'))
         assert not re.search(r'(?i)(evidence|provenance|bindings).*\.sqlite', child._git('ls-tree', '-r', '--name-only', 'HEAD').stdout)
         probes = {}
@@ -462,7 +466,7 @@ print(json.dumps(results))'''
         assert not any(child._checkpoint_token in p.read_text(errors='ignore') for p in
                        child.agent_workspace.rglob('*.json'))
         outputs[mode] = dict(probes=probes, revise_result=result,
-                             registration=json.loads((child.agent_workspace / 'registrations.json').read_text()))
+                             registration=json.loads((child.agent_workspace / 'documents/registrations.json').read_text()))
         child._stop_server()
         restored = offline_runner(child.workspace_dir)
         assert restored._checkpoint_token != child._checkpoint_token

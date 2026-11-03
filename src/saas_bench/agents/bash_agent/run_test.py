@@ -701,6 +701,11 @@ __pycache__/
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
+        if refs := getattr(self, 'public_refs', None):
+            env['CEOBENCH_PUBLIC_REFS'] = json.dumps(dict(path=str(refs.path), require_existing=True,
+                **({'snapshot': str(refs._read_path)} if refs.unavailable else {})))
+        else:
+            env.pop('CEOBENCH_PUBLIC_REFS', None)
         from .tools import agent_runtime_dir
         env['CEOBENCH_AGENT_RUNTIME'] = str(agent_runtime_dir())
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
@@ -930,6 +935,11 @@ __pycache__/
         shutil.copy2(self.workspace_dir / 'manifest.json', directory / 'manifest.json')
         copying = _time.monotonic()
         copy_workspace(self.agent_workspace, directory / 'agent_workspace', omit_session_world=self._session_id)
+        private = self.workspace_dir / 'private-agent'
+        if private.exists():
+            copy_workspace(private, directory / 'private-agent', exact=True)
+        if self.tool_executor:
+            self.tool_executor.public_refs.snapshot(directory / 'public-refs.sqlite')
         workspace_copy_s = _time.monotonic()-copying
         # Open descriptors and exact cutoffs bind append-only logs without copying them
         # on the model's critical path. A later append cannot enter this generation.
@@ -939,7 +949,9 @@ __pycache__/
             if source.exists():
                 stream = source.open('rb')
                 request_logs[name] = (stream, os.fstat(stream.fileno()).st_size)
-        checkpoint = dict(version=2, day=day, run_id=self.run_id,
+        checkpoint = dict(version=2, public_history_format=1,
+                          public_refs=dict(path=str(self.tool_executor.public_refs.path), snapshot='public-refs.sqlite'),
+                          day=day, run_id=self.run_id,
                           session_id=self._session_id, snapshot_id=snapshot_id,
                           files={}, request_logs={},
                           request_log_cutoffs={n: size for n, (_, size) in request_logs.items()})
@@ -985,6 +997,9 @@ __pycache__/
                     checkpoint['request_logs'][name] = file_hash(target)
                 copied = _time.monotonic()
                 checkpoint['workspace_sha256'] = tree_hash(directory / 'agent_workspace')
+                checkpoint['private_agent_sha256'] = tree_hash(directory / 'private-agent')
+                if (directory / 'public-refs.sqlite').exists():
+                    checkpoint['files']['public-refs.sqlite'] = file_hash(directory / 'public-refs.sqlite')
                 if self.sql_evidence_config:
                     checkpoint['sql_evidence']['sha256'] = file_hash(directory / 'sql-evidence.sqlite')
                 write_json(directory / 'checkpoint.json', checkpoint)
@@ -1007,7 +1022,9 @@ __pycache__/
         from saas_bench.run_state import checkpoint_directory, checkpoint_manifest, copy_workspace, restore_sql_evidence
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
         checkpoint_manifest(self.workspace_dir, directory)
-        if self.sql_evidence_config and checkpoint.get('sql_evidence'):
+        from saas_bench.legacy_privacy import PUBLIC_HISTORY_FORMAT
+        legacy = checkpoint.get('public_history_format') != PUBLIC_HISTORY_FORMAT
+        if self.sql_evidence_config and checkpoint.get('sql_evidence') and not legacy:
             restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
             controls = directory / 'sql-evidence.controls.jsonl'
             if controls.exists() and not (self.workspace_dir / controls.name).exists():
@@ -1032,7 +1049,32 @@ __pycache__/
             raise
         for name in checkpoint['request_logs']:
             shutil.copy2(directory / 'request_logs' / name, self.logs_dir / name)
-        self._restored_snapshot_dir = directory
+        from saas_bench.legacy_privacy import PUBLIC_HISTORY_FORMAT, quarantine_legacy_standalone
+        self._legacy_history_unavailable = checkpoint.get('public_history_format') != PUBLIC_HISTORY_FORMAT
+        if self._legacy_history_unavailable:
+            self._restored_snapshot_dir = quarantine_legacy_standalone(self.workspace_dir,
+                self.agent_workspace, self._public_dir(), directory, self._session_id)
+            self._git_init_workspace()
+            if self.sql_evidence_config:
+                for key in ('parent_branch', 'fork_seq', 'source_manifest_sha256'):
+                    self.sql_evidence_config.pop(key, None)
+                from saas_bench.run_state import write_json
+                manifest_path = self.workspace_dir / 'manifest.json'
+                manifest = json.loads(manifest_path.read_text())
+                manifest['sql_evidence'] = self.sql_evidence_config
+                manifest['capture_history'] = dict(source_checkpoint_coverage='unavailable', effective_at='new_recovery_attempt')
+                write_json(manifest_path, manifest)
+        else:
+            private = directory / 'private-agent'
+            if private.exists():
+                copy_workspace(private, self.workspace_dir / 'private-agent', exact=True)
+            from saas_bench.public_refs import PublicRefs
+            saved_refs = checkpoint.get('public_refs')
+            authority = saved_refs['path'] if saved_refs else self.workspace_dir / ('missing-public-refs-' + uuid.uuid4().hex + '.sqlite')
+            frozen = directory / (saved_refs['snapshot'] if saved_refs else 'public-refs.sqlite')
+            self._restored_public_refs = PublicRefs(authority, snapshot=frozen if frozen.exists() else None,
+                require_existing=True)
+            self._restored_snapshot_dir = directory
 
     def _load_checkpoint(self) -> Optional[Dict]:
         """Load checkpoint from disk."""
@@ -1073,6 +1115,14 @@ __pycache__/
         write_json(self.workspace_dir / 'usage_summary.json', record)
         self._last_weekly_day = status['day']
 
+    def _check_reference_history(self):
+        from saas_bench.public_refs import PublicReferenceUnavailable
+        from saas_bench.run_lifecycle import RunCancelled
+        try:
+            self.public_refs.require_available()
+        except PublicReferenceUnavailable as exc:
+            raise RunCancelled('public_reference_history_unavailable', str(exc)) from None
+
     def _check_capture_health(self):
         if self.evidence_store:
             self.evidence_store.assert_healthy(settle=5)
@@ -1090,7 +1140,7 @@ __pycache__/
             self.agent.usage_recorder.summary = checkpoint['usage']
             new_capture_context = self.execution_capture and self._source_manifest and (
                 (self._source_manifest.get('sql_evidence') or {}).get('capture_scope') != 'execution')
-            if checkpoint['context_boundary'] == 'same_week' and not new_capture_context:
+            if checkpoint['context_boundary'] == 'same_week' and not new_capture_context and not getattr(self, '_legacy_history_unavailable', False):
                 if not self.agent.load_conversation_snapshot(self.agent._snapshot_path):
                     raise ValueError('Cannot restore the checkpoint conversation')
                 if self.configuration_overrides:
@@ -1144,18 +1194,25 @@ __pycache__/
         if not self._session_id:
             raise RuntimeError("No session ID found. Cannot proceed.")
 
+        from saas_bench.public_refs import PublicRefs
+        public_refs = getattr(self, '_restored_public_refs', None) or PublicRefs(
+            self.workspace_dir.parent / '.public-refs' / (self.run_id + '.sqlite'))
+        self.public_refs = public_refs
+
         # ── Step 2: Launch server subprocess ──
         self._launch_server()
 
         if self.execution_capture:
             from saas_bench.sql_evidence import SQLEvidenceStore
             self.evidence_store = SQLEvidenceStore(self.workspace_dir / 'sql-evidence.sqlite', self.sql_evidence_config)
+            self.evidence_store.public_refs = public_refs
 
         registry = None
         if self.text_registration != 'off':
             from saas_bench.text_registry import TextRegistry
             registry = TextRegistry(self.agent_workspace, self.text_registration, self.evidence_store,
-                                    sim_day=lambda: self.agent.current_day)
+                                    sim_day=lambda: self.agent.current_day, private_root=self.workspace_dir / 'private-agent')
+            registry.public_refs = public_refs
 
         # ── Step 3: Create tool executor + agent ──
         # Pass NOVAMIND_API_PORT so the CLI (./novamind-operation) connects to
@@ -1165,7 +1222,7 @@ __pycache__/
             env={"NOVAMIND_API_PORT": str(self._server_port)},
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
             evidence_store=self.evidence_store,
-            text_registry=registry,
+            text_registry=registry, private_root=self.workspace_dir / 'private-agent', public_refs=public_refs,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions(registry is not None, self.text_registration == 'pf')
@@ -1190,6 +1247,7 @@ __pycache__/
         )
 
         self.agent.lifecycle = getattr(self, 'lifecycle', None)
+        self.agent.usage_recorder.request_check = self._check_reference_history
 
         # Wire the per-session conversation snapshot path. The agent writes
         # this after every LLM call; on resume, _restore_from_checkpoint can
@@ -1282,19 +1340,25 @@ __pycache__/
                                   pending.get('arguments', {}), cancelled,
                                   call_id=pending['id'], outcome='cancelled')
             self.agent.record_tool_result(cancelled)
-        self._save_checkpoint(day)
+        reference_hold = reason == 'public_reference_history_unavailable'
+        if not reference_hold:
+            self._save_checkpoint(day)
         checkpoint = self._load_checkpoint()
-        receipt = dict(day=day, reason=reason, status='paused',
+        hold_fields = dict(hold=True, manual_resume_required=True) if reference_hold else {}
+        receipt = dict(day=day, reason=reason, status='paused', **hold_fields,
                        snapshot_id=checkpoint['snapshot_id'],
                        context_boundary=checkpoint['context_boundary'])
         if detail:
             receipt['detail'] = detail
         write_json(self.workspace_dir / 'pause-receipt.json', receipt)
+        if reference_hold:
+            write_json(self.workspace_dir / 'HOLD', receipt)
         return dict(run_id=self.run_id, seed=self.seed, scenario=self.scenario,
                     final_cash=status['cash'], days_run=day, outcome='paused',
                     total_turns=self.agent.total_turns,
                     total_anthropic_fallbacks=self.agent.total_anthropic_fallbacks,
-                    workspace_dir=str(self.workspace_dir), **{k: receipt[k] for k in ('reason', 'context_boundary', 'snapshot_id')})
+                    workspace_dir=str(self.workspace_dir), **hold_fields,
+                    **{k: receipt[k] for k in ('reason', 'context_boundary', 'snapshot_id')})
 
     def _run(self, verbose=True):
         self.setup()
@@ -1320,6 +1384,8 @@ __pycache__/
                     print(f"{'='*60}\n")
             else:
                 print(f"WARNING: No checkpoint found, starting from Day 1")
+
+        self._check_reference_history()
 
         if start_day == 1 and verbose:
             print(f"\n{'='*60}")

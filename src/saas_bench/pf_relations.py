@@ -9,8 +9,10 @@ import re
 import subprocess
 import uuid
 
+from .public_errors import PublicPFError, PublicPFPermissionError
 from . import evidence_handles, pf_render
 from .pf_deadline import check
+from .public_evidence import PublicEvidence
 from .registration_evidence import git_reference, native_repository
 from .registration_schema import cite_text
 from .relation_registry import encode
@@ -50,22 +52,28 @@ def _label(endpoint):
     return ref.get('cite') or ref.get('operation_ref') or ref.get('event_ref') or 'unknown'
 
 
+def _path_endpoint(endpoint):
+    return None if endpoint is None else dict(ref=deepcopy(endpoint['ref']),
+                                             storage_role=endpoint.get('storage_role'))
+
+
 class RelationQuery:
     def __init__(self, registry):
         self.registry, self.store, self.resolver = registry, registry.store, registry.resolver
         self.role = registry.role
+        self.public = PublicEvidence(self.store, registry)
 
     def answer(self, operation, values):
         if operation not in ('pf_dependencies', 'pf_dependents'):
-            raise ValueError('Unknown relation query operation')
+            raise PublicPFError('Unknown relation query operation')
         if values.get('cursor'):
             saved = (self.store.load_state('pf_cursors') or {}).get(values['cursor'])
             if not saved or saved.get('operation') != operation or not saved.get('relation_snapshot'):
-                raise ValueError('Unknown relation cursor; start a new relation query')
+                raise PublicPFError('Unknown relation cursor; start a new relation query')
             name = saved['relation_snapshot']
             snapshot = self.store.load_state(name)
             if not snapshot or snapshot.get('format') != FORMAT:
-                raise ValueError('Relation snapshot is unavailable; start a new relation query')
+                raise PublicPFError('Relation snapshot is unavailable; start a new relation query')
             offset, detail, selection = saved['offset'], saved['detail'], saved['selection']
             self._authorize(snapshot)
         else:
@@ -74,24 +82,26 @@ class RelationQuery:
             self.store.save_state(name, snapshot)
             offset, detail, selection = 0, values.get('detail', False), [0, len(snapshot['items'])]
         common = {k: deepcopy(snapshot[k]) for k in ('format', 'scope', 'cutoff', 'root', 'counts')}
+        common['cutoff'] = self.public.cutoff(snapshot['cutoff'])
         common.update(total_in_scope=len(snapshot['items']), detail=detail)
         common['root'] = self._compact_endpoint(snapshot['root'])
         start, stop = selection
         if not 0 <= start <= stop <= len(snapshot['items']):
-            raise ValueError('Invalid relation cursor selection')
+            raise PublicPFError('Invalid relation cursor selection')
         if detail:
-            content = json.dumps(dict(scope=snapshot['scope'], cutoff=snapshot['cutoff'],
-                                      root=snapshot['root'], items=snapshot['items'][start:stop]),
+            content = json.dumps(dict(scope=snapshot['scope'], cutoff=self.public.cutoff(snapshot['cutoff']),
+                                      root=self.public.endpoint(snapshot['root']),
+                                      items=[self.public.relation(item) for item in snapshot['items'][start:stop]]),
                                  ensure_ascii=True, indent=2, sort_keys=True)
             if not 0 <= offset <= len(content):
-                raise ValueError('Invalid relation detail cursor offset')
+                raise PublicPFError('Invalid relation detail cursor offset')
             end = min(len(content), offset + DETAIL_CHARS)
             cursor = self._cursor(operation, name, end, True, selection) if end < len(content) else None
             return dict(common, items=[], returned=stop-start, detail_text=content[offset:end],
                         range=[offset, end], total_chars=len(content), next_cursor=cursor,
                         detail_cursor=None, has_more=cursor is not None)
         if not start <= offset <= stop:
-            raise ValueError('Invalid relation cursor offset')
+            raise PublicPFError('Invalid relation cursor offset')
         end = min(stop, offset + snapshot['limit'])
         while end > offset + 1 and len(json.dumps([self._compact(item) for item in snapshot['items'][offset:end]], ensure_ascii=True)) > 16000:
             end -= 1
@@ -120,36 +130,34 @@ class RelationQuery:
         return list(READABLE_ROLES[self.role])
 
     def _registry(self, role, filename):
-        workspace = self.registry.repository(role)
-        path = workspace / filename
+        path = self.registry.authority_path(role, filename)
         try:
-            with open_file(workspace, path) as stream:
-                raw = stream.read()
+            raw = path.read_bytes()
         except FileNotFoundError:
             return {}, None
         state = json.loads(raw)
         expected = RELATION_FORMAT if filename == 'relations.json' else TEXT_FORMAT
         if state.get('format') != expected or not isinstance(state.get('records'), dict):
-            raise ValueError('Invalid public relation or text registry')
+            raise ValueError('Invalid private relation or text registry')
         for history in state['records'].values():
             if not isinstance(history, list) or not history:
-                raise ValueError('Invalid public registry revision history')
+                raise ValueError('Invalid private registry revision history')
             for record in history:
                 check()
                 author = record.get('author_role') if filename == 'relations.json' else record.get('author')
                 if author != role:
-                    raise ValueError('Public registry author differs from its workspace owner')
+                    raise ValueError('Private registry author differs from its workspace owner')
                 if self.registry.identity:
                     identity = self.registry.identity
                     if record.get('role') != role or any(record.get(k) != getattr(identity, k) for k in ('run_id', 'world_id')):
-                        raise ValueError('Public registry identity differs from its workspace owner')
+                        raise ValueError('Private registry identity differs from its workspace owner')
                     if not all(isinstance(record.get(k), str) and record[k] for k in ('agent_id', 'session_id')):
-                        raise ValueError('Public registry identity is incomplete')
+                        raise ValueError('Private registry identity is incomplete')
         return state['records'], hashlib.sha256(raw).hexdigest()
 
     def _snapshot(self, operation, values):
         if not values.get('target'):
-            raise ValueError('target is required')
+            raise PublicPFError('target is required')
         self.registries, registry_cutoff = {}, {}
         self.validations = {}
         for role in self._roles():
@@ -271,6 +279,12 @@ class RelationQuery:
                         producer_role=None, source_role=None, storage_role=None,
                         availability='not_saved_in_relation', reason='No saved relation snapshot for this operation')
         value = target.get('record') or target.get('version') or target.get('path')
+        if value and evidence_handles.EXACT.fullmatch(value) and ':event' in value:
+            event = evidence_handles.resolve_ref(self.store, 'event', value)
+            self.store.readable_event(self.conn, event)
+            if event not in self.events:
+                raise PublicPFError('Captured execution is unavailable')
+            return self._execution_endpoint(event)
         if value and not self.registry.identity:
             value = self._qualify(value)
         if value and evidence_handles.RECORD.fullmatch(value):
@@ -279,7 +293,7 @@ class RelationQuery:
             history = self.registries.get((owner, 'registrations.json'), {}).get(name.split('.')[0], [])
             record = next((r for r in history if r['version'] == name), None) if '.' in name else history[-1] if history else None
             if record is None:
-                raise ValueError('Unknown registered text revision')
+                raise PublicPFError('Unknown registered text revision')
             return self._text_endpoint(owner, record)
         if value and (match := GIT_INPUT.fullmatch(value)):
             owner, path, commit = match.groups()
@@ -317,7 +331,7 @@ class RelationQuery:
                 matches = [v for v, row in self.captures.items() if row['meta']['layer'] == 'file_bytes'
                            and row['meta'].get('object_id') == path and row['meta'].get('owner_role', self.role) == owner]
         if not matches:
-            raise ValueError('No saved exact endpoint matches; use a captured handle, text revision, operation reference or exact Git commit')
+            raise PublicPFError('No saved exact endpoint matches; use a captured handle, text revision, operation reference or exact Git commit')
         return self._capture_endpoint(matches[-1])
 
     def _text_endpoint(self, owner, record):
@@ -513,7 +527,7 @@ class RelationQuery:
             if endpoint is not None and 'missing' not in endpoint['ref'] and endpoint['source_state'] != 'unknown':
                 adjacency[_key(endpoint)].append((index, row))
         root_key = _key(root)
-        queue = deque([(root_key, 0, [_label(root)], [root_key], False)])
+        queue = deque([(root_key, 0, [_path_endpoint(root)], [root_key], False)])
         scheduled, seen_rows, result = {root_key}, set(), []
         while queue:
             check()
@@ -531,11 +545,11 @@ class RelationQuery:
                 stop = ('empty_source_set' if endpoint is None else 'missing' if endpoint.get('source_state') in ('missing', 'unknown') else
                         'execution_membership' if membership else 'cycle' if cycle else 'already_expanded' if already else
                         'depth_limit' if distance + 1 >= depth and adjacency.get(next_key) else None)
-                result.append(dict(deepcopy(row), depth=distance+1, path=path + [_label(endpoint)],
+                result.append(dict(deepcopy(row), depth=distance+1, path=path + [_path_endpoint(endpoint)],
                                    historical_only=past, unexpanded=stop))
                 if next_key and not stop and distance+1 < depth:
                     scheduled.add(next_key)
-                    queue.append((next_key, distance+1, path + [_label(endpoint)], path_keys + [next_key], past))
+                    queue.append((next_key, distance+1, path + [_path_endpoint(endpoint)], path_keys + [next_key], past))
         return result
 
     def _validate_revision(self, item):
@@ -547,7 +561,7 @@ class RelationQuery:
         self.registry.repository(owner)
         parts = PurePosixPath(path).parts
         if not parts or PurePosixPath(path).is_absolute() or '..' in parts or '.git' in parts or parts[0] == 'sessions' or '\x00' in path:
-            raise PermissionError('Only public business files may be queried')
+            raise PublicPFPermissionError('Only public business files may be queried')
 
     def _git_bytes(self, owner, path, commit):
         check()
@@ -557,7 +571,7 @@ class RelationQuery:
         result = self.registry.git_run(['git', '--no-replace-objects', '-C', str(workspace), 'show', commit + ':' + path],
                                        capture_output=True, timeout=10)
         if result.returncode:
-            raise ValueError('Saved Git snapshot is unavailable')
+            raise PublicPFError('Saved Git snapshot is unavailable')
         return result.stdout
 
     def _validate_endpoint(self, endpoint):
@@ -626,7 +640,7 @@ class RelationQuery:
     def _authorize(self, snapshot):
         roles = set(self._roles())
         if snapshot['scope']['reader_role'] != self.role:
-            raise PermissionError('Relation snapshot belongs to another reader')
+            raise PublicPFPermissionError('Relation snapshot belongs to another reader')
         for endpoint in [snapshot['root'], *(endpoint for item in snapshot['items'] for endpoint in (item['source'], item['target']) if endpoint)]:
             for role in (endpoint.get('source_role'), endpoint.get('producer_role'), endpoint.get('storage_role')):
                 if role:
@@ -639,37 +653,36 @@ class RelationQuery:
                 if kind == 'revision':
                     role, path = validation['role'], validation['path']
                     if role not in roles:
-                        raise PermissionError('Relation author is inaccessible')
+                        raise PublicPFPermissionError('Relation author is inaccessible')
                     if (role, path) not in loaded:
                         loaded[role, path] = self._registry(role, path)[0]
                     records = loaded[role, path].get(validation['id'], [])
                     record = next((r for r in records if r['revision'] == validation['revision']), None)
                     if record is None or _hash(record) != validation['sha256']:
-                        raise ValueError('Relation snapshot revision is unavailable or changed; start a new query')
+                        raise PublicPFError('Relation snapshot revision is unavailable or changed; start a new query')
                 elif kind == 'capture':
                     try:
                         _, raw = self.store.public_content(validation['version'], connection=conn)
                     except (KeyError, ValueError) as exc:
-                        raise ValueError('Relation snapshot content is unavailable or changed; start a new query') from exc
+                        raise PublicPFError('Relation snapshot content is unavailable or changed; start a new query') from exc
                     if hashlib.sha256(raw).hexdigest() != validation['sha256']:
-                        raise ValueError('Relation snapshot content is unavailable or changed; start a new query')
+                        raise PublicPFError('Relation snapshot content is unavailable or changed; start a new query')
                 elif kind == 'event':
                     row = conn.execute('SELECT request FROM requests WHERE event_id=?', (validation['event'],)).fetchone()
                     if row is None or _hash(json.loads(row['request'])) != validation['request_sha256']:
-                        raise ValueError('Relation snapshot event is unavailable or changed; start a new query')
+                        raise PublicPFError('Relation snapshot event is unavailable or changed; start a new query')
                     self.store.readable_event(conn, validation['event'])
                 elif kind == 'git':
                     raw = self._git_bytes(validation['role'], validation['path'], validation['commit'])
                     if hashlib.sha256(raw).hexdigest() != validation['sha256']:
-                        raise ValueError('Relation snapshot Git content is unavailable or changed; start a new query')
+                        raise PublicPFError('Relation snapshot Git content is unavailable or changed; start a new query')
 
-    @staticmethod
-    def _compact_endpoint(endpoint):
+    def _compact_endpoint(self, endpoint):
         if endpoint is None:
             return None
-        fields = ('kind', 'ref', 'source_state', 'readable', 'producer_role', 'source_role', 'storage_role',
-                  'sha256', 'availability', 'content_ref', 'event_ref', 'event_kind', 'parent_event_ref')
-        result = {k: deepcopy(endpoint[k]) for k in fields if k in endpoint}
+        result = self.public.endpoint(endpoint)
+        for key in ('request', 'result', 'record', 'operation'):
+            result.pop(key, None)
         if result['ref'].get('cite') and len(result['ref']['cite']) > 400:
             result['ref']['cite'] = pf_render.short(result['ref']['cite'], 400)
             result['ref_truncated'] = True
@@ -685,7 +698,9 @@ class RelationQuery:
         return result
 
     def _compact(self, item):
-        result = {k: deepcopy(v) for k, v in item.items() if k not in ('source', 'target', 'reference', 'history', 'observation', 'path')}
+        result = self.public.relation(item)
+        for key in ('reference', 'observation'):
+            result.pop(key, None)
         result.update(source=self._compact_endpoint(item['source']), target=self._compact_endpoint(item['target']))
         for field in ('reason', 'note'):
             if result.get(field):
@@ -694,15 +709,17 @@ class RelationQuery:
 
 
 def render(page):
-    cutoff = {k: v for k, v in page['cutoff'].items() if k != 'registries'}
-    cutoff['registries'] = {role: {name: dict(sha256=value['sha256'], revision_count=len(value['revisions']))
-        for name, value in files.items()} for role, files in page['cutoff']['registries'].items()}
+    cutoff = page['cutoff']
     lines = ['PF relations: saved records only; no replay or validity judgment.',
              'Scope: ' + json.dumps(page['scope'], ensure_ascii=True, sort_keys=True),
              'Root: ' + pf_render.short(_label(page['root']), 240),
              'Snapshot cutoff: ' + json.dumps(cutoff, sort_keys=True),
              'Counts: ' + json.dumps(page['counts'], sort_keys=True),
              f"returned={page['returned']}; total_in_scope={page['total_in_scope']}; has_more={str(page['has_more']).lower()}."]
+    if page.get('next_cursor'):
+        lines.append('More from the same snapshot: pf more ' + page['next_cursor'])
+    if page.get('detail_cursor'):
+        lines.append('Complete reasons, saved operation results and missing-source fields: pf more ' + page['detail_cursor'])
     if page.get('detail'):
         lines.append(f"Detail characters {page['range'][0]}:{page['range'][1]}/{page['total_chars']}.")
         lines.append(page['detail_text'])
@@ -726,8 +743,4 @@ def render(page):
             lines.append('  Explore this execution: ' + item['navigation'])
     if not page['items'] and not page.get('detail'):
         lines.append('No saved relationships in this scope. --all-revisions includes superseded and retired revisions; --include-candidates adds saved execution observations.')
-    if page.get('detail_cursor'):
-        lines.append('Complete reasons, saved operation results and missing-source fields: pf more ' + page['detail_cursor'])
-    if page.get('next_cursor'):
-        lines.append('More from the same snapshot: pf more ' + page['next_cursor'])
     return '\n'.join(lines)

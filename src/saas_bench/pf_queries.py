@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from .public_errors import PublicPFError, PublicPFPermissionError, public_diagnostics
 from .execution_capture import CapturedText, OBJECT_FIELDS, origin
 from .pf_deadline import budget_scope, check
 from . import evidence_handles, pf_render
@@ -22,18 +23,18 @@ from .sql_evidence import PUBLIC_LAYERS, encoded
 class Target(Input):
     path: Text | None = None
     sql: Text | None = None
-    operation_ref: Annotated[str, Field(pattern=r"^op:[0-9a-f]{32}$")] | None = None
+    operation_ref: Annotated[str, Field(pattern=r"^(ceo|growth|ops_finance):[1-9][0-9]*$")] | None = None
     record: Annotated[str, Field(pattern=r'^(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?$')] | None = None
     version: Annotated[str, Field(pattern=evidence_handles.HANDLE_PATTERN)] | None = None
 
     @model_validator(mode='after')
     def captured_target(self):
         if sum(v is not None for v in (self.path, self.sql, self.record, self.version, self.operation_ref)) != 1:
-            raise ValueError('Specify exactly one captured path, SQL, registered text, or version handle')
+            raise PublicPFError('Specify exactly one captured path, SQL, registered text, or version handle')
         if self.path is not None:
             path = PurePosixPath(self.path)
             if path.is_absolute() or '..' in path.parts or path.as_posix() != self.path or '\x00' in self.path:
-                raise ValueError('Path must be normalized and workspace-relative')
+                raise PublicPFError('Path must be normalized and workspace-relative')
         return self
 
 
@@ -60,20 +61,20 @@ class Candidates(Input):
     @model_validator(mode='after')
     def ordered_days(self):
         if self.day_from is not None and self.day_to is not None and self.day_from > self.day_to:
-            raise ValueError('day_from must not exceed day_to')
+            raise PublicPFError('day_from must not exceed day_to')
         from .sql_access import PUBLIC_COLUMNS
         if self.column and not self.table:
-            raise ValueError('SQL column filters require a public table')
+            raise PublicPFError('SQL column filters require a public table')
         if self.table is not None:
             self.table = self.table.casefold()
             if self.table not in PUBLIC_COLUMNS:
-                raise ValueError('Unknown public SQL table; read docs/tables/')
+                raise PublicPFError('Unknown public SQL table; read docs/tables/')
             if self.column is not None:
                 self.column = self.column.casefold()
                 if self.column not in PUBLIC_COLUMNS[self.table]:
-                    raise ValueError('Unknown public SQL column; read docs/tables/')
+                    raise PublicPFError('Unknown public SQL column; read docs/tables/')
         if (self.table or self.sql_accesses) and self.kind not in (None, 'sql'):
-            raise ValueError('SQL access filters and directory require kind sql')
+            raise PublicPFError('SQL access filters and directory require kind sql')
         return self
 
 
@@ -90,9 +91,9 @@ class Search(Page):
     @model_validator(mode='after')
     def search_mode(self):
         if not self.cursor and (self.object is None) == (self.text is None):
-            raise ValueError('Specify one object or literal text')
+            raise PublicPFError('Specify one object or literal text')
         if self.text is not None and self.all:
-            raise ValueError('Text search already includes historical versions')
+            raise PublicPFError('Text search already includes historical versions')
         return self
 
 
@@ -186,7 +187,7 @@ class PFQueries:
         from .runtime_options import runtime_value
         self.call_timeout = runtime_value('pf_timeout', 600) if call_timeout is None else call_timeout
         if registry.mode != 'pf':
-            raise ValueError('PF queries require PF mode')
+            raise PublicPFError('PF queries require PF mode')
         self.store, self.resolver = registry.store, registry.resolver
         self.registry = registry
         self.workspace = registry.workspace
@@ -266,7 +267,7 @@ class PFQueries:
             version = printed[0][0]
             output = self.resolver.handle(version) + again(handles.repeated(version))
         else:
-            name, day = handles.pending('cmd', record.get('call'), evidence_handles.body_digest(body))
+            name, day = handles.pending('cmd', record.get('call'), evidence_handles.body_digest(body), capture.event + ':tool_return')
             output = name + again(day)
             if printed:
                 output += ', with ' + ' and '.join(('' if full else 'part of ') + self.resolver.handle(v)
@@ -296,7 +297,7 @@ class PFQueries:
         for path, item in (after or {}).items():
             version = item.get('version')
             group = handles.info.get(version, (None, None))[1] if version else None
-            if not group or not group.get('note') or version in written or noise(path):
+            if not group or not handles.note(version) or version in written or noise(path):
                 continue
             text = self._text(version)
             if text and text.strip() and text.strip() in body:
@@ -309,7 +310,7 @@ class PFQueries:
             if operation == 'pf_more':
                 saved = (self.store.load_state('pf_cursors') or {}).get(More.model_validate(args).cursor)
                 if not saved:
-                    raise ValueError('Unknown cursor; run the pf command again')
+                    raise PublicPFError('Unknown cursor; run the pf command again')
                 operation = saved['operation']
             page = self.last_answer = self.answer(operation, args)  # structured form kept for audits
             if isinstance(page, str):
@@ -351,18 +352,18 @@ class PFQueries:
         try:
             values = MODELS[operation].model_validate(args).model_dump(exclude_none=True)
         except ValidationError as exc:
-            raise ValueError('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg']
+            raise PublicPFError('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg']
                                       for e in exc.errors(include_input=False))) from exc
         if operation == 'pf_candidates':
             if 'cursor' in values and set(args) != {'cursor'}:
-                raise ValueError('Continue with cursor only, or start a new candidates query')
+                raise PublicPFError('Continue with cursor only, or start a new candidates query')
             from .pf_candidates import CandidateQuery
             return CandidateQuery(self.registry).answer(values)
         if operation in ('pf_dependencies', 'pf_dependents'):
             saved = (self.store.load_state('pf_cursors') or {}).get(values.get('cursor'))
             if 'cursor' not in values or saved and saved.get('relation_snapshot'):
                 if 'cursor' in values and set(args) != {'cursor'}:
-                    raise ValueError('Continue with cursor only, or start a new relationship query')
+                    raise PublicPFError('Continue with cursor only, or start a new relationship query')
                 from .pf_relations import RelationQuery
                 return RelationQuery(self.registry).answer(operation, values)
         offset, cutoff = 0, None
@@ -370,10 +371,10 @@ class PFQueries:
         self.cursors = self.store.load_state(self.cursor_name) or {}
         if 'cursor' in values:
             if set(args) != {'cursor'}:
-                raise ValueError('Continue with cursor only, or omit cursor to start a new query')
+                raise PublicPFError('Continue with cursor only, or omit cursor to start a new query')
             saved = self.cursors.get(values['cursor'])
             if not saved or saved['operation'] != operation:
-                raise ValueError('Unknown query cursor; start a new query')
+                raise PublicPFError('Unknown query cursor; start a new query')
             values, offset, cutoff = saved['values'], saved['offset'], saved['cutoff']
         self._index(cutoff)
         self.operation, self.values = operation, values
@@ -381,7 +382,7 @@ class PFQueries:
             if 'text' in values:
                 return self._search_text(values['text'], offset)
             if 'object' not in values:
-                raise ValueError('object is required')
+                raise PublicPFError('object is required')
             wanted = values['object']
             same = lambda o: str(o['id']) == wanted['id'] and wanted.get('kind', o['kind']) == o['kind']
             matches = [v for v in self.nodes if not self._rerun(v) and any(same(o) for o in self._objects(v))]
@@ -395,7 +396,7 @@ class PFQueries:
                 self.store.save_state(self.cursor_name, self.cursors)
             return page
         if 'target' not in values:
-            raise ValueError('target is required')
+            raise PublicPFError('target is required')
         target = self._target(values['target'])
         if operation == 'pf_log':
             return self._log(target, offset)
@@ -411,16 +412,16 @@ class PFQueries:
         if operation == 'pf_read':
             mode = values['mode']
             if (mode == 'diff') != ('baseline' in values):
-                raise ValueError('baseline is required only for diff')
+                raise PublicPFError('baseline is required only for diff')
             if values['full'] and mode != 'content':
-                raise ValueError('full is supported only for content reads')
+                raise PublicPFError('full is supported only for content reads')
             if values['detail'] and mode != 'history':
-                raise ValueError('detail is supported only for history')
+                raise PublicPFError('detail is supported only for history')
             if mode == 'captures':
                 row = self.nodes[target]
                 event = self.events[row['event_id']]
                 if row['meta']['layer'] not in ('tool_return', 'stdout', 'stderr') or event['request']['kind'] not in ('bash', 'cli_python'):
-                    raise ValueError('captures requires a saved command or script output')
+                    raise PublicPFError('captures requires a saved command or script output')
                 self.values = dict(values, capture_event=row['event_id'], scope='latest captured execution for this handle')
                 return self._captures(row['event_id'], offset)
             if mode == 'history':
@@ -501,12 +502,20 @@ class PFQueries:
             if row['event_id'] not in self.events:
                 continue
             meta = json.loads(row['metadata'])
+            file_path = meta.get('object_id') or ''
             try:
                 with closing(self.store.connect()) as conn:
                     self.store.authorize_version(conn, row['event_id'], meta, public=meta['layer'] in PUBLIC_LAYERS, graph=True)
+                    if meta['layer'] == 'file_text' and meta.get('derived_from'):
+                        source = conn.execute('SELECT metadata FROM versions WHERE version_id=?',
+                                              (meta['derived_from'],)).fetchone()
+                        if source is not None:
+                            file_path = json.loads(source['metadata']).get('object_id') or ''
             except PermissionError:
                 continue
             event = self.events[row['event_id']]
+            if meta['layer'] in ('file_bytes', 'file_text') and noise(file_path):
+                continue
             retrieval = (meta['layer'] in ('stdout', 'stderr', 'tool_return')
                          and event['result'].get('pf_retrieval', bool(event['result'].get('pf_calls'))))
             if meta['layer'] in PUBLIC_LAYERS and not event['request']['kind'].startswith('pf_') and not retrieval:
@@ -639,10 +648,15 @@ class PFQueries:
                 for o in self.nodes[version]['meta'].get('objects', [])]
 
     def _target(self, target):
+        target = dict(target)
+        for field in ('path', 'version'):
+            if field in target and evidence_handles.EXACT.fullmatch(target[field]):
+                target = {'version': target[field]}
+                break
         if 'version' in target and evidence_handles.RAW_VERSION.fullmatch(target['version']):
             self.store.public_content(target['version'])
             if target['version'] not in self.nodes:
-                raise ValueError('Captured version is unavailable in this cursor')
+                raise PublicPFError('Captured version is unavailable in this cursor')
             return target['version']
         owner = self.store.identity.get('role')
         target = dict(target)
@@ -663,7 +677,7 @@ class PFQueries:
         if 'version' in target:
             members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
             if not members:
-                raise ValueError('Unknown version handle; pf log <file or output> lists its versions')
+                raise PublicPFError('Unknown version handle; pf log <file or output> lists its versions')
             return members[-1]
         matches = []
         for version, row in self.nodes.items():
@@ -680,8 +694,8 @@ class PFQueries:
             if owner and self.store.identity.get('role'):
                 from .role_policy import READABLE_ROLES
                 if owner not in READABLE_ROLES[self.store.identity['role']]:
-                    raise PermissionError('Evidence is inaccessible')
-            raise ValueError('No captured version matches; use another path, SQL or registered text')
+                    raise PublicPFPermissionError('Evidence is inaccessible')
+            raise PublicPFError('No captured version matches; use another path, SQL or registered text')
         return matches[-1]
 
     def _describe(self, version):
@@ -703,7 +717,7 @@ class PFQueries:
         if meta['extent'] != 'full':
             result['extent'] = meta['extent']
         if event['result'].get('capture_gaps'):
-            result['capture_gaps'] = event['result']['capture_gaps']
+            result['capture_gaps'] = public_diagnostics(event['result'])['capture_gaps']
         if about := _about(meta['content_time']):
             result['about'] = about
         if (request.get('parsed') or {}).get('tool') == 'get_group_insights':
@@ -727,6 +741,8 @@ class PFQueries:
                           reason=record['reason'], applies_at=record['applies_at'],
                           current_revision=self.latest[self._key(version)] == version)
         handles = evidence_handles.index(self.store)
+        if note := handles.note(version):
+            result.update(note=note, note_context=handles.note_context(version))
         if previous := handles.previous(version):
             result['previous_version'] = previous
         if (day := handles.repeated(version)) is not None:
@@ -746,7 +762,7 @@ class PFQueries:
     def _brief(self, version):
         full = self._describe(version)
         return {k: full[k] for k in ('version', 'day', 'what', 'owner', 'truncated', 'extent',
-                                    'snapshot_day', 'refresh_hint') if k in full} | (
+                                    'snapshot_day', 'refresh_hint', 'note', 'note_context') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
     def _node(self, version):
@@ -830,9 +846,14 @@ class PFQueries:
         handles = evidence_handles.index(self.store)
         before = dict(zip(map(id, groups[1:]), groups))
         def describe(group):
-            member = next(m for m in group['members'] if m in self.nodes)
+            members = [m for m in group['members'] if m in self.nodes]
+            member = members[-1]
+            note_source = handles.note_sources.get(member)
+            if handles.note(member) and note_source in self.nodes:
+                member = note_source
             item = self._brief(member) | dict(version=handles.name(member), day=group['day'],
-                                              acquisitions=len(group['members']))
+                                              acquisitions=len(members),
+                                              content_ref=evidence_handles.public_ref(self.store, 'capture', member))
             text, layer = self._text(member), self.nodes[member]['meta']['layer']
             earlier = before.get(id(group))
             if text is not None and layer == 'server_public_response':
@@ -844,7 +865,7 @@ class PFQueries:
                 previous = earlier and self._text(next(m for m in earlier['members'] if m in self.nodes))
                 item['size'] = (pf_render.text_change(previous, text) if previous is not None
                                 else pf_render.plural(len(text.splitlines()), 'line'))
-            if note := group.get('note'):
+            if note := handles.note(member):
                 item['note'] = note
             if same := handles.same_as(member):
                 item['same_content_as'] = same
@@ -859,20 +880,20 @@ class PFQueries:
             if '.' in requested.get('record', requested.get('version', '')):
                 return version, revisions[-1]
             if len(revisions) < 2:
-                raise ValueError(f"{self.records[version]['version']} has no other revision to compare")
+                raise PublicPFError(f"{self.records[version]['version']} has no other revision to compare")
             return revisions[-2], revisions[-1]
         groups = self._groups(version)
         newest = lambda g: [m for m in g['members'] if m in self.nodes][-1]
         if 'version' in requested or evidence_handles.VERSIONED.fullmatch(requested.get('path', '')):
             return version, newest(groups[-1])
         if len(groups) < 2:
-            raise ValueError(f"{evidence_handles.index(self.store).name(version)} is the only version; nothing to compare")
+            raise PublicPFError(f"{evidence_handles.index(self.store).name(version)} is the only version; nothing to compare")
         return newest(groups[-2]), newest(groups[-1])
 
     def _blame(self, target):
         """Each line of a text version with the version and day that introduced it."""
         if target in self.records:
-            raise ValueError('pf blame works on files and outputs; pf log rN lists the revisions of a text')
+            raise PublicPFError('pf blame works on files and outputs; pf log rN lists the revisions of a text')
         handles = evidence_handles.index(self.store)
         group = handles.group(target)
         groups = [g for g in self._groups(target) if g['k'] <= group['k']]
@@ -881,7 +902,7 @@ class PFQueries:
             check()
             text = self._text(next(m for m in g['members'] if m in self.nodes))
             if text is None:
-                raise ValueError('blame needs a text version')
+                raise PublicPFError('blame needs a text version')
             new = text.splitlines()
             fresh = []
             for tag, a, b, c, d in difflib.SequenceMatcher(None, lines, new, autojunk=False).get_opcodes():
@@ -905,9 +926,9 @@ class PFQueries:
         return text
 
     def _search_text(self, term, offset):
-        """Literal, case-insensitive search of public history at the cursor cutoff."""
+        """Search business content and notes on the exact output or changed-file acquisition."""
         pattern = re.compile(re.escape(term), re.IGNORECASE)
-        matches, seen = [], set()
+        matches, seen, noted = [], set(), set()
         handles = evidence_handles.index(self.store)
         with closing(self.store.connect()) as conn:
             for version, row in reversed(self.nodes.items()):
@@ -915,24 +936,35 @@ class PFQueries:
                 if self._rerun(version):
                     continue
                 key = (handles.key(version), row['content_hash'])
-                if key in seen:
-                    continue
-                seen.add(key)
                 try:
-                    body = self.resolver.content(version, connection=conn)[1].decode('utf-8')
+                    body = self.resolver.content(version, connection=conn, public=True)[1].decode('utf-8')
                 except UnicodeDecodeError:
                     continue
-                match = pattern.search(body)
-                if match:
-                    start, end = max(0, match.start() - 80), min(len(body), match.start() + 200)
-                    matches.append(dict(source_version=version,
-                        day=self.event_day[row['event_id']], snippet=body[start:end], source_range=[start, end]))
-        # Bound rendered excerpts too, so a large --limit never skips hits when
-        # the enclosing Bash return reaches its character limit.
+                note = handles.note(version)
+                note_key = (row['event_id'], 'file', row['meta'].get('object_id')) if row['meta']['layer'] == 'file_bytes' else (
+                    row['event_id'], 'output', row['meta'].get('body_sha256') or row['content_hash'])
+                note_match = (note and (body or row['meta']['layer'] == 'file_bytes')
+                              and handles.note_sources.get(version) == version
+                              and note_key not in noted and pattern.search(note[1]))
+                if note_match:
+                    noted.add(note_key)
+                body_match = pattern.search(body) if key not in seen else None
+                seen.add(key)
+                if not note_match and not body_match:
+                    continue
+                item = dict(source_version=version, day=self.event_day[row['event_id']],
+                            content_ref=evidence_handles.public_ref(self.store, 'capture', version),
+                            event_ref=evidence_handles.public_ref(self.store, 'event', row['event_id']))
+                if body_match:
+                    start, end = max(0, body_match.start() - 80), min(len(body), body_match.start() + 200)
+                    item.update(snippet=body[start:end], source_range=[start, end], match_basis='content')
+                else:
+                    item.update(snippet=note[1], note=note, match_basis='note')
+                matches.append(item)
         end, size = offset, 0
         for item in matches[offset:offset + self.values['limit']]:
             name = self.resolver.handle(item['source_version'])
-            width = len(name) + len(item['snippet']) + 80
+            width = len(name) + len(item['snippet']) + 180
             if end > offset and size + width > 22000:
                 break
             item['version'] = name
@@ -942,15 +974,18 @@ class PFQueries:
                     remaining=len(matches) - end, total=len(matches), detail=self.values['detail'])
 
     def _render_text_search(self, page):
-        text = f"pf search --text {self.values['text']!r}: {page['total']} matching objects/content versions, newest first."
-        sources = []
-        for item in page['items']:
-            text += f"\n{item['version']} · day {item['day'] if item['day'] is not None else 'unknown'} · excerpt:\n"
-            sources.append(dict(version_id=item['source_version'], source_range=item['source_range'],
-                                request_range=[len(text), len(text) + len(item['snippet'])], full_source=False))
-            text += item['snippet']
+        text = (f"pf search --text {self.values['text']!r}: {page['total']} matching objects/content versions, newest first."
+                f" Returned {len(page['items'])} of {page['total']}.")
         if page['next_cursor']:
             text += f"\n{page['remaining']} more: pf more {page['next_cursor']}."
+        sources = []
+        for item in page['items']:
+            text += (f"\n{item['version']} · {item['content_ref']} · day {item['day'] if item['day'] is not None else 'unknown'}"
+                     f" · {'call note' if item['match_basis'] == 'note' else 'excerpt'}:\n")
+            if 'source_range' in item:
+                sources.append(dict(version_id=item['source_version'], source_range=item['source_range'],
+                                    request_range=[len(text), len(text) + len(item['snippet'])], full_source=False))
+            text += item['snippet']
         return CapturedText(text, sources)
 
     def _sections(self, matches, wanted):
@@ -988,7 +1023,7 @@ class PFQueries:
         roots = [v for v, row in self.nodes.items() if row['event_id'] == event_id
                  and row['meta']['layer'] in ('tool_return', 'stdout', 'stderr')]
         if not roots:
-            raise ValueError('Captured execution is unavailable in this cursor')
+            raise PublicPFError('Captured execution is unavailable in this cursor')
         root = next((v for v in roots if self.nodes[v]['meta']['layer'] == 'tool_return'), roots[0])
         children = {event_id}
         for child, event in self.events.items():
@@ -1016,7 +1051,8 @@ class PFQueries:
                     what=pf_render.label('server_public_response', event['request']['kind'], request,
                         event['query'][5] if event['query'] else None,
                         classification=event['result'].get('classification'))))
-        gaps = sorted({gap for child in children for gap in self.events[child]['result'].get('capture_gaps', [])})
+        gaps = sorted({gap for child in children for gap in
+            public_diagnostics(self.events[child]['result']).get('capture_gaps', [])})
         return self._page(versions + missing, offset,
             lambda item: self._describe(item) if isinstance(item, str) else item,
             root=self._describe(root), scope=self.values['scope'], capture_gaps=gaps,
@@ -1044,19 +1080,19 @@ class PFQueries:
         try:
             content = raw.decode('utf-8')
         except UnicodeDecodeError as exc:
-            raise ValueError('This captured version is not UTF-8 text') from exc
+            raise PublicPFError('This captured version is not UTF-8 text') from exc
         header = {}
         if self.values['mode'] == 'diff':
             baseline = baseline or self._target(self.values['baseline'])
             key = self._key(target)
             if key != self._key(baseline) or not (key[0] in ('query', 'public_read', 'file_bytes', 'registered_text', 'registered_script',
                                                               'dashboard') or key[0].startswith(('script_', 'command_'))):
-                raise ValueError('Diff requires two versions of the same captured object')
+                raise PublicPFError('Diff requires two versions of the same captured object')
             old_meta, old = self.resolver.content(baseline, public=True)
             try:
                 before = old.decode('utf-8')
             except UnicodeDecodeError as exc:
-                raise ValueError('Diff requires UTF-8 text') from exc
+                raise PublicPFError('Diff requires UTF-8 text') from exc
             header.update(direction='baseline_to_target', raw_equal=old == raw)
             if key[0] == 'query':
                 events = [self.events[self.nodes[v]['event_id']] for v in (baseline, target)]
@@ -1080,6 +1116,7 @@ class PFQueries:
                       next_cursor=self._cursor(end) if end < len(content) else None)
         if end < len(content):
             header['truncated_reason'] = 'character_limit'
+        header['next_command'] = 'pf more ' + header['next_cursor'] if header['next_cursor'] else None
         prefix = encoded(header).decode() + '\n'
         # The continuation command follows the body; the header keeps the delivery fields.
         more = f"\n[{len(content) - end:,} more characters: pf more {header['next_cursor']}]" if header['next_cursor'] else ''

@@ -121,7 +121,7 @@ def checkpoint_directory(run, checkpoint):
     required = {'world.nmdb', 'session.json', 'server_state.json', 'manifest.json'}
     if not required.issubset(checkpoint['files']):
         raise ValueError('Incomplete checkpoint file list')
-    allowed = required | {'sql-evidence.controls.jsonl'}
+    allowed = required | {'sql-evidence.controls.jsonl', 'public-refs.sqlite'}
     for name, checksum in checkpoint['files'].items():
         if name not in allowed or file_hash(directory / name) != checksum:
             raise ValueError('Checkpoint checksum mismatch: ' + name)
@@ -130,6 +130,8 @@ def checkpoint_directory(run, checkpoint):
             raise ValueError('Checkpoint request log checksum mismatch: ' + name)
     if tree_hash(directory / 'agent_workspace') != checkpoint['workspace_sha256']:
         raise ValueError('Checkpoint workspace checksum mismatch')
+    if checkpoint.get('public_history_format') == 1 and tree_hash(directory / 'private-agent') != checkpoint.get('private_agent_sha256'):
+        raise ValueError('Checkpoint private registration checksum mismatch')
     evidence = checkpoint.get('sql_evidence')
     manifest = json.loads((directory / 'manifest.json').read_text())
     dropped = checkpoint.get('dropped_sql_evidence')
@@ -227,6 +229,11 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None):
         manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
                                         fork_seq=checkpoint['sql_evidence']['cutoff'],
                                         source_manifest_sha256=source_manifest)
+    if checkpoint.get('public_history_format') == 1 and checkpoint.get('public_refs'):
+        from .public_refs import PublicRefs
+        authority = destination.parent / '.public-refs' / (destination.name + '-' + branch_id + '.sqlite')
+        refs = PublicRefs(authority, snapshot=target / 'public-refs.sqlite')
+        checkpoint = dict(checkpoint, public_refs=dict(path=str(refs.path), snapshot='public-refs.sqlite'))
     shutil.copy2(source / 'config.json', destination / 'config.json')
     write_json(destination / 'manifest.json', manifest)
     write_json(destination / 'checkpoint.json', checkpoint)

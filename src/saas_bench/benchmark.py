@@ -237,7 +237,8 @@ class Benchmark:
 
     def _run_daily_jobs(self) -> List[str]:
         """Run registered daily jobs from snapshotted content."""
-        jobs_file = self.workspace_dir / 'agent' / '.daily_jobs.json'
+        from .private_storage import private_root
+        jobs_file = private_root(self.tools.workspace_path) / 'daily-jobs.json'
         if not jobs_file.exists():
             return []
 

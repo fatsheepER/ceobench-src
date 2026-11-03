@@ -229,7 +229,7 @@ def test_owned_registration_memory_and_registered_scripts(team, role):
     args = dict(text=role + '-claim', objects=[dict(kind='plan', id='A')],
         references=[dict(cite='unknown: offline')], applies='0-', reason='offline')
     assert r.executor.execute('text_create', args).startswith(f'Registered {role}:r1.1')
-    saved = json.loads((r.workspace / 'registrations.json').read_text())['records']['r1'][0]
+    saved = json.loads(r.registry.path.read_text())['records']['r1'][0]
     assert saved['author'] == saved['role'] == role
     for key, value in r.identity.fields().items():
         assert saved[key] == value
@@ -253,7 +253,7 @@ def test_owned_registration_memory_and_registered_scripts(team, role):
         if scripts:
             assert 'OWNER-' + owner in scripts['same.py']
     saved['author'] = 'forged'
-    path = r.workspace / 'registrations.json'
+    path = r.registry.path
     original = path.read_text()
     tampered = json.loads(original)
     tampered['records']['r1'][0] = saved
@@ -287,7 +287,7 @@ def test_model_receipts_and_private_evidence_identity(team, role):
     assert all(e['role'] == role and e['world_state_id'] for e in audit)
     if team.mode == 'git':
         assert r.store is r.registry.store is r.executor.evidence_store is None
-        assert not list((team.root / 'private').rglob('*.sqlite'))
+        assert not list((team.root / 'private').rglob('*evidence.sqlite'))
         assert 'tool_return' not in r.audit.path.read_text()
     else:
         with r.store.connect() as conn:

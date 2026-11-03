@@ -291,6 +291,7 @@ def _freeze(runtime, directory):
     save_session_db(server.conn, directory / 'world.nmdb')
     copy_workspace(runtime.root / 'roles', directory / 'roles', exact=True)
     copy_workspace(runtime.root / 'private', directory / 'private')
+    runtime.public_refs.snapshot(directory / 'private' / 'public-refs.sqlite')
     evidence = None
     if runtime.roles['ceo'].store:
         evidence = runtime.roles['ceo'].store.snapshot(directory / 'private' / 'evidence.sqlite')
@@ -316,8 +317,10 @@ def _freeze(runtime, directory):
     if result is not None and not is_dataclass(result):
         raise ValueError('Checkpoint requires the simulator DayResult data shape')
     role_weeks = {name: role.week.snapshot() if role.week else None for name, role in runtime.roles.items()}
-    state = dict(version=1, saved_at=datetime.now(timezone.utc).isoformat(),
+    from .legacy_privacy import PUBLIC_HISTORY_FORMAT
+    state = dict(version=1, public_history_format=PUBLIC_HISTORY_FORMAT, saved_at=datetime.now(timezone.utc).isoformat(),
         source_root=str(runtime.root), configuration=runtime.configuration,
+        public_refs=dict(path=str(runtime.public_refs.path), snapshot='private/public-refs.sqlite'),
         runtime_environment=dict(server.runtime_environment),
         benchmark_config=asdict(server.tools.config), day=server.tools.current_day,
         seed=server.tools.seed, tools_rng=server.tools.rng.bit_generator.state,
@@ -501,6 +504,9 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     except BaseException:
         logging.exception('Checkpoint workspace copy failed')
         raise
+    from .legacy_privacy import PUBLIC_HISTORY_FORMAT, quarantine_legacy_runtime
+    if state.get('public_history_format') != PUBLIC_HISTORY_FORMAT:
+        quarantine_legacy_runtime(root, public, state)
     client_updates = refresh_registered_script_client(root, public)
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
@@ -516,6 +522,9 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
         shutil.copy2(snapshot / 'world.nmdb', world)
     try:
         conn = load_session_db(world)
+        if state.get('_legacy_history_unavailable'):
+            from .legacy_privacy import clear_legacy_scripts
+            clear_legacy_scripts(conn)
     except Exception as exc:
         raise CheckpointDataError(f'Cannot restore selected world {snapshot / "world.nmdb"}: {exc}') from exc
     try:
@@ -621,17 +630,20 @@ def restore_runtime_state(runtime, state):
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
         role.usage.expected_model = role.agent.model if 'model' in state.get('_configuration_changes', {}) else saved['expected_model']
-        regenerate_prompt = bool(state.get('_configuration_changes'))
+        regenerate_prompt = bool(state.get('_configuration_changes') or state.get('_legacy_history_unavailable'))
         if not regenerate_prompt:
             role.agent.system_prompt = with_registered_script_contract(
                 saved['system_prompt'].replace(original, str(runtime.root)))
-        try:
-            role.agent.load_conversation_snapshot(role.agent._snapshot_path, required=True)
-            week = captured['role_weeks'][name]
-            if week is not None and week['initialized'] and not role.agent.conversation:
-                raise ValueError('Initialized role has an empty conversation')
-        except Exception as exc:
-            raise CheckpointDataError(f'Cannot restore {name} conversation: {exc}') from exc
+        if state.get('_legacy_history_unavailable'):
+            role.agent.reset()
+        else:
+            try:
+                role.agent.load_conversation_snapshot(role.agent._snapshot_path, required=True)
+                week = captured['role_weeks'][name]
+                if week is not None and week['initialized'] and not role.agent.conversation:
+                    raise ValueError('Initialized role has an empty conversation')
+            except Exception as exc:
+                raise CheckpointDataError(f'Cannot restore {name} conversation: {exc}') from exc
         for message in role.agent.conversation:
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)

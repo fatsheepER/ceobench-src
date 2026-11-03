@@ -238,16 +238,18 @@ def render_list(page, title, wanted=None):
     start = page['total'] - page['remaining'] - len(items) + 1
     lines = [f"{title}: {page['total']} saved, newest first" +
              (f"; showing {start}–{start + len(items) - 1}." if items else '.')]
+    if more := _more(page, 'older'):
+        lines.append(more)
     for item in items:
         lines.append(item_line(item))
         if detail:
             lines.append(item_detail(item, wanted))
-    tail = ' '.join(filter(None, [_more(page, 'older'), f"Read one: pf show {items[0]['version']}." if items else '']))
+    tail = f"Read one: pf show {items[0]['version']}." if items else ''
     return '\n'.join(lines + ([tail] if tail else []))
 
 
 def log_line(item):
-    """MEMORY.md@v9 · day 49 · +44 −48 lines · note (day 49): "..."."""
+    """Content version age and the exact acquisition carrying its displayed note."""
     day = item['day'] if item.get('day') is not None else 'unknown'
     if item.get('record'):
         return (f"{item['record']} · day {day} · {item['text_status']}: \"{short(item.get('text', ''), 90)}\""
@@ -263,8 +265,11 @@ def log_line(item):
     flags += [f"same content as {item['same_content_as']}"] if item.get('same_content_as') else []
     if flags:
         parts.append(', '.join(flags))
+    if item.get('content_ref'):
+        parts.append('capture ' + item['content_ref'])
     if item.get('note'):
-        parts.append(f"note: \"{short(item['note'][1], 150)}\"")
+        note_day = item['note'][0] if item['note'][0] is not None else 'unknown'
+        parts.append(f"note (day {note_day}): \"{short(item['note'][1], 150)}\"")
     return ' · '.join(parts)
 
 
@@ -277,6 +282,8 @@ def render_captures(page):
              f"Command status: {root['status']}; scripts: {counts(page['script_statuses'])}.",
              f"Business calls: {counts(page['call_statuses'])}.",
              'Capture gaps: ' + (', '.join(page['capture_gaps']) or 'none reported') + '.']
+    if more := _more(page, 'captured items'):
+        lines.append(more)
     states = page['call_statuses']
     if 'partially_succeeded' in states or ('succeeded' in states and any(
             state in states for state in ('failed', 'rejected', 'timed_out', 'cancelled'))):
@@ -289,8 +296,6 @@ def render_captures(page):
             lines.append(item_line(item))
     if not page['items']:
         lines.append('No captured items in this scope.')
-    if more := _more(page, 'captured items'):
-        lines.append(more)
     lines.append('Read a saved item: pf show HANDLE --full')
     return '\n'.join(lines)
 
@@ -302,8 +307,10 @@ def render_log(page):
     what = f"text {root['record'].split('.')[0]}" if root.get('record') else root['what']
     noun = 'revision' if page.get('kind') == 'record' else 'version'
     lines = [f"{what}: {plural(page['total'], noun)}, newest first"]
+    if more := _more(page, 'older'):
+        lines.append(more)
     lines += [log_line(item) for item in items]
-    tail = [_more(page, 'older')]
+    tail = []
     if not root.get('record') and items:
         newest = items[0]['version']
         tail.append(f'pf show {shlex.quote(newest)}')

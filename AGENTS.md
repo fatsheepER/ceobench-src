@@ -38,6 +38,9 @@
 - PF 跨调用/跨周候选、同内容多事件、稳定分页、详情、权限复核、模型投递范围与选点恢复从 `tests/test_pf_candidates.py`、`tests/test_pf_candidates_team.py` 定位。
 - SQL 授权表列观察、视图展开与同名 CTE、公开目录、失败/拒绝/截断/未知、稳定分页与权限复核、真实模型投递及 checkpoint 恢复从 `tests/test_sql_access.py`、`tests/test_sql_access_team.py` 定位；访问观察不是行级血缘或模型采用。
 - 只读双向关系、旧文本与 Git 精确版本、操作目标、声明/推断/执行成员候选、稳定分页/实时权限/完整详情和模型投递/恢复从 `tests/test_pf_relations.py`、`tests/test_pf_relations_team.py` 定位。
+- 操作短编号的公共回执、SQL 与关系查询、跨角色一致性和回退不复用从 `tests/test_operation_refs.py` 定位；独立运行的编号共用、重复恢复和权威缺失从 `tests/test_private_record_recovery.py` 定位；编号权威缺失或冲突时的 controller 与独立包装层 HOLD、选点保留和零新增模型请求从 `tests/test_reference_hold.py` 定位。
+- 登记原件与工具笔记私有、公开完整修订、旧 checkpoint 历史隔离从 `tests/test_private_records.py` 定位；PF 精确短引用、同内容采集、note 检索、分页与权限复核从 `tests/test_pf_public_projection.py` 定位；精确采集 note、普通读取及 Git 独立输出快照从 `tests/test_note_visibility.py` 定位；Git 短哈希唯一性和嵌套证据投影从 `tests/test_public_reference_details.py` 定位。
+- 脚本与角色请求的公开回执从 `tests/test_public_framework_receipts.py` 定位；PF 错误的私有诊断、公开状态及实际模型输入从 `tests/test_pf_public_errors.py` 定位；外层 Bash 捕获边界的初始提示、help 与两次调用从 `tests/test_pf_capture_guidance.py` 定位。
 - 高频回执的摘要、完整捕获清单、设置差异与实际模型输入从 `tests/test_receipt_outputs.py` 定位；SQL 极小结果上限下的错误发送及公共客户端继续从 `tests/test_public_sql.py`、`tests/test_sql_capture_residuals.py` 定位。
 - 职责写权完整入口矩阵、专家操作回执与互读路径从 `tests/test_responsibility_authority.py` 定位；跨角色历史与私有层隔离从 `tests/test_preflight_multi_agent.py`、`tests/test_preflight_team_evidence.py` 定位。
 - 企业协商的客户标识、拒绝与七天超时，以及公共 SDK 的定向 ops 四范围和 dev 组映射替换契约，从 `tests/test_enterprise_sdk_contracts.py` 定位。

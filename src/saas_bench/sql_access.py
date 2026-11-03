@@ -2,6 +2,7 @@
 import sqlite3
 
 from .database import TABLE_DOCS
+from .public_errors import PublicPFPermissionError
 
 
 FORMAT = 'pf.sql_access.v1'
@@ -55,7 +56,7 @@ def projection(record):
 
 def authorize_projection(record):
     if record and projection(record) != record:
-        raise PermissionError('Saved SQL access observations are no longer public; start a new query')
+        raise PublicPFPermissionError('Saved SQL access observations are no longer public; start a new query')
 
 
 def matches(record, table=None, column=None):

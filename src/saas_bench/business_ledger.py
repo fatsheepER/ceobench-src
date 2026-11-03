@@ -6,7 +6,7 @@ import uuid
 
 
 OPERATION_COLUMNS = {
-    'operation_ref': 'TEXT PRIMARY KEY. Stable random reference across restored routes.',
+    'operation_ref': 'TEXT PRIMARY KEY. Stable role:number reference, e.g. growth:1. Numbers are never reused after rollback.',
     'operation_seq': 'INTEGER. Operation admission order on the retained route.',
     'actor': 'TEXT. Role bound by the host listener.',
     'initiator': 'TEXT. model, registered_script, or host; bound by the host.',
@@ -70,6 +70,26 @@ def ensure_schema(conn, day):
     conn.commit()
 
 
+def migrate_operation_refs(conn, public_refs):
+    legacy = conn.execute("SELECT operation_ref,actor FROM business_operations ORDER BY operation_seq").fetchall()
+    replacements = [(old, public_refs.assign('operation', actor, old)) for old, actor in legacy
+                    if re.fullmatch(r'op:[0-9a-f]{32}', old)]
+    if not replacements:
+        return
+    conn.execute('PRAGMA defer_foreign_keys=ON')
+    try:
+        for old, new in replacements:
+            conn.execute('UPDATE business_operations SET operation_ref=? WHERE operation_ref=?', (new, old))
+            rows = conn.execute('SELECT effect_ref FROM business_effects WHERE operation_ref=?', (old,)).fetchall()
+            for (effect,) in rows:
+                conn.execute('UPDATE business_effects SET operation_ref=?,effect_ref=? WHERE effect_ref=?',
+                             (new, new + effect[len(old):], effect))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def read_operation(conn, operation_ref):
     """Read only the public ledger projection; callers own the world lock."""
     cursor = conn.execute('SELECT ' + ','.join(OPERATION_COLUMNS) +
@@ -84,13 +104,14 @@ def read_operation(conn, operation_ref):
 
 
 class BusinessOperation:
-    def __init__(self, conn, *, actor, initiator, tool, day, parameters):
+    def __init__(self, conn, *, actor, initiator, tool, day, parameters, public_refs):
         if conn.in_transaction:
             raise RuntimeError('Business operation requires a clean world connection')
         if initiator not in ('host', 'model', 'registered_script'):
             raise ValueError('Invalid host business initiator')
         self.conn, self.day, self.tool = conn, day, tool
-        self.ref = 'op:' + uuid.uuid4().hex
+        self.internal_ref = 'op:' + uuid.uuid4().hex
+        self.ref = public_refs.assign('operation', actor, self.internal_ref)
         self.parameters = deepcopy(parameters)
         self.next_effect = 0
         self.commit_failed = False

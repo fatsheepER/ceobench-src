@@ -104,7 +104,7 @@ actions after reading the current CEO directions. Questions and checkpoint
 recovery do not replay a completed automatic batch.
 A new nested path is a different registry name from an old basename-only
 entry. Use list-daily-scripts and remove the old entry if you are replacing it.
-The server receipt includes name, registered and sha256. Exit code 0 requires
+The server receipt includes name, registered, size and whether the snapshot changed. Exit code 0 requires
 server success; file, connection and server errors exit nonzero.
 
 #### `./novamind-operation list-daily-scripts`
@@ -113,7 +113,7 @@ List the current role's server snapshots in insertion order.
 
 Usage: ./novamind-operation list-daily-scripts [--session ID]
 
-Returns the server's scripts list with name, size and sha256 for each entry.
+Returns the server's scripts list with name and size for each entry.
 These snapshots run at the start of each week. Local files are not a registry.
 Exit code 0 requires server success; connection and server errors exit nonzero.
 

@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 import subprocess
+import uuid
 
 from pydantic import ValidationError
 
@@ -17,14 +18,18 @@ from .sql_evidence import encoded
 
 
 class TextRegistry:
-    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None):
+    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None, private_root=None):
         if mode not in ('git', 'prefix', 'pf'):
             raise ValueError('Invalid registration mode')
         self.git_run = subprocess.run
         self.identity = identity
         self.role = identity.role if identity else "ceo"
         self.workspace = Path(workspace).resolve()
-        self.path = self.workspace / 'registrations.json'
+        from .private_storage import private_root as storage_root
+        self.private_root = storage_root(self.workspace, identity=identity, root=private_root)
+        self.path = self.private_root / 'registrations.json'
+        self.public_path = self.workspace / 'documents/registrations.json'
+        self.public_refs = getattr(store, 'public_refs', None)
         self.mode, self.store, self.sim_day = mode, store, sim_day
         if mode in ('prefix', 'pf') and (store is None or not store.execution_capture):
             raise ValueError('Prefix/PF registration requires execution capture')
@@ -40,7 +45,7 @@ class TextRegistry:
         if not self.path.exists():
             return dict(format='ceobench.text-register.v1', records={})
         from .workspace_io import open_file
-        with open_file(self.workspace, self.path) as stream:
+        with open_file(self.private_root, self.path) as stream:
             value = json.load(stream)
         if value.get('format') != 'ceobench.text-register.v1' or not isinstance(value.get('records'), dict):
             raise ValueError('Invalid registration file')
@@ -59,7 +64,8 @@ class TextRegistry:
     def _git_reference(self, workspace, evidence):
         if self.identity:
             native_repository(workspace)
-        return git_reference(workspace, evidence, run=self.git_run)
+        reference, full = git_reference(workspace, evidence, run=self.git_run)
+        return dict(reference, commit=full), full
 
     def execute(self, operation, args):
         with self.resolver.binding_scope() if self.resolver else nullcontext():
@@ -80,9 +86,9 @@ class TextRegistry:
             return self._list(state, **values)
         records = state['records']
         if operation == 'create':
-            record_id = 'r' + str(max((int(k[1:]) for k in records), default=0) + 1)
+            record_id = None
             previous = None
-            record = dict(values, id=record_id, revision=1, status='active')
+            record = dict(values, status='active')
         else:
             record_id = values.pop('record')
             if record_id not in records:
@@ -90,11 +96,11 @@ class TextRegistry:
             previous = records[record_id][-1]
             if previous['status'] == 'retired':
                 raise ValueError('Registered text is retired; create a new text to resume it')
-            record = dict(deepcopy(previous), **values, revision=previous['revision'] + 1)
+            record = dict(deepcopy(previous), **values)
             if operation == 'retire':
                 record['status'] = 'retired'
         # Agents reason in simulated days; clock time stays in the private event record.
-        record.update(version=f"{record_id}.{record['revision']}", sim_day=self.sim_day(), author=self.role)
+        record.update(sim_day=self.sim_day(), author=self.role)
         if self.identity:
             record.update(self.identity.fields())
         warnings, bindings = [], []
@@ -111,35 +117,23 @@ class TextRegistry:
             for ref in record['references']:
                 if 'snapshot_source' in ref:
                     retain_snapshot(self.workspace, ref['evidence']['commit'], run=self.git_run)
+        if record_id is None:
+            record_id = 'r' + str(self.allocate('text'))
+        record.update(id=record_id, revision=self.allocate('text_revision:' + record_id))
+        record['version'] = f"{record_id}.{record['revision']}"
         records.setdefault(record_id, []).append(record)
         # Publish only after every reference validates and each snapshot is retained.
-        if self.identity:
-            import os
-            import uuid
-            from .workspace_io import parent_fd
-            with parent_fd(self.workspace, self.path) as (directory, name):
-                temp = '.registration-' + uuid.uuid4().hex
-                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-                try:
-                    with os.fdopen(fd, 'w') as stream:
-                        json.dump(state, stream, ensure_ascii=False)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temp, name, src_dir_fd=directory, dst_dir_fd=directory)
-                finally:
-                    try:
-                        os.unlink(temp, dir_fd=directory)
-                    except FileNotFoundError:
-                        pass
-        else:
-            write_json(self.path, state)
+        from .private_storage import publish_json
+        from .public_records import public_text, public_text_state
+        publish_json(self.private_root, self.path, state, prefix='.registration-')
+        publish_json(self.workspace, self.public_path, public_text_state(state, self.public_commit), prefix='.public-registration-')
         if self.store:
             try:
                 event = CURRENT_EVENT.get()
                 owned = event is None
                 if owned:
                     event = self.store.begin_event('text_' + operation, values)
-                version = self.store.version(event, 'registered_text', encoded(record),
+                version = self.store.version(event, 'registered_text', encoded(public_text(record, self.public_commit)),
                                              layer='registered_text', object_id='record:' + record_id)
                 private = dict(version_id=version, references=bindings)
                 self.store.version(event, 'declaration', encoded(private), layer='agent_declaration',
@@ -163,7 +157,7 @@ class TextRegistry:
         else:
             # Git and prefix receipts show only what the Git group can know: the stored reference.
             cited = [self._git_cited(ref['evidence']) +
-                     (' (snapshot of ' + cite_text(ref['snapshot_source']) + ')' if 'snapshot_source' in ref else '')
+                     (' (snapshot of ' + self._git_cited(ref['snapshot_source']) + ')' if 'snapshot_source' in ref else '')
                      for ref in record['references']]
         verb = dict(create='Registered', revise='Revised', retire='Retired')[operation]
         handle = (self.role + ":" if self.identity else "") + record["version"]
@@ -182,7 +176,10 @@ class TextRegistry:
             return f"unknown ({evidence['unknown']})"
         if 'record' in evidence:
             return evidence['record']
-        return cite_text(evidence)
+        from .public_records import public_evidence_reference
+        shown = public_evidence_reference(evidence, self.public_commit, self.role)
+        text = cite_text(shown)
+        return text + ' (original commit unavailable)' if shown.get('availability') else text
 
     def _pf_cited(self, binding, evidence):
         shown = self._display_binding(binding)
@@ -192,7 +189,7 @@ class TextRegistry:
             return f"unknown ({shown['reason']})"
         if shown.get('status') == 'commit_only':
             seen = f"; you saw {shown['delivered']}" if shown.get('delivered') else ''
-            return f"{cite_text(evidence)} (commit only: those bytes never reached you{seen})"
+            return f"{self._git_cited(evidence)} (commit only: those bytes never reached you{seen})"
         handles = evidence_handles.index(self.store)
         group = handles.group(binding['version_id'])
         text = shown['version'] + (f" (day {group['day'] if group['day'] is not None else 'unknown'})" if group else '')
@@ -242,6 +239,12 @@ class TextRegistry:
                 calls.append(f"day {day} " + pf_render.call_text(parsed))
         return (sorted(touched), calls[-6:]) if calls else None
 
+    def public_commit(self, owner, commit):
+        workspace = self.repository(owner)
+        result = self.git_run(['git', '--no-replace-objects', '-C', str(workspace),
+            'rev-parse', '--short=7', '--verify', commit + '^{commit}'], capture_output=True, timeout=10)
+        return result.stdout.decode().strip() if result.returncode == 0 else None
+
     def repository(self, owner=None):
         if not self.identity:
             return self.workspace
@@ -250,6 +253,18 @@ class TextRegistry:
         if owner not in READABLE_ROLES[self.role]:
             raise PermissionError('Evidence is inaccessible')
         return self.workspace.parent / owner
+
+    def allocate(self, namespace):
+        if self.public_refs is None:
+            from .public_refs import PublicRefs
+            self.public_refs = PublicRefs(self.private_root / 'public-refs.sqlite')
+        return self.public_refs.ordinal(namespace, self.role, uuid.uuid4().hex)
+
+    def authority_path(self, owner, filename):
+        if filename not in ('registrations.json', 'relations.json'):
+            raise ValueError('Unknown private registry')
+        self.repository(owner)
+        return (self.private_root if owner == self.role or not self.identity else self.private_root.parent / owner) / filename
 
     def _reference_owner(self, evidence):
         owner = evidence.get('owner', self.role)
@@ -286,8 +301,8 @@ class TextRegistry:
             if self.identity and ':' in requested:
                 record_owner, requested = requested.split(':', 1)
                 from .workspace_io import open_file
-                peer = self.repository(record_owner)
-                with open_file(peer, peer / 'registrations.json') as stream:
+                path = self.authority_path(record_owner, 'registrations.json')
+                with open_file(path.parent, path) as stream:
                     record_store = json.load(stream)['records']
             history = record_store.get(requested.split('.')[0], [])
             target = (next((r for r in history if r['version'] == requested), None)
@@ -391,7 +406,8 @@ class TextRegistry:
         for record in page:
             if result[-1] != '[':
                 result += ','
-            content = encoded(record).decode()
+            from .public_records import public_text
+            content = encoded(public_text(record, self.public_commit)).decode()
             if self.store:
                 binding = self.store.load_state('declaration:' + record['version'])
                 if binding and self.store.get_content(binding['version_id'])[1] == content.encode():

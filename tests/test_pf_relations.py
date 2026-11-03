@@ -132,7 +132,7 @@ def test_git_relations_are_readable_by_ordinary_script():
         write(team, 'growth', 'source', 'source.txt')
         write(team, 'growth', 'target', 'target.txt')
         saved = batch(team, 'growth', [create('link', 'growth:target.txt', ['growth:source.txt'])], 'link')['items'][0]
-        script = "import json; from pathlib import Path; print(json.dumps(json.loads(Path('relations.json').read_text())))"
+        script = "import json; from pathlib import Path; print(json.dumps(json.loads(Path('documents/relations.json').read_text())))"
         output = cli(team, 'growth', 'python', '-c', script)
         assert saved['relation'] in output
         data = json.loads(output)
@@ -235,10 +235,12 @@ def test_pf_queries_keep_legacy_git_commit_and_cross_role_storage():
         commit = team._snapshot_history(team.roles['growth'], 'saved source')
         declare(team, 'ceo', 'Legacy Git evidence', ['growth:git-source.txt@' + commit[:7]])
         record = team.roles['ceo'].registry._load()['records']['r1'][0]
-        assert len(record['references'][0]['evidence']['commit']) == 7
+        assert record['references'][0]['evidence']['commit'] == commit
         write(team, 'growth', 'later bytes', 'git-source.txt')
         output = cli(team, 'ops_finance', 'pf', 'depend', 'ceo:r1.1', '--detail')
-        assert commit in output and 'saved_content_unavailable' not in output
+        short = team._git(team.roles['growth'], 'rev-parse', '--short=7', commit)
+        assert short in output and commit not in output and 'saved_content_unavailable' not in output
+        assert team._git(team.roles['growth'], 'show', short + ':git-source.txt') == 'saved bytes'
         exact = 'growth:git-source.txt@' + commit
         assert 'ceo:r1.1' in cli(team, 'ops_finance', 'pf', 'rdepend', exact)
         assert 'ceo:r1.1' in cli(team, 'ops_finance', 'pf', 'rdepend', exact[:-33])

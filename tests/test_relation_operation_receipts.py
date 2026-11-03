@@ -1,3 +1,4 @@
+from saas_bench.public_refs import PublicRefs
 import json
 import shlex
 import threading
@@ -154,13 +155,13 @@ def test_timeout_receipt_does_not_wait_for_late_operation_or_claim_terminal_stat
         assert receipt['outcome'] == 'unfinished'
 
 
-def test_operation_metadata_does_not_change_duplicate_finalization():
+def test_operation_metadata_does_not_change_duplicate_finalization(tmp_path):
     from saas_bench.business_ledger import BusinessOperation
     from saas_bench.database import init_database
     from saas_bench.tools import ToolResult
     conn = init_database(':memory:')
     try:
-        operation = BusinessOperation(conn, actor='ceo', initiator='model', tool='set_capacity_tier', day=0, parameters={})
+        operation = BusinessOperation(conn, public_refs=PublicRefs(tmp_path / 'refs.sqlite'), actor='ceo', initiator='model', tool='set_capacity_tier', day=0, parameters={})
         result = ToolResult(True, 'unchanged', {'changes': {}})
         operation.finish(result)
         result.operation = operation.receipt()

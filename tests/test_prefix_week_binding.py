@@ -116,9 +116,12 @@ def test_prefix_forks_share_registration_time_public_bytes_and_exact_evidence(of
             graph = relation_details(child.tool_executor, 'pf depend r1 --detail')
             source = graph['items'][0]['source']
             assert graph['items'][0]['target']['ref']['cite'] == 'r1.1'
-            assert source['binding'] == b
-            assert source['ref']['cite'] == 'ceo:facts.json@' + b['git_commit']
-            assert child._execute_tool('bash', {'command': 'git show ' + b['git_commit'] + ':facts.json'}) == '{"n":1}'
+            assert 'binding' not in source and 'sha256' not in source
+            owner_path, commit = source['ref']['cite'].rsplit('@', 1)
+            assert owner_path == 'ceo:facts.json'
+            assert commit == git(child.agent_workspace, 'rev-parse', '--short=7', b['git_commit'])
+            assert git(child.agent_workspace, 'rev-parse', commit) == b['git_commit']
+            assert child._execute_tool('bash', {'command': 'git show ' + commit + ':facts.json'}) == '{"n":1}'
             assert child.evidence_store.load_state('declaration:r1.1')['references'][0] == b
             assert child.tool_executor.text_registry.path.read_bytes() == public
         else:

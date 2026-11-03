@@ -5,10 +5,12 @@ import json
 import shlex
 import uuid
 
+from .public_errors import PublicPFError, PublicPFPermissionError
 from . import evidence_handles, pf_render, sql_access
 from .execution_capture import CURRENT_EVENT
 from .pf_deadline import check
 from .sql_evidence import now
+from .public_evidence import PublicEvidence
 
 
 LAYERS = dict(file_bytes='file', file_text='file', server_public_response='api', stdout='stdout', stderr='stderr',
@@ -24,17 +26,18 @@ class CandidateQuery:
     def __init__(self, registry):
         self.registry, self.store, self.resolver = registry, registry.store, registry.resolver
         self.role = self.store.identity.get('role', 'ceo')
+        self.public = PublicEvidence(self.store)
         self.cursors = self.store.load_state('pf_cursors') or {}
 
     def answer(self, values):
         if 'cursor' in values:
             saved = self.cursors.get(values['cursor'])
             if not saved or saved.get('operation') != 'pf_candidates':
-                raise ValueError('Unknown candidate cursor; start a new pf candidates query')
+                raise PublicPFError('Unknown candidate cursor; start a new pf candidates query')
             name = saved.get('candidate_snapshot')
             snapshot = self.store.load_state(name) if name else None
             if not snapshot or snapshot.get('format') != FORMAT:
-                raise ValueError('Candidate snapshot is unavailable; start a new pf candidates query')
+                raise PublicPFError('Candidate snapshot is unavailable; start a new pf candidates query')
             offset, detail, selection = saved['offset'], saved['detail'], saved['selection']
         else:
             snapshot = self._snapshot(values)
@@ -42,30 +45,31 @@ class CandidateQuery:
             self.store.save_state(name, snapshot)
             offset, detail, selection = 0, values['detail'], [0, len(snapshot['items'])]
         self._authorize(snapshot)
-        common = dict(scope=snapshot['scope'], cutoff=snapshot['cutoff'], total_in_scope=len(snapshot['items']),
-                      detail=detail, model_delivery_scope=snapshot['model_delivery_scope'])
+        common = dict(scope=self.public.scope(snapshot['scope']), cutoff=self.public.cutoff(snapshot['cutoff']), total_in_scope=len(snapshot['items']),
+                      detail=detail, model_delivery_scope=self.public.delivery_scope(snapshot['model_delivery_scope']))
         for field in ('view', 'sql_access_coverage'):
             if field in snapshot and snapshot[field] is not None:
                 common[field] = snapshot[field]
         start, stop = selection
         if not 0 <= start <= stop <= len(snapshot['items']):
-            raise ValueError('Invalid candidate cursor selection')
+            raise PublicPFError('Invalid candidate cursor selection')
         if detail:
             selected = snapshot['items'][start:stop] if snapshot.get('view') == 'sql_accesses' else [
                 dict(item, **snapshot['events'][item['event_ref']]) for item in snapshot['items'][start:stop]]
+            selected = [self.public.directory(item) if snapshot.get('view') == 'sql_accesses' else self.public.candidate(item) for item in selected]
             content = json.dumps(selected, ensure_ascii=True, indent=2, sort_keys=True)
             end = min(len(content), offset + DETAIL_CHARS)
             if not 0 <= offset <= len(content):
-                raise ValueError('Invalid candidate detail cursor offset')
+                raise PublicPFError('Invalid candidate detail cursor offset')
             cursor = self._cursor(name, end, True, selection) if end < len(content) else None
             return dict(common, items=[], returned=stop - start, detail_text=content[offset:end],
                         range=[offset, end], total_chars=len(content), next_cursor=cursor, has_more=cursor is not None)
         if not start <= offset <= stop:
-            raise ValueError('Invalid candidate cursor offset')
+            raise PublicPFError('Invalid candidate cursor offset')
         end = min(stop, offset + 20)
         cursor = self._cursor(name, end, False, selection) if end < stop else None
         detail_cursor = self._cursor(name, 0, True, [offset, end]) if end > offset else None
-        items = snapshot['items'][offset:end]
+        items = [self.public.directory(item) if snapshot.get('view') == 'sql_accesses' else self.public.candidate(item) for item in snapshot['items'][offset:end]]
         return dict(common, items=items, returned=len(items), next_cursor=cursor, has_more=cursor is not None,
                     detail_cursor=detail_cursor)
 
@@ -86,7 +90,7 @@ class CandidateQuery:
         else:
             from .role_policy import READABLE_ROLES
             if event.get('role', event.get('author')) not in READABLE_ROLES[self.role]:
-                raise PermissionError('Candidate event is inaccessible')
+                raise PublicPFPermissionError('Candidate event is inaccessible')
 
     def _authorize(self, snapshot):
         with closing(self.store.connect()) as conn:
@@ -99,20 +103,23 @@ class CandidateQuery:
                     row = conn.execute('SELECT event_id,content_hash,metadata FROM versions WHERE version_id=?',
                                        (item['content_ref'],)).fetchone()
                     if row is None or row['content_hash'] != item['sha256']:
-                        raise ValueError('Candidate snapshot content is unavailable or changed')
+                        raise PublicPFError('Candidate snapshot content is unavailable or changed')
                     self.store.authorize_version(conn, row['event_id'], json.loads(row['metadata']), public=True)
                 else:
                     row = conn.execute('SELECT request FROM requests WHERE event_id=?', (item['event_ref'],)).fetchone()
                     if row is None:
-                        raise ValueError('Candidate snapshot event is unavailable')
+                        raise PublicPFError('Candidate snapshot event is unavailable')
                     self._event_allowed(conn, json.loads(row[0]))
 
     def _snapshot(self, values):
+        values = dict(values)
+        if values.get('event'):
+            values['event'] = evidence_handles.resolve_ref(self.store, 'event', values['event'])
         today = self.registry.sim_day()
         role = values.get('role', self.role)
         explicit_days = 'day_from' in values or 'day_to' in values
         if not values['history'] and not explicit_days and type(today) is not int:
-            raise ValueError('Current simulated day is unknown; specify --history or a day range')
+            raise PublicPFError('Current simulated day is unknown; specify --history or a day range')
         start = values.get('day_from') if explicit_days or values['history'] else today // 7 * 7
         end = values.get('day_to') if explicit_days or values['history'] else start + 6
         scope = dict(role=role, role_basis='execution_initiator', day_from=start, day_to=end,
@@ -159,11 +166,11 @@ class CandidateQuery:
             descendants = set()
             if wanted:
                 if wanted not in events:
-                    raise ValueError('Unknown candidate event')
+                    raise PublicPFError('Unknown candidate event')
                 if events[wanted]['request']['kind'] not in EVENT_KINDS and not any(
                         json.loads(row[0])['layer'] in LAYERS for row in conn.execute(
                         'SELECT metadata FROM versions WHERE event_id=?', (wanted,))):
-                    raise PermissionError('Candidate event is inaccessible')
+                    raise PublicPFPermissionError('Candidate event is inaccessible')
                 try:
                     self.store.readable_event(conn, wanted)
                 except PermissionError:
@@ -197,7 +204,7 @@ class CandidateQuery:
                 source = by_version.get(meta.get('derived_from')) if layer == 'file_text' else None
                 if layer == 'file_text':
                     if source is None:
-                        raise ValueError('Captured file read source is unavailable')
+                        raise PublicPFError('Captured file read source is unavailable')
                     if source['event_id'] == row['event_id']:
                         continue
                     meta['object_id'] = json.loads(source['metadata'])['object_id']
@@ -300,6 +307,8 @@ class CandidateQuery:
                 (scope['event'] is None or item['event_ref'] in descendants))
 
     def _text_match(self, item, text, conn):
+        if item.get('note') and text.casefold() in item['note'][1].casefold():
+            return True
         if text.casefold() in item['name'].casefold() or (item['kind'] != 'file' and
                 text.casefold() in json.dumps(item['request'], ensure_ascii=False).casefold()):
             return True
@@ -360,6 +369,8 @@ class CandidateQuery:
                     model_delivery=deliveries.get(version, dict(historical=dict(status='unknown', occurrences=[]),
                                                                current=dict(status='unknown', occurrences=[]))),
                     association='execution_observation', request=detail_request, receipt=receipt)
+        if version and (note := evidence_handles.index(self.store).note(version)):
+            item['note'] = note
         if kind == 'sql':
             item['sql_access'] = sql_access.projection(result.get('sql_access'))
             item['access_match_bases'] = sorted({read['basis'] for read in item['sql_access']['public_reads']})
@@ -425,6 +436,10 @@ def render(page):
              'Snapshot cutoff: ' + json.dumps(page['cutoff'], sort_keys=True),
              f"returned={page['returned']}; total_in_scope={page['total_in_scope']}; has_more={str(page['has_more']).lower()}.",
              'Model delivery: this reader only; historical/current request before query; unknown is not unread.']
+    if page.get('next_cursor'):
+        lines.append('More from the same snapshot: pf more ' + page['next_cursor'])
+    if page.get('detail_cursor'):
+        lines.append('Exact events, capture gaps and ranges for this page: pf more ' + page['detail_cursor'])
     directory = page.get('view') == 'sql_accesses'
     if directory:
         lines[0] = 'PF SQL access directory: authorization observations, not proof of use.'
@@ -454,9 +469,5 @@ def render(page):
             lines.append('  authorization=' + item['sql_access']['status'] + '; match_bases=' + ','.join(item['access_match_bases']))
     if not page['items'] and not page['detail']:
         lines.append('No candidates in this scope. Use --history or --role all explicitly to broaden it.')
-    if page.get('detail_cursor'):
-        lines.append('Exact events, capture gaps, ranges and hashes for this page: pf more ' + page['detail_cursor'])
-    if page['next_cursor']:
-        lines.append('More from the same snapshot: pf more ' + page['next_cursor'])
     lines.append('Read content: pf show HANDLE --full. Event details: pf candidates --history --event EVENT --detail.')
     return '\n'.join(lines)

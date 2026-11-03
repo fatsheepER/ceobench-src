@@ -65,10 +65,12 @@ class Compare(Input):
 
 CITE_FORMS = dict(
     git='a saved workspace file path (snapshotted immediately), path@week-N or '
-        'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>"',
+        'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>". '
+        'Use operation_ref endpoints in relation_batch for business operations; cite does not accept them',
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
        'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
-       'or "unknown: <reason>"')
+       'or "unknown: <reason>". Use operation_ref endpoints in relation_batch for business operations; '
+       'cite does not accept them')
 _RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 _SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')
 _COMMIT = re.compile(r'week-[1-9][0-9]*|[0-9a-fA-F]{1,40}')
@@ -306,7 +308,7 @@ def tool_definitions(pf=False, team=False):
                   ' Notes over 200 characters are truncated. Returns rN and rN.M.',
         'revise': 'Append a revision with a reason. Omitted fields, including references, stay unchanged; '
                   'supplied references replace the whole list, and [] clears it. '
-                  'Earlier revisions remain in registrations.json.',
+                  'Earlier revisions remain in documents/registrations.json.',
         'retire': 'Stop using a registered text. Appends a retired revision with a reason and keeps all history.',
         'list': 'List saved active texts as compact excerpts in creation order. '
                 'Use raw=true for complete records, references and notes. '
@@ -374,7 +376,7 @@ def tool_definitions(pf=False, team=False):
             'revise': (
                 'Append a revision with a reason. Omitted fields retain their values; supplied references replace '
                 'the complete list, and [] clears it. Preserve the complete intended evidence set. Use local rN; '
-                'share the returned role-qualified revision. Earlier revisions remain in registrations.json.'
+                'share the returned role-qualified revision. Earlier revisions remain in documents/registrations.json.'
             ),
             'retire': (
                 'Retire your judgment with a reason while preserving history. Use local rN; the receipt includes '

@@ -32,6 +32,7 @@ READ_ONLY_TASK_TOOLS = frozenset(('get_social_posts', 'get_cost_info', 'get_mark
 
 from .role_policy import CALL_POLICY, ROLES, require_call, require_advance, require_role, require_script_observation
 from .tools import AgentTools, ToolResult
+from .public_refs import PublicReferenceUnavailable
 from .database import TABLE_DOCS
 from .environment import build_weekly_dashboard
 
@@ -419,15 +420,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._send_internal_error(exc, op=f"DELETE {self.path}")
 
     def _send_internal_error(self, exc: BaseException, *, op: str, status: int = 500) -> None:
-        """Centralized 5xx response.
-
-        The full traceback is written to the server log (stderr) so operators
-        can debug, but the agent only ever sees a stable
-        ``{"error": "internal_error", "request_id": ...}`` payload — no
-        exception type, no message, no traceback, no source paths. This is
-        the choke point that prevents engine internals from leaking into
-        the agent's tool-result stream the way they did before.
-        """
+        """Log private diagnostics and send the public internal-error envelope."""
         request_id = uuid.uuid4().hex[:12]
         try:
             tb = traceback.format_exc()
@@ -449,7 +442,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                 {
                     "success": False,
                     "error": "internal_error",
-                    "request_id": request_id,
                     "data": None,
                 },
                 status,
@@ -556,6 +548,9 @@ class _APIHandler(BaseHTTPRequestHandler):
             raise
         except PermissionError as e:
             self._send_json({"success": False, "error": str(e)}, 403)
+        except PublicReferenceUnavailable as exc:
+            self._send_json(dict(success=False, error='operation_reference_unavailable',
+                                 message=str(exc), manual_resume_required=True), 500)
         except Exception as e:
             self._send_internal_error(e, op="call")
 
@@ -795,11 +790,11 @@ class _APIHandler(BaseHTTPRequestHandler):
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
                 scripts = server.get_daily_scripts(self.role)
+                changed = scripts.get(name) != content
                 scripts[name] = content
                 server.set_daily_scripts(scripts, registration=name, role=self.role, initiator=self.server._initiator)
-            import hashlib
             self._send_json({"success": True, "data": {"name": name, "registered": True,
-                "sha256": hashlib.sha256(content.encode()).hexdigest()}})
+                "changed": changed, "size": len(content)}})
         except PermissionError as e:
             self._send_json({'success': False, 'error': str(e)}, 403)
         except Exception as e:
@@ -809,8 +804,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         """List registered daily scripts: GET /daily-scripts."""
         server: NovaMindAPIServer = self.server._api_server
         with server._lock:
-            import hashlib
-            scripts = [{"name": n, "size": len(c), "sha256": hashlib.sha256(c.encode()).hexdigest()}
+            scripts = [{"name": n, "size": len(c)}
                        for n, c in server.get_daily_scripts(self.role).items()]
         self._send_json({"success": True, "data": {"scripts": scripts}})
 
@@ -978,7 +972,8 @@ def registered_script_source(executor, name, code):
     if not valid_registered_script_name(name):
         raise ValueError('Registered script name must be a relative file path inside the owner workspace')
     source = executor.workspace_path / name
-    snapshot = source.with_name('.registered-' + uuid.uuid4().hex + '.py')
+    number = executor.public_refs.ordinal('registered_script', executor.role, uuid.uuid4().hex)
+    snapshot = source.with_name(f'.registered-{number}.py')
     with ExitStack() as resources:
         try:
             directory, filename = resources.enter_context(parent_fd(executor.workspace_path, snapshot, create=True))
@@ -1039,7 +1034,7 @@ class NovaMindAPIServer:
                  shock_manager=None, event_logger=None, script_workspace=None,
                  require_sandbox=False, sql_evidence=None, checkpoint_token=None,
                  role_sockets=None, role_stores=None, role_executors=None, role_audits=None,
-                 script_role_sockets=None):
+                 script_role_sockets=None, public_refs=None):
         """Initialize the API server.
 
         Args:
@@ -1077,6 +1072,12 @@ class NovaMindAPIServer:
             sql_evidence.assert_healthy()
         if self.oracle_mode and (require_sandbox or os.environ.get('CEOBENCH_RUN_KIND') == 'formal'):
             raise ValueError('Formal runs cannot enable oracle mode')
+        if public_refs is None:
+            from pathlib import Path
+            from .public_refs import PublicRefs
+            workspace = Path(script_workspace or tools.workspace_path).resolve()
+            public_refs = PublicRefs(workspace.parent / '.public-refs' / (workspace.name + '.sqlite'))
+        self.public_refs = public_refs
         self.tools = tools
         self.simulator = simulator
         self.conn = conn
@@ -1237,7 +1238,8 @@ class NovaMindAPIServer:
                 operation = None
                 try:
                     operation = BusinessOperation(self.conn or self.tools.conn, actor=role,
-                        initiator=initiator, tool=tool_name, day=self.tools.current_day, parameters=args)
+                        initiator=initiator, tool=tool_name, day=self.tools.current_day, parameters=args,
+                        public_refs=self.public_refs)
                     with operation.bind(self.tools):
                         result = dispatch_fn(self.tools, args)
                     operation.finish(result)
@@ -1369,7 +1371,8 @@ class NovaMindAPIServer:
                 from .business_ledger import BusinessOperation
                 with self._lock:
                     business_operation = BusinessOperation(self.conn, actor=role, initiator=initiator,
-                        tool='next_week', day=old_day, parameters=dict(predictions=predictions, rationale=rationale))
+                        tool='next_week', day=old_day, parameters=dict(predictions=predictions, rationale=rationale),
+                        public_refs=self.public_refs)
             result = self._advance_week(predictions, rationale, on_settled=settle,
                                         business_operation=business_operation)
             if result.get('error') == 'prediction_save_failed':
@@ -1638,6 +1641,7 @@ class NovaMindAPIServer:
         if self.team_mode and self.role_executors.get(role) is None:
             raise RuntimeError('Registered scripts require their owner-bound executor')
         executor = self.role_executors.get(role) or BashAgentToolExecutor(workspace, bash_timeout=300,
+            public_refs=self.public_refs,
             evidence_store=self.sql_evidence if self.sql_evidence and self.sql_evidence.execution_capture else None,
             require_sandbox=self.require_sandbox,
             env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0'})

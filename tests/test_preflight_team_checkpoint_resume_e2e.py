@@ -121,7 +121,7 @@ class ModelHandler(BaseHTTPRequestHandler):
                 assert (runtime.workspace / 'notebook.md').read_text() == name + ' midweek notes\nextra notes\n'
                 assert (runtime.workspace / 'draft.py').read_text() == 'LIMIT = 99\n'
                 assert getattr(runtime.executor, '_pf_service', None) is None and not runtime.executor.preserved_process
-                records = json.loads((runtime.workspace / 'registrations.json').read_text())['records']
+                records = json.loads(runtime.registry.path.read_text())['records']
                 assert records['r2'][0]['text'] == 'Midweek draft'
                 if group == 'pf':
                     assert runtime.store.load_state('declaration:r2.1') is not None

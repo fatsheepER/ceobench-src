@@ -1,5 +1,4 @@
 """The public script CLI must report the server's registered snapshots."""
-import hashlib
 import json
 import os
 import sys
@@ -33,11 +32,11 @@ def test_public_snapshot_register_list_remove(backend, tmp_path, monkeypatch, ca
     invoke(monkeypatch, 'register-daily-script', source)
     registered = json.loads(capsys.readouterr().out)
     assert registered['success'] is True
-    assert registered['data']['sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert registered['data'] == {'name': 'metric.py', 'registered': True, 'changed': True, 'size': len(source.read_text())}
     source.write_text("print('version B')")
     invoke(monkeypatch, 'list-daily-scripts')
     listing = json.loads(capsys.readouterr().out)
-    assert listing['data']['scripts'][0]['sha256'] == registered['data']['sha256']
+    assert listing['data']['scripts'] == [{'name': 'metric.py', 'size': registered['data']['size']}]
     assert backend.get_daily_scripts() == {'metric.py': "print('version A')"}
     invoke(monkeypatch, 'remove-daily-script', source.name)
     assert json.loads(capsys.readouterr().out)['data']['removed'] == source.name

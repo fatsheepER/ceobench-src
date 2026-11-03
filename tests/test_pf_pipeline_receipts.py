@@ -9,7 +9,7 @@ import pytest
 
 from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
 from saas_bench.execution_capture import CapturedText, model_request, text_sources
-from saas_bench.registration_evidence import HANDLES
+from saas_bench.evidence_handles import authority
 from saas_bench.role_policy import AgentIdentity
 from saas_bench.sql_evidence import SQLEvidenceStore, encoded
 from saas_bench.text_registry import TextRegistry
@@ -29,8 +29,9 @@ def d63(workspace, tmp_path):
     event = store.begin(encoded({'sql': fixture['sql']}), 'public-sql-v1')
     store.finish(event, 200, '', fixture['response'].encode(), {'day': 63})
     store.delivered(event, 'sent')
-    key = encoded(['test-run', 'world-1', 'public-sql-v1', fixture['sql'], None]).decode()
-    store.save_state(HANDLES, {'query': {key: 195}})
+    # Retain the recorded D63 handle while allocating its earlier numbers durably.
+    for number in range(1, 195):
+        assert authority(store).ordinal('object:query', 'growth', f'prior-query-{number}') == number
     assert registry.resolver.handle(event + ':public_response') == fixture['handle']
     return fixture, store, registry, executor
 

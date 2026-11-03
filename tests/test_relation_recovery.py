@@ -98,7 +98,7 @@ def fail_second_item(monkeypatch, registry, boundary, *, wait_for=None):
     def replace_relation(source, target, *args, **kwargs):
         directory = kwargs.get('dst_dir_fd')
         ours = target == 'relations.json' and directory is not None and (
-            Path(os.readlink(f'/proc/self/fd/{directory}')) == registry.workspace)
+            Path(os.readlink(f'/proc/self/fd/{directory}')) == registry.private_root)
         if not ours:
             return replace(source, target, *args, **kwargs)
         publications.append(target)
@@ -210,9 +210,16 @@ def test_selected_checkpoint_keeps_relations_and_call_receipts_without_replaying
         repeated = resumed.executor.execute('relation_batch', kept_args, tool_call_id='kept-call')
         assert json.loads(repeated) == json.loads(kept)
         history = json.loads(repeated)['items'][0]['history']
-        assert history['path'] == 'relations.json'
+        assert history['path'] == 'documents/relations.json'
         read = resumed.executor.execute('read_file', {'path': history['path']})
-        assert 'kept' in read and 'discarded-call' not in read
+        retained = json.loads(repeated)['items'][0]
+        assert retained['relation_revision'] in read and 'discarded-call' not in read
+        public = json.loads((resumed.workspace / history['path']).read_text())
+        assert 'calls' not in public
+        revision, = public['records'][retained['relation'].split(':', 1)[1]]
+        for field in ('relation_revision', 'target', 'sources', 'author_role', 'assertion', 'reason'):
+            assert revision[field] == retained[field]
+        assert 'item_id' not in revision and 'attempt_id' not in revision
         assert len(resumed.registry.relations._load()['records']) == 1
         assert restored.run(stop_after_day=7).reason == 'observation_end', restored.failure
         assert len(resumed.registry.relations._load()['records']) == 1
@@ -274,10 +281,10 @@ def test_real_attempt_wrapper_persists_hold_and_manual_restore_preserves_failed_
     hold = batch.read(original / 'HOLD')
     assert hold['manual_resume_required'] and hold['reason'] == 'relation_persistence_unknown'
     source = Path(record['checkpoint'])
-    state = batch.read(original / 'runtime/roles/growth/relations.json')
+    state = batch.read(original / 'runtime/private/growth/relations.json')
     assert len(state['records']) == 1
     preserved = {name: (original / name).read_bytes() for name in
-        ('attempt.json', 'HOLD', 'runtime/roles/growth/relations.json', 'runtime/private/growth/model-usage.jsonl')}
+        ('attempt.json', 'HOLD', 'runtime/private/growth/relations.json', 'runtime/private/growth/model-usage.jsonl')}
     monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps({entry['run_id']: str(source)}))
     resumed = batch.prepare(path, entry['run_id'], resume=True, live=True,
         client_factory=clients(), simulator_factory=simulator)
@@ -285,6 +292,6 @@ def test_real_attempt_wrapper_persists_hold_and_manual_restore_preserves_failed_
     assert resumed['source_checkpoint'] == str(source)
     assert len(batch.attempts(entry)) == 2
     assert all((original / name).read_bytes() == value for name, value in preserved.items())
-    new_relations = batch.attempts(entry)[-1] / 'runtime/roles/growth/relations.json'
+    new_relations = batch.attempts(entry)[-1] / 'runtime/private/growth/relations.json'
     assert not new_relations.exists()
     save_sample('attempt-hold-restore', first=record, hold=hold, saved_state=state, resumed=resumed)

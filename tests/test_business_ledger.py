@@ -54,7 +54,7 @@ def test_runtime_commit_failure_restores_memory_and_sql(world):
 
 
 def test_commit_adapter_covers_sql_and_context_commits(world):
-    operation = BusinessOperation(world.conn, actor='ceo', initiator='host', tool='post_social_media', day=0, parameters={})
+    operation = BusinessOperation(world.conn, public_refs=world.public_refs, actor='ceo', initiator='host', tool='post_social_media', day=0, parameters={})
     with operation.bind(world.tools) as conn:
         conn.execute("INSERT INTO agent_social_media_posts(day,content) VALUES(0,'first')")
         conn.cursor().execute('COMMIT')

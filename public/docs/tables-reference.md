@@ -94,7 +94,7 @@ Authorized business calls shared by Git and PF. Query deliberately; default rece
 
 | Column | Description |
 |--------|-------------|
-| `operation_ref` | TEXT PRIMARY KEY. Stable random reference across restored routes. |
+| `operation_ref` | TEXT PRIMARY KEY. Stable role:number reference, e.g. growth:1. Numbers are never reused after rollback. |
 | `operation_seq` | INTEGER. Operation admission order on the retained route. |
 | `actor` | TEXT. Role bound by the host listener. |
 | `initiator` | TEXT. model, registered_script, or host; bound by the host. |

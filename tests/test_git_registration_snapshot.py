@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 
@@ -51,7 +52,8 @@ def test_bare_snapshot_preserves_exact_bytes_index_head_and_gc(workspace):
     receipt = registry.execute('create', declaration({'path': path}))
     evidence = saved(registry)['evidence']
     assert read_git(workspace, evidence) == raw
-    assert evidence['commit'] in receipt
+    short = registry.public_commit(None, evidence['commit'])
+    assert short in receipt and git(workspace, 'rev-parse', short) == evidence['commit']
     assert git(workspace, 'ls-tree', '-r', '--name-only', evidence['commit']) == '"nested/a b\\tfile.bin"'
     for value in (b'second', b'third'):
         (workspace / path).write_bytes(value)
@@ -173,10 +175,13 @@ def test_model_receives_snapshot_and_reads_registered_bytes_after_overwrite():
         if turns[role] == 2:
             receipt = next(m['content'] for m in body['messages'] if m.get('name') == 'text_create')
             ref = saved(team.roles[role].registry)
-            assert cite_text(ref['evidence']) in receipt
-            observed['receipt_input'] = body
             evidence = ref['evidence']
-            return calls(('bash', {'command': shlex.join(['git', 'show', evidence['commit'] + ':' + evidence['path']])}))
+            commit = re.search(r'(?:growth:)?basis\.txt@([0-9a-f]{7,40})', receipt)[1]
+            assert commit == git(team.roles[role].workspace, 'rev-parse', '--short=7', evidence['commit'])
+            assert git(team.roles[role].workspace, 'rev-parse', commit) == evidence['commit']
+            assert len(evidence['commit']) == 40
+            observed['receipt_input'] = body
+            return calls(('bash', {'command': shlex.join(['git', 'show', commit + ':' + evidence['path']])}))
         result = [m['content'] for m in body['messages'] if m.get('name') == 'bash'][-1]
         assert result == 'registered original'
         assert (team.roles[role].workspace / 'basis.txt').read_text() == 'newer working file'

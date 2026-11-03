@@ -456,7 +456,8 @@ def test_registered_expert_refusals_reach_owner_before_normal_business_actions(m
             assert message.reply not in opening
             assert closing.count(message.reply) == 1
             assert message.world_state_id != team.server.world_state_id
-            assert 'request_world_state_id=' + message.world_state_id in closing
+            assert message.world_state_id not in closing
+            assert 'request_id=' + team._request_ref(message) in closing
             assert ' | world_state_id=' not in closing
         for role in actions:
             messages = [row['body']['messages'] for row in team.test_wire if row['role'] == role][-1]

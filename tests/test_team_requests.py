@@ -127,10 +127,10 @@ def test_experts_request_idle_ceo_fifo_then_wake_handed_off_peer(mode, monkeypat
         assert len({message.request_id for message in requests}) == 4
         for request in requests:
             receiver = [row['body'] for row in team.test_wire if row['role'] == request.receiver]
-            accepted = [body for body in receiver if any(request.request_id in str(m.get('content', ''))
+            accepted = [body for body in receiver if any(team._request_ref(request) in str(m.get('content', ''))
                         and 'Team request' in str(m.get('content', '')) for m in body['messages'])]
             assert accepted
-            assert all(sum(request.request_id in str(m.get('content', '')) and
+            assert all(sum(team._request_ref(request) in str(m.get('content', '')) and
                 'Team request' in str(m.get('content', '')) for m in body['messages']) == 1 for body in accepted)
 
 
@@ -639,7 +639,7 @@ def test_queued_request_enters_next_input_while_prior_answer_keeps_ownership(mod
             return final('ANSWER-growth')
         assert active.sender == 'ops_finance'
         latest = body['messages'][-1]['content']
-        assert active.request_id in latest and 'QUEUED-ops_finance' not in latest
+        assert team._request_ref(active) in latest and 'QUEUED-ops_finance' not in latest
         assert sum('QUEUED-ops_finance' in str(m.get('content')) for m in body['messages']) == 1
         return final('ANSWER-ops_finance')
     with make_team(mode, respond, 'request-intake') as team:

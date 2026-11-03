@@ -122,7 +122,8 @@ def test_bare_path_snapshots_now_and_explicit_week_labels_resolve_after_closing(
     call(registry, 'create', **declaration({'path': 'plan.json@week-3'}))
     call(registry, 'create', **declaration({'path': 'plan.json', 'commit': 'week-2'}))
     refs = [r['references'][0]['evidence'] for r in call(registry, 'list')['records']]
-    assert refs[1] == dict(path='plan.json', commit='week-3') and refs[2]['commit'] == 'week-2'
+    assert all(ref['path'] == 'plan.json' for ref in refs[1:])
+    assert all(git(workspace, 'show', ref['commit'] + ':plan.json') == '{"v":2}' for ref in refs[1:])
 
 
 def test_direct_registered_text_reference_before_commit_and_pagination(workspace):
@@ -328,12 +329,12 @@ def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(work
     if delivered:
         send(store, executor.execute('read_file', {'path': 'evidence.json'}))
     result = prefix.execute('create', declaration({'path': 'evidence.json'}))
-    public = prefix.path.read_bytes()
-    prefix.path.unlink()
-    baseline = TextRegistry(workspace, 'git', sim_day=lambda: 7)
+    public = prefix.public_path.read_bytes()
+    private_before = prefix.path.read_bytes()
+    baseline = TextRegistry(workspace, 'git', sim_day=lambda: 7, private_root=tmp_path / 'git-private')
     baseline_result = baseline.execute('create', declaration({'path': 'evidence.json'}))
     expected = json.loads(public)
-    actual = json.loads(baseline.path.read_bytes())
+    actual = json.loads(baseline.public_path.read_bytes())
     expected_evidence = expected['records']['r1'][0]['references'][0]['evidence']
     actual_evidence = actual['records']['r1'][0]['references'][0]['evidence']
     expected_commit, actual_commit = expected_evidence['commit'], actual_evidence['commit']
@@ -345,6 +346,8 @@ def test_prefix_public_state_and_returns_do_not_disclose_private_resolution(work
     assert baseline_result.replace(actual_commit, expected_commit) == result
     actual_evidence['commit'] = expected_commit
     assert actual == expected
+    assert prefix.path.read_bytes() == private_before
+    assert prefix.public_refs.path != baseline.public_refs.path
     private = store.load_state('declaration:r1.1')['references'][0]
     assert private['status'] == ('resolved' if delivered else 'unknown')
     assert b'delivered_in' not in public and b'version_id' not in public
@@ -368,9 +371,10 @@ def test_fork_inherits_prefix_bindings_but_not_sibling_versions(workspace, tmp_p
 def test_storage_escape_and_tool_availability(workspace, tmp_path):
     outside = tmp_path / 'outside.json'
     outside.write_text('private')
-    (workspace / 'registrations.json').symlink_to(outside)
+    registry = TextRegistry(workspace, 'git')
+    registry.path.symlink_to(outside)
     with pytest.raises(ValueError, match='symlink'):
-        call(TextRegistry(workspace, 'git'), 'create', **declaration())
+        call(registry, 'create', **declaration())
     assert outside.read_text() == 'private'
     plain = BashAgentToolExecutor(workspace)
     assert plain.execute('text_list', {}).startswith('Error: Unknown tool')
@@ -550,7 +554,7 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     send(runner.evidence_store, page)
     runner._save_checkpoint(0)
     snapshot = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
-    assert (snapshot / 'agent_workspace/registrations.json').read_bytes() == (runner.agent_workspace / 'registrations.json').read_bytes()
+    assert (snapshot / 'private-agent/registrations.json').read_bytes() == runner.tool_executor.text_registry.path.read_bytes()
     runner._stop_server()
     restored = offline_runner(runner.workspace_dir)
     assert restored.text_registration == 'prefix'
@@ -586,7 +590,7 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
         for branch in (restored, *children):
             target = output / branch.text_registration
             target.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(branch.agent_workspace / 'registrations.json', target / 'registrations.json')
+            shutil.copy2(branch.tool_executor.text_registry.public_path, target / 'registrations.json')
             if branch.evidence_store:
                 branch.evidence_store.snapshot(target / 'evidence.sqlite')
         (output / 'validation.json').write_text(json.dumps(dict(

@@ -17,7 +17,7 @@ class Cite(Input):
 
 
 class Operation(Input):
-    operation_ref: Annotated[str, Field(pattern=r'^op:[0-9a-f]{32}$')]
+    operation_ref: Annotated[str, Field(pattern=r'^(ceo|growth|ops_finance):[1-9][0-9]*$')]
 
 
 class MissingRef(Input):
@@ -78,7 +78,7 @@ def tool_definition():
     return dict(name='relation_batch', description=(
         'Save source declarations for several targets, one complete source set per item. '
         'Use create, revise, or retire. Endpoints are {cite: ROLE:rN.K}, saved file paths '
-        '(snapshotted at registration), exact ROLE:path@COMMIT, or {operation_ref: op:...} copied '
+        '(snapshotted at registration), exact ROLE:path@COMMIT, or {operation_ref: growth:1} copied '
         'from a business receipt. PF also accepts exact captured ROLE:HANDLE@vK. '
         'Each source is {ref: endpoint, note?: text}, or {ref: {missing: {description, reason, '
         'last_known_ref?: text}}}. Missing targets are invalid. No lookup or predicate is required. '

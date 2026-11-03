@@ -428,6 +428,12 @@ def cmd_start_server(args, base: Path):
         if Path(evidence_path).resolve().is_relative_to(base.resolve()):
             raise ValueError('SQL evidence must be outside the agent workspace')
         sql_evidence = SQLEvidenceStore(evidence_path, identity)
+    public_refs = None
+    if settings := os.environ.get('CEOBENCH_PUBLIC_REFS'):
+        from saas_bench.public_refs import PublicRefs
+        public_refs = PublicRefs(**json.loads(settings))
+        if sql_evidence is not None:
+            sql_evidence.public_refs = public_refs
     api_server = NovaMindAPIServer(
         tools=tools,
         simulator=simulator,
@@ -438,8 +444,12 @@ def cmd_start_server(args, base: Path):
         script_workspace=base,
         require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
         sql_evidence=sql_evidence,
+        public_refs=public_refs,
         checkpoint_token=os.environ.get('CEOBENCH_CHECKPOINT_TOKEN'),
     )
+    if os.environ.get('CEOBENCH_RESTORE_SERVER_STATE'):
+        from saas_bench.business_ledger import migrate_operation_refs
+        migrate_operation_refs(conn, api_server.public_refs)
     from saas_bench.run_state import write_json
     checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')
     if checkpoint_root:

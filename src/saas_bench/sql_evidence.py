@@ -619,6 +619,15 @@ class SQLEvidenceStore:
         raise PermissionError('Evidence is inaccessible')
 
     def authorize_version(self, conn, event, meta, *, public=False, graph=False):
+        from .public_records import private_framework_path
+        if public or graph:
+            if meta.get('public_visibility') == 'private' or (meta['layer'] in ('file_bytes', 'file_text') and
+                    private_framework_path(meta.get('object_id', ''))):
+                raise PermissionError('Private framework history is unavailable')
+            if meta['layer'] == 'file_text' and meta.get('derived_from'):
+                parent = conn.execute('SELECT event_id,metadata FROM versions WHERE version_id=?', (meta['derived_from'],)).fetchone()
+                if parent is not None:
+                    self.authorize_version(conn, parent[0], json.loads(parent[1]), public=True)
         if not self.identity.get('role'):
             self._visible(conn, event)
             if public:

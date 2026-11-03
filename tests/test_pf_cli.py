@@ -66,8 +66,9 @@ def test_pf_runs_in_bash_with_notes_log_diff_blame_and_search(workspace, tmp_pat
     log = executor.execute('bash', {'command': 'cd /workspace && pf log MEMORY.md'})
     lines = log.splitlines()
     assert lines[0] == 'file MEMORY.md: 2 versions, newest first'
-    assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · note: "' + 'x' * 147)
-    assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · note: "first notes"'
+    items = executor.pf_queries.last_answer['items']
+    assert lines[1].startswith('MEMORY.md@v2 · day 0 · +2 −1 lines · capture ' + items[0]['content_ref'] + ' · note (day 0): "' + 'x' * 147)
+    assert lines[2] == 'MEMORY.md@v1 · day 0 · 2 lines · capture ' + items[1]['content_ref'] + ' · note (day 0): "first notes"'
     assert lines[3:] == ['pf show MEMORY.md@v2', 'pf diff MEMORY.md@v1 MEMORY.md@v2',
                          'pf blame MEMORY.md', 'Before changing this source: pf rdepend MEMORY.md@v2 --detail.']
     assert executor.execute('bash', {'command': 'pf log MEMORY.md | head -2'}) == '\n'.join(lines[:2]) + '\n'
@@ -122,8 +123,9 @@ def test_pf_shell_uses_and_cleans_long_owned_tmpdir(workspace, tmp_path, monkeyp
 
     monkeypatch.setattr(executor.pf_queries, 'execute', observed)
     result = executor.execute('bash', {'command': 'pf log owned.txt'})
+    capture = executor.pf_queries.last_answer['items'][0]['content_ref']
     assert result.splitlines()[:2] == [
-        'file owned.txt: 1 version, newest first', 'owned.txt@v1 · day unknown · 1 line']
+        'file owned.txt: 1 version, newest first', 'owned.txt@v1 · day unknown · 1 line · capture ' + capture]
     assert len(sockets) == 1
     assert executor.last_status == 'succeeded'
     bash = next(row['result'] for row in records(store) if row['request']['kind'] == 'bash')
@@ -159,7 +161,10 @@ def test_receipts_preserve_declared_applicability_and_references(workspace, tmp_
     text = registry.execute('create', dict(text='Plan', objects=[dict(kind='plan', id='B')], applies='7-13',
                                            reason='r', references=[dict(cite='evidence.json', note='why')]))
     evidence = registry._load()['records']['r1'][0]['references'][0]['evidence']
-    cited = 'evidence.json@' + evidence['commit'] + ' (snapshot of evidence.json)'
+    commit = git(workspace, 'rev-parse', '--short=7', evidence['commit'])
+    assert git(workspace, 'rev-parse', commit) == evidence['commit']
+    assert len(evidence['commit']) == 40
+    cited = 'evidence.json@' + commit + ' (snapshot of evidence.json)'
     assert text == 'Registered r1.1 (active).\nCited: ' + cited
     assert registry.execute('revise', dict(record='r1', reason='wording', text='Plan B')) == (
         'Revised r1.2 (active).\nRetained references: ' + cited)
@@ -291,9 +296,11 @@ def test_identical_writes_update_notes_but_reads_do_not(workspace, tmp_path):
     result = executor.execute('read_file', {'path': 'MEMORY.md'})
     assert 'MEMORY.md@v1' in result and 'second' in result and 'first' not in result
     executor.execute('bash', dict(command='cat MEMORY.md', note='read only'))
+    log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
+    assert '"second"' in log and '"first"' not in log and 'read only' not in log
     executor.execute('write_file', dict(path='MEMORY.md', content='same'))
     log = executor.execute('bash', {'command': 'pf log MEMORY.md'})
-    assert '1 version,' in log and 'second' in log and 'read only' not in log
+    assert '1 version,' in log and 'note' not in executor.pf_queries.last_answer['items'][0]
     # A rebuilt index must agree with the incrementally refreshed one.
     del store._handle_index
     assert executor.execute('bash', {'command': 'pf log MEMORY.md'}) == log

@@ -262,7 +262,7 @@ NOTE_LIMIT = 200
 NOTE_PARAMETER = {
     'type': 'string',
     'description': ('Optional. Why you ran this or what the change is for. The note is saved with this call and its '
-                    'outputs and changed files in .tool-notes.jsonl. Up to 200 characters.'),
+                    'outputs and changed file versions. The internal event log is private. Up to 200 characters.'),
 }
 
 
@@ -360,7 +360,7 @@ class BashAgentToolExecutor:
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
                  text_registry=None,
                  identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None,
-                 bash_memory_limit_bytes=None):
+                 bash_memory_limit_bytes=None, private_root=None, public_refs=None):
         """Initialize the tool executor.
 
         Args:
@@ -380,6 +380,11 @@ class BashAgentToolExecutor:
         if identity and not require_sandbox:
             raise ValueError('Team execution requires the Linux sandbox')
         self.workspace_path = Path(workspace_path).resolve()
+        from saas_bench.private_storage import private_root as storage_root
+        root = private_root or (text_registry.private_root if text_registry else None)
+        self.private_root = storage_root(self.workspace_path, identity=identity, root=root, readable=self.readable_workspaces)
+        from saas_bench.public_refs import PublicRefs
+        self.public_refs = public_refs or getattr(evidence_store, 'public_refs', None) or PublicRefs(self.private_root / 'public-refs.sqlite')
         self.runtime_environment = runtime_environment_snapshot()
         self.extra_env = dict(self.runtime_environment)
         self.extra_env.update(env or {})
@@ -501,6 +506,7 @@ class BashAgentToolExecutor:
         before = None
         note_before = self._note_files() if tool_name in NOTE_TOOLS and args.get('note', '').strip() else None
         result, status = '', 'succeeded'
+        self._note_output = None
         try:
             if capture:
                 capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root),
@@ -535,7 +541,11 @@ class BashAgentToolExecutor:
                             output_sha256=hashlib.sha256(str(result).encode()).hexdigest(),
                             files=sorted(path for path in note_before.keys() | note_after.keys() if note_before.get(path) != note_after.get(path)),
                             **(self.identity.fields() if self.identity else {}))
-                with open_file(self.workspace_path, self.workspace_path / '.tool-notes.jsonl', 'ab') as stream:
+                if self.text_registry and self.text_registry.mode in ('git', 'prefix'):
+                    from saas_bench.tool_notes import record_git_note
+                    artifact = record_git_note(self, note, self._note_output if self._note_output is not None else str(result))
+                    result = str(result) + '\n' + artifact
+                with open_file(self.private_root, self.private_root / 'tool-notes.jsonl', 'ab') as stream:
                     stream.write((json.dumps(note, ensure_ascii=False) + '\n').encode())
         except RelationHold as exc:
             if lifecycle := getattr(self, 'lifecycle', None):
@@ -553,7 +563,14 @@ class BashAgentToolExecutor:
             self._bash_error = exc
             self._bash_facts['error_type'] = type(exc).__name__
             self._bash_facts['error_errno'] = getattr(exc, 'errno', None)
-            result = f"Error: {exc}"
+            if tool_name.startswith('pf_'):
+                from saas_bench.public_errors import public_exception_message
+                logging.exception('Private PF tool failure')
+                if capture:
+                    capture.facts['private_error'] = dict(type=type(exc).__name__, message=str(exc))
+                result = 'Error: ' + public_exception_message(exc)
+            else:
+                result = f"Error: {exc}"
             status = 'timed_out' if self.bash_warn_after is not None and self._timed_out else 'failed'
             if status == 'timed_out':
                 result = (f'Error: Command timed out after {self.bash_timeout:g} seconds. '
@@ -1088,6 +1105,7 @@ class BashAgentToolExecutor:
 
             if self.capture:
                 self.capture.origins = self._stream_origins(stdout, stderr)
+            self._note_output = output
             output_limit = runtime_value('bash_output_max_chars', 100000, environment=self.runtime_environment)
             if output_limit and len(output) > output_limit and not getattr(self, 'registered_execution', False):
                 path = self._save_full_output(output)
@@ -1205,7 +1223,8 @@ class BashAgentToolExecutor:
     def _save_full_output(self, text):
         from saas_bench.workspace_io import open_file
         raw = text.encode()
-        relative = Path('tool-outputs') / (hashlib.sha256(raw).hexdigest() + '.txt')
+        number = self.public_refs.ordinal('tool_output', self.role, hashlib.sha256(raw).hexdigest())
+        relative = Path('tool-outputs') / f'output{number}.txt'
         with open_file(self.workspace_path, self.workspace_path / relative, 'wb') as stream:
             stream.write(raw)
         return relative.as_posix()
@@ -1268,7 +1287,9 @@ class BashAgentToolExecutor:
             source_start += len(line) + 1
             target += len(prefix) + len(line) + 1
 
-        return scope + '\n'.join(numbered)
+        from saas_bench.tool_notes import current_file_note
+        annotation = current_file_note(self, path, content)
+        return scope + '\n'.join(numbered) + ('\n' + annotation if annotation else '')
 
     def _exec_write_file(self, args: Dict) -> str:
         """Write file contents."""

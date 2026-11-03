@@ -91,7 +91,7 @@ class RoleWorker:
 
 class MultiAgentRuntime:
     def __init__(self, root, tools, *, client_factory, mode='git', conn=None,
-                 simulator=None, public_dir=None, run_id=None, world_id=None,
+                 simulator=None, public_dir=None, run_id=None, world_id=None, public_refs_path=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
                  analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, **server_options):
@@ -148,6 +148,18 @@ class MultiAgentRuntime:
             run_id, world_id = saved_run, saved_world
         else:
             run_id, world_id = run_id or uuid.uuid4().hex, world_id or uuid.uuid4().hex
+        from urllib.parse import quote
+        from .public_refs import PublicRefs
+        saved_refs = (_restored_state or {}).get('public_refs')
+        refs_root = Path(_restored_state['source_root']) if _restored_state else self.root
+        refs_path = (saved_refs['path'] if saved_refs else public_refs_path or
+            refs_root.parent / '.public-refs' / (quote(run_id, safe='') + '.sqlite'))
+        current_restore = bool(_restored_state and not _restored_state.get('_legacy_history_unavailable'))
+        if current_restore and not saved_refs:
+            refs_path = self.root / 'private' / ('missing-public-refs-' + uuid.uuid4().hex + '.sqlite')
+        self.public_refs = PublicRefs(refs_path,
+            snapshot=self.root / (saved_refs['snapshot'] if saved_refs else 'private/public-refs.sqlite') if _restored_state else None,
+            require_existing=current_restore)
         from .runtime_temp import prepare_tmpdir
         self._temp_root = prepare_tmpdir(self.root / 'tmp')
         self._sockets = tempfile.TemporaryDirectory(prefix='ceobench-team-', dir=self._temp_root)
@@ -172,12 +184,16 @@ class MultiAgentRuntime:
             store = stores[role] = SQLEvidenceStore(private / 'evidence.sqlite', dict(
                 identity.fields(), branch_id=role, data_source_id=world_id, format=FORMAT,
                 capture_scope='execution')) if mode == 'pf' else None
+            if store is not None:
+                store.public_refs = self.public_refs
             audit = audits[role] = RoleAudit(role_private / 'audit.jsonl', identity)
-            registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day, identity=identity)
+            registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day, identity=identity, private_root=role_private)
+            registry.public_refs = self.public_refs
             env = dict(NOVAMIND_API_PORT='1', NOVAMIND_API_SOCKET='/run/novamind-api/api.sock',
                        PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(workspace / 'docs'))
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
-                require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role],
+                require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role], private_root=role_private,
+                public_refs=self.public_refs,
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
             settings = (dict(bash_timeout=analyst_bash_timeout, bash_warn_after=analyst_bash_warn_after) if role != 'ceo'
                         else dict(bash_timeout=ceo_bash_timeout, bash_warn_after=ceo_bash_warn_after))
@@ -219,7 +235,11 @@ class MultiAgentRuntime:
         self.roles = MappingProxyType(runtimes)
         self.server = NovaMindAPIServer(tools, simulator=simulator, conn=conn,
             script_workspace=workspaces['ceo'], require_sandbox=True, sql_evidence=stores['ceo'],
+            public_refs=self.public_refs,
             role_sockets=sockets, script_role_sockets=script_sockets, role_stores=stores, role_executors=script_executors, role_audits=audits, **server_options)
+        if _restored_state:
+            from .business_ledger import migrate_operation_refs
+            migrate_operation_refs(self.server.conn, self.public_refs)
         def operation_lookup(reference):
             from .business_ledger import read_operation
             from .relation_registry import Rejected
@@ -260,7 +280,7 @@ class MultiAgentRuntime:
             self.server.start()
             for runtime in self.roles.values():
                 runtime.executor.verify_sandbox()
-                if not _restored_state:
+                if not _restored_state or _restored_state.get('_legacy_history_unavailable'):
                     self._initialize_history(runtime)
             if _restored_state:
                 from .team_checkpoint import restore_runtime_state
@@ -561,7 +581,15 @@ class MultiAgentRuntime:
             raise RunCancelled('natural_end')
         self._lifecycle.check(retry=True)
 
+    def _check_reference_history(self):
+        from .public_refs import PublicReferenceUnavailable
+        try:
+            self.public_refs.require_available()
+        except PublicReferenceUnavailable as exc:
+            raise RunCancelled('public_reference_history_unavailable', str(exc)) from None
+
     def _check_model_send(self):
+        self._check_reference_history()
         from .runtime_options import timeout_value
         timeout = timeout_value('completion_wait', 30, environment=self.server.runtime_environment)
         deadline = time.monotonic() + timeout if timeout is not None else float('inf')
@@ -628,6 +656,10 @@ class MultiAgentRuntime:
             self._transition(message, 'queued')
         return message
 
+    def _request_ref(self, request):
+        number = self.public_refs.ordinal('team_request', request.sender, request.request_id)
+        return f'{request.sender}:request{number}'
+
     def _team_permission(self, role, operation):
         with self._team_condition:
             worker = self._workers[role]
@@ -672,7 +704,7 @@ class MultiAgentRuntime:
                 self._workers[receiver].inbox.append(message)
         if refusal is not None:
             self._transition(message, 'rejected', refusal)
-            return f'Error: {refusal} request_id={message.request_id}'
+            return f'Error: {refusal} request_id={self._request_ref(message)}'
         self._transition(message, 'queued')
         with self._team_condition:
             self._team_condition.notify_all()
@@ -749,14 +781,14 @@ class MultiAgentRuntime:
     def _accept_question(self, request, *, queued=False):
         active = self._workers[request.receiver].question
         if queued:
-            instruction = (f'Queued after active request_id={active.request_id}. Continue answering that active request. '
+            instruction = (f'Queued after active request_id={self._request_ref(active)}. Continue answering that active request. '
                            if active else 'Queued for later. Continue your current weekly task. ')
             instruction += 'The host will activate this queued request by ID after earlier work finishes.'
         else:
             instruction = ('Answer this request in final text. You may use your tools. '
                            'This answers only the request; the host will resume your prior task afterward.')
         self._role_input(request.receiver,
-            f'Team request | request_id={request.request_id} | from={request.sender} | '
+            f'Team request | request_id={self._request_ref(request)} | from={request.sender} | '
             f'to={request.receiver} | day={request.day}\n{request.text}\n{instruction}', day=request.day)
         request.input_accepted = True
         self._transition(request, 'queued' if queued else 'running')
@@ -804,13 +836,13 @@ class MultiAgentRuntime:
             try:
                 self._check()
                 if request.input_accepted:
-                    self._role_input(role, f'Now answer queued request_id={request.request_id} in final text. '
+                    self._role_input(role, f'Now answer queued request_id={self._request_ref(request)} in final text. '
                         'This answers only that request; the host will resume your prior task afterward.', day=request.day)
                     self._transition(request, 'running')
                 else:
                     self._accept_question(request)
                 answer = self._drive_role(role, completion='answer', question=request)
-                request.handoff_commit = self._snapshot_history(runtime, f'Team reply {request.request_id[:7]} (day {request.day})')
+                request.handoff_commit = self._snapshot_history(runtime, f'Team reply {self._request_ref(request)} (day {request.day})')
                 self._transition(request, 'completed', answer)
                 handled = True
             except BaseException:
@@ -894,7 +926,7 @@ class MultiAgentRuntime:
                 self._update_role_week(role)
                 answer = self._drive_role(role, completion='answer')
                 observation = None
-                request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {request.request_id[:7]} (day {request.day})')
+                request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {self._request_ref(request)} (day {request.day})')
                 self._transition(request, 'completed', answer)
                 if request.kind == 'weekly_task':
                     self._update_role_week(role, weekly_status='completed')
@@ -906,15 +938,19 @@ class MultiAgentRuntime:
         return requests
 
     def _handoff(self, request):
+        runtime = self.roles[request.receiver]
+        commit = runtime.executor.run_private(
+            ['git', '-C', str(runtime.workspace), 'rev-parse', '--short=7', request.handoff_commit],
+            capture_output=True, text=True, check=True, timeout=10).stdout.strip()
         header = (f'Analyst handoff | role={request.receiver} | day={request.day} | '
-                  f'request_world_state_id={request.world_state_id} | request_id={request.request_id}\n'
-                  f'Workspace: {self.roles[request.receiver].workspace}\n'
-                  f'Snapshot commit: {request.handoff_commit}\n')
+                  f'request_id={self._request_ref(request)}\n'
+                  f'Workspace: {runtime.workspace}\n'
+                  f'Snapshot commit: {commit}\n')
         if request.kind == 'question':
             header = (f'Team reply | from={request.receiver} | to={request.sender} | day={request.day} | '
-                      f'request_id={request.request_id} | request_world_state_id={request.world_state_id}\n'
-                      f'Workspace: {self.roles[request.receiver].workspace}\n'
-                      f'Snapshot commit: {request.handoff_commit}\n')
+                      f'request_id={self._request_ref(request)}\n'
+                      f'Workspace: {runtime.workspace}\n'
+                      f'Snapshot commit: {commit}\n')
         return join_text(header, '\n', request.reply)
 
     def _parallel(self, requests, dashboard=None):
@@ -1016,6 +1052,7 @@ class MultiAgentRuntime:
         self._lifecycle.hold = Path(hold) if hold and Path(hold).name == 'STOP' else None
         self._set_phase(self._stage)
         try:
+            self._check_reference_history()
             with self._lifecycle, ThreadPoolExecutor(max_workers=3, thread_name_prefix="team-role") as pool:
                 self._pool = pool
                 self._workers_stopping = False
