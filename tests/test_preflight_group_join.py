@@ -296,6 +296,7 @@ def test_group_freeze_and_public_driver_check_do_not_register_attempts(frozen, t
         selection_rule=original['seed_selection_rule'], excluded_seeds=original['excluded_debug_seeds'],
         scheduling='group_independent')
     path = tmp_path / 'formal/manifest.json'
+    assert not (path.parent / 'runs').exists()
     assert batch.validate_manifest(path)['scheduling'] == manifest['scheduling']
     expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
     expected.update(manifest=str(path), manifest_sha256=file_hash(path), host_logs=str(tmp_path / 'host-logs'),
@@ -338,6 +339,7 @@ def test_two_seed_group_freeze_cli_and_driver_check(tmp_path):
         '--scheduling', 'group_independent'], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     path = directory / 'manifest.json'
+    assert not (directory / 'runs').exists()
     manifest = json.loads(result.stdout)
     validated = subprocess.run([*command, 'validate', '--manifest', str(path)],
         env=env, capture_output=True, text=True, check=True, timeout=60)

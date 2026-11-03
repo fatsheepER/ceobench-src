@@ -596,9 +596,18 @@ def test_git_citations_reject_repository_aliases_and_keep_explicit_peer_owner(mo
         assert accepted.startswith('Registered growth:') and 'ops_finance:same.txt@' in accepted, accepted
         reference = growth.registry._load()['records']['r1'][-1]['references'][0]
         assert reference['evidence']['owner'] == 'ops_finance'
-        assert reference['evidence']['path'] == 'same.txt' and reference['evidence']['commit'] == commit[:7]
+        assert reference['evidence']['path'] == 'same.txt' and reference['evidence']['commit'] == commit
+        assert commit not in accepted
         if mode == 'pf':
-            assert growth.store.load_state('declaration:r1.1')['references'][0]['git_commit'] == commit
+            binding = growth.store.load_state('declaration:r1.1')['references'][0]
+            assert binding['git_commit'] == commit
+            handle = growth.registry.resolver.handle(binding['version_id'])
+            assert handle in accepted
+            body = growth.executor.execute('pf_read', dict(target={'version': handle})).split('\n', 1)[1]
+            assert body == 'ops_finance-EXACT-CONTENT'
+        else:
+            public_commit = team._git(peer, 'rev-parse', '--short=7', commit)
+            assert 'ops_finance:same.txt@' + public_commit in accepted
         output = growth.executor.execute('bash', dict(command='git -c safe.directory=* -C ' + shlex.quote(str(peer.workspace)) + ' show ' + commit + ':same.txt'))
         assert 'ops_finance-EXACT-CONTENT' in output
 
@@ -623,7 +632,15 @@ def test_team_git_citations_accept_detached_own_history(mode):
             assert output.startswith('Registered growth:'), output
             version = growth.registry.last_result['version']
             record = growth.registry._load()['records'][version.split('.')[0]][-1]
-            assert record['references'][0]['evidence'] == dict(owner='growth', path='same.txt', commit=commit[:7])
+            assert record['references'][0]['evidence'] == dict(owner='growth', path='same.txt', commit=commit)
+            assert commit not in output
             if mode == 'pf':
                 binding = growth.store.load_state('declaration:' + version)['references'][0]
                 assert binding['git_commit'] == commit and binding['git_content_matches'] is True
+                handle = growth.registry.resolver.handle(binding['version_id'])
+                assert handle in output
+                body = growth.executor.execute('pf_read', dict(target={'version': handle})).split('\n', 1)[1]
+                assert body == 'Growth original'
+            else:
+                public_commit = team._git(growth, 'rev-parse', '--short=7', commit)
+                assert 'same.txt@' + public_commit in output

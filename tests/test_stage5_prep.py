@@ -6,6 +6,7 @@ import re
 import httpx
 import pytest
 
+from saas_bench import evidence_handles
 from saas_bench.execution_capture import ExecutionCapture
 from saas_bench.pf_queries import PFQueries
 from saas_bench.pf_read import accounting, apply_delta
@@ -249,11 +250,14 @@ def test_same_content_object_reads_compare_with_the_previous_output(offline_runn
     first = runner._execute_tool('bash', {'command': "cat > report.py <<'EOF'\n" + body + "EOF\n./novamind-operation python report.py"})
     second = runner._execute_tool('bash', {'command': 'echo rerun; ./novamind-operation python ./report.py'})
     event, ledger = deliver(runner.evidence_store, [first, second])
-    assert ledger[1]['mode'] in ('DELTA', 'UNCHANGED') and ledger[1]['base_handle'] == 'cmd2@v1'
+    assert ledger[1]['mode'] in ('DELTA', 'UNCHANGED')
+    base_handle = ledger[1]['base_handle']
+    assert ledger[1]['base'] == ledger[0]['target']
+    assert ledger[0]['target'] in evidence_handles.index(runner.evidence_store).lookup(base_handle)
     if ledger[1]['mode'] == 'DELTA':
         assert apply_delta(str(first), ledger[1]['edits']) == str(second)
     wire = json.loads(runner.evidence_store.get_content(event + ':wire')[1])
-    assert json.loads(wire['messages'][1]['content'].split('\n', 1)[0])['base'] == 'cmd2@v1'
+    assert json.loads(wire['messages'][1]['content'].split('\n', 1)[0])['base'] == base_handle
     # Inline Python and ordinary commands keep the same-call identity.
     other = runner._execute_tool('bash', {'command': './novamind-operation python -c "print(1)"'})
     _, ledger = deliver(runner.evidence_store, [first, other])

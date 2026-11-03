@@ -128,6 +128,7 @@ def test_startup_failure_preserves_finished_attempt_and_runs_peer(observer, cont
                 raise OSError('injected worker startup failure')
             child = popen([sys.executable, '-c', 'raise SystemExit(2)'], **kwargs)
             failed_children.append(child)
+            children.append((entry['run_id'], child))
             return child
         return launch(command, **kwargs)
 

@@ -415,7 +415,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     for group in layout.groups:
         entry = next(run for run in runs if run['group'] == group)
         with tempfile.TemporaryDirectory(prefix='team-prompts-') as temporary:
-            team = make_team(manifest, entry, Path(temporary), token_counter=counter)
+            team = make_team(manifest, dict(entry, output_dir=temporary), Path(temporary), token_counter=counter)
             try:
                 prompts[group] = prompt_templates(team)
             finally:
