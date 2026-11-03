@@ -47,7 +47,8 @@ def test_compact_lines_carry_day_source_and_declaration_metadata(workspace, tmp_
                  registry.path.read_text()):
         assert not CLOCK.search(text), text
     header = json.loads(executor.execute('pf_read', {'target': {'record': 'r1'}}).split('\n', 1)[0])
-    assert set(header) == {'delivery', 'next_cursor', 'range', 'target', 'total_chars'}
+    assert set(header) == {'delivery', 'next_cursor', 'next_command', 'range', 'target', 'total_chars'}
+    assert header['next_command'] is None
     assert set(header['target']) == {'version', 'day', 'what', 'owner'}
     assert header['target']['owner'] == 'ceo'
 
@@ -96,7 +97,8 @@ def test_search_and_history_are_newest_first_with_one_optional_detail_line(works
         call(registry, 'create', **declaration(text=f'plan {i}'))
     lines = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'limit': 2, 'all': True}).splitlines()
     assert lines[0] == 'pf search B: 3 saved, newest first; showing 1–2.'
-    assert '"plan 2"' in lines[1] and '"plan 1"' in lines[2] and '1 more older: pf more c1.' in lines[3]
+    assert '1 more older: pf more c1.' in lines[1]
+    assert '"plan 2"' in lines[2] and '"plan 1"' in lines[3]
     detail = executor.execute('pf_search', {'object': {'kind': 'plan', 'id': 'B'}, 'detail': True, 'all': True}).splitlines()
     assert len(detail) == 1 + 3 * 2 + 1 and detail[2].startswith('    B declared')
     assert executor.execute('pf_read', {'target': {'record': 'r1'}, 'detail': True}).startswith('Error:')

@@ -18,16 +18,26 @@ class PublicRefs:
             self._read_path = Path(snapshot).resolve() if snapshot else self.path
             return
         self._read_path = self.path
-        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS references_by_key (
-                kind TEXT NOT NULL, role TEXT NOT NULL, private_key TEXT NOT NULL,
-                number INTEGER NOT NULL CHECK(number>0), public_ref TEXT NOT NULL,
-                PRIMARY KEY(kind,role,private_key), UNIQUE(kind,public_ref), UNIQUE(kind,role,number))''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS counters (
-                kind TEXT NOT NULL, role TEXT NOT NULL, last_number INTEGER NOT NULL,
-                PRIMARY KEY(kind,role))''')
-            conn.commit()
+        if require_existing:
+            try:
+                with self._connect(readonly=True) as conn:
+                    conn.execute('SELECT kind,role,private_key,number,public_ref FROM references_by_key LIMIT 0')
+                    conn.execute('SELECT kind,role,last_number FROM counters LIMIT 0')
+            except sqlite3.DatabaseError:
+                self.unavailable = 'Public reference allocator is invalid; new references require the original allocation history'
+                self._read_path = Path(snapshot).resolve() if snapshot else self.path
+                return
+        else:
+            self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            with self._connect() as conn:
+                conn.execute('''CREATE TABLE IF NOT EXISTS references_by_key (
+                    kind TEXT NOT NULL, role TEXT NOT NULL, private_key TEXT NOT NULL,
+                    number INTEGER NOT NULL CHECK(number>0), public_ref TEXT NOT NULL,
+                    PRIMARY KEY(kind,role,private_key), UNIQUE(kind,public_ref), UNIQUE(kind,role,number))''')
+                conn.execute('''CREATE TABLE IF NOT EXISTS counters (
+                    kind TEXT NOT NULL, role TEXT NOT NULL, last_number INTEGER NOT NULL,
+                    PRIMARY KEY(kind,role))''')
+                conn.commit()
         self.path.chmod(0o600)
         if snapshot and Path(snapshot).is_file():
             self.reserve(snapshot)

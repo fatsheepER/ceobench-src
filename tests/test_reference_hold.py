@@ -21,6 +21,10 @@ def break_authority(checkpoint, fault, snapshot):
     elif fault == 'authority':
         path = Path(refs['path'])
         path.rename(path.with_suffix('.preserved'))
+    elif fault in ('empty', 'malformed'):
+        path = Path(refs['path'])
+        shutil.copyfile(path, path.with_suffix('.preserved'))
+        path.write_bytes(b'' if fault == 'empty' else b'invalid SQLite database')
     else:
         with sqlite3.connect(Path(snapshot) / refs['snapshot']) as frozen:
             row = frozen.execute('SELECT kind,role,private_key FROM references_by_key LIMIT 1').fetchone()
@@ -31,7 +35,7 @@ def break_authority(checkpoint, fault, snapshot):
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-@pytest.mark.parametrize('fault', ['authority', 'locator', 'conflict'])
+@pytest.mark.parametrize('fault', ['authority', 'locator', 'conflict', 'empty', 'malformed'])
 def test_driver_restores_selected_world_then_holds_without_model_requests(driver, group, fault):
     policy, entry = driver.policy('reference-history', group)
     _, original, first = driver.run(policy, entry)
@@ -61,7 +65,7 @@ def test_driver_restores_selected_world_then_holds_without_model_requests(driver
     assert tree_hash(selected, exact=True) == preserved
 
 
-@pytest.mark.parametrize('fault', ['authority', 'locator', 'conflict'])
+@pytest.mark.parametrize('fault', ['authority', 'locator', 'conflict', 'empty', 'malformed'])
 def test_standalone_wrapper_holds_selected_checkpoint_before_model_send(offline_runner, monkeypatch, fault):
     source = offline_runner(text_registration='git')
     source.agent.current_day = 0
