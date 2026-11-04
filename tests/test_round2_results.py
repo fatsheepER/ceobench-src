@@ -3,7 +3,7 @@ import pytest
 from saas_bench.team_results import summarize_pairs
 
 
-@pytest.mark.parametrize('end', [28, 56, 112])
+@pytest.mark.parametrize('end', [28, 56, 70, 112])
 def test_complete_pair_uses_assigned_observation_end(end):
     runs = [dict(run_id=f'{group}-one', seed=101, repeat=1, group=group,
                  status='reached_d112' if end == 112 else 'reached_stop_day',

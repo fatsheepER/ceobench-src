@@ -70,8 +70,12 @@ BATCH_PROFILES = {
     'engineering': BatchProfile('engineering', (1,), 1, ('git', 'pf'), 28),
     'r2-git-exploration': BatchProfile('formal', (2,), 1, ('git',), 56),
     'r2-paired-pilot': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
+    'r3-d70': BatchProfile('formal', (2,), 1, ('git', 'pf'), 70),
 }
 ROUND_TWO_PROFILES = ('r2-git-exploration', 'r2-paired-pilot')
+ROUND_THREE_PROFILE = 'r3-d70'
+EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE)
+ROUND_THREE_SEEDS = (1048, 1049)
 
 
 class CheckpointPublicationError(RuntimeError):
@@ -337,8 +341,8 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     public = Path(public_dir or root / 'public').resolve()
     if category not in ('formal', 'engineering'):
         raise ValueError('Category must be formal or engineering')
-    if profile is not None and profile not in ROUND_TWO_PROFILES:
-        raise ValueError('Unknown round-two profile')
+    if profile is not None and profile not in EXPERIMENT_PROFILES:
+        raise ValueError('Unknown experiment profile')
     layout = BATCH_PROFILES[profile or category]
     if category != layout.category:
         raise ValueError('Category conflicts with the selected profile')
@@ -346,7 +350,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if scheduling not in ('paired', 'group_independent'):
         raise ValueError('Unknown frozen scheduling policy')
     if profile and scheduling != 'group_independent':
-        raise ValueError('Round-two profiles use independent group queues')
+        raise ValueError('Experiment profiles use independent group queues')
     exclusion_source = None
     excluded_seeds = set(excluded_seeds)
     if profile == 'r2-paired-pilot':
@@ -368,7 +372,11 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         raise ValueError('Seeds must be unique nonnegative integers')
     if len(seeds) not in layout.seed_counts:
         raise ValueError(f'{profile or category} requires seed count in {layout.seed_counts}')
-    if category == 'formal' and (not selection_rule.strip() or set(seeds) & excluded_seeds):
+    if profile == ROUND_THREE_PROFILE:
+        if sorted(seeds) != list(ROUND_THREE_SEEDS):
+            raise ValueError('Third round requires sealed D0 seeds 1048 and 1049')
+        selection_rule = 'Reuse sealed D0 seeds 1048 and 1049 in ascending group queues'
+    elif category == 'formal' and (not selection_rule.strip() or set(seeds) & excluded_seeds):
         raise ValueError('Batches require unused seeds and a recorded selection rule')
     if profile:
         seeds.sort()
@@ -382,24 +390,34 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     run_prefix = f'{profile}-{batch_id}' if profile else category
     pairs = [(seed, repeat) for seed in seeds for repeat in range(1, layout.repeats + 1)]
     ordering = random.Random(order_seed)
-    ordering.shuffle(pairs)
+    if profile != ROUND_THREE_PROFILE:
+        ordering.shuffle(pairs)
     runs = []
     for seed, repeat in pairs:
         groups = list(layout.groups)
-        ordering.shuffle(groups)
+        if profile != ROUND_THREE_PROFILE:
+            ordering.shuffle(groups)
         for group in groups:
             run_id = f'{run_prefix}-s{seed}-r{repeat}-{group}'
             runs.append(dict(run_id=run_id, pair_id=f's{seed}-r{repeat}', seed=seed, repeat=repeat,
                 group=group, category=category, d0=d0[str(seed)]['path'],
                 output_dir=str(destination / 'runs' / run_id), stop_after_day=layout.stop_after_day))
+    parameters = canonical(PARAMETERS)
+    if profile == ROUND_THREE_PROFILE:
+        from .agent_capabilities import AgentCapabilities
+        parameters['capabilities'] = {group: AgentCapabilities.round_three(group).to_dict()
+                                      for group in layout.groups}
+        for entry in runs:
+            entry['capabilities'] = parameters['capabilities'][entry['group']]
     controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
     manifest = dict(version=1, category=category, batch_id=batch_id, seeds=seeds,
         excluded_debug_seeds=sorted(excluded_seeds), seed_selection_rule=selection_rule,
-        order=dict(method='python.Random.shuffle pairs then groups', seed=order_seed),
+        order=dict(method='fixed seeds ascending then groups' if profile == ROUND_THREE_PROFILE
+                   else 'python.Random.shuffle pairs then groups', seed=order_seed),
         source_root=str(root), source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
         controller_sha256={name: file_hash(root / name) for name in controllers},
-        public_dir=str(public), build=build, parameters=PARAMETERS, pricing=prices,
+        public_dir=str(public), build=build, parameters=parameters, pricing=prices,
         price_source=price_source, attempt_policy='manual_checkpoint_resume', d0=d0, runs=runs)
     if profile:
         manifest['profile'] = profile
@@ -446,7 +464,7 @@ def validate_manifest(path):
         if layout is None or layout.category != category:
             logging.warning('Batch profile or resource category mismatch')
         if category == 'formal':
-            if len(seeds) not in (layout.seed_counts if layout else (2, 3)) or len(set(seeds)) != len(seeds) or set(seeds) & set(manifest['excluded_debug_seeds']) or not manifest['seed_selection_rule'].strip():
+            if len(seeds) not in (layout.seed_counts if layout else (2, 3)) or len(set(seeds)) != len(seeds) or (profile != ROUND_THREE_PROFILE and set(seeds) & set(manifest['excluded_debug_seeds'])) or not manifest['seed_selection_rule'].strip():
                 logging.warning('Formal batch seed selection mismatch')
             expected = {(seed, repeat, group) for seed in seeds
                 for repeat in range(1, layout.repeats + 1) for group in layout.groups} if layout else set()
@@ -455,6 +473,16 @@ def validate_manifest(path):
         else:
             logging.warning('Batch category or engineering seed mismatch')
             expected = {(row['seed'], row['repeat'], row['group']) for row in manifest['runs']}
+        if profile == ROUND_THREE_PROFILE:
+            from .agent_capabilities import AgentCapabilities
+            if seeds != list(ROUND_THREE_SEEDS) or [(row['seed'], row['group']) for row in manifest['runs']] != [
+                    (seed, group) for seed in ROUND_THREE_SEEDS for group in layout.groups]:
+                logging.warning('Third-round fixed seeds or queue order mismatch')
+            expected_capabilities = {group: AgentCapabilities.round_three(group).to_dict() for group in layout.groups}
+            if manifest['parameters'] != dict(PARAMETERS, capabilities=expected_capabilities):
+                logging.warning('Third-round model parameters or capabilities mismatch')
+            if any(row.get('capabilities') != expected_capabilities.get(row['group']) for row in manifest['runs']):
+                logging.warning('Third-round run capabilities mismatch')
         actual, ids, outputs = set(), set(), set()
         for entry in manifest['runs']:
             key = entry['seed'], entry['repeat'], entry['group']
@@ -1168,7 +1196,7 @@ def main(argv=None):
     frozen.add_argument('--price-source', required=True)
     shape = frozen.add_mutually_exclusive_group()
     shape.add_argument('--category', choices=('formal', 'engineering'), default='formal')
-    shape.add_argument('--profile', choices=ROUND_TWO_PROFILES)
+    shape.add_argument('--profile', choices=EXPERIMENT_PROFILES)
     frozen.add_argument('--exploration-manifest', type=Path,
         help='Prior Git exploration manifest, required for the paired pilot seed exclusions.')
     frozen.add_argument('--excluded-debug-seed', '--excluded-seed', action='append', type=int, default=[])

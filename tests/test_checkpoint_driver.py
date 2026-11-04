@@ -84,7 +84,12 @@ def _worker(spec_path, argv):
         holder['team'] = team
         if boundary == 'ready':
             source = record.get('source_checkpoint')
-            ready = dict(source=source, day=team.server.tools.current_day, stage=team._stage)
+            ready = dict(source=source, day=team.server.tools.current_day, stage=team._stage,
+                configuration=team.configuration, generation_policy={role: dict(
+                    memory_max_chars=runtime.agent.memory_max_chars,
+                    max_output_tokens=runtime.agent.max_output_tokens,
+                    invalid_generation_attempts=runtime.agent.invalid_generation_attempts)
+                    for role, runtime in team.roles.items()})
             if source:
                 snapshot = Path(source)
                 saved = batch.read(snapshot / 'team.json')
