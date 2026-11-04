@@ -29,7 +29,7 @@ def item(label, role='growth', source=None):
 
 
 def action(arguments, call_id):
-    result = calls(('relation_batch', arguments))
+    result = calls(('escalate', arguments))
     result['tool_calls'][0]['id'] = call_id
     return result
 
@@ -56,7 +56,7 @@ def test_model_receives_each_item_replays_same_call_and_corrects_new_call(mode):
         turns[role] += 1
         if turns[role] == 1:
             return action(arguments, 'logical-relation-call')
-        receipt = json.loads([m['content'] for m in body['messages'] if m.get('name') == 'relation_batch'][-1])
+        receipt = json.loads([m['content'] for m in body['messages'] if m.get('name') == 'escalate'][-1])
         receipts.append(receipt)
         if turns[role] == 2:
             assert receipt['status'] == 'partial'
@@ -86,8 +86,8 @@ def test_model_receives_each_item_replays_same_call_and_corrects_new_call(mode):
         for body in sent:
             assert RELATIONS in body['messages'][0]['content']
             assert ('pf candidates' in body['messages'][0]['content']) == (mode == 'pf')
-            assert any(tool['function']['name'] == 'relation_batch' for tool in body['tools'])
-        assert sum(len([m for m in body['messages'] if m.get('name') == 'relation_batch']) for body in sent) == 6
+            assert any(tool['function']['name'] == 'escalate' for tool in body['tools'])
+        assert sum(len([m for m in body['messages'] if m.get('name') == 'escalate']) for body in sent) == 6
         save_sample(mode + '-model', wire=wire, usage=usage, receipts=receipts, state=state)
 
 
@@ -164,7 +164,7 @@ def test_uncertain_publication_keeps_prefix_and_stops_models_and_partner(mode, b
         call, = persisted['calls'].values()
         assert call['complete'] is False
         before = registry.path.read_bytes()
-        rejected = team.roles['growth'].executor.execute('relation_batch', {'items': [item('after-hold')]},
+        rejected = team.roles['growth'].executor.execute('escalate', {'items': [item('after-hold')]},
                                                        tool_call_id='after-hold')
         assert rejected.startswith('Error:')
         assert registry.path.read_bytes() == before
@@ -195,10 +195,10 @@ def test_selected_checkpoint_keeps_relations_and_call_receipts_without_replaying
         declare(original, 'growth', 'A reusable conclusion.', ['unknown: initial material'])
         runtime = original.roles['growth']
         kept_args = {'items': [item('kept')]}
-        kept = runtime.executor.execute('relation_batch', kept_args, tool_call_id='kept-call')
+        kept = runtime.executor.execute('escalate', kept_args, tool_call_id='kept-call')
         assert json.loads(kept)['saved'] == 1
         checkpoint = original.checkpoint()
-        later = runtime.executor.execute('relation_batch', {'items': [item('discarded')]}, tool_call_id='discarded-call')
+        later = runtime.executor.execute('escalate', {'items': [item('discarded')]}, tool_call_id='discarded-call')
         assert json.loads(later)['saved'] == 1
         original_state = runtime.registry.relations.path.read_bytes()
         restored = MultiAgentRuntime.restore(checkpoint, tmp_path / 'restored',
@@ -207,7 +207,7 @@ def test_selected_checkpoint_keeps_relations_and_call_receipts_without_replaying
         state = resumed.registry.relations._load()
         assert len(state['records']) == 1 and len(state['calls']) == 1
         assert all('discarded-call' not in key for key in state['calls'])
-        repeated = resumed.executor.execute('relation_batch', kept_args, tool_call_id='kept-call')
+        repeated = resumed.executor.execute('escalate', kept_args, tool_call_id='kept-call')
         assert json.loads(repeated) == json.loads(kept)
         history = json.loads(repeated)['items'][0]['history']
         assert history['path'] == 'documents/relations.json'
@@ -249,7 +249,7 @@ def test_real_attempt_wrapper_persists_hold_and_manual_restore_preserves_failed_
             if role == 'growth':
                 assert seen[role] == 1
                 message = calls(('text_create', declarations),
-                    ('relation_batch', {'items': [item('first'), item('uncertain'), item('unattempted')]}))
+                    ('escalate', {'items': [item('first'), item('uncertain'), item('unattempted')]}))
             else:
                 message = final('Existing material is sufficient.')
             return completion(message, body.get('stream', False))

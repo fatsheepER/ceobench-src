@@ -44,7 +44,7 @@ def test_sql_access_model_discovers_reads_and_declares_exact_query():
             assert 'MODEL_SQL_ACCESS_PAYLOAD' in results[-1]
             return calls(('write_file', {'path': 'access-note.txt', 'content': 'Retain the observed ledger note.'}))
         if turns[role] == 6:
-            return calls(('relation_batch', {'items': [dict(item_id='ledger-source', op='create',
+            return calls(('escalate', {'items': [dict(item_id='ledger-source', op='create',
                 target={'cite': 'growth:access-note.txt@v1'}, sources=[dict(ref={'cite': saved['version']})],
                 assertion='author_declared', reason='Keep the exact query I read.')] }))
         if turns[role] == 7:

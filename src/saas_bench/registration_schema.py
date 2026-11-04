@@ -66,10 +66,10 @@ class Compare(Input):
 CITE_FORMS = dict(
     git='a saved workspace file path (snapshotted immediately), path@week-N or '
         'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>". '
-        'Use operation_ref endpoints in relation_batch for business operations; cite does not accept them',
+        'Use operation_ref endpoints in escalate for business operations; cite does not accept them',
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
        'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
-       'or "unknown: <reason>". Use operation_ref endpoints in relation_batch for business operations; '
+       'or "unknown: <reason>". Use operation_ref endpoints in escalate for business operations; '
        'cite does not accept them')
 _RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
 _SINGLE = re.compile(r'[a-z_]+[1-9][0-9]*')

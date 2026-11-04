@@ -21,7 +21,7 @@ def test_third_round_definitions_and_direct_agent(mode):
         text_registration=True, pf_queries=mode == 'pf', team=True, capabilities=capabilities)
     names = {item['name'] for item in definitions}
     assert not names & {'text_create', 'text_revise', 'text_retire', 'text_list'}
-    assert ('relation_batch' in names) == (mode == 'pf')
+    assert ('escalate' in names) == (mode == 'pf')
     for item in definitions:
         if item['name'] in ('bash', 'write_file', 'edit_file'):
             assert ('note' in item['parameters']['properties']) == (mode == 'pf')
@@ -42,6 +42,7 @@ def test_team_capabilities_reject_before_side_effects_and_continue(mode):
             assert not executor.text_registry.path.exists()
             assert 'text_create' not in role.agent.system_prompt
             if mode == 'git':
+                assert executor.execute('escalate', {}).startswith('Error:')
                 assert executor.execute('relation_batch', {}).startswith('Error:')
                 for tool, args in (
                     ('bash', dict(command='touch forbidden.txt')),
@@ -68,7 +69,7 @@ def test_disabled_calls_reach_model_and_normal_week_still_finishes(mode):
         if turns[role] == 1:
             actions = [('text_list', {})]
             if mode == 'git':
-                actions += [('relation_batch', {'items': []}),
+                actions += [('escalate', {'items': []}), ('relation_batch', {'items': []}),
                             ('bash', dict(command='touch forbidden', note='disabled'))]
             return calls(*actions)
         if turns[role] == 2:
@@ -122,7 +123,7 @@ def test_pf_nontext_declarations_versions_operations_and_model_use():
             return final('No additional changes.')
         turns[role] += 1
         if turns[role] == 1:
-            return calls(('relation_batch', dict(items=[create('model-file', 'growth:report.txt@v1', [chosen['output']])])) )
+            return calls(('escalate', dict(items=[create('model-file', 'growth:report.txt@v1', [chosen['output']])])) )
         if turns[role] == 2:
             receipt = json.loads(body['messages'][-1]['content'].split('\n[pf:', 1)[0])
             assert receipt['saved'] == 1
@@ -345,7 +346,7 @@ def test_git_extra_saves_can_be_disabled_independently(tmp_path):
     assert 'private note' not in executor.execute('read_file', {'path': 'source.txt'})
     assert (executor.private_root / 'tool-notes.jsonl').exists()
     from test_relation_batch import create
-    result = json.loads(executor.execute('relation_batch', {'items': [create('source', 'source.txt', ['source.txt'])]}))
+    result = json.loads(executor.execute('escalate', {'items': [create('source', 'source.txt', ['source.txt'])]}))
     assert result['rejected'] == 1 and 'Immediate Git snapshots are disabled' in result['items'][0]['error']
     assert not git(workspace, 'for-each-ref', '--format=%(refname)', 'refs/ceobench/snapshots')
     assert git(workspace, 'show', 'HEAD:source.txt') == 'source'

@@ -72,7 +72,7 @@ capture relationships. It does not select old revisions.
 Files, outputs, exact text revisions and concrete role:number operation references (growth:1) can
 be relation targets or sources. Copy operation_ref from its business receipt.
 Text references[].cite accepts saved file/output handles and exact text revisions;
-use relation_batch with {operation_ref: "growth:1"} for an operation.
+use escalate with {operation_ref: "growth:1"} for an operation.
 Git file references keep their exact commit and storage role. Author declarations,
 other authors' inferences and automatic execution observations remain separate.
 --include-candidates adds saved derivation/range links and execution membership.
@@ -82,7 +82,7 @@ co-occurring input and output or prove source use. Missing materials retain thei
 fabricated readable version. Each declaration keeps its author, record and revision.
 The header gives returned/total counts and the next pf more command before results.
 Use pf more to continue the frozen page or read its public details. Known sources
-can be registered directly with relation_batch, without a candidates query.
+can be registered directly with escalate, without a candidates query.
 
 3. Find versions and revise references
 When evidence changed, inspect its history and compare versions of the same object:
@@ -143,7 +143,7 @@ Use the returned pf more cursor to continue the frozen snapshot or expand this
 page's details. For a copied EVENT, --event EVENT includes its captured children;
 --detail pages exact requests and receipt metadata. Source bodies use pf show.
 Details include content_ref, an exact acquisition accepted by pf show, separately
-from the reusable content handle. Use the content handle in relation_batch.
+from the reusable content handle. Use the content handle in escalate.
 Captured, delivered to a model, and declared used are different. Model delivery
 is shown for your reader role and the originating request before the query. Unknown
 does not mean unread. Candidate summaries do not deliver the full source body.

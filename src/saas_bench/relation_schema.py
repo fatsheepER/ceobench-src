@@ -75,7 +75,7 @@ MODELS = dict(create=Create, revise=Revise, retire=Retire)
 
 
 def tool_definition(*, texts=True, git_extra_saves=True):
-    definition = dict(name='relation_batch', description=(
+    definition = dict(name='escalate', description=(
         'Save source declarations for several targets, one complete source set per item. '
         'Use create, revise, or retire. Endpoints are {cite: ROLE:rN.K}, saved file paths '
         '(snapshotted at registration), exact ROLE:path@COMMIT, or {operation_ref: growth:1} copied '

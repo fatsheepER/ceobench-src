@@ -19,7 +19,7 @@ def operate(team, tier):
 
 
 def declare_operation(team, ref):
-    result = team.roles['growth'].executor.execute('relation_batch', {'items': [{
+    result = team.roles['growth'].executor.execute('escalate', {'items': [{
         'item_id': 'operation-source', 'op': 'create', 'target': {'operation_ref': ref},
         'sources': [{'ref': {'missing': {'description': 'Initial observation', 'reason': 'No saved source'}}}],
         'assertion': 'author_declared', 'reason': 'Record the exact business decision.'}]})

@@ -296,7 +296,7 @@ requests, finish the current batch and answer them before retrying advancement.
         if capabilities.text_tools:
             prompt += '\n' + RELATIONS
         else:
-            prompt += '\nUse relation_batch to declare complete sources for exact files, captured outputs or business operations. Declarations are optional; inspect every item receipt.\n'
+            prompt += '\nUse escalate to declare complete sources for exact files, captured outputs or business operations. Declarations are optional; inspect every item receipt.\n'
     history = '' if role == 'ceo' else ((PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
                                         if capabilities.text_tools else common_history)
     handoff = HANDOFF

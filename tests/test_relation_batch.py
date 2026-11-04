@@ -15,7 +15,7 @@ from test_text_registry import git
 
 def batch(team, role, items, call_id):
     output = team.roles[role].executor.execute(
-        'relation_batch', {'items': items}, tool_call_id=call_id)
+        'escalate', {'items': items}, tool_call_id=call_id)
     assert not output.startswith('Error:'), output
     return json.loads(output)
 
@@ -44,7 +44,7 @@ def test_relation_schema_is_shared_and_discoverable():
     definitions = []
     for pf in (False, True):
         tools = get_bash_agent_tool_descriptions(text_registration=True, pf_queries=pf, team=True)
-        relation = next(tool for tool in tools if tool['name'] == 'relation_batch')
+        relation = next(tool for tool in tools if tool['name'] == 'escalate')
         definitions.append(relation)
         schema = json.dumps(relation['parameters'])
         for field in ('item_id', 'op', 'target', 'sources', 'assertion', 'reason',

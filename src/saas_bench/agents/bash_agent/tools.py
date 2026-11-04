@@ -481,8 +481,10 @@ class BashAgentToolExecutor:
         disabled = None
         if tool_name in ('text_create', 'text_revise', 'text_retire', 'text_list') and not self.capabilities.text_tools:
             disabled = 'Text tools are disabled for this run'
-        if tool_name == 'relation_batch' and not self.capabilities.source_declarations:
+        if tool_name in ('escalate', 'relation_batch') and not self.capabilities.source_declarations:
             disabled = 'Source declarations are disabled for this run'
+        elif tool_name == 'relation_batch':
+            disabled = 'relation_batch has been renamed to escalate; retry the same items with escalate'
         if tool_name in NOTE_TOOLS and 'note' in args and not self.capabilities.tool_notes:
             disabled = 'The note parameter is disabled for this run; retry without note'
         if disabled:
@@ -506,7 +508,7 @@ class BashAgentToolExecutor:
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
-            dispatch['relation_batch'] = lambda args: self.text_registry.relations.execute(args, tool_call_id=tool_call_id)
+            dispatch['escalate'] = lambda args: self.text_registry.relations.execute(args, tool_call_id=tool_call_id)
         facts = {}
         self._exit_code = None
         self._timed_out = False

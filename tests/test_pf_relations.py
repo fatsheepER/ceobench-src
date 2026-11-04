@@ -358,7 +358,7 @@ def test_single_role_common_relations_normalize_query_copies(workspace, tmp_path
     assert 'Registered r1.1' in created
     written = executor.execute('write_file', {'path': 'target.txt', 'content': 'stored target'})
     assert not written.startswith('Error:'), written
-    receipt = json.loads(executor.execute('relation_batch', {'items': [
+    receipt = json.loads(executor.execute('escalate', {'items': [
         create('file', 'target.txt@v1', ['r1.1', 'evidence.json@v1'], assertion='inferred'),
         create('text', 'r1.1', ['evidence.json@v1'], assertion='inferred'),
     ]}, tool_call_id='single-role-relations'))

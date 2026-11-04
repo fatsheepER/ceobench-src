@@ -78,13 +78,13 @@ def test_candidate_model_can_discover_read_and_declare_returned_source():
             return calls(('bash', {'command': 'python -c ' + shlex.quote(code)}))
         if turns[role] == 4:
             assert 'F1.txt@v1' in results[-1] and 'F2.txt@v1' in results[-1]
-            return calls(('relation_batch', {'items': [dict(item_id=label, op='create', target={'cite': 'growth:F' + str(i) + '.txt@v1'},
+            return calls(('escalate', {'items': [dict(item_id=label, op='create', target={'cite': 'growth:F' + str(i) + '.txt@v1'},
                 sources=[dict(ref={'cite': chosen[label]})], assertion='author_declared', reason='Keep the selected source.') for i, label in enumerate(('q1', 'q2'), 1)]}))
         if turns[role] == 5:
             result = json.loads(results[-1])
             assert result['saved'] == 2
             chosen['relation'] = result['items'][0]['relation_revision']
-            return calls(('relation_batch', {'items': [dict(item_id='earlier', op='revise', relation=chosen['relation'].rsplit('.', 1)[0],
+            return calls(('escalate', {'items': [dict(item_id='earlier', op='revise', relation=chosen['relation'].rsplit('.', 1)[0],
                 expected_revision=chosen['relation'], sources=[dict(ref={'cite': chosen[label]}) for label in ('q1', 'q0')],
                 reason='Add the earlier observed source without replacing the retained query.')]}))
         result = json.loads(results[-1])

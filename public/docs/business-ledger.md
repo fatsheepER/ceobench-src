@@ -44,7 +44,30 @@ SELECT * FROM business_effects WHERE operation_ref = 'growth:1'
 ORDER BY effect_seq, item_index;
 ```
 
-The example reference must be replaced with the actual receipt. Use `{operation_ref: "growth:1"}` as a `relation_batch` endpoint and `pf depend growth:1` to query saved sources in PF. Text `references[].cite` supports saved file/output handles and text revisions; operation sources use `relation_batch`.
+The example reference must be replaced with the actual receipt. Use `{operation_ref: "growth:1"}` as an `escalate` endpoint and `pf depend growth:1` to query saved sources in PF. Text `references[].cite` supports saved file/output handles and text revisions; operation sources use `escalate`.
+
+`escalate` is a model tool, not a business SDK method or a `pf` subcommand. It accepts
+`{"items": [...]}`; each item independently creates, revises, or retires one source
+declaration. Inspect every item receipt, including partial failures. For example:
+
+```json
+{"items":[{"item_id":"capacity-basis","op":"create","target":{"operation_ref":"growth:1"},"sources":[{"ref":{"cite":"growth:capacity.md@v1"}}],"assertion":"author_declared","reason":"This saved calculation informed the capacity change."}]}
+```
+
+The operation and file handles above are placeholders: copy the actual operation
+reference from its business receipt and the exact file version from a PF receipt
+or `pf log`. Use `assertion: "inferred"` for another role's target. `revise` and
+`retire` take the returned `relation`, `expected_revision`, an `item_id` and a
+`reason`; a supplied `sources` list replaces the complete list. A missing source
+uses `{"ref":{"missing":{"description":"...","reason":"..."}}}`. A saved declaration
+does not certify business success, completeness, or current validity. Availability
+depends on the run's capabilities; third-round Git disables declarations and
+third-round PF permits non-text targets and sources. The old model tool name
+`relation_batch` returns a rename error when declarations are enabled; both names
+return a disabled error when that capability is off. Neither old-name path executes
+a declaration. Historical relation fields and revisions
+retain their existing names and remain readable.
+
 
 For a large result, request its `result_json` or narrower columns separately and reduce the page size to fit the normal public SQL response limits. `LIMIT` is explicit; continue until a page is empty. No ledger result is broadcast automatically.
 

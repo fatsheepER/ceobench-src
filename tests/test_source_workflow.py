@@ -150,7 +150,7 @@ def test_public_sources_survive_revision_overwrite_and_next_week_handoff(mode):
         missing = create('missing', targets['F2'], [])
         missing['sources'] = [{'ref': {'missing': {'description': 'Unsaved earlier forecast',
             'reason': 'No saved bytes or query receipt exists.', 'last_known_ref': 'unavailable-forecast'}}}]
-        body = yield calls(('relation_batch', {'items': [
+        body = yield calls(('escalate', {'items': [
             create('F1', targets['F1'], [sources['Q1']]),
             create('F2', targets['F2'], [sources['Q2']]),
             create('invalid', targets['F2'], ['growth:never-saved.json']), missing]}))
@@ -189,7 +189,7 @@ def test_public_sources_survive_revision_overwrite_and_next_week_handoff(mode):
             body = yield bash(reader_command(mode, q0, body))
         recovered_q0 = exact_json(output(body), mode)
         assert recovered_q0['success'] and recovered_q0['rows']
-        body = yield calls(('relation_batch', {'items': [dict(item_id='add-Q0', op='revise',
+        body = yield calls(('escalate', {'items': [dict(item_id='add-Q0', op='revise',
             relation=summary['relation'], expected_revision=summary['revision'],
             sources=[{'ref': {'cite': summary['refs']['Q1']}}, {'ref': {'cite': q0}}],
             reason='CEO requested the earlier D0 count; retain D7 Q1.')]}))
@@ -271,7 +271,7 @@ def test_public_sources_survive_revision_overwrite_and_next_week_handoff(mode):
         target = 'ceo:reused-budget.json'
         if mode == 'pf':
             target = 'ceo:' + re.search(r'(reused-budget\.json@v\d+)', output(body))[1]
-        body = yield calls(('relation_batch', {'items': [create('downstream', target, [refs[name] for name in ('F1', 'F2', 'Q0')])]}))
+        body = yield calls(('escalate', {'items': [create('downstream', target, [refs[name] for name in ('F1', 'F2', 'Q0')])]}))
         reuse = json.loads(output(body))
         assert reuse['saved'] == 1 and all(s['ref']['readable'] for s in reuse['items'][0]['sources'])
         observed.update(read=read, downstream=downstream, reuse=reuse)

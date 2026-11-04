@@ -15,12 +15,12 @@ observed facts and estimates. Give the relevant day, coverage, units, assumption
 locatable evidence and unresolved questions. Brief free prose is enough.
 
 Register sources selectively for important judgments, files or actions that will
-be reused or handed off. Use relation_batch for several targets at once. Known
+be reused or handed off. Use escalate for several targets at once. Known
 sources can be submitted directly; no candidate lookup or predicate is required.
 Copy exact versions and operation references from receipts. Describe missing
 material explicitly. A saved relation is your declaration, not proof of validity.
 Operation references use the executing role and a number, such as growth:12.
-Use them in relation_batch operation_ref endpoints or business ledger SQL.
+Use them in escalate operation_ref endpoints or business ledger SQL.
 Text references[].cite accepts files, outputs and texts, not operations.
 Review each item result. Revisions preserve history; a supplied sources list
 replaces the whole list. Registration never blocks handoff or business progress.
@@ -47,7 +47,7 @@ revised or retired) or "unknown: <reason>". Review your judgments using current
 evidence when needed.
 
 `references[].cite` accepts the evidence forms listed below. To link a concrete
-business operation, copy its `operation_ref` into a `relation_batch` endpoint;
+business operation, copy its `operation_ref` into a `escalate` endpoint;
 operation references are not text citations.
 
 The dashboard reflects the last weekly advance; after changing settings within
