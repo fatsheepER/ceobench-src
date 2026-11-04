@@ -18,7 +18,9 @@ from .sql_evidence import encoded
 
 
 class TextRegistry:
-    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None, private_root=None):
+    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None, private_root=None, capabilities=None):
+        from .agent_capabilities import AgentCapabilities
+        self.capabilities = AgentCapabilities.resolve(capabilities)
         if mode not in ('git', 'prefix', 'pf'):
             raise ValueError('Invalid registration mode')
         self.git_run = subprocess.run
@@ -68,6 +70,8 @@ class TextRegistry:
         return dict(reference, commit=full), full
 
     def execute(self, operation, args):
+        if not self.capabilities.text_tools:
+            return 'Error: Text tools are disabled for this run'
         with self.resolver.binding_scope() if self.resolver else nullcontext():
             return self._execute(operation, args)
 
@@ -312,6 +316,8 @@ class TextRegistry:
             evidence['record'] = (record_owner + ':' if self.identity else '') + target['version']
         elif self.mode in ('git', 'prefix') and 'path' in evidence and 'commit' not in evidence \
                 and '@' not in evidence['path']:
+            if not self.capabilities.git_extra_saves:
+                raise ValueError('Immediate Git snapshots are disabled; save and commit the file, then cite path@COMMIT')
             if (ref.get('select') or ref.get('predicate')) and not evidence['path'].endswith(('.json', '.csv')):
                 raise ValueError('Plain text supports whole-text equality only')
             ref['evidence'], full = snapshot_reference(workspace, evidence['path'], self.workspace,

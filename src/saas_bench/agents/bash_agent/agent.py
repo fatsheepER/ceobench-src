@@ -161,6 +161,7 @@ class BashAgent(BaseAgent):
         memory_max_chars=None,
         max_output_tokens=None,
         before_request_callback=None,
+        capabilities=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -209,13 +210,14 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
-        if pf and not text_registration:
-            raise ValueError('PF requires text registration')
-        self.text_registration, self.pf = text_registration, pf
-        if text_registration:
+        from saas_bench.agent_capabilities import AgentCapabilities
+        self.capabilities = AgentCapabilities.resolve(capabilities, text_registration=text_registration, pf=pf)
+        self.text_registration, self.pf = self.capabilities.text_tools, pf
+        self.history_enabled = bool(text_registration or pf or identity or capabilities is not None)
+        if self.history_enabled:
             # Registration groups integrate their sections into the original prompt.
             from saas_bench.registration_prompt import integrate
-            self.system_prompt = integrate(self.system_prompt, pf)
+            self.system_prompt = integrate(self.system_prompt, pf, self.capabilities)
 
         # Agent state
         self.conversation: List[Message] = []
@@ -334,7 +336,7 @@ class BashAgent(BaseAgent):
                             f"Showing first {max_memory_chars:,} of {len(memory_content):,} characters. "
                             "Use the read_file tool to see the full contents if needed."
                         )
-                    if getattr(self, 'text_registration', False):
+                    if getattr(self, 'history_enabled', False):
                         from saas_bench.registration_prompt import MEMORY_HEADER
                         history = self._memory_history(memory_version)
                         prompt += MEMORY_HEADER + (history + '\n' if history else '') + '\n' + memory_content

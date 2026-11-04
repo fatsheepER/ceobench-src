@@ -457,6 +457,9 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     source_changed = tree_hash(Path(__file__).parent) != state.get('source_sha256')
     public_changed = artifact_hashes(public) != state.get('public_artifacts')
     configuration = dict(state['configuration'])
+    if 'capabilities' in options:
+        from .agent_capabilities import AgentCapabilities
+        options['capabilities'] = AgentCapabilities.resolve(options['capabilities']).to_dict()
     with advisory():
         validate_executor_settings(configuration, state['roles'])
     changes = {}
@@ -470,7 +473,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
             value = runtime_value(key, None)
             options[key] = value or None if key.endswith('_warn_after') else value
     for key in list(options):
-        if key in configuration or key in policy_keys:
+        if key in configuration or key in policy_keys or key == 'capabilities':
             requested = options.pop(key)
             previous = configuration.get(key)
             configuration[key] = requested
@@ -598,6 +601,17 @@ def _relocate_prompt(text, original, destination):
     return CapturedText(''.join(parts), origins, text.pf_read, reads)
 
 
+def _with_frozen_memory(prompt, saved):
+    """Replace capability instructions without rereading this week's MEMORY."""
+    from .execution_capture import CapturedText, slice_origins, slice_read_spans
+    start = saved.find('\n\n## Your MEMORY.md (auto-loaded)\n\n')
+    if start < 0:
+        return prompt
+    return CapturedText(prompt + saved[start:],
+        slice_origins(getattr(saved, 'origins', []), start, len(saved), len(prompt)),
+        pf_read_spans=slice_read_spans(getattr(saved, 'pf_read_spans', []), start, len(saved), len(prompt)))
+
+
 def restore_runtime_state(runtime, state):
     from .execution_capture import restore_sources
     from .multi_agent import RoleWeek, TeamMessage
@@ -630,7 +644,8 @@ def restore_runtime_state(runtime, state):
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
         role.usage.expected_model = role.agent.model if 'model' in state.get('_configuration_changes', {}) else saved['expected_model']
-        regenerate_prompt = bool(state.get('_configuration_changes') or state.get('_legacy_history_unavailable'))
+        regenerate_prompt = bool('capabilities' in runtime.configuration or
+            state.get('_configuration_changes') or state.get('_legacy_history_unavailable'))
         if not regenerate_prompt:
             role.agent.system_prompt = with_registered_script_contract(
                 saved['system_prompt'].replace(original, str(runtime.root)))
@@ -648,8 +663,11 @@ def restore_runtime_state(runtime, state):
             before, after = (original, str(runtime.root)) if message.role == 'system' else (old_workspace, new_workspace)
             message.content = _relocate_prompt(message.content, before, after)
             if message.role == 'system':
-                message.content = (role.agent._get_system_prompt_with_memory() if regenerate_prompt
-                    else with_registered_script_contract(message.content))
+                if 'capabilities' in runtime.configuration:
+                    message.content = _with_frozen_memory(role.agent.system_prompt, message.content)
+                else:
+                    message.content = (role.agent._get_system_prompt_with_memory() if regenerate_prompt
+                        else with_registered_script_contract(message.content))
         role.agent._last_observation = _relocate_prompt(role.agent._last_observation, old_workspace, new_workspace)
         role.agent.total_turns = saved['total_turns']
         week = captured['role_weeks'].get(name)

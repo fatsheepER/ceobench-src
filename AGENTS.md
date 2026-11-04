@@ -48,6 +48,7 @@
 - 推进失败终态、客户端先退出及关闭交错从 `tests/test_advance_terminal.py` 定位。
 - 显式历史选点、初始周界、真实 driver 重复恢复与旧 attempt 保留从 `tests/test_checkpoint_driver.py` 定位；必要恢复数据、空会话、周状态及 checkpoint 发布失败从 `tests/test_checkpoint_recovery.py` 定位。晚完成推进的共享资源收尾、清理超时后 controller HOLD 接管和恢复作废记账从 `tests/test_checkpoint_close.py` 定位；缺失继承用量、角色范围及跨目录祖先链的未知值从 `tests/test_checkpoint_usage_gaps.py` 定位。
 - 自动周检、重放及状态传播已删除。周初看板、注册脚本、全文交接与检查点恢复的真实模型输入从 `tests/test_week_start_observation.py` 定位；主动来源查询不重放、不判断条件及旧 findings 不再投递从 `tests/test_pf_readonly_sources.py` 定位。
+- 第三轮独立能力开关、旧调用拒绝后继续、Git 附加保存关闭、PF 非文本来源与历史读取、三角色真实模型输入和 `make_team`/checkpoint 配置恢复从 `tests/test_agent_capabilities.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。
 - 三角色同步请求、FIFO、循环等待拒绝、整批工具后的模型投递、原会话唤醒与问答权限从 `tests/test_team_requests.py` 定位。
 - 登记脚本的工作区相对路径、真实源码快照文件、`__file__`、相邻数据与模块、完整输出及关闭后清理从 `tests/test_registered_script_environment.py` 定位；自动批次只读经营接口、正常角色保留写权、拒绝回执入模和恢复不重放从 `tests/test_registered_script_observation.py` 定位。 旧客户端及帮助更新、真实旧 checkpoint 的嵌套登记和安全文件替换从 `tests/test_registered_script_legacy.py` 定位。

@@ -74,8 +74,8 @@ class Batch(Input):
 MODELS = dict(create=Create, revise=Revise, retire=Retire)
 
 
-def tool_definition():
-    return dict(name='relation_batch', description=(
+def tool_definition(*, texts=True, git_extra_saves=True):
+    definition = dict(name='relation_batch', description=(
         'Save source declarations for several targets, one complete source set per item. '
         'Use create, revise, or retire. Endpoints are {cite: ROLE:rN.K}, saved file paths '
         '(snapshotted at registration), exact ROLE:path@COMMIT, or {operation_ref: growth:1} copied '
@@ -90,3 +90,12 @@ def tool_definition():
         'missing sources is incomplete evidence, and saved does not certify business success or validity. '
         'History is readable in relations.json. Existing text references stay unchanged.'),
         parameters=compact_schema(Batch.model_json_schema()))
+    if not texts:
+        definition['description'] = definition['description'].replace(
+            'Endpoints are {cite: ROLE:rN.K}, saved file paths ', 'Endpoints are {cite: saved file path}, ')
+        definition['description'] = definition['description'].replace(
+            ' Existing text references stay unchanged.', ' New and revised declarations accept only files, captured outputs and business operations; registered texts are disabled. Historical records remain readable.')
+    if not git_extra_saves:
+        definition['description'] = definition['description'].replace(
+            '(snapshotted at registration)', '(commit files yourself before citing them)')
+    return definition

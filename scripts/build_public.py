@@ -51,6 +51,7 @@ _ENGINE_MODULES = [
     "public_evidence",
     "public_errors",
     "tool_notes",
+    "agent_capabilities",
     "role_policy",
     "workspace_io",
     "public_sql",

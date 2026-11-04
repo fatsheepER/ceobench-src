@@ -309,6 +309,7 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             run_id=entry['run_id'], world_id=manifest['d0'][str(entry['seed'])]['world_id'],
             public_refs_path=Path(entry['output_dir']) / 'private' / 'public-refs.sqlite',
             model=MODEL, reasoning_effort='high', total_days=500,
+            capabilities=entry.get('capabilities', manifest['parameters'].get('capabilities', {}).get(entry['group'])),
             model_pricing=manifest['pricing'], token_counter=token_counter,
             **(analyst_bash_settings(manifest) | explicit_bash_settings()))
     except BaseException:

@@ -267,8 +267,11 @@ NOTE_PARAMETER = {
 
 
 def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, ask_analyst=False, team=False,
-                                     bash_timeout=1200, bash_warn_after=None) -> List[Dict[str, Any]]:
+                                     bash_timeout=1200, bash_warn_after=None, capabilities=None) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
+    from saas_bench.agent_capabilities import AgentCapabilities
+    explicit_capabilities = capabilities is not None
+    capabilities = AgentCapabilities.resolve(capabilities, text_registration=text_registration, pf=pf_queries)
     definitions = BASH_AGENT_TOOL_DEFS
     if team:
         definitions = [dict(t, description=(
@@ -295,14 +298,21 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
         definitions = [dict(t, description=t['description'] +
             ' Run Git directly as `git`. `git help -a` lists commands; `git log -h` gives log options.')
             if t['name'] == 'bash' else t for t in definitions]
-    if text_registration or pf_queries:
+    if capabilities.tool_notes:
         # PF queries run as the `pf` command inside bash; the function tools stay those of Git.
+        note_parameter = NOTE_PARAMETER if pf_queries or capabilities.git_extra_saves else dict(
+            NOTE_PARAMETER, description='Optional reason stored in the private execution record. No output or file snapshot is saved. Up to 200 characters.')
         definitions = [dict(t, parameters=dict(t['parameters'], properties=dict(
-            t['parameters']['properties'], note=NOTE_PARAMETER))) if t['name'] in NOTE_TOOLS else t
+            t['parameters']['properties'], note=note_parameter))) if t['name'] in NOTE_TOOLS else t
             for t in definitions]
-    if text_registration:
+    if capabilities.text_tools:
         from saas_bench.registration_schema import tool_definitions
-        definitions = definitions + tool_definitions(pf=pf_queries, team=team or ask_analyst)
+        definitions = definitions + [tool for tool in tool_definitions(pf=pf_queries, team=team or ask_analyst)
+                                     if tool['name'].startswith('text_')]
+    if capabilities.source_declarations and (team or ask_analyst or explicit_capabilities):
+        from saas_bench.relation_schema import tool_definition
+        definitions = definitions + [tool_definition(texts=capabilities.text_tools,
+                                                      git_extra_saves=capabilities.git_extra_saves)]
     if team:
         definitions = definitions + [dict(name='ask_agent', description=
             "Ask another team role a focused question in this week's conversation. You wait for its reply before any further tool or model work. "
@@ -360,7 +370,7 @@ class BashAgentToolExecutor:
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
                  text_registry=None,
                  identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None,
-                 bash_memory_limit_bytes=None, private_root=None, public_refs=None):
+                 bash_memory_limit_bytes=None, private_root=None, public_refs=None, capabilities=None):
         """Initialize the tool executor.
 
         Args:
@@ -404,6 +414,11 @@ class BashAgentToolExecutor:
         self.stop_on_timeout = stop_on_timeout
         self.evidence_store = evidence_store
         self.text_registry = text_registry
+        from saas_bench.agent_capabilities import AgentCapabilities
+        self.capabilities = AgentCapabilities.resolve(
+            capabilities if capabilities is not None else getattr(text_registry, 'capabilities', None))
+        if text_registry and text_registry.capabilities != self.capabilities:
+            raise ValueError('Executor and registry capabilities must agree')
         self.pf_queries = None
         if text_registry and text_registry.mode == 'pf':
             from saas_bench.pf_queries import PFQueries
@@ -463,6 +478,21 @@ class BashAgentToolExecutor:
             return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
 
     def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None, tool_call_id=None):
+        disabled = None
+        if tool_name in ('text_create', 'text_revise', 'text_retire', 'text_list') and not self.capabilities.text_tools:
+            disabled = 'Text tools are disabled for this run'
+        if tool_name == 'relation_batch' and not self.capabilities.source_declarations:
+            disabled = 'Source declarations are disabled for this run'
+        if tool_name in NOTE_TOOLS and 'note' in args and not self.capabilities.tool_notes:
+            disabled = 'The note parameter is disabled for this run; retry without note'
+        if disabled:
+            self.last_status = 'failed'
+            self._exit_code, self._timed_out = None, False
+            self._bash_facts = dict(process_started=False, target_started=False, boundary_closed=True)
+            if self.audit:
+                self.audit.record('tool_execution', tool=tool_name, status='failed', tool_call_id=tool_call_id,
+                    model_request_event=model_request_event, context_id=model_context_id, **self._bash_facts)
+            return 'Error: ' + disabled
         dispatch = {
             'bash': self._exec_bash,
             'read_file': self._exec_read_file,
@@ -541,7 +571,7 @@ class BashAgentToolExecutor:
                             output_sha256=hashlib.sha256(str(result).encode()).hexdigest(),
                             files=sorted(path for path in note_before.keys() | note_after.keys() if note_before.get(path) != note_after.get(path)),
                             **(self.identity.fields() if self.identity else {}))
-                if self.text_registry and self.text_registry.mode in ('git', 'prefix'):
+                if self.capabilities.git_extra_saves and self.text_registry and self.text_registry.mode in ('git', 'prefix'):
                     from saas_bench.tool_notes import record_git_note
                     artifact = record_git_note(self, note, self._note_output if self._note_output is not None else str(result))
                     result = str(result) + '\n' + artifact

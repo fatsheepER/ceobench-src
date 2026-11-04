@@ -94,7 +94,7 @@ class MultiAgentRuntime:
                  simulator=None, public_dir=None, run_id=None, world_id=None, public_refs_path=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
-                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, **server_options):
+                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
@@ -102,6 +102,10 @@ class MultiAgentRuntime:
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
             total_days=total_days, model_pricing=model_pricing)
+        from .agent_capabilities import AgentCapabilities
+        self.capabilities = AgentCapabilities.resolve(capabilities)
+        if capabilities is not None:
+            self.configuration['capabilities'] = self.capabilities.to_dict()
         self.configuration.update(ceo_bash_timeout=ceo_bash_timeout, ceo_bash_warn_after=ceo_bash_warn_after)
         from .run_warnings import advisory
         with advisory():
@@ -187,7 +191,8 @@ class MultiAgentRuntime:
             if store is not None:
                 store.public_refs = self.public_refs
             audit = audits[role] = RoleAudit(role_private / 'audit.jsonl', identity)
-            registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day, identity=identity, private_root=role_private)
+            registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day,
+                identity=identity, private_root=role_private, capabilities=self.capabilities)
             registry.public_refs = self.public_refs
             env = dict(NOVAMIND_API_PORT='1', NOVAMIND_API_SOCKET='/run/novamind-api/api.sock',
                        PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(workspace / 'docs'))
@@ -201,7 +206,7 @@ class MultiAgentRuntime:
             if _restored_state:
                 settings = _restored_state['roles'][role]['executor']
                 script_settings = _restored_state['roles'][role]['script_executor']
-            executor = BashAgentToolExecutor(**executor_options, text_registry=registry, **settings)
+            executor = BashAgentToolExecutor(**executor_options, text_registry=registry, capabilities=self.capabilities, **settings)
             script_executors[role] = BashAgentToolExecutor(**dict(executor_options, env=dict(env), api_socket=script_sockets[role]), **script_settings)
             executor.lifecycle = script_executors[role].lifecycle = self._lifecycle
             executor.temp_root = script_executors[role].temp_root = self._temp_root
@@ -220,13 +225,14 @@ class MultiAgentRuntime:
                     if OPTIONS[option][0] in _restored_state.get('_explicit_runtime_environment', []):
                         generation_policy.pop(key, None)
             agent = BashAgent(get_bash_agent_tool_descriptions(text_registration=True, pf_queries=mode == 'pf',
-                ask_analyst=role == 'ceo', team=True, bash_timeout=executor.bash_timeout, bash_warn_after=executor.bash_warn_after),
+                ask_analyst=role == 'ceo', team=True, bash_timeout=executor.bash_timeout,
+                bash_warn_after=executor.bash_warn_after, capabilities=self.capabilities),
                 client, workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
-                text_registration=True, pf=mode == 'pf', identity=identity,
+                text_registration=True, pf=mode == 'pf', identity=identity, capabilities=self.capabilities,
                 allow_final_text=role != 'ceo', **generation_policy)
             agent.system_prompt = system_prompt(agent.system_prompt, role, mode, total_days,
-                self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]])
+                self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]], self.capabilities)
             agent.lifecycle = self._lifecycle
             registry.git_run = executor.run_private
             agent.git_run = executor.run_private

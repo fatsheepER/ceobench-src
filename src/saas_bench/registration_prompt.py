@@ -181,12 +181,54 @@ def edits(pf):
     ]
 
 
-def integrate(prompt, pf=False):
+def capability_history(pf, capabilities):
+    if capabilities.text_tools:
+        history = PF_HISTORY if pf else GIT_HISTORY
+        if not pf and (not capabilities.tool_notes or not capabilities.git_extra_saves):
+            history = history.replace(GIT_CALL_NOTES, '')
+        return history
+    if pf:
+        history = '''## File and Output History (pf)
+
+PF saves captured workspace file versions and command outputs, including unsaved
+outputs. Run `pf` directly in Bash. Use `pf help` for syntax, `pf search` to find
+saved material, `pf log` for versions, and `pf show HANDLE --full` for exact content.
+`pf diff` and `pf blame` inspect changes. `pf depend` and `pf rdepend` read saved
+source relationships; `pf candidates` finds captured sources. Saved, delivered
+and declared used are different. Query current business facts or recompute when needed.
+Use actual returned handles and follow returned pagination cursors.
+
+'''
+        if capabilities.tool_notes:
+            history += 'The optional note on bash, write_file and edit_file records the reason with the exact captured output and file version.\n\n'
+        return history + PF_CAPTURE_BOUNDARY
+    history = '''## File History (git)
+
+Your workspace is a Git repository. The host commits initialization, handoffs,
+answers and weekly boundaries. Save useful command results in files yourself.
+Use ordinary files, MEMORY.md and Git for durable work. `git log`, `git show`,
+`git diff` and `git blame` inspect saved history; you may make your own commits.
+Use the published handoff workspace, commit and path to read another role's evidence.
+
+'''
+    if capabilities.tool_notes and capabilities.git_extra_saves:
+        history += GIT_CALL_NOTES
+    return history
+
+
+def integrate(prompt, pf=False, capabilities=None):
     """The original system prompt with the registration group's sections in place."""
+    if capabilities is not None and not capabilities.text_tools:
+        return prompt.replace('You have 6 tools:', 'Use the available workspace tools:').replace(
+            'MEMORY.md is the ONLY way to carry knowledge forward.',
+            'MEMORY.md is the only file loaded into your context automatically.').replace(
+                '## Weekly Workflow', capability_history(pf, capabilities) + '## Weekly Workflow')
     for old, new in edits(pf):
         if prompt.count(old) != 1:
             raise ValueError('Registration prompt anchor must occur exactly once: ' + old[:60])
         prompt = prompt.replace(old, new)
+    if capabilities is not None:
+        prompt = prompt.replace(PF_HISTORY if pf else GIT_HISTORY, capability_history(pf, capabilities))
     return prompt
 
 

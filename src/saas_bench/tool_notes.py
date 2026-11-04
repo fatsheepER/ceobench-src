@@ -12,6 +12,8 @@ from .workspace_io import open_file, parent_fd
 
 
 def record_git_note(executor, note, output):
+    if not executor.capabilities.tool_notes or not executor.capabilities.git_extra_saves:
+        raise ValueError('Git note snapshots are disabled for this run')
     registry = executor.text_registry
     number = executor.public_refs.ordinal('noted_call', executor.role, uuid.uuid4().hex)
     relative = Path('tool-outputs') / f'call{number}.txt'
@@ -86,6 +88,8 @@ def record_git_note(executor, note, output):
 
 
 def current_file_note(executor, path, text):
+    if not executor.capabilities.tool_notes or not executor.capabilities.git_extra_saves:
+        return ''
     registry = executor.text_registry
     if registry is None or registry.mode not in ('git', 'prefix'):
         return ''

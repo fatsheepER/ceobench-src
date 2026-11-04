@@ -88,6 +88,8 @@ class RelationRegistry:
         raise RelationHold(self.failed, detail)
 
     def execute(self, args, *, tool_call_id=None):
+        if not self.texts.capabilities.source_declarations:
+            return 'Error: Source declarations are disabled for this run'
         if self.failed:
             raise RelationHold(self.failed, 'An earlier relation save is unresolved; resume from a checkpoint')
         if not isinstance(args, dict) or set(args) != {'items'} or not isinstance(args.get('items'), list) or not args['items']:
@@ -135,7 +137,7 @@ class RelationRegistry:
                         record, retained = None, []
                     else:
                         result = self._receipt(label, record)
-                    for commit in retained:
+                    for commit in retained if self.texts.capabilities.git_extra_saves else []:
                         retain_snapshot(self.workspace, commit, run=self.texts.git_run)
                     if record is not None:
                         state['records'].setdefault(record['id'], []).append(record)
@@ -176,6 +178,20 @@ class RelationRegistry:
             if previous['status'] == 'retired':
                 raise Rejected('retired', 'This relation is retired; create a new relation')
             record = deepcopy(previous)
+        if not self.texts.capabilities.text_tools and item['op'] != 'retire':
+            # Validate the whole source set before binding can save any file.
+            endpoints = ([item['target']] if 'target' in item else []) + [
+                source['ref'] for source in item.get('sources', [])]
+            inherited = []
+            if previous:
+                if 'target' not in item:
+                    inherited.append(previous['target'])
+                if 'sources' not in item:
+                    inherited.extend(source['ref'] for source in previous['sources'])
+            if any('record' in parse_cite(endpoint['cite'], self.texts.mode == 'pf')
+                   for endpoint in endpoints if 'cite' in endpoint) or any(
+                    endpoint.get('kind') == 'text' for endpoint in inherited):
+                raise Rejected('disabled_reference', 'Registered text targets and sources are disabled; use files, captured outputs or operations')
         retained = []
         if 'target' in item:
             target, commits = self._bind(item['target'])
@@ -273,7 +289,7 @@ class RelationRegistry:
             retained_by_owner = self.texts.git_run(['git', '-C', str(workspace), 'show-ref', '--verify', '--quiet',
                 'refs/ceobench/snapshots/' + full], capture_output=True, timeout=10).returncode == 0
             source_role = producer if producer is not None else owner
-            if owner != self.role and not retained_by_owner:
+            if owner != self.role and not retained_by_owner and self.texts.capabilities.git_extra_saves:
                 # Preserve the requested old bytes without writing retention refs in the peer's repository.
                 full = self._copy_git_bytes(path, raw, original['cite'])
                 owner = self.role

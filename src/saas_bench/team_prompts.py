@@ -244,10 +244,13 @@ days such as 49, 49-55 or 49-. Registration is optional.
 GIT_CEO_HISTORY += registration_prompt.GIT_CALL_NOTES
 GIT_ANALYST_HISTORY += registration_prompt.GIT_CALL_NOTES
 
-def system_prompt(base, role, mode, total_days, effective_end, workspace, readable):
+def system_prompt(base, role, mode, total_days, effective_end, workspace, readable, capabilities=None):
+    from .agent_capabilities import AgentCapabilities
+    capabilities = AgentCapabilities.resolve(capabilities)
+    common_history = registration_prompt.capability_history(mode == 'pf', capabilities)
     if role == 'ceo':
-        old_history = registration_prompt.PF_HISTORY if mode == 'pf' else registration_prompt.GIT_HISTORY
-        history = PF_CEO_HISTORY if mode == 'pf' else GIT_CEO_HISTORY
+        old_history = common_history
+        history = (PF_CEO_HISTORY if mode == 'pf' else GIT_CEO_HISTORY) if capabilities.text_tools else common_history
         if base.count(old_history) != 1:
             raise ValueError('Team history anchor must occur exactly once')
         base = base.replace(old_history, history)
@@ -257,7 +260,8 @@ def system_prompt(base, role, mode, total_days, effective_end, workspace, readab
         before, workflow = base.split(start)
         _, forecasts = workflow.split(end)
         prompt = (before + CEO_DECISIONS + end + forecasts).replace(
-            'You have 10 tools:', 'Use these workspace tools and ask_analyst:')
+            'You have 10 tools:', 'Use these workspace tools and ask_analyst:').replace(
+            'You have 6 tools:', 'Use these workspace tools and ask_analyst:')
     else:
         prompt = (f'You are the {role} analyst for the NovaMind SaaS business.\n'
                   + ROLE_BRIEFS[role] + '\n\n' + ANALYST_CONTEXT)
@@ -286,6 +290,23 @@ Do not advance time while answering a request. If next-week reports pending team
 requests, finish the current batch and answer them before retrying advancement.
 '''
     from .registration_prompt import RELATIONS
-    prompt += '\n' + RELATIONS
-    history = '' if role == 'ceo' else (PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
-    return with_registered_script_contract(prompt + HANDOFF + '\n' + history)
+    if not capabilities.text_tools or not capabilities.source_declarations:
+        prompt += '\n' + RELATIONS.split('Register sources selectively', 1)[0]
+    if capabilities.source_declarations:
+        if capabilities.text_tools:
+            prompt += '\n' + RELATIONS
+        else:
+            prompt += '\nUse relation_batch to declare complete sources for exact files, captured outputs or business operations. Declarations are optional; inspect every item receipt.\n'
+    history = '' if role == 'ceo' else ((PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
+                                        if capabilities.text_tools else common_history)
+    handoff = HANDOFF
+    if not capabilities.text_tools:
+        prompt = prompt.replace(ANALYST_CONTEXT[ANALYST_CONTEXT.index('\nUse text_create'):], '\n')
+        prompt = prompt.replace('Register decisions only\nwhen you expect to rely on them later.', '')
+        start = handoff.index('Register only judgments')
+        end = handoff.index('Analyst handoffs include')
+        handoff = handoff[:start] + handoff[end:]
+    if not capabilities.tool_notes or not capabilities.git_extra_saves:
+        prompt = prompt.replace(registration_prompt.GIT_CALL_NOTES, '')
+        history = history.replace(registration_prompt.GIT_CALL_NOTES, '')
+    return with_registered_script_contract(prompt + handoff + '\n' + history)
