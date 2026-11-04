@@ -52,6 +52,7 @@
 - 第三轮独立能力开关、旧调用拒绝后继续、Git 附加保存关闭、PF 非文本来源与历史读取、三角色真实模型输入和 `make_team`/checkpoint 配置恢复从 `tests/test_agent_capabilities.py` 定位。
 - 第三轮按能力组合的 standalone、三角色首次及恢复 ModelUsage 提示、公共 PF help、真实引用的示例声明与修订，从 `tests/test_round3_prompts.py` 定位；旧文本提示与帮助分支继续保留。
 - 公开来源工具 `escalate` 的改名、非文本逐项回执入模、旧名拒绝和历史声明恢复去重从 `tests/test_escalate.py` 定位；历史关系分类字段继续保留。
+- 第三轮三角色旧名拒绝后纠正、非文本采集短引用、私有记录隔离、准确旧版本与真实 ModelUsage 输入的公共闭环从 `tests/test_round3_acceptance.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。
 - 三角色同步请求、FIFO、循环等待拒绝、整批工具后的模型投递、原会话唤醒与问答权限从 `tests/test_team_requests.py` 定位。
 - 登记脚本的工作区相对路径、真实源码快照文件、`__file__`、相邻数据与模块、完整输出及关闭后清理从 `tests/test_registered_script_environment.py` 定位；自动批次只读经营接口、正常角色保留写权、拒绝回执入模和恢复不重放从 `tests/test_registered_script_observation.py` 定位。 旧客户端及帮助更新、真实旧 checkpoint 的嵌套登记和安全文件替换从 `tests/test_registered_script_legacy.py` 定位。
