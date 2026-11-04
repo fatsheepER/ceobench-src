@@ -156,7 +156,7 @@ class ShellService:
             if error:
                 result, code, outcome = error, 2, 'usage_error'
             elif operation == 'pf_help':
-                result = pf_cli.HELP
+                result = pf_cli.command_help(self.executor.capabilities)
             else:
                 try:
                     result = self.executor.pf_queries.execute(operation, args)

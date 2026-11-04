@@ -292,11 +292,9 @@ requests, finish the current batch and answer them before retrying advancement.
     from .registration_prompt import RELATIONS
     if not capabilities.text_tools or not capabilities.source_declarations:
         prompt += '\n' + RELATIONS.split('Register sources selectively', 1)[0]
-    if capabilities.source_declarations:
-        if capabilities.text_tools:
-            prompt += '\n' + RELATIONS
-        else:
-            prompt += '\nUse escalate to declare complete sources for exact files, captured outputs or business operations. Declarations are optional; inspect every item receipt.\n'
+    if capabilities.source_declarations and capabilities.text_tools:
+        prompt += '\n' + RELATIONS
+
     history = '' if role == 'ceo' else ((PF_ANALYST_HISTORY if mode == 'pf' else GIT_ANALYST_HISTORY)
                                         if capabilities.text_tools else common_history)
     handoff = HANDOFF

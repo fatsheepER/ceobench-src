@@ -182,6 +182,25 @@ pipes and redirection can leave only a partial view.
 
 HELP += '\n' + PF_CAPTURE_BOUNDARY
 
+
+def command_help(capabilities):
+    """The shell uses the same enabled instructions as the model system prompt."""
+    if capabilities.text_tools:
+        return HELP
+    from .registration_prompt import capability_history
+    # Historical text reads remain supported, but no disabled text-writing workflow
+    # is advertised. Keep the legacy help above for explicitly enabled text tools.
+    usage = USAGE.replace('growth:r4.2', 'growth:report.md@v1').replace(
+        'query7, growth:r4', 'query7, growth:report.md').replace('Bare r4 is local. ', '')
+    advanced = HELP[HELP.index('6. Find sources across calls and weeks'):]
+    advanced = advanced.removesuffix('\n' + PF_CAPTURE_BOUNDARY)
+    if not capabilities.source_declarations:
+        advanced = advanced.replace('Use the content handle in escalate.',
+                                    'Use the content handle for saved-version queries.')
+        advanced = advanced.replace('Known sources can be registered directly.', '')
+    return usage + '\n\n' + capability_history(True, capabilities) + advanced
+
+
 VERBS = ('log', 'show', 'diff', 'blame', 'depend', 'rdepend', 'search', 'candidates', 'more', 'help')
 _INVOCATION = re.compile(r'(?:^|&&|\|\||[;|\n(])\s*pf(?:\s+(?:' + '|'.join(VERBS + ('--help', '-h')) + r')\b|\s*$)', re.M)
 

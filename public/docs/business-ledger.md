@@ -44,7 +44,7 @@ SELECT * FROM business_effects WHERE operation_ref = 'growth:1'
 ORDER BY effect_seq, item_index;
 ```
 
-The example reference must be replaced with the actual receipt. Use `{operation_ref: "growth:1"}` as an `escalate` endpoint and `pf depend growth:1` to query saved sources in PF. Text `references[].cite` supports saved file/output handles and text revisions; operation sources use `escalate`.
+The example reference must be replaced with the actual receipt. Use `{operation_ref: "growth:1"}` as an `escalate` endpoint and `pf depend growth:1` to query saved sources in PF. This optional declaration workflow is available only when source declarations are enabled; Git users can save the operation reference and reasoning in ordinary files.
 
 `escalate` is a model tool, not a business SDK method or a `pf` subcommand. It accepts
 `{"items": [...]}`; each item independently creates, revises, or retires one source
