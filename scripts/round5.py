@@ -20,11 +20,7 @@ OUT = Path.home() / 'Documents' / 'Codex' / 'round5-first'
 MODEL = 'deepseek-v4.1-flash'
 ENDPOINT = 'https://opencode.ai/zen/go/v1/'
 SEEDS = {42: 'A', 43: 'B', 44: 'C'}
-TRANSPORT_ERRORS = (
-    'APIConnectionError', 'APITimeoutError', 'LLMTimeoutError', 'NetworkError',
-    'ConnectError', 'ReadError', 'WriteError', 'CloseError', 'TimeoutException',
-    'ConnectTimeout', 'ReadTimeout', 'WriteTimeout', 'PoolTimeout', 'RemoteProtocolError', 'ProxyError',
-)
+from saas_bench.team_models import TRANSPORT_ERRORS
 
 
 def read(path, default=None):

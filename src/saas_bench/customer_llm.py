@@ -158,14 +158,16 @@ class CustomerSimulator:
     """
 
     def __init__(self, client: OpenAI, conn: sqlite3.Connection, config: BenchmarkConfig):
-        self.max_output_tokens = runtime_value('model_max_output_tokens', None)
+        self.max_output_tokens = (config.simulator_model_config['max_output_tokens']
+            if config.simulator_model_config else runtime_value('model_max_output_tokens', None))
         self.invalid_generation_attempts = runtime_value('invalid_generation_attempts', 4)
         self.usage_recorder = ModelUsage(os.environ.get('CEOBENCH_SIMULATOR_USAGE_LOG'), 'simulator', config.model_pricing)
         self.client = self.usage_recorder.attach(client)
         self.conn = conn
         self.config = config
-        self.model = config.agent_llm_model  # Fallback model (used when provider != bedrock)
-        self.reasoning_effort = config.agent_llm_reasoning_effort
+        self.model = config.simulator_model_config['model'] if config.simulator_model_config else config.agent_llm_model
+        self.reasoning_effort = (config.simulator_model_config['reasoning_effort']
+            if config.simulator_model_config else config.agent_llm_reasoning_effort)
         self.event_logger = None  # Optional event logger
         self.current_day = 0  # Track current day for logging
 
@@ -249,7 +251,8 @@ class CustomerSimulator:
             attempt += 1
             try:
                 response = self.usage_recorder.call(api, kwargs, invoke, day=self.current_day,
-                                                  provider=provider, outer_attempt=attempt)
+                                                  provider=provider, outer_attempt=attempt,
+                    **({'model_config': self.config.simulator_model_config} if self.config.simulator_model_config else {}))
                 break
             except InvalidModelResponse as exc:
                 if self.invalid_generation_attempts and attempt >= self.invalid_generation_attempts:

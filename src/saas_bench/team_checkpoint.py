@@ -538,7 +538,9 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
             if env in environment_before and environment_before[env] is None:
                 os.environ[env] = value
         config = BenchmarkConfig(**state['benchmark_config'])
-        for key, fields in dict(model=('agent_llm_model', 'social_post_llm_model', 'enterprise_llm_model'),
+        model_fields = (('agent_llm_model',) if configuration.get('model_configs') else
+                        ('agent_llm_model', 'social_post_llm_model', 'enterprise_llm_model'))
+        for key, fields in dict(model=model_fields,
                 reasoning_effort=('agent_llm_reasoning_effort',), total_days=('total_days',)).items():
             if key in changes:
                 for field in fields:

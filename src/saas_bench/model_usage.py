@@ -69,6 +69,19 @@ def is_network_error(exc):
         status = getattr(error, 'status_code', 0) or (
             error.response.status_code if isinstance(error, httpx.HTTPStatusError) else 0)
         if status:
+            # A 429 may be a permanent credit/quota refusal, not rate limiting.
+            body = getattr(error, 'body', None)
+            if body is None and isinstance(error, httpx.HTTPStatusError):
+                try:
+                    body = error.response.json()
+                except (ValueError, httpx.ResponseNotRead):
+                    pass
+            if isinstance(body, dict):
+                detail = body.get('error', body)
+                if isinstance(detail, dict) and any(detail.get(key) in {
+                        'credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached',
+                        'billing_not_active'} for key in ('code', 'type')):
+                    return False
             return status in (408, 409, 429) or 500 <= status < 600
     if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol,
                              httpx.PoolTimeout)) for error in chain):

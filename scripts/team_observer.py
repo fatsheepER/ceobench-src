@@ -289,27 +289,34 @@ def poll(manifest_path, output, expected, state, *, quota_fn=None,
                             elif state.get('billing_rebuild'):
                                 record_billing(row, state, group, path)
                             continue
-                        issue = round5.model_issue(row)
+                        models = manifest['parameters'].get('model_configs')
+                        if models:
+                            from saas_bench.team_models import model_issue
+                            issue = model_issue(row, models)
+                        else:
+                            issue = round5.model_issue(row)
                         if row['event'] == 'http_request':
                             physical_requests[row['attempt_id']] = {
                                 field: row.get('body', {}).get(field) for field in ('model', 'stream')}
                         if row['event'] == 'http_response' and 200 <= row.get('status', 0) < 400 and not row.get('error'):
                             body = physical_body(row.get('body'))
-                            wire_usage = usage_values(body, 'chat')
+                            api = (models['simulator' if row.get('role') == 'simulator' else 'agent']['api']
+                                   if models else 'chat')
+                            wire_usage = usage_values(body, api)
                             request_meta = physical_requests.get(row['attempt_id'], {})
                             if body.get('model') != request_meta.get('model'):
                                 issue = 'served_model_changed'
                             elif any(wire_usage.get(field) is None for field in (
                                     'input_tokens', 'output_tokens')):
                                 issue = 'missing_usage'
-                        if row['event'] == 'http_request' and row.get('role') != 'simulator':
+                        if not models and row['event'] == 'http_request' and row.get('role') != 'simulator':
                             if (row['body'].get('reasoning_effort') != 'high' or
                                     row['body'].get('thinking') != {'type': 'enabled'}):
                                 issue = 'business_thinking_changed'
                         detail = dict(issue=issue, path=key, call_id=row.get('call_id'),
                                       attempt_id=row.get('attempt_id'))
                         if issue in ('model_route_changed', 'served_model_changed',
-                                     'simulator_thinking_changed', 'business_thinking_changed',
+                                     'simulator_thinking_changed', 'business_thinking_changed', 'model_output_limit_changed',
                                      'missing_usage', 'model_call_error'):
                             routes.append(detail)
                         elif issue:

@@ -35,6 +35,7 @@ from .run_state import file_hash, tree_hash, verify_build, write_json
 from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
+from .team_models import ROUND_FOUR_PROFILES, round_four_models, validate_profile_models
 from .team_checkpoint import CheckpointDataError, retention_lock
 from .run_lifecycle import BusinessOutcomeUnknown
 from .run_warnings import AttemptWarnings, advisory, optional_hash
@@ -71,10 +72,14 @@ BATCH_PROFILES = {
     'r2-git-exploration': BatchProfile('formal', (2,), 1, ('git',), 56),
     'r2-paired-pilot': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r3-d70': BatchProfile('formal', (2,), 1, ('git', 'pf'), 70),
+    'r4-d56': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
+    'r4-flash-max-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
+    'r4-sol-high-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
 }
 ROUND_TWO_PROFILES = ('r2-git-exploration', 'r2-paired-pilot')
 ROUND_THREE_PROFILE = 'r3-d70'
-EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE)
+EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES)
+FIXED_PROFILES = (ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES)
 ROUND_THREE_SEEDS = (1048, 1049)
 
 
@@ -94,11 +99,18 @@ def canonical(value):
     return json.loads(json.dumps(value, allow_nan=False))
 
 
-def configuration(seed, prices):
+def configuration(seed, prices, models=None):
     config = BenchmarkConfig(seed=seed, total_days=500, initial_cash=1_000_000.,
         agent_llm_model=MODEL, agent_llm_reasoning_effort='high', model_pricing=prices['rates'],
         social_post_llm_provider='opencode', social_post_llm_model=MODEL,
         enterprise_llm_provider='opencode', enterprise_llm_model=MODEL)
+    if models:
+        agent, world = models['agent'], models['simulator']
+        config.agent_llm_provider, config.agent_llm_model = agent['provider'], agent['model']
+        config.agent_llm_reasoning_effort = agent['reasoning_effort']
+        config.social_post_llm_provider = config.enterprise_llm_provider = world['provider']
+        config.social_post_llm_model = config.enterprise_llm_model = world['model']
+        config.simulator_model_config = world
     for name, value in normalize_runtime_config(
             {name: getattr(config, name) for name in RUNTIME_CONFIG_FIELDS}).items():
         setattr(config, name, value)
@@ -119,20 +131,28 @@ def check_prices(prices, source):
 
 
 def checked_client(role, session, *, transport=None, no_models=False, config=None,
-                   request_guard=None, response_guard=None, hold=None):
+                   request_guard=None, response_guard=None, hold=None, model_config=None):
     def request_check(request):
         if no_models:
             raise AssertionError('Preparation must not request a model')
         if request_guard:
             request_guard(request)
 
-    key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get('OPENCODE_API_KEY')
+    model_config = model_config or (config.simulator_model_config if config else None)
+    credential_env = model_config['credential_env'] if model_config else 'OPENCODE_API_KEY'
+    key = 'OFFLINE-PREPARATION' if no_models or transport is not None else os.environ.get(credential_env)
     if not key:
+        if model_config:
+            from .run_lifecycle import RunCancelled
+            raise RunCancelled('model_configuration_missing', f'{credential_env} is unavailable')
         logging.warning('OPENCODE_API_KEY is unavailable; attempting the configured provider')
         key = 'MISSING-API-KEY'
-    return OpenAI(api_key=key, base_url=ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'],
+    headers = {'User-Agent': 'CEO-Bench/1.0', 'x-ceobench-session': session + ':' + role}
+    if not model_config or model_config['provider'] == 'opencode':
+        headers['x-opencode-session'] = session + ':' + role
+    return OpenAI(api_key=key, base_url=model_config['base_url'] if model_config else ENDPOINT, max_retries=PARAMETERS['sdk_max_retries'],
         timeout=httpx.Timeout(**PARAMETERS['timeout_seconds']),
-        default_headers={'User-Agent': 'CEO-Bench/1.0', 'x-opencode-session': session + ':' + role},
+        default_headers=headers,
         http_client=httpx.Client(transport=transport, event_hooks={'request': [request_check],
             'response': [response_guard] if response_guard else []}))
 
@@ -295,9 +315,11 @@ def close_team(runtime, record=None):
 
 def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=None, token_counter=None):
     root = Path(root)
-    config = configuration(entry['seed'], manifest['pricing'])
+    models = manifest['parameters'].get('model_configs')
+    config = configuration(entry['seed'], manifest['pricing'], models)
     session = uuid.uuid4().hex
-    factory = client_factory or (lambda role: checked_client(role, session, no_models=True))
+    factory = client_factory or (lambda role: checked_client(role, session, no_models=True,
+        model_config=models['agent'] if models else None))
     conn, sim, rng = open_d0(entry['d0'], root, config)
     if simulator_factory:
         sim = simulator_factory(conn, config, rng)
@@ -312,7 +334,8 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             client_factory=factory, public_dir=manifest['public_dir'], mode=entry['group'],
             run_id=entry['run_id'], world_id=manifest['d0'][str(entry['seed'])]['world_id'],
             public_refs_path=Path(entry['output_dir']) / 'private' / 'public-refs.sqlite',
-            model=MODEL, reasoning_effort='high', total_days=500,
+            model=config.agent_llm_model, reasoning_effort=config.agent_llm_reasoning_effort, total_days=500,
+            model_configs=models,
             capabilities=entry.get('capabilities', manifest['parameters'].get('capabilities', {}).get(entry['group'])),
             model_pricing=manifest['pricing'], token_counter=token_counter,
             **(analyst_bash_settings(manifest) | explicit_bash_settings()))
@@ -336,7 +359,7 @@ def explicit_bash_settings():
 def freeze_batch(destination, d0_sources, prices, *, price_source, category='formal',
                  order_seed=0, excluded_seeds=(), selection_rule='',
                  root=ROOT, public_dir=None, token_counter=None, scheduling=None,
-                 profile=None, exploration_manifest=None):
+                 profile=None, exploration_manifest=None, model_configs=None):
     root, destination = Path(root).resolve(), Path(destination).resolve()
     public = Path(public_dir or root / 'public').resolve()
     if category not in ('formal', 'engineering'):
@@ -372,10 +395,11 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         raise ValueError('Seeds must be unique nonnegative integers')
     if len(seeds) not in layout.seed_counts:
         raise ValueError(f'{profile or category} requires seed count in {layout.seed_counts}')
-    if profile == ROUND_THREE_PROFILE:
-        if sorted(seeds) != list(ROUND_THREE_SEEDS):
-            raise ValueError('Third round requires sealed D0 seeds 1048 and 1049')
-        selection_rule = 'Reuse sealed D0 seeds 1048 and 1049 in ascending group queues'
+    if profile in FIXED_PROFILES:
+        expected_seeds = (1048,) if profile in ROUND_FOUR_PROFILES[1:] else ROUND_THREE_SEEDS
+        if sorted(seeds) != list(expected_seeds):
+            raise ValueError(f'{profile} requires sealed D0 seeds {expected_seeds}')
+        selection_rule = 'Reuse sealed D0 seeds ' + ', '.join(map(str, expected_seeds)) + ' in ascending group queues'
     elif category == 'formal' and (not selection_rule.strip() or set(seeds) & excluded_seeds):
         raise ValueError('Batches require unused seeds and a recorded selection rule')
     if profile:
@@ -383,6 +407,10 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if category == 'engineering' and seeds != [42]:
         raise ValueError('D28 engineering verification uses seed 42')
     check_prices(prices, price_source)
+    if profile in ROUND_FOUR_PROFILES:
+        model_configs = validate_profile_models(profile, model_configs or round_four_models(profile, prices), prices)
+    elif model_configs is not None:
+        raise ValueError('Explicit model configurations require a round-four profile')
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
     d0 = {str(seed): verify_d0(path, seed=seed) for seed, path in d0_sources.items()}
     destination.mkdir(parents=True, exist_ok=False)
@@ -390,12 +418,12 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     run_prefix = f'{profile}-{batch_id}' if profile else category
     pairs = [(seed, repeat) for seed in seeds for repeat in range(1, layout.repeats + 1)]
     ordering = random.Random(order_seed)
-    if profile != ROUND_THREE_PROFILE:
+    if profile not in FIXED_PROFILES:
         ordering.shuffle(pairs)
     runs = []
     for seed, repeat in pairs:
         groups = list(layout.groups)
-        if profile != ROUND_THREE_PROFILE:
+        if profile not in FIXED_PROFILES:
             ordering.shuffle(groups)
         for group in groups:
             run_id = f'{run_prefix}-s{seed}-r{repeat}-{group}'
@@ -403,16 +431,28 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
                 group=group, category=category, d0=d0[str(seed)]['path'],
                 output_dir=str(destination / 'runs' / run_id), stop_after_day=layout.stop_after_day))
     parameters = canonical(PARAMETERS)
-    if profile == ROUND_THREE_PROFILE:
+    if profile in FIXED_PROFILES:
         from .agent_capabilities import AgentCapabilities
         parameters['capabilities'] = {group: AgentCapabilities.round_three(group).to_dict()
                                       for group in layout.groups}
         for entry in runs:
             entry['capabilities'] = parameters['capabilities'][entry['group']]
+    if model_configs:
+        parameters['model_configs'] = canonical(model_configs)
+        agent = model_configs['agent']
+        parameters.update(provider=agent['provider'], model=agent['model'], reasoning_effort=agent['reasoning_effort'],
+            temperature=agent['temperature'], thinking=agent['thinking'], max_tokens=agent['max_output_tokens'],
+            memory_characters=agent['memory_characters'])
+        for entry in runs:
+            entry['comparison_role'] = 'exploration' if profile in ROUND_FOUR_PROFILES[1:] else 'paired'
     controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
+    if profile in ROUND_FOUR_PROFILES:
+        controllers = (*controllers, 'scripts/round4.py')
+        from importlib.metadata import version
+        parameters['openai_sdk_version'] = version('openai')
     manifest = dict(version=1, category=category, batch_id=batch_id, seeds=seeds,
         excluded_debug_seeds=sorted(excluded_seeds), seed_selection_rule=selection_rule,
-        order=dict(method='fixed seeds ascending then groups' if profile == ROUND_THREE_PROFILE
+        order=dict(method='fixed seeds ascending then groups' if profile in FIXED_PROFILES
                    else 'python.Random.shuffle pairs then groups', seed=order_seed),
         source_root=str(root), source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         source_sha256=source, host_script_sha256=file_hash(root / 'scripts' / 'team_batch.py'),
@@ -428,7 +468,8 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if scheduling == 'group_independent':
         manifest['scheduling'] = dict(mode=scheduling, queues={group:
             [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
-    counter = token_counter or load_counter('opencode', MODEL)
+    counter = token_counter or load_counter(model_configs['agent']['provider'] if model_configs else 'opencode',
+                                          model_configs['agent']['model'] if model_configs else MODEL)
     manifest['tokenizer'] = counter.metadata if counter else None
     prompts = {}
     for group in layout.groups:
@@ -464,7 +505,7 @@ def validate_manifest(path):
         if layout is None or layout.category != category:
             logging.warning('Batch profile or resource category mismatch')
         if category == 'formal':
-            if len(seeds) not in (layout.seed_counts if layout else (2, 3)) or len(set(seeds)) != len(seeds) or (profile != ROUND_THREE_PROFILE and set(seeds) & set(manifest['excluded_debug_seeds'])) or not manifest['seed_selection_rule'].strip():
+            if len(seeds) not in (layout.seed_counts if layout else (2, 3)) or len(set(seeds)) != len(seeds) or (profile not in FIXED_PROFILES and set(seeds) & set(manifest['excluded_debug_seeds'])) or not manifest['seed_selection_rule'].strip():
                 logging.warning('Formal batch seed selection mismatch')
             expected = {(seed, repeat, group) for seed in seeds
                 for repeat in range(1, layout.repeats + 1) for group in layout.groups} if layout else set()
@@ -483,6 +524,14 @@ def validate_manifest(path):
                 logging.warning('Third-round model parameters or capabilities mismatch')
             if any(row.get('capabilities') != expected_capabilities.get(row['group']) for row in manifest['runs']):
                 logging.warning('Third-round run capabilities mismatch')
+        if profile in ROUND_FOUR_PROFILES:
+            validate_profile_models(profile, manifest['parameters']['model_configs'], manifest['pricing'])
+            expected_seeds = [1048] if profile in ROUND_FOUR_PROFILES[1:] else [1048, 1049]
+            if seeds != expected_seeds:
+                logging.warning('Fourth-round fixed seeds mismatch')
+            from .agent_capabilities import AgentCapabilities
+            if any(row.get('capabilities') != AgentCapabilities.round_three(row['group']).to_dict() for row in manifest['runs']):
+                logging.warning('Fourth-round capabilities mismatch')
         actual, ids, outputs = set(), set(), set()
         for entry in manifest['runs']:
             key = entry['seed'], entry['repeat'], entry['group']
@@ -968,7 +1017,27 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
                 write_json(output / 'HOLD', notice)
                 logging.warning(detail)
                 return record
-            counter = load_counter('opencode', MODEL)
+            models = manifest['parameters'].get('model_configs')
+            if source:
+                from .team_checkpoint import validate_snapshot
+                _, checkpoint_state = validate_snapshot(source)
+                models = checkpoint_state['configuration'].get('model_configs')
+            if live and models:
+                needed = {config['credential_env'] for role, config in models.items()
+                          if (role == 'agent' and client_factory is None) or (role == 'simulator' and simulator_factory is None)}
+                missing = sorted(name for name in needed if not os.environ.get(name))
+                if missing:
+                    detail = 'Missing credential environment variables: ' + ', '.join(missing)
+                    record.update(status='paused', hold=True, reason='model_configuration_missing', hold_detail=detail,
+                                  finished_at=datetime.now(timezone.utc).isoformat())
+                    notice = dict(reason=record['reason'], detail=detail, manual_resume_required=True,
+                                  checkpoint=record.get('checkpoint'), resume_week=1 if source is None else None)
+                    write_json(directory / 'attempt.json', record)
+                    write_json(directory / 'HOLD', notice)
+                    write_json(output / 'HOLD', notice)
+                    return record
+            counter = load_counter(models['agent']['provider'] if models else 'opencode',
+                                   models['agent']['model'] if models else MODEL)
             record['tokenizer_changed'] = canonical(counter.metadata if counter else None) != manifest['tokenizer']
             session = record['attempt_id']
             def check_request():
@@ -980,9 +1049,10 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
             guard_options = dict(request_guard=guarded_request if request_guard else None, response_guard=response_guard,
                 hold=None)
             factory = client_factory or (lambda role: checked_client(role, session, no_models=not live,
-                **guard_options))
+                model_config=models['agent'] if models else None, **guard_options))
             def world_factory(conn, config, rng):
-                client = checked_client('simulator', session, no_models=not live, config=config, **guard_options)
+                client = checked_client('simulator', session, no_models=not live, config=config,
+                    model_config=models['simulator'] if models else None, **guard_options)
                 sim = simulator(conn, config, rng, client=client)
                 sim.customer_simulator.usage_recorder.path = directory / 'runtime' / 'private' / 'simulator-model-usage.jsonl'
                 sim.customer_simulator.usage_recorder.expected_model = config.social_post_llm_model
@@ -1174,7 +1244,7 @@ def summarize(path, resource_paths=None):
             usage['missing_receipts'] = [gap for gap in usage.get('missing_receipts', [])
                 if gap['reason'] != 'unterminated_log_tail'] + tails
             mark_truncated_totals(usage, tails, category=row['category'])
-    single_group = manifest.get('profile') == 'r2-git-exploration'
+    single_group = manifest.get('profile') in ('r2-git-exploration', *ROUND_FOUR_PROFILES[1:])
     return dict(category=manifest['category'], batch_id=manifest.get('batch_id'),
         profile=manifest.get('profile'), runs=rows,
         comparison_status='not_applicable_single_group' if single_group else 'paired',
@@ -1197,6 +1267,7 @@ def main(argv=None):
     shape = frozen.add_mutually_exclusive_group()
     shape.add_argument('--category', choices=('formal', 'engineering'), default='formal')
     shape.add_argument('--profile', choices=EXPERIMENT_PROFILES)
+    frozen.add_argument('--model-configs', type=Path, help='Credential-free agent/simulator JSON for round four.')
     frozen.add_argument('--exploration-manifest', type=Path,
         help='Prior Git exploration manifest, required for the paired pilot seed exclusions.')
     frozen.add_argument('--excluded-debug-seed', '--excluded-seed', action='append', type=int, default=[])
@@ -1231,7 +1302,8 @@ def main(argv=None):
         result = freeze_batch(args.output, sources, load_pricing(args.pricing), price_source=args.price_source,
             category=args.category, order_seed=args.order_seed, excluded_seeds=args.excluded_debug_seed,
             selection_rule=args.seed_selection_rule, scheduling=args.scheduling,
-            profile=args.profile, exploration_manifest=args.exploration_manifest)
+            profile=args.profile, exploration_manifest=args.exploration_manifest,
+            model_configs=read(args.model_configs) if args.model_configs else None)
     elif args.command == 'policy':
         result = create_policy(args.manifest, args.output, run_ids=args.run_id, group=args.group)
     elif args.command == 'validate':

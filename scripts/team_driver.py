@@ -63,6 +63,8 @@ def _main(argv, warnings):
             runs=[row['run_id'] for row in manifest['runs']], assignments=manifest['runs'],
             memory_high=args.memory_high, memory_max=args.memory_max,
             runtime_limits=runtime_environment(args),
+            model_configs=manifest['parameters'].get('model_configs'),
+            tokenizer=manifest.get('tokenizer'), source_commit=manifest.get('source_commit'),
             model_requests=0, credential_read=False, new_attempts=0)))
         return 0
     directory = args.policy.resolve().parent

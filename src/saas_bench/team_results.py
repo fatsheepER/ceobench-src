@@ -37,6 +37,8 @@ def summarize_pairs(runs):
     runs = list(runs)
     indexed = {}
     for run in runs:
+        if run.get('comparison_role') == 'exploration':
+            continue
         key = (run['seed'], run['repeat'])
         pair = indexed.setdefault(key, {})
         if run['group'] not in ('git', 'pf') or run['group'] in pair:

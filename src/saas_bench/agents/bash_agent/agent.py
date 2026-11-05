@@ -162,6 +162,7 @@ class BashAgent(BaseAgent):
         max_output_tokens=None,
         before_request_callback=None,
         capabilities=None,
+        model_config=None,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -178,6 +179,7 @@ class BashAgent(BaseAgent):
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
         self.usage_recorder.attach(client)
         self.model = model
+        self.model_config = model_config
         self.max_turns_per_day = max_turns_per_day
         self.response_callback = response_callback
         self.before_request_callback = before_request_callback
@@ -206,7 +208,8 @@ class BashAgent(BaseAgent):
             'api.deepseek.com',
             'opencode.ai',
         )
-        self.supports_responses_api = not any(h in base_url for h in _non_responses_hosts)
+        self.supports_responses_api = (model_config['api'] == 'responses' if model_config else
+                                       not any(h in base_url for h in _non_responses_hosts))
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
@@ -538,7 +541,8 @@ class BashAgent(BaseAgent):
         try:
             self.usage_recorder.message_ids = [m.message_id for m in self.conversation]
             response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
-                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt,
+                                                **({'model_config': self.model_config} if self.model_config else {}))
         finally:
             known = physical_usage_summary(self.usage_recorder.summary)['known']
             for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
@@ -789,7 +793,8 @@ class BashAgent(BaseAgent):
                 _base_url = str(getattr(self.client, 'base_url', '') or '')
                 _is_together = 'api.together.xyz' in _base_url
                 _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
-                _is_opencode = 'opencode.ai' in _base_url
+                _is_opencode = (self.model_config['provider'] == 'opencode' if self.model_config else
+                                'opencode.ai' in _base_url)
                 _is_deepseek_compat = (
                     'api.deepseek.com' in _base_url or _is_opencode
                 )
@@ -1016,6 +1021,11 @@ class BashAgent(BaseAgent):
                 }
                 for t in self.tool_descriptions
             ]
+            if self.model_config:
+                # Preserve the benchmark's optional fields across API families.
+                # Responses otherwise attempts to normalize schemas to strict mode.
+                for tool in tools:
+                    tool['strict'] = False
 
             try:
                 api_kwargs = {
@@ -1029,6 +1039,8 @@ class BashAgent(BaseAgent):
                 if self.reasoning_effort:
                     api_kwargs['reasoning'] = {'effort': self.reasoning_effort, 'summary': 'auto'}
 
+                if self.model_config:
+                    api_kwargs.update(store=self.model_config['store'], include=self.model_config['include'])
                 api_kwargs['timeout'] = 600
                 response = self._request_model('responses', api_kwargs,
                     lambda: self.client.responses.create(**api_kwargs))

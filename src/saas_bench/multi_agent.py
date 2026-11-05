@@ -94,7 +94,7 @@ class MultiAgentRuntime:
                  simulator=None, public_dir=None, run_id=None, world_id=None, public_refs_path=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
-                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, **server_options):
+                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, model_configs=None, **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
@@ -102,6 +102,12 @@ class MultiAgentRuntime:
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
             total_days=total_days, model_pricing=model_pricing)
+        if model_configs is not None:
+            from .team_models import validate_models
+            validate_models(model_configs)
+            self.configuration['model_configs'] = model_configs
+            if (model, reasoning_effort) != (model_configs['agent']['model'], model_configs['agent']['reasoning_effort']):
+                raise ValueError('Agent identity differs from frozen model configuration')
         from .agent_capabilities import AgentCapabilities
         self.capabilities = AgentCapabilities.resolve(capabilities)
         if capabilities is not None:
@@ -118,7 +124,7 @@ class MultiAgentRuntime:
             validate_executor_settings(_restored_state['configuration'], _restored_state['roles'])
         if mode == 'pf' and token_counter is None:
             from .payload_tokens import load_counter
-            token_counter = load_counter('opencode', model)
+            token_counter = load_counter(model_configs['agent']['provider'] if model_configs else 'opencode', model)
         self.effective_end = total_days // 7 * 7
         self._lifecycle = WorkerLifecycle()
         self._message_lock = threading.Lock()
@@ -215,7 +221,9 @@ class MultiAgentRuntime:
             usage = ModelUsage(role_private / 'model-usage.jsonl', role,
                 pricing=(model_pricing or {}).get('rates', {}), evidence_store=store, identity=identity, token_counter=token_counter)
             client = client_factory(role)
-            generation_policy = {}
+            generation_policy = (dict(memory_max_chars=model_configs['agent']['memory_characters'],
+                                      max_output_tokens=model_configs['agent']['max_output_tokens'])
+                                 if model_configs else {})
             if _restored_state:
                 generation_policy = dict(_restored_state['roles'][role].get('generation_policy', {}))
                 if not generation_policy and 'runtime_environment' not in _restored_state:
@@ -232,7 +240,8 @@ class MultiAgentRuntime:
                 client, workspace_path=workspace, usage_recorder=usage,
                 model=model, reasoning_effort=reasoning_effort, total_days=total_days,
                 text_registration=True, pf=mode == 'pf', identity=identity, capabilities=self.capabilities,
-                allow_final_text=role != 'ceo', **generation_policy)
+                allow_final_text=role != 'ceo', model_config=model_configs['agent'] if model_configs else None,
+                **generation_policy)
             agent.system_prompt = system_prompt(agent.system_prompt, role, mode, total_days,
                 self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]], self.capabilities)
             agent.lifecycle = self._lifecycle

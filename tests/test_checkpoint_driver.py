@@ -54,10 +54,13 @@ def _worker(spec_path, argv):
     socket.socket.connect = local_only
     run_test.load_env_file = no_credentials
     os.environ['OPENCODE_API_KEY'] = 'OFFLINE-ONLY'
+    os.environ['OPENAI_API_KEY'] = 'OFFLINE-ONLY'
     checked_client, prepare = batch.checked_client, batch.prepare
     save, close = batch.save_checkpoint, batch.close_team
 
     def client(*args, **kwargs):
+        if kwargs.get('model_config'):
+            kwargs['model_config'] = dict(kwargs['model_config'], base_url=batch.ENDPOINT)
         result = checked_client(*args, **kwargs)
         clients.append(result)
         return result
@@ -168,20 +171,44 @@ def _worker(spec_path, argv):
         def do_POST(self):
             try:
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                role = self.headers['x-opencode-session'].rsplit(':', 1)[-1]
+                role = (self.headers.get('x-ceobench-session') or self.headers['x-opencode-session']).rsplit(':', 1)[-1]
                 team = holder['team']
                 with lock:
                     proof['wire'].append(dict(role=role, day=team.server.tools.current_day,
-                                              phase=team.phase, body=body))
+                                              phase=team.phase, body=body, endpoint=self.path))
                     if len(proof['wire']) > spec.get('max_requests', 16):
                         raise AssertionError('Unexpected repeated model turns in one-week fixture')
                 if spec.get('stop_on_day') == team.server.tools.current_day:
                     (Path(argv[argv.index('--policy') + 1]).parent / 'STOP').touch()
                 if spec.get('reject_run') == argv[argv.index('--worker') + 1]:
-                    payload, content_type, status = b'{"error":{"message":"offline permanent rejection"}}', 'application/json', 400
+                    payload = json.dumps({'error': {'message': 'offline permanent rejection', 'code': spec.get('reject_code')}}).encode()
+                    content_type, status = 'application/json', spec.get('reject_status', 400)
                 else:
-                    reply = completion(response(team, role, body), body.get('stream', False))
-                    payload, content_type = reply.content, reply.headers['content-type']
+                    if 'input' in body:
+                        messages = []
+                        for item in body['input']:
+                            if item.get('type') == 'function_call':
+                                messages.append(dict(role='assistant', name=item['name'], content=item['arguments']))
+                            elif item.get('type') == 'function_call_output':
+                                messages.append(dict(role='tool', content=item['output']))
+                            elif 'role' in item:
+                                messages.append(item)
+                        chat = response(team, role, {'messages': messages})
+                        assistant = chat
+                        output = [dict(id='rs1', type='reasoning', summary=[], encrypted_content='offline-reasoning')]
+                        for call in assistant.get('tool_calls') or []:
+                            output.append(dict(id='fc-' + call['id'], type='function_call', call_id=call['id'],
+                                name=call['function']['name'], arguments=call['function']['arguments'], status='completed'))
+                        if assistant.get('content'):
+                            output.append(dict(id='msg1', type='message', role='assistant', status='completed',
+                                content=[dict(type='output_text', text=assistant['content'], annotations=[])]))
+                        result = dict(id='resp1', object='response', created_at=1, status='completed', model=body['model'],
+                            output=output, usage=dict(input_tokens=10, output_tokens=2, total_tokens=12,
+                                input_tokens_details={'cached_tokens': 3}, output_tokens_details={'reasoning_tokens': 1}))
+                        payload, content_type = json.dumps(result).encode(), 'application/json'
+                    else:
+                        reply = completion(response(team, role, body), body.get('stream', False))
+                        payload, content_type = reply.content, reply.headers['content-type']
                     status = 200
             except BaseException as exc:
                 proof['errors'].append(type(exc).__name__ + ': ' + str(exc))
