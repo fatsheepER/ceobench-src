@@ -311,7 +311,7 @@ def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False, 
                                      if tool['name'].startswith('text_')]
     if capabilities.source_declarations and (team or ask_analyst or explicit_capabilities):
         from saas_bench.relation_schema import tool_definition
-        definitions = definitions + [tool_definition(texts=capabilities.text_tools,
+        definitions = definitions + [tool_definition(pf=pf_queries, texts=capabilities.text_tools,
                                                       git_extra_saves=capabilities.git_extra_saves)]
     if team:
         definitions = definitions + [dict(name='ask_agent', description=

@@ -74,28 +74,30 @@ class Batch(Input):
 MODELS = dict(create=Create, revise=Revise, retire=Retire)
 
 
-def tool_definition(*, texts=True, git_extra_saves=True):
-    definition = dict(name='escalate', description=(
-        'Save source declarations for several targets, one complete source set per item. '
-        'Use create, revise, or retire. Endpoints are {cite: ROLE:rN.K}, saved file paths '
-        '(snapshotted at registration), exact ROLE:path@COMMIT, or {operation_ref: growth:1} copied '
-        'from a business receipt. PF also accepts exact captured ROLE:HANDLE@vK. '
+def tool_definition(*, texts=True, git_extra_saves=True, pf=False):
+    if pf:
+        endpoints = ('Endpoints use {cite: "ROLE:HANDLE@vK"} for exact captured files or outputs. '
+                     'Copy role-qualified handles from receipts. ')
+        endpoints += ('A bare file path binds a version read in this request or written in this context. ' if texts else
+                      'File/output declarations require an explicit @vK version. ')
+    else:
+        saving = ('saved file paths (snapshotted at registration)' if git_extra_saves else
+                  'files you have committed yourself')
+        endpoints = ('Endpoints use {cite: "ROLE:path@COMMIT"} for an exact saved file, or ' + saving + '. ')
+    if texts:
+        endpoints += 'Exact text revisions use {cite: ROLE:rN.K}. '
+    endpoints += 'Use {operation_ref: growth:1} copied from a business receipt for an operation. '
+    return dict(name='escalate', description=(
+        'Optionally save source declarations for selected reusable work, one complete source set per item. '
+        'Use create, revise, or retire. ' + endpoints +
         'Each source is {ref: endpoint, note?: text}, or {ref: {missing: {description, reason, '
-        'last_known_ref?: text}}}. Missing targets are invalid. No lookup or predicate is required. '
+        'last_known_ref?: text}}}. Missing targets are invalid. Known exact sources need no extra lookup. '
         'author_declared requires the target producer to be your role; use inferred for another '
-        'role or unknown author. The host supplies identity. For revise/retire use your relation '
+        'role or unknown author. A source may be an exact version from a readable peer workspace. '
+        'The host supplies identity. For revise/retire use your relation '
         'ID and expected_revision from its receipt. Omitted revision fields stay; supplied sources '
         'replace the whole set, including []. Changing target kind requires a new relation. '
         'Inspect each item result: ordinary rejection leaves other items eligible; saved with '
         'missing sources is incomplete evidence, and saved does not certify business success or validity. '
-        'History is readable in relations.json. Existing text references stay unchanged.'),
+        'Declarations are optional, including for handoffs. History is readable in documents/relations.json.'),
         parameters=compact_schema(Batch.model_json_schema()))
-    if not texts:
-        definition['description'] = definition['description'].replace(
-            'Endpoints are {cite: ROLE:rN.K}, saved file paths ', 'Endpoints are {cite: saved file path}, ')
-        definition['description'] = definition['description'].replace(
-            ' Existing text references stay unchanged.', ' New and revised declarations accept only files, captured outputs and business operations; registered texts are disabled. Historical records remain readable.')
-    if not git_extra_saves:
-        definition['description'] = definition['description'].replace(
-            '(snapshotted at registration)', '(commit files yourself before citing them)')
-    return definition

@@ -84,14 +84,10 @@ last rewrites removed.
 GIT_HISTORY += GIT_CALL_NOTES
 
 PF_CAPTURE_BOUNDARY = '''Workspace files are captured before and after the outer Bash call. Files created
-or changed inside that call are not refreshed in PF until it ends. Finish the
-writing call, then use its returned file handles in a later Bash call. To inspect
-current bytes inside the same Bash call, use ordinary file commands.
-
-First Bash call: run your script to write `reports/w4_calc.out`, then wait for the
-call to finish and return its PF receipt. Second Bash call: run
-`pf log reports/w4_calc.out`, or `pf show HANDLE --full` with the returned handle.
-These are two separate tool calls.
+or changed inside that call are not refreshed in PF until it ends. Use handles already returned
+by that call; no extra lookup is needed. If a needed handle is absent, follow the
+receipt's complete-capture command or locate it with PF. To inspect current bytes
+inside the same Bash call, use ordinary file commands.
 '''
 
 PF_HISTORY = '''## File and Output History (pf)
@@ -108,8 +104,8 @@ Content versions and execution events are separate. Saved, delivered and declare
 used are different; candidates are observations, not proof of use. After a command, a line such as
 `[pf: scripts/an_w7d.py.out@v1 | wrote scripts/an_w7d.py@v1]` names them:
 NAME@vK is version K of that file or output, and K rises only when the content
-changes. In `text_create`, cite such a handle, a file path (the version you last
-saw or wrote), a committed file (`MEMORY.md@week-6`), another text (`r4.2`) or
+changes. In `text_create`, cite an exact captured handle, a file path (a version
+read in this request or written in this context), another text (`r4.2`) or
 `unknown: <reason>`. Source navigation reads saved versions and relationships.
 Run current public queries or recompute your calculations when needed.
 Optional select/predicate fields store your declared condition without evaluating it.
@@ -225,14 +221,42 @@ Use these paths when saved evidence would help your business work:
   They preserve the query's scope and cutoff. Read missing-source descriptions and
   capture gaps; missing unsaved output stays missing. `pf help` gives full syntax.
 
-Uppercase names above are placeholders, not literal handles. Get real file/output
-handles from tool receipts or `pf log report.md` after saving that file; get unknown
-locations from search/candidates. Copy the exact returned role-qualified version
-for cross-role evidence (for example growth:report.md@v1, also a placeholder).
+Uppercase names above are placeholders, not literal handles. Copy exact file/output
+handles from receipts. Use log when you need version history or a missing handle;
+use search/candidates for unknown locations.
 A bare name reads the latest version. Operation targets use the operation_ref from
 the business receipt or business_operations SQL. Source role and storage role may differ.
 Compact DELTA/UNCHANGED replies name a baseline and a full-read command; use that
 command when needed. Do not treat a partial read as the complete source.
+
+"""
+
+
+PF_PEER_HISTORY = """## Working with peer evidence
+
+The following names illustrate formats; use actual paths and versions from your
+peer's handoff or receipts. Before reusing Growth's forecast, `pf log growth:forecast.md`
+shows its saved history. `pf show growth:forecast.md@v3 --full` reads that exact
+version, even if Growth has since overwritten the file. `growth:forecast.md` reads
+the latest captured version. `../growth/forecast.md` and an authorized absolute
+workspace path also work; `growth/forecast.md` means a local directory.
+
+After changing material already shared, `pf rdepend OLD_SOURCE_HANDLE --detail`
+finds recorded referrers to that exact old version. Review their declarations and
+in team runs use direct questions (ask_agent, or CEO's ask_analyst) to discuss a
+correction with the relevant role. Results cover recorded relationships, not all users
+of the material, and do not establish whether a business conclusion is affected.
+
+"""
+
+PF_PEER_DECLARATIONS = """When your work uses a peer's material, you may retain that precise source with
+escalate. For example, OpsFinance can record that its saved cash plan used Growth's
+forecast. The names and versions below illustrate the shape; replace both with
+actual returned handles and use your own role for an author_declared target:
+
+```json
+{"items":[{"item_id":"peer-basis","op":"create","target":{"cite":"ops_finance:cash-plan.md@v2"},"sources":[{"ref":{"cite":"growth:forecast.md@v3"}}],"assertion":"author_declared","reason":"Growth's forecast supplies the acquisition assumption in this cash plan."}]}
+```
 
 """
 
@@ -298,11 +322,13 @@ def capability_history(pf, capabilities):
     if pf:
         if capabilities.tool_notes:
             history += PF_NOTES
-        history += PF_CAPTURE_BOUNDARY + '\n'
+        history += PF_CAPTURE_BOUNDARY + '\n' + PF_PEER_HISTORY
     elif capabilities.tool_notes and capabilities.git_extra_saves:
         history += GIT_CALL_NOTES
     if capabilities.source_declarations:
         history += SOURCE_DECLARATIONS
+        if pf:
+            history += PF_PEER_DECLARATIONS
     return history
 
 
@@ -319,6 +345,10 @@ def integrate(prompt, pf=False, capabilities=None):
         prompt = prompt.replace(old, new)
     if capabilities is not None:
         prompt = prompt.replace(PF_HISTORY if pf else GIT_HISTORY, capability_history(pf, capabilities))
+        if not capabilities.source_declarations:
+            prompt = prompt.replace(
+                'To link a concrete\nbusiness operation, copy its `operation_ref` into a `escalate` endpoint;\noperation references are not text citations.',
+                'Operation references are not text citations; keep them in ordinary files.')
     return prompt
 
 

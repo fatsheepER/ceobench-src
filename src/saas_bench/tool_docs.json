@@ -656,7 +656,7 @@
   "set_targeted_dev_spend": {
     "name": "set_targeted_dev_spend",
     "category": "Marketing & Spend",
-    "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops.",
+    "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. Per-group quality bonus increases by 0.0225 \u00d7 ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -684,7 +684,7 @@
       "failure": "Invalid group IDs: {X}. Valid groups: S1-S3, E1-E3, ..."
     },
     "mechanics": {
-      "quality_bonus": "Per-group quality bonus ACCUMULATES daily: +0.005 \u00d7 log(1 + spend/1000) per day (5\u00d7 more efficient than global dev spend). At $5000/day: +0.00896/day cumulative. After 30 days: +0.269 total. Investment persists if spending stops.",
+      "quality_bonus": "Per-group quality bonus increases by 0.0225 \u00d7 ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops. At $5000/day: about +0.01560 quality units/day, or +0.46787 over 30 days at that constant spend (before model-tier scaling).",
       "scope": "Only affects subscribers in the targeted group (not global q_shared). Like building group-specific features \u2014 investment compounds over time.",
       "cost": "Extra dollars are deducted from cash daily as development cost"
     },

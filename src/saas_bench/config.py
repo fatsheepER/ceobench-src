@@ -483,7 +483,7 @@ class BenchmarkConfig:
 
     # Per-group targeted dev spend: {group_id: additional_$/day}
     # ADDITIONAL to global dev spending. Provides CUMULATIVE per-group quality bonuses.
-    # Each group accumulates: 0.0005 * log(1 + spend / 500) per day to q_group_bonus_{group_id}.
+    # Each group accumulates: 0.0225 * ln(1 + spend / 5000) per day to q_group_bonus_{group_id}.
     # Investment persists even after spending stops (like building features for a segment).
     # Example: {"E1": 500, "S1": 200} adds $700/day extra dev cost, building quality for E1 and S1
     targeted_dev_spend: Dict[str, float] = field(default_factory=dict)

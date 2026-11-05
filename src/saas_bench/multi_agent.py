@@ -180,6 +180,8 @@ class MultiAgentRuntime:
                 shutil.copytree(public / 'docs', workspace / 'docs')
                 shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
                 (workspace / 'MEMORY.md').write_text('')
+            from .workspace_guides import write_guides
+            write_guides(workspace, mode, self.capabilities)
             identity = (AgentIdentity(**_restored_state['roles'][role]['identity']) if _restored_state else
                 AgentIdentity(run_id, world_id, role, uuid.uuid4().hex, uuid.uuid4().hex))
             role_private = private / role

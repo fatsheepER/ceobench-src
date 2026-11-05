@@ -90,7 +90,7 @@
     "name": "set_targeted_dev_spend",
     "python_call": "novamind_api.analytics.set_targeted_dev_spend(...)",
     "category": "Marketing & Spend",
-    "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops.",
+    "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. Per-group quality bonus increases by 0.0225 \u00d7 ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops.",
     "parameters": {
       "targeted_spend": {
         "type": "Dict[str, float]",
@@ -121,6 +121,7 @@
       "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
       "targeted_spend": "Dict[str, float] \u2014 {group_id: $/day}",
       "total_extra_per_day": "float \u2014 total additional dev spend per day",
+      "quality_effect": "Per-group daily quality formula and spend units; describes the rule, not a realized gain.",
       "_access": "result['targeted_spend']['E1'] \u2192 E1's extra dev spend"
     },
     "impact": "Extra dollars are deducted from cash daily. Each targeted group ACCUMULATES a quality bonus over time (like building features for that segment). The bonus persists even after spending stops. Use to invest in features/customization for high-value segments.",

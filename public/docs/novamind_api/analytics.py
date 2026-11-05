@@ -54,7 +54,9 @@ def set_targeted_ops_spend(
 def set_targeted_dev_spend(targeted_spend: Dict[str, float]) -> Dict:
     """Set per-group targeted development spend.
 
-    Per-group dev spend ACCUMULATES a quality bonus daily. Persists after spending stops.
+    Per-group quality grows by 0.0225 × ln(1 + spend/5000) daily, where spend
+    is that group's targeted development spend in USD per day. This adds to
+    global development gains and persists after spending stops.
 
     Args:
         targeted_spend: {group_id: daily_amount} dict. Replaces the whole group

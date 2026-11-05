@@ -744,5 +744,5 @@ def render(page):
             lines.append(f"  execution_membership: member={item['member_role']}; event_ref={item['event_ref']}; content_ref={item['content_ref']}. This records membership, not source adoption.")
             lines.append('  Explore this execution: ' + item['navigation'])
     if not page['items'] and not page.get('detail'):
-        lines.append('No saved relationships in this scope. --all-revisions includes superseded and retired revisions; --include-candidates adds saved execution observations.')
+        lines.append('No saved relationships in this scope. This does not enumerate all users of the material. --all-revisions includes superseded and retired revisions; --include-candidates adds saved execution observations.')
     return '\n'.join(lines)

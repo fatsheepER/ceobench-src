@@ -380,7 +380,7 @@ def render_dependents(page):
     root, detail = page['root'], page.get('detail')
     lines = ['Referrers of ' + item_line(root)]
     if not page['items']:
-        lines.append('No active registered text cites it.')
+        lines.append('No recorded referrers in this scope. This does not enumerate all users of the material.')
     for i, row in enumerate(page['items'], 1):
         source = row['source']
         via = row['path'][1:-1]

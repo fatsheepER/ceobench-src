@@ -151,6 +151,8 @@ def build():
     render_table_docs(tables_dir)
     render_cli_docs(docs_dir)
     render_tools_reference(docs_dir / "tools-reference.md")
+    from saas_bench.workspace_guides import build_guides
+    build_guides(docs_dir)
     render_tables_reference(docs_dir / "tables-reference.md")
 
     # Drop any stale empty JSON

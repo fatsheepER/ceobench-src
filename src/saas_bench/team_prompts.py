@@ -277,6 +277,8 @@ enterprise deals, submit final forecasts and advance time. Shared settings use e
 partial-update or replacement rules.
 All roles can read business MEMORY.md, scripts, reports, saved outputs,
 registrations and history in the listed workspaces. Write only your own workspace.
+Read docs/workspace-history.md for your enabled history tools and examples;
+docs/business-ledger.md explains shared SQL operation records and result paging.
 '''
     prompt += '''Use ask_agent(role, message) for focused synchronous requests to another role.
 Requests arrive after your current model response and complete tool batch. Answer the

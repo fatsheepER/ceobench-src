@@ -188,6 +188,9 @@ def test_nontext_help_keeps_notes_and_declarations_independent(notes, declaratio
 def test_public_guide_matches_enabled_examples():
     from pathlib import Path
     from saas_bench.registration_prompt import capability_history
+    from saas_bench.workspace_guides import render_guides
     guide = (Path(__file__).resolve().parents[1] / 'public/docs/workspace-history.md').read_text()
+    assert '\\n' not in guide and 'escalate' not in guide
     for mode in ('git', 'pf'):
-        assert capability_history(mode == 'pf', AgentCapabilities.round_three(mode)) in guide
+        caps = AgentCapabilities.round_three(mode)
+        assert capability_history(mode == 'pf', caps) in render_guides(mode, caps)['workspace-history.md']

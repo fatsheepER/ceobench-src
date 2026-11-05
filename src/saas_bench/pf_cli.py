@@ -73,8 +73,8 @@ Files, outputs, exact text revisions and concrete role:number operation referenc
 be relation targets or sources. Copy operation_ref from its business receipt.
 Text references[].cite accepts saved file/output handles and exact text revisions;
 use escalate with {operation_ref: "growth:1"} for an operation.
-Git file references keep their exact commit and storage role. Author declarations,
-other authors' inferences and automatic execution observations remain separate.
+Author declarations, other authors' inferences and automatic execution observations
+remain separate. Source role and storage role can differ.
 --include-candidates adds saved derivation/range links and execution membership.
 Membership names a captured object and its execution, stops at that event, and
 provides a candidates command for its recorded members. It does not connect every
@@ -186,7 +186,13 @@ HELP += '\n' + PF_CAPTURE_BOUNDARY
 def command_help(capabilities):
     """The shell uses the same enabled instructions as the model system prompt."""
     if capabilities.text_tools:
-        return HELP
+        if capabilities.source_declarations:
+            return HELP
+        return HELP.replace('use escalate with {operation_ref: "growth:1"} for an operation.',
+                            'keep operation references in ordinary files.').replace(
+            'Known sources\ncan be registered directly with escalate, without a candidates query.', '').replace(
+            'Use the content handle in escalate.', 'Use the content handle for saved-version queries.').replace(
+            'Known sources can be registered directly.', '')
     from .registration_prompt import capability_history
     # Historical text reads remain supported, but no disabled text-writing workflow
     # is advertised. Keep the legacy help above for explicitly enabled text tools.

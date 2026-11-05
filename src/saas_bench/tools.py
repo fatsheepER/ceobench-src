@@ -78,6 +78,9 @@ def _render_table_doc(table_name: str, max_cols: int | None = None) -> str:
 # Used by get_tool_documentation() to render tool docs.
 # Previously maintained as a separate tool_docs.json file.
 # =====================================================================
+TARGETED_DEV_EFFECT = "Per-group quality bonus increases by 0.0225 × ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops."
+
+
 TOOL_DOCS = {
     "set_prices": {
         "name": "set_prices",
@@ -371,7 +374,7 @@ TOOL_DOCS = {
     "set_targeted_dev_spend": {
         "name": "set_targeted_dev_spend",
         "category": "Marketing & Spend",
-        "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops.",
+        "description": "Set ADDITIONAL per-group development spending on top of the global dev spend. " + TARGETED_DEV_EFFECT,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -398,10 +401,11 @@ TOOL_DOCS = {
             "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
             "targeted_spend": "Dict[str, float] — {group_id: $/day}",
             "total_extra_per_day": "float — total additional dev spend per day",
+            "quality_effect": "Per-group daily quality formula and spend units; describes the rule, not a realized gain.",
             "_access": "result['targeted_spend']['E1'] → E1's extra dev spend"
         },
         "mechanics": {
-            "quality_bonus": "Per-group quality bonus ACCUMULATES daily: +0.005 × log(1 + spend/1000) per day (5× more efficient than global dev spend). At $5000/day: +0.00896/day cumulative. After 30 days: +0.269 total. Investment persists if spending stops.",
+            "quality_bonus": TARGETED_DEV_EFFECT + " At $5000/day: about +0.01560 quality units/day, or +0.46787 over 30 days at that constant spend (before model-tier scaling).",
             "scope": "Only affects subscribers in the targeted group (not global q_shared). Like building group-specific features — investment compounds over time.",
             "cost": "Extra dollars are deducted from cash daily as development cost"
         },
@@ -2420,8 +2424,8 @@ class AgentTools:
         result_msg = f"Targeted dev spend updated (extra ${total_extra:.0f}/day on top of global dev):\n"
         if summary_parts:
             result_msg += '\n'.join(summary_parts)
-            result_msg += f"\n\nEffect: Each targeted group ACCUMULATES a quality bonus of "
-            result_msg += f"0.005 × log(1 + spend/1000) per day (5× more efficient than global dev spend). This compounds over time and persists if spending stops."
+            result_msg += "\n\nEffect: "
+            result_msg += TARGETED_DEV_EFFECT
         else:
             result_msg += "  (no targeted dev spend — all dev spend is global)"
 
@@ -2433,6 +2437,7 @@ class AgentTools:
             'changes': changes,
             'targeted_spend': targeted_spend,
             'total_extra_per_day': total_extra,
+            'quality_effect': TARGETED_DEV_EFFECT,
         })
 
     def set_ads_strength(self, global_strength=None, by_group=None, by_customer=None) -> ToolResult:

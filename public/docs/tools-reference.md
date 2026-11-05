@@ -18,7 +18,7 @@ See [business ledger](business-ledger.md) for stable query examples and commit s
 | `set_daily_spend` | Set daily spending for operations and development. Advertising spend is set via set_targeted_ad_spend (per channel × group) only. |
 | `set_targeted_ad_spend` | Set per-(channel, group) ad spend. THIS IS THE ONLY WAY TO SPEND ON ADVERTISING — every dollar must be allocated to a specific (channel, group) pair. |
 | `set_targeted_ops_spend` | Set ADDITIONAL operations spending targeted at specific scopes (group, plan, group+plan, individual customer). Each scope runs its own independent Poisson resolution pool on top of the global ops pool. |
-| `set_targeted_dev_spend` | Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops. |
+| `set_targeted_dev_spend` | Set ADDITIONAL per-group development spending on top of the global dev spend. Per-group quality bonus increases by 0.0225 × ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops. |
 | `set_capacity_tier` | Set infrastructure capacity tier. Higher tiers handle more usage but cost more per day. |
 | `set_usage_quotas` | Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota degrades experience. |
 | `send_enterprise_deal` | Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, an active enterprise subscription is required to start renegotiation. Identify customers by customer_id, not message_id. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). At 7 days without an agent reply to a customer message, new leads are lost and existing subscribers cancel. |
@@ -1252,7 +1252,7 @@ Set per-(channel, group) ad spend. THIS IS THE ONLY WAY TO SPEND ON ADVERTISING 
 
 **Python:** `novamind_api.analytics.set_targeted_dev_spend(...)`
 
-Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops.
+Set ADDITIONAL per-group development spending on top of the global dev spend. Per-group quality bonus increases by 0.0225 × ln(1 + spend/5000) per day; spend is this group's targeted development spend in USD per day. It adds to global development gains and persists after spending stops.
 
 **Parameters:**
 
@@ -1284,6 +1284,7 @@ Set ADDITIONAL per-group development spending on top of the global dev spend. Pr
   "changes": "Changed fields as {before, after}; {} means unchanged. None marks an added or removed entry.",
   "targeted_spend": "Dict[str, float] — {group_id: $/day}",
   "total_extra_per_day": "float — total additional dev spend per day",
+  "quality_effect": "Per-group daily quality formula and spend units; describes the rule, not a realized gain.",
   "_access": "result['targeted_spend']['E1'] → E1's extra dev spend"
 }
 ```

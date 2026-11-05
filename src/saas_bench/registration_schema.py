@@ -68,7 +68,7 @@ CITE_FORMS = dict(
         'path@<commit prefix>, a registered text r4 or r4.2, or "unknown: <reason>". '
         'Use operation_ref endpoints in escalate for business operations; cite does not accept them',
     pf='a handle from a [pf: ...] line such as scripts/an_w7d.py.out@v1 or MEMORY.md@v8, a file path (the '
-       'version present in this request or written in this context), path@week-N or path@<commit prefix>, a registered text r4 or r4.2, '
+       'version present in this request or written in this context), a registered text r4 or r4.2, '
        'or "unknown: <reason>". Use operation_ref endpoints in escalate for business operations; '
        'cite does not accept them')
 _RECORD = re.compile(r'(?:(?:ceo|growth|ops_finance):)?r[1-9][0-9]*(\.[1-9][0-9]*)?')
@@ -342,7 +342,7 @@ def tool_definitions(pf=False, team=False):
                 '[{kind,id}], references, applies, and reason. Each reference has cite, optional purpose current '
                 '(default) or historical_only, and optional note (max 200 characters retained). applies uses '
                 'simulated days: "7", "7-13", "7-", or "unknown: <reason>". Cite actual [pf: ...] handles, file paths '
-                'read in this request or written in this context, committed path@week-N or path@COMMIT, registered '
+                'read in this request or written in this context, registered '
                 'texts, or "unknown: <reason>". Whole-version citations bind saved evidence; coverage is recorded '
                 'separately. Selected fields require a read in this request or your current-context write. '
                 'select/predicate are stored without condition evaluation. Use table row/col '
@@ -389,4 +389,4 @@ def tool_definitions(pf=False, team=False):
         }
     from .relation_schema import tool_definition
     return [dict(name='text_' + name, description=descriptions[name], parameters=compact_schema(model.model_json_schema()))
-            for name, model in models.items()] + ([tool_definition()] if team else [])
+            for name, model in models.items()] + ([tool_definition(pf=pf)] if team else [])

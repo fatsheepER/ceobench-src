@@ -389,7 +389,10 @@ def refresh_registered_script_client(root, public):
     updates = []
     for role in ROLES:
         for source, relative in ((public / 'novamind-client', 'novamind-operation'),
-                                 (public / 'docs/cli.md', 'docs/cli.md')):
+                                 (public / 'docs/cli.md', 'docs/cli.md'),
+                                 (public / 'docs/api/analytics.json', 'docs/api/analytics.json'),
+                                 (public / 'docs/tools-reference.md', 'docs/tools-reference.md'),
+                                 (public / 'docs/novamind_api/analytics.py', 'docs/novamind_api/analytics.py')):
             content = source.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             mode = stat.S_IMODE(source.stat().st_mode)

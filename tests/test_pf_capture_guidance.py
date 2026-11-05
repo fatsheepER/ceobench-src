@@ -15,8 +15,8 @@ def test_capture_boundary_reaches_initial_models_and_log_show_help():
                          runtime.executor.execute('bash', {'command': 'pf show --help'})):
                 assert 'before and after the outer Bash call' in text
                 assert 'not refreshed in PF until it ends' in text
-                assert 'First Bash call' in text and 'Second Bash call' in text
-                assert 'pf log reports/w4_calc.out' in text
+                assert 'Use handles already returned' in text
+                assert 'reports/w4_calc.out' not in text
             requests = [json.loads(line)['body'] for line in runtime.usage.path.read_text().splitlines()
                         if json.loads(line)['event'] == 'http_request']
             assert requests[-1] == body

@@ -1,0 +1,128 @@
+"""Runtime-owned guides rendered for the run's history mode and capabilities."""
+import os
+from pathlib import Path
+import uuid
+
+from .agent_capabilities import AgentCapabilities
+from .registration_prompt import REGISTERED_TEXTS, SOURCE_DECLARATIONS, capability_history
+from .workspace_io import parent_fd
+
+
+BUSINESS_LEDGER = """# Query business operations
+
+Git and PF share the same world ledger. Every role can query `business_operations`, `business_effects`, and `business_ledger_metadata` with `novamind_api.query` or `./novamind-operation query`.
+
+Each authorized public business call has a stable `operation_ref` such as `growth:1`, `ops_finance:1`, or `ceo:1`. Copy the returned reference; its number is assigned by the host and increases within the producing role across weeks. The host binds `actor` and `initiator`. In multi-agent runs, model calls have `initiator = 'model'`; registered scripts have `initiator = 'registered_script'`, including raw HTTP and nested clients. Direct host calls have `initiator = 'host'`. Caller-supplied headers cannot change these fields. Permission and phase refusals before dispatch remain in the private host audit. Business validation rejections after dispatch have an operation and no effects.
+
+`parameters_json` preserves the public request. `result_json` preserves the complete tool result, including every enterprise item when the batch fails or succeeds partially. For successful `next_week`, it stores the canonical business terminal result (`success`, `day`, `advance`); dashboard rendering and response delivery remain separate. Confirmed terminal results are immutable: repeating the same finalization is accepted, and a conflicting finalization fails. Business receipts add short `operation` metadata with the exact `operation_ref`, admission `operation_seq`, recorded `outcome`, and committed `effect_seqs`. The SDK includes it in returned result data and in business rejection exceptions. The CLI prints it with `next-week` results. Permission and phase refusals before dispatch have no operation reference. An unfinished receipt uses `effect_seqs: null`; inspect the public ledger after work settles. Full business results remain in the ledger.
+
+`operation_seq` orders admission on the retained world route. `effect_seq` orders actual committed transactions. Multiple effects from one commit share `effect_seq` and have distinct zero-based `item_index` values. `effect_ref` combines the operation reference with its local effect index, for example `growth:1/effect:0`. Same-value writes are new operations and new effects. Runtime configuration effects record full before/after scopes, including mapping replacement and clearing. Row effects contain only explicitly public columns. Precise hidden insight snapshots, relationship values and enterprise reply scheduling are excluded.
+
+## Read fixed pages
+
+Capture both high-water marks in one query. Substitute the returned integers for `OP_HIGH` and `EFFECT_HIGH` below.
+
+```sql
+SELECT
+  (SELECT COALESCE(MAX(operation_seq), 0) FROM business_operations) AS operation_high,
+  (SELECT COALESCE(MAX(effect_seq), 0) FROM business_effects) AS effect_high;
+```
+
+Read operation pages. Start `OP_LAST` at 0 and use the last returned `operation_seq` for the next page.
+
+```sql
+SELECT * FROM business_operations
+WHERE operation_seq > OP_LAST AND operation_seq <= OP_HIGH
+ORDER BY operation_seq LIMIT 100;
+```
+
+Read effect pages. Start `EFFECT_LAST` at 0 and `ITEM_LAST` at -1. Use the last returned pair for the next page. Keep the original high-water marks for the entire scan.
+
+```sql
+SELECT * FROM business_effects
+WHERE effect_seq <= EFFECT_HIGH
+  AND (effect_seq > EFFECT_LAST
+       OR (effect_seq = EFFECT_LAST AND item_index > ITEM_LAST))
+ORDER BY effect_seq, item_index LIMIT 100;
+```
+
+The high-water marks fix membership, not the final status of unfinished operations. An admitted operation can gain effects and a result later. Query it again by its stable reference after it settles.
+
+```sql
+SELECT * FROM business_operations WHERE operation_ref = 'growth:1';
+SELECT * FROM business_effects WHERE operation_ref = 'growth:1'
+ORDER BY effect_seq, item_index;
+```
+
+The example reference must be replaced with the actual receipt. Save useful operation references and reasoning in ordinary files.
+
+For a large result, request its `result_json` or narrower columns separately and reduce the page size to fit the normal public SQL response limits. `LIMIT` is explicit; continue until a page is empty. No ledger result is broadcast automatically.
+
+## Interpret incomplete work
+
+`outcome` is `succeeded`, `rejected`, `partial`, `unknown`, or `unfinished`. `unfinished` means there is no confirmed final result. It does not mean zero effects, and it does not prove that a worker is still running. Inspect committed effects independently. An unexpected exception on a clean connection can record a sanitized unknown result. A dirty exception leaves the pending transaction untouched and the operation unfinished. Public SQL remains unavailable while the world is failed or has an unfinished transaction. The original attempt preserves the fault scene for host inspection.
+
+`next_week` includes separately committed predictions and actual simulator commit progress. Each `advance_progress` effect reports the reached day and the last completed day available from the committed simulator checkpoint state. A null completed day means that evidence is unavailable. These are transaction progress summaries, not a row-by-row simulation audit. A partial day may commit changes before that day is complete. Server completion, response delivery and background resource closure remain separate facts. A late completion settles the original operation.
+
+The ledger travels with the world database through checkpoints. Restoring a checkpoint keeps its earlier records and discards later records in the new attempt. The abandoned attempt retains its old records. New tails use new role numbers. A number allocated after the selected checkpoint remains reserved for its original operation and is never assigned to another operation, even though that discarded operation is absent from the restored ledger. Admission and effect sequence numbers can repeat after rollback; use operation_ref as the stable identity. `business_ledger_metadata.inception_day` identifies when the ledger was added to an older world; earlier operations are not reconstructed. Existing checkpoint recovery applies to runtime configuration. SQLite and Python memory do not have process-crash atomicity.
+"""
+
+PUBLIC_HISTORY = """# Saved business work
+
+Ordinary files, MEMORY.md, SQL, full handoffs, direct questions and automatic
+observation scripts remain available. The runtime supplies this workspace guide
+for the run's enabled history mode and capabilities at initialization and recovery.
+Use your system instructions for mode-specific commands.
+"""
+
+
+def render_guides(mode, capabilities=None):
+    if mode not in ('git', 'pf'):
+        raise ValueError('Workspace guides require git or pf mode')
+    caps = AgentCapabilities.resolve(capabilities)
+    history = '# Saved business work\n\n'
+    history += ('Use ordinary files, MEMORY.md, SQL, full handoffs, direct questions and '
+                'automatic observation scripts for business work.\n\n')
+    if caps.text_tools:
+        history += REGISTERED_TEXTS
+        if not caps.source_declarations:
+            history = history.replace(
+                'To link a concrete\nbusiness operation, copy its `operation_ref` into a `escalate` endpoint;\noperation references are not text citations.',
+                'Operation references are not text citations; keep them in ordinary files.')
+    history += capability_history(mode == 'pf', caps)
+    ledger = BUSINESS_LEDGER
+    if caps.source_declarations:
+        ledger += '\n' + SOURCE_DECLARATIONS
+        ledger += ('Copy exact file/output handles from PF receipts. For a saved operation basis, '
+                   '`pf depend growth:1` uses the actual receipt reference.\n' if mode == 'pf' else
+                   'Use saved file paths or exact ROLE:path@COMMIT references from Git receipts.\n')
+    return {'workspace-history.md': history, 'business-ledger.md': ledger}
+
+
+def write_guides(workspace, mode, capabilities=None):
+    """Replace only runtime-owned guides; never follow a restored file symlink."""
+    workspace = Path(workspace)
+    for name, content in render_guides(mode, capabilities).items():
+        with parent_fd(workspace, workspace / 'docs' / name, create=True) as (directory, target):
+            temporary = '.workspace-guide-' + uuid.uuid4().hex
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o644, dir_fd=directory)
+            try:
+                with os.fdopen(descriptor, 'w') as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+
+
+def build_guides(directory):
+    """Public bundle contains shared material; each role gets its enabled guide."""
+    directory = Path(directory)
+    (directory / 'workspace-history.md').write_text(PUBLIC_HISTORY)
+    (directory / 'business-ledger.md').write_text(BUSINESS_LEDGER)
