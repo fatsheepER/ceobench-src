@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import PurePosixPath
 import re
+import shlex
 import uuid
 
 from pydantic import ValidationError
@@ -26,8 +27,9 @@ def encode(value):
 
 
 class Rejected(ValueError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, **details):
         self.code = code
+        self.details = details
         super().__init__(message)
 
 
@@ -134,6 +136,16 @@ class RelationRegistry:
                         message = ('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg'] for e in exc.errors(include_input=False))
                                    if isinstance(exc, ValidationError) else str(exc))
                         result = dict(item_id=label, status='rejected', error_code=code, error=message)
+                        if isinstance(exc, Rejected):
+                            result.update(exc.details)
+                        elif isinstance(exc, ValidationError):
+                            location = exc.errors(include_input=False)[0]['loc']
+                            if location and location[0] == 'target':
+                                result['error_location'] = 'target'
+                            elif len(location) >= 3 and location[0] == 'sources' and location[2] == 'ref':
+                                result['error_location'] = f'sources[{location[1]}].ref'
+                            if 'error_location' in result:
+                                result['correction'] = 'Use exactly one cite or operation_ref endpoint; a source may instead contain missing with description and reason.'
                         record, retained = None, []
                     else:
                         result = self._receipt(label, record)
@@ -180,35 +192,43 @@ class RelationRegistry:
             record = deepcopy(previous)
         if not self.texts.capabilities.text_tools and item['op'] != 'retire':
             # Validate the whole source set before binding can save any file.
-            endpoints = ([item['target']] if 'target' in item else []) + [
-                source['ref'] for source in item.get('sources', [])]
+            endpoints = ([('target', item['target'])] if 'target' in item else []) + [
+                (f'sources[{i}].ref', source['ref']) for i, source in enumerate(item.get('sources', []))]
+            for location, endpoint in endpoints:
+                try:
+                    if 'cite' in endpoint and 'record' in parse_cite(endpoint['cite'], self.texts.mode == 'pf'):
+                        raise Rejected('disabled_reference', 'Registered text targets and sources are disabled; use files, captured outputs or operations')
+                except ValueError as exc:
+                    raise self._endpoint_error(endpoint, location, exc) from exc
             inherited = []
             if previous:
                 if 'target' not in item:
-                    inherited.append(previous['target'])
+                    inherited.append(('target', previous['target']))
                 if 'sources' not in item:
-                    inherited.extend(source['ref'] for source in previous['sources'])
-            if any('record' in parse_cite(endpoint['cite'], self.texts.mode == 'pf')
-                   for endpoint in endpoints if 'cite' in endpoint) or any(
-                    endpoint.get('kind') == 'text' for endpoint in inherited):
-                raise Rejected('disabled_reference', 'Registered text targets and sources are disabled; use files, captured outputs or operations')
+                    inherited.extend((f'sources[{i}].ref', source['ref']) for i, source in enumerate(previous['sources']))
+            for location, endpoint in inherited:
+                if endpoint.get('kind') == 'text':
+                    raise self._endpoint_error(endpoint['ref'], location,
+                        Rejected('disabled_reference', 'Replace the inherited text endpoint with a file, captured output or operation'))
         retained = []
         if 'target' in item:
-            target, commits = self._bind(item['target'])
+            target, commits = self._bind_at(item['target'], 'target')
             retained += commits
             if previous and target['kind'] != previous['target']['kind']:
-                raise Rejected('target_kind_changed', 'Create a new relation to change target kind')
+                raise self._endpoint_error(item['target'], 'target',
+                    Rejected('target_kind_changed', 'Create a new relation to change target kind'))
             record['target'] = target
         if 'sources' in item:
             sources = []
-            for source in item['sources']:
-                bound, commits = self._bind(source['ref'])
+            for index, source in enumerate(item['sources']):
+                bound, commits = self._bind_at(source['ref'], f'sources[{index}].ref')
                 retained += commits
                 sources.append(dict(ref=bound, **({'note': source['note']} if 'note' in source else {})))
             record['sources'] = sources
         record.update(assertion=item.get('assertion', record.get('assertion')), reason=item['reason'])
         if record['assertion'] == 'author_declared' and record['target']['producer_role'] != self.role:
-            raise Rejected('author_mismatch', 'The target producer is another role or unknown; use inferred')
+            raise self._endpoint_error(record['target']['ref'], 'target',
+                Rejected('author_mismatch', 'The target producer is another role or unknown; use inferred'))
         if item['op'] == 'retire':
             record['status'] = 'retired'
         if record_id is None:
@@ -228,6 +248,56 @@ class RelationRegistry:
         return dict(item_id=label, status='saved', **{k: record[k] for k in fields}, record_status=record['status'],
                     source_state='missing' if any(s['ref']['source_state'] == 'missing' for s in record['sources']) else 'available',
                     history=dict(path='documents/relations.json', role=self.role, relation=record['relation'], revision=record['revision']))
+
+    def _bind_at(self, endpoint, location):
+        try:
+            return self._bind(endpoint)
+        except (Rejected, PermissionError, ValueError, FileNotFoundError) as exc:
+            raise self._endpoint_error(endpoint, location, exc) from exc
+
+    def _endpoint_error(self, endpoint, location, exc):
+        code = exc.code if isinstance(exc, Rejected) else 'permission_denied' if isinstance(exc, PermissionError) else 'invalid_reference'
+        details = dict(error_location=location)
+        correction = 'Use an accessible public file/output reference; for a peer use ROLE:path. Copy the exact version from its receipt.'
+        if code == 'permission_denied':
+            correction = 'Use an authorized public reference; private files, escaping paths and symbolic links cannot be cited.'
+        elif 'operation_ref' in endpoint:
+            details['reference'] = dict(endpoint)
+            correction = 'Copy operation_ref from a completed public business receipt; query business_operations if needed.'
+        elif 'cite' in endpoint:
+            # Never echo absolute host paths or storage diagnostics. Canonicalize
+            # only caller-supplied, authorized public names; this is not a claim
+            # that the requested version exists.
+            try:
+                from .pf_paths import normalize, peer_hint
+                evidence = parse_cite(endpoint['cite'], self.texts.mode == 'pf')
+                if 'unknown' not in evidence:
+                    field = 'path' if 'path' in evidence else 'version' if 'version' in evidence else 'record'
+                    evidence[field] = normalize(self.texts, evidence[field])
+                    cite = cite_text(evidence)
+                    details['reference'] = dict(cite=cite)
+                    if field == 'record':
+                        correction = 'Use an exact saved text revision ROLE:rN.K copied from its receipt or history.'
+                    elif self.texts.mode == 'pf':
+                        base = cite.rsplit('@v', 1)[0] if re.fullmatch(r'.+@v[1-9][0-9]*', cite) else cite
+                        correction = 'Run ' + shlex.join(['pf', 'log', base]) + '; copy an available exact @vN handle for this endpoint.'
+                        correction += peer_hint(cite)
+                    else:
+                        correction = 'Use a saved public file or an exact ROLE:path@COMMIT that exists in the named repository.'
+            except (ValueError, PermissionError):
+                pass
+        if code == 'disabled_reference':
+            correction = 'Use a file, captured output or operation_ref; text endpoints are disabled for this run.'
+        elif code == 'author_mismatch':
+            correction = 'Use inferred for a target produced by another role or an unknown author.'
+        elif code == 'target_kind_changed':
+            correction = 'Create a new relation to change the target kind.'
+        details['correction'] = correction
+        from .public_errors import PublicPFPermissionError
+        message = ('Saved reference is unavailable' if isinstance(exc, FileNotFoundError) else
+                   'Evidence is inaccessible' if isinstance(exc, PermissionError) and not isinstance(exc, PublicPFPermissionError)
+                   else str(exc))
+        return Rejected(code, f'{location}: {message}', **details)
 
     def _bind(self, endpoint):
         if 'missing' in endpoint:
@@ -254,6 +324,9 @@ class RelationRegistry:
             raise Rejected('ambiguous_version', 'Cite an exact text revision ROLE:rN.K')
         if 'version' in evidence and not re.fullmatch(r'.+@v[1-9][0-9]*', evidence['version']):
             raise Rejected('ambiguous_version', 'Cite an exact captured version ROLE:HANDLE@vK')
+        if (self.texts.mode == 'pf' and not self.texts.capabilities.text_tools
+                and 'path' in evidence and 'commit' not in evidence):
+            raise Rejected('ambiguous_version', 'Cite an exact captured file version ROLE:path@vN; a bare path does not identify the version you used')
         ref = dict(evidence=evidence)
         try:
             binding = self.texts._bind(ref, self.texts._load()['records'])

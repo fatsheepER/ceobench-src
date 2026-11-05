@@ -287,6 +287,11 @@ class TextRegistry:
 
     def _bind(self, ref, records):
         evidence = ref['evidence']
+        if self.mode == 'pf':
+            from .pf_paths import normalize
+            for field in ('path', 'version'):
+                if field in evidence:
+                    evidence[field] = normalize(self, evidence[field])
         owner = self._reference_owner(evidence)
         workspace = self.repository(owner)
         if 'unknown' in evidence:

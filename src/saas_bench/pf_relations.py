@@ -331,7 +331,9 @@ class RelationQuery:
                 matches = [v for v, row in self.captures.items() if row['meta']['layer'] == 'file_bytes'
                            and row['meta'].get('object_id') == path and row['meta'].get('owner_role', self.role) == owner]
         if not matches:
-            raise PublicPFError('No saved exact endpoint matches; use a captured handle, text revision, operation reference or exact Git commit')
+            from .pf_paths import missing
+            raise PublicPFError(missing(self.registry, value, prefix='No saved exact endpoint matches') +
+                                '; business operations use ROLE:number')
         return self._capture_endpoint(matches[-1])
 
     def _text_endpoint(self, owner, record):

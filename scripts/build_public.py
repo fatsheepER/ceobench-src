@@ -50,6 +50,7 @@ _ENGINE_MODULES = [
     "legacy_privacy",
     "public_evidence",
     "public_errors",
+    "pf_paths",
     "tool_notes",
     "agent_capabilities",
     "role_policy",

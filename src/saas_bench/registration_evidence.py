@@ -460,7 +460,7 @@ class EvidenceResolver:
         if 'version' in evidence:
             named = self.lookup(evidence['version'])
             if not named:
-                raise ValueError('Unknown version handle; cite the handle shown in a [pf: ...] line, or a file path')
+                raise ValueError('Unknown version handle; copy an exact handle from a [pf: ...] receipt or pf log')
             members = set(named)
             _, object_id, _, kind = self.identity(named[-1])
             groups = handles.versions(named[-1])

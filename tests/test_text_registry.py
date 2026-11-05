@@ -211,7 +211,7 @@ def test_pf_requires_actual_send_uses_delivered_version_and_preserves_binding(wo
     assert store.load_state('declaration:r1.3')['references'][0]['version_id'] != binding['version_id']
     delivered = send(store, revised)
     assert json.loads(store.get_content(delivered + ':wire')[1])['messages'][0]['content'] == revised
-    with pytest.raises(ValueError, match='or a file path'):
+    with pytest.raises(ValueError, match='copy an exact handle'):
         call(registry, 'create', **declaration({'version': 'v999'}))
 
 

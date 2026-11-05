@@ -6,7 +6,6 @@ import json
 import re
 import shlex
 import time
-from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, model_validator
@@ -30,11 +29,7 @@ class Target(Input):
     @model_validator(mode='after')
     def captured_target(self):
         if sum(v is not None for v in (self.path, self.sql, self.record, self.version, self.operation_ref)) != 1:
-            raise PublicPFError('Specify exactly one captured path, SQL, registered text, or version handle')
-        if self.path is not None:
-            path = PurePosixPath(self.path)
-            if path.is_absolute() or '..' in path.parts or path.as_posix() != self.path or '\x00' in self.path:
-                raise PublicPFError('Path must be normalized and workspace-relative')
+            raise PublicPFError('Specify exactly one path, SQL, operation_ref, record, or version')
         return self
 
 
@@ -255,7 +250,7 @@ class PFQueries:
                 printed.append((version, covered([(0, len(output))], shown) if shown else False, output == body))
         capture.facts['pf_retrieval'] = bool(capture.facts.get('pf_calls')) and not observed and not printed
         if capture.facts['pf_retrieval']:
-            return body + '\n[pf: ' + ' | '.join(wrote + noted) + ']' if wrote else text
+            return body + '\n[pf: ' + ' | '.join(wrote + noted + [self._capture_cursor(capture.event)]) + ']' if wrote else text
         shown_files = self._shown_notes(after, written, body)
         if not observed and not printed and not written:
             return body + ''.join('\n' + line for line in shown_files) if shown_files else text
@@ -278,13 +273,16 @@ class PFQueries:
         counts = []
         if len(observed) > 1:
             counts = [f'{sql_count} SQL, {len(observed) - sql_count} API']
+        line = '[pf: ' + ' | '.join([output] + query + counts + wrote + noted + [self._capture_cursor(capture.event)]) + ']'
+        return body + '\n' + line + ''.join('\n' + line for line in shown_files)
+
+    def _capture_cursor(self, event):
         cursors = self.store.load_state('pf_cursors') or {}
         cursor = 'c' + str(len(cursors) + 1)
         cursors[cursor] = dict(operation='pf_read', values=dict(mode='captures',
-            capture_event=capture.event, limit=20, detail=False, scope='this execution'), offset=0, cutoff=None)
+            capture_event=event, limit=20, detail=False, scope='this execution'), offset=0, cutoff=None)
         self.store.save_state('pf_cursors', cursors)
-        line = '[pf: ' + ' | '.join([output] + query + counts + wrote + noted + ['captures: pf more ' + cursor]) + ']'
-        return body + '\n' + line + ''.join('\n' + line for line in shown_files)
+        return 'captures: pf more ' + cursor
 
     def _noted(self, version):
         note = evidence_handles.index(self.store).note(version)
@@ -354,6 +352,11 @@ class PFQueries:
         except ValidationError as exc:
             raise PublicPFError('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg']
                                       for e in exc.errors(include_input=False))) from exc
+        from .pf_paths import normalize
+        for name in ('target', 'baseline'):
+            for field in ('path', 'version'):
+                if field in values.get(name, {}):
+                    values[name][field] = normalize(self.registry, values[name][field])
         if operation == 'pf_candidates':
             if 'cursor' in values and set(args) != {'cursor'}:
                 raise PublicPFError('Continue with cursor only, or start a new candidates query')
@@ -677,7 +680,9 @@ class PFQueries:
         if 'version' in target:
             members = [v for v in self.resolver.lookup(target['version']) or [] if v in self.nodes]
             if not members:
-                raise PublicPFError('Unknown version handle; pf log <file or output> lists its versions')
+                from .pf_paths import missing
+                raise PublicPFError(missing(self.registry, target['version'], prefix=
+                    'Unknown version handle; pf log <file or output> lists its versions'))
             return members[-1]
         matches = []
         for version, row in self.nodes.items():
@@ -695,7 +700,8 @@ class PFQueries:
                 from .role_policy import READABLE_ROLES
                 if owner not in READABLE_ROLES[self.store.identity['role']]:
                     raise PublicPFPermissionError('Evidence is inaccessible')
-            raise PublicPFError('No captured version matches; use another path, SQL or registered text')
+            from .pf_paths import missing
+            raise PublicPFError(missing(self.registry, target.get('path')))
         return matches[-1]
 
     def _describe(self, version):
@@ -1022,9 +1028,15 @@ class PFQueries:
             self.store.readable_event(conn, event_id)
         roots = [v for v, row in self.nodes.items() if row['event_id'] == event_id
                  and row['meta']['layer'] in ('tool_return', 'stdout', 'stderr')]
-        if not roots:
+        if roots:
+            root = self._describe(next((v for v in roots if self.nodes[v]['meta']['layer'] == 'tool_return'), roots[0]))
+        elif any(row['event_id'] == event_id and row['meta']['layer'] == 'file_bytes' for row in self.nodes.values()):
+            # A PF-only read is not new citable output, but files written by the
+            # same outer Bash still need a complete, execution-specific inventory.
+            root = dict(version=evidence_handles.public_ref(self.store, 'event', event_id),
+                        status=self.events[event_id]['result'].get('status', 'result_unknown'))
+        else:
             raise PublicPFError('Captured execution is unavailable in this cursor')
-        root = next((v for v in roots if self.nodes[v]['meta']['layer'] == 'tool_return'), roots[0])
         children = {event_id}
         for child, event in self.events.items():
             if event['request'].get('parent_event_id') in children and not event['request']['kind'].startswith('pf_'):
@@ -1055,7 +1067,7 @@ class PFQueries:
             public_diagnostics(self.events[child]['result']).get('capture_gaps', [])})
         return self._page(versions + missing, offset,
             lambda item: self._describe(item) if isinstance(item, str) else item,
-            root=self._describe(root), scope=self.values['scope'], capture_gaps=gaps,
+            root=root, scope=self.values['scope'], capture_gaps=gaps,
             call_statuses=dict(Counter(status(event) for event in calls.values())),
             script_statuses=dict(Counter(status(self.events[child]) for child in children
                 if self.events[child]['request']['kind'] == 'cli_python')))
