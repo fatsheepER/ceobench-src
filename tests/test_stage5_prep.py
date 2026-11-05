@@ -132,8 +132,9 @@ def test_git_and_prefix_see_no_pf_text_and_pf_sees_its_own_rules():
     for word in ('PF', 'pf ', 'pf_', '@v1', '[pf:', '"compare"', 'delivered', 'last saw', 'keeps the note'):
         assert word not in git_text, word
     for word in ('pf log', 'pf diff', 'pf depend', 'pf rdepend', 'pf blame', '"compare"', '@v1', 'PF keeps it',
-                 'path@week-N', 'this request'):
+                 'cite an exact captured handle', 'this request'):
         assert word in pf_text, word
+    assert 'path@week-N' not in pf_text  # PF guidance uses captured versions, not Git syntax.
     names = lambda pf: [t['name'] for t in get_bash_agent_tool_descriptions(True, pf)]
     assert names(True) == names(False)
     tools = {pf: {tool['name']: tool for tool in get_bash_agent_tool_descriptions(True, pf)}

@@ -226,3 +226,95 @@ def test_selected_legacy_checkpoint_keeps_legacy_clients(worlds, tmp_path, monke
     assert {state['roles'][role]['client']['endpoint'] for role in ROLES} == {batch.ENDPOINT}
     assert state['simulator_usage']['client']['endpoint'] == batch.ENDPOINT
     assert tree_hash(snapshot, exact=True) == original_hash
+
+
+@pytest.mark.parametrize('profile', ['legacy', *ROUND_FOUR_PROFILES])
+def test_observer_consumes_real_frozen_manifest_and_model_usage(worlds, tmp_path, monkeypatch, profile):
+    import importlib.util
+    import shutil
+    from saas_bench.model_usage import ModelUsage
+    from saas_bench.team_models import round_four_models
+    from test_preflight_usage import reply
+
+    root = tmp_path / 'batch'
+    if profile == 'legacy':
+        manifest = batch.freeze_batch(root, worlds, PRICES, price_source=PRICES['source'],
+            selection_rule='Offline observer compatibility fixture')
+        assert manifest['parameters'] == batch.PARAMETERS
+    else:
+        manifest = freeze(worlds, root, profile)
+    policy = batch.create_policy(root / 'manifest.json', tmp_path / 'control')
+    expected = policy['identity']
+    Path(expected['host_logs']).mkdir()  # Created by the controller before polling.
+    scripts = batch.ROOT / 'scripts'
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location('r4_observer', scripts / 'team_observer.py')
+    observer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(observer)
+    entry = manifest['runs'][0]
+    attempt = Path(entry['output_dir']) / 'attempt-001'
+    batch.write_json(attempt / 'attempt.json', dict(status='running', attempt=1, day=0))
+    explicit = manifest['parameters'].get('model_configs')
+    models = explicit or round_four_models('r4-d56', PRICES)
+    logs, clients, wire = [], [], []
+
+    def respond(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        response = reply('responses' if request.url.path.endswith('/responses') else 'chat')
+        response['model'] = body['model']
+        return httpx.Response(200, json=response)
+
+    def invoke(role, *, wrong_model=False):
+        config = models['simulator' if role == 'simulator' else 'agent']
+        client = batch.checked_client(role, 'observer-fixture', transport=httpx.MockTransport(respond),
+            model_config=config if explicit else None)
+        clients.append(client)
+        path = attempt / 'runtime/private' / role / 'model-usage.jsonl'
+        if path not in logs:
+            logs.append(path)
+        usage = ModelUsage(path, role, pricing=PRICES['rates'])
+        usage.attach(client)
+        kwargs = dict(model='wrong-model' if wrong_model else config['model'])
+        if config['api'] == 'responses':
+            kwargs.update(input='probe', reasoning={'effort': config['reasoning_effort']}, store=False,
+                include=config['include'], max_output_tokens=config['max_output_tokens'])
+            usage.call('responses', kwargs, lambda: client.responses.create(**kwargs))
+        else:
+            kwargs.update(messages=[{'role': 'user', 'content': 'probe'}],
+                reasoning_effort=config['reasoning_effort'], extra_body={'thinking': {'type': config['thinking']}},
+                max_tokens=config['max_output_tokens'])
+            usage.call('chat', kwargs, lambda: client.chat.completions.create(**kwargs))
+
+    state, output = {}, tmp_path / 'control/observer'
+    quota = lambda: {key: dict(status='ok', percent=1) for key in ('rolling', 'weekly', 'monthly')}
+    def poll():
+        return observer.poll(root / 'manifest.json', output, expected, state, quota_fn=quota)
+    try:
+        for role in (*ROLES, 'simulator'):
+            invoke(role)
+        health = poll()
+        assert health['checks'] == health['route_errors'] == []
+        assert all(not row['transient_receipt_failures'] for row in _jsonl(output / 'events.jsonl'))
+        assert health['billing_coverage'] == 'complete'
+        assert state['billing_groups'][entry['run_id']]['calls'] == 4
+        assert all(health['coverage'][str(path)]['offset'] == path.stat().st_size for path in logs)
+        sent = [row['body'] for path in logs for row in _jsonl(path) if row['event'] == 'http_request']
+        assert sent == wire
+        invoke('growth', wrong_model=True)
+        health = poll()
+        assert health['checks'] == []
+        assert [row['issue'] for row in health['route_errors']] == ['model_route_changed', 'served_model_changed']
+        assert state['billing_groups'][entry['run_id']]['calls'] == 5
+        # Copied inherited receipts plus a restarted observer must not double count.
+        inherited = attempt.with_name('attempt-002')
+        shutil.copytree(attempt, inherited)
+        state = batch.read(output / 'state.json')
+        health = poll()
+        assert health['checks'] == health['route_errors'] == []
+        assert state['billing_groups'][entry['run_id']]['calls'] == 5
+        assert all(row['backlog_bytes'] == 0 for row in health['coverage'].values())
+    finally:
+        for client in clients:
+            client.close()
+    assert all(client._client.is_closed for client in clients)

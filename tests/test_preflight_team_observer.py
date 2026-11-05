@@ -23,7 +23,9 @@ def observer(tmp_path, monkeypatch):
     host_logs = tmp_path / 'host-logs'
     host_logs.mkdir()
     manifest = dict(batch_id='paired-s42', category='engineering', source_root='frozen-source',
-        public_dir='frozen-public', source_commit='frozen-commit', runs=[
+        public_dir='frozen-public', source_commit='frozen-commit',
+        # All freeze_batch generations have parameters; legacy ones omit model_configs.
+        parameters=module.batch.canonical(module.batch.PARAMETERS), runs=[
             dict(run_id=role, group=role, output_dir=str(tmp_path / 'runs' / role)) for role in ('git', 'pf')])
     expected = {key: manifest[key] for key in ('batch_id', 'source_root', 'public_dir', 'source_commit')}
     expected.update(manifest=str(manifest_path), manifest_sha256=module.file_hash(manifest_path),

@@ -60,6 +60,11 @@ def normalize(registry, value):
         relative = '/'.join(parts)
         if '.git' in parts or parts[0] == 'sessions' or private_framework_path(relative):
             raise PublicPFPermissionError('Only public workspace files may be referenced')
+        # An exact @vN names stored bytes, not the current filesystem object.
+        # Do not traverse even an ancestor link when resolving saved history.
+        # The resolver still requires a real capture and rechecks its visibility.
+        if suffix:
+            continue
         try:
             is_link = (root / relative).is_symlink()
         except OSError as exc:

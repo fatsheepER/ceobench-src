@@ -167,10 +167,12 @@ def test_paths_reject_escape_private_symlink_and_revoked_role(monkeypatch):
         # Deletion must not invalidate real captured history.
         assert 'public old bytes' in bash(reader, 'pf show ../growth/source.txt@v1 --full')
         (peer.workspace / 'source.txt').symlink_to(team.test_root / 'world.db')
-        paths = ['growth:source.txt@v1', '../growth/source.txt@v1',
-                 str(peer.workspace / 'source.txt') + '@v1', '../growth/../../world.db',
+        # Bare current paths still reject links; exact captured history is separate.
+        paths = ['growth:source.txt', '../growth/source.txt',
+                 str(peer.workspace / 'source.txt'), '../growth/../../world.db',
                  'growth:../ceo/MEMORY.md', '../growth/.git/config', '../growth/sessions/private.json',
-                 '../growth/registrations.json', str(team.test_root / 'world.db')]
+                 '../growth/registrations.json', '../growth/registrations.json@v1',
+                 '../growth/../../world.db@v1', str(team.test_root / 'world.db')]
         for index, path in enumerate(paths):
             output = bash(reader, shlex.join(['pf', 'show', path, '--full']))
             assert '[exit code: 1]' in output and 'public old bytes' not in output, (path, output)
@@ -220,20 +222,93 @@ def test_public_host_bundles_path_resolution_dependency():
     assert result.stdout.strip() == 'saas_bench.pf_paths'
 
 
-def test_overlong_reference_rejects_one_item_and_next_public_call_continues():
+@pytest.mark.parametrize('suffix, message, code', [
+    ('', 'path component is too long', 'ambiguous_version'),
+    ('@v1', 'Unknown version handle', 'invalid_reference'),
+])
+def test_overlong_reference_rejects_one_item_and_next_public_call_continues(suffix, message, code):
     with make_team('pf', lambda *args: final('done'), 'r4-long-reference', capabilities=CAPS) as team:
         role = team.roles['growth']
         write(role, 'source.txt', 'captured bytes')
-        too_long = 'a' * 300 + '@v1'
+        too_long = 'a' * 300 + suffix
         query = bash(role, shlex.join(['pf', 'show', too_long, '--full']))
-        assert 'path component is too long' in query, query
+        assert message in query and '[exit code: 1]' in query, query
         request = [create('bad-source', 'source.txt@v1', [too_long]),
                    create('bad-target', too_long, ['source.txt@v1']),
                    create('valid', 'source.txt@v1', ['source.txt@v1'])]
         receipt = batch(team, 'growth', request, 'long-reference')
         assert (receipt['saved'], receipt['rejected'], receipt['unknown']) == (1, 2, 0), receipt
         assert [item['error_location'] for item in receipt['items'][:2]] == ['sources[0].ref', 'target']
+        assert [item['error_code'] for item in receipt['items'][:2]] == [code, code]
         assert not role.registry.relations.failed
         assert 'continued' in bash(role, 'printf continued')
         role.store.assert_healthy()
         artifact('long-reference.json', receipt)
+
+
+@pytest.mark.parametrize('link_kind', ['file', 'directory'])
+def test_exact_saved_peer_version_survives_symlink_replacement_in_model(link_kind, monkeypatch):
+    from contextlib import closing
+    from saas_bench import role_policy
+
+    turns = Counter()
+    secret = 'NEVER_READ_CURRENT_SYMLINK_TARGET'
+
+    def respond(team, name, body):
+        if name != 'ops_finance':
+            return final('done')
+        turns[name] += 1
+        if turns[name] == 1:
+            return calls(('bash', {'command': 'pf show ../growth/reports/source.txt@v1 --full'}))
+        if turns[name] == 2:
+            output = body['messages'][-1]['content']
+            assert 'saved original bytes' in output and 'later public bytes' not in output
+            assert secret not in output and '[exit code:' not in output
+            return calls(('escalate', {'items': [create('old-source', 'decision.txt@v1',
+                ['../growth/reports/source.txt@v1'])]}))
+        receipt = json.loads(body['messages'][-1]['content'])
+        assert (receipt['saved'], receipt['rejected']) == (1, 0), receipt
+        assert receipt['items'][0]['sources'][0]['ref']['ref']['cite'] == 'growth:reports/source.txt@v1'
+        return final('Used the exact original snapshot.')
+
+    with make_team('pf', respond, 'r4-saved-symlink', capabilities=CAPS) as team:
+        reader, peer = team.roles['ops_finance'], team.roles['growth']
+        write(peer, 'reports/source.txt', 'saved original bytes')
+        write(peer, 'reports/source.txt', 'later public bytes')
+        write(reader, 'decision.txt', 'saved decision')
+        outside = team.test_root / 'private-target'
+        outside.mkdir()
+        (outside / 'source.txt').write_text(secret)
+        source = peer.workspace / 'reports/source.txt'
+        source.unlink()
+        if link_kind == 'directory':
+            source.parent.rmdir()
+            source.parent.symlink_to(outside, target_is_directory=True)
+        else:
+            source.symlink_to(outside / 'source.txt')
+        aliases = ['growth:reports/source.txt', '../growth/reports/source.txt', str(source)]
+        for alias in aliases:
+            saved = bash(reader, shlex.join(['pf', 'show', alias + '@v1', '--full']))
+            assert 'saved original bytes' in saved and secret not in saved, saved
+            assert '[exit code: 1]' in bash(reader, shlex.join(['pf', 'show', alias, '--full']))
+            missing = bash(reader, shlex.join(['pf', 'show', alias + '@v99', '--full']))
+            assert '[exit code: 1]' in missing and secret not in missing, missing
+        # Follow the real agent/tool loop and check exactly what ModelUsage sent.
+        action = reader.agent.act('Retrieve and cite the original source.', 0, False, {'day': 0})
+        output = reader.executor.execute(action.tool, action.arguments)
+        action = reader.agent.act(output, 0, False, {'day': 0})
+        output = reader.executor.execute(action.tool, action.arguments)
+        reader.agent.act(output, 0, False, {'day': 0})
+        usage = [json.loads(line) for line in reader.usage.path.read_text().splitlines()]
+        sent = [row['body'] for row in usage if row['event'] == 'http_request']
+        assert len(sent) == 3
+        assert sent == [row['body'] for row in team.test_wire if row['role'] == 'ops_finance']
+        assert secret not in json.dumps(sent)
+        with closing(reader.store.connect()) as conn:
+            assert not conn.execute('SELECT 1 FROM blobs WHERE instr(content,?)>0', (secret.encode(),)).fetchone()
+        rights = dict(role_policy.READABLE_ROLES)
+        rights['ops_finance'] = ('ops_finance',)
+        monkeypatch.setattr(role_policy, 'READABLE_ROLES', rights)
+        for alias in aliases:
+            denied = bash(reader, shlex.join(['pf', 'show', alias + '@v1', '--full']))
+            assert 'inaccessible' in denied and 'saved original bytes' not in denied
