@@ -679,8 +679,11 @@ def test_queued_request_enters_next_input_while_prior_answer_keeps_ownership(mod
 
 
 @pytest.mark.parametrize('mode', ['git', 'pf'])
-def test_completed_reply_does_not_form_cycle_while_sender_receipt_is_pending(mode, monkeypatch):
+@pytest.mark.parametrize('receiver_busy', [False, True])
+def test_completed_reply_does_not_form_cycle_while_sender_receipt_is_pending(mode, receiver_busy, monkeypatch):
     first_queued, reverse_attempted = threading.Event(), threading.Event()
+    receiver_started, first_completed, receipt_pending = (threading.Event() for _ in range(3))
+    reverse_edges = []
     counts = Counter()
     def respond(team, role, body):
         assert_paired(body['messages'])
@@ -691,36 +694,73 @@ def test_completed_reply_does_not_form_cycle_while_sender_receipt_is_pending(mod
         if active is not None:
             return final('ANSWER-' + active.text)
         if role == 'growth':
-            if counts[role] == 1:
+            if not first_queued.is_set():
+                if receiver_busy:
+                    assert receiver_started.wait(10)
                 return calls(('ask_agent', dict(role='ops_finance', message='FIRST')))
             return final('WEEKLY-growth')
-        if counts[role] == 1:
+        # Weekly work may start before FIRST arrives, or after its answer.
+        # Temporary question turns must not determine the fake model's next action.
+        if not first_completed.is_set():
+            assert receiver_busy
+            receiver_started.set()
             assert first_queued.wait(10)
             return calls(('write_file', dict(path='ops-root.txt', content='continue')))
-        if counts[role] == 3:
+        if not reverse_attempted.is_set():
+            assert receipt_pending.wait(10)
             return calls(('ask_agent', dict(role='growth', message='REVERSE')))
         assert 'ANSWER-REVERSE' in json.dumps(body)
         return final('WEEKLY-ops_finance')
     with make_team(mode, respond, 'request-completed-edge') as team:
+        team.test_event('test_schedule', receiver_busy=receiver_busy)
+        service = team._service_inbox
+        def scheduled_service(role, **kwargs):
+            if role == 'ops_finance' and not receiver_busy:
+                assert first_queued.wait(10)
+            return service(role, **kwargs)
+        monkeypatch.setattr(team, '_service_inbox', scheduled_service)
         transition = team._transition
         record = team.roles['growth'].agent.record_tool_result
         def observed(message, status, reply=None):
             transition(message, status, reply)
             if message.text == 'FIRST' and status == 'queued':
                 first_queued.set()
+            if message.text == 'FIRST' and status == 'completed':
+                first_completed.set()
             if message.text == 'REVERSE' and status in ('queued', 'rejected'):
+                waiting = team._workers['growth'].waiting
+                edge = dict(sender_waiting=waiting.text if waiting else None,
+                    first_status=waiting.status if waiting else None,
+                    reverse_status=status, receipt_pending=receipt_pending.is_set())
+                reverse_edges.append(edge)
+                team.test_event('pending_reply_at_reverse_admission', **edge)
                 reverse_attempted.set()
         def delayed(result):
             if 'ANSWER-FIRST' in str(result):
+                receipt_pending.set()
                 assert reverse_attempted.wait(10)
             return record(result)
         monkeypatch.setattr(team, '_transition', observed)
         monkeypatch.setattr(team.roles['growth'].agent, 'record_tool_result', delayed)
         result = team.run(stop_after_day=7)
-        save_evidence(team, 'completed-edge')
-        assert result.reason == 'observation_end', team.failure
+        save_evidence(team, 'completed-edge-' + ('busy' if receiver_busy else 'early'))
+        assert result.reason == 'observation_end', (team.failure, getattr(team, 'failure_detail', None))
         questions = [m for m in team.messages if m.kind == 'question']
         assert len(questions) == 2 and all(m.status == 'delivered' for m in questions)
+        assert reverse_edges == [dict(sender_waiting='FIRST', first_status='completed',
+            reverse_status='queued', receipt_pending=True)]
+        assert counts['ops_finance'] == (4 if receiver_busy else 3)
+        assert result.day == 7 and team.failure is None
+        assert all(not worker.waiting and not worker.question and not worker.inbox
+            for worker in team._workers.values())
+        for role, runtime in team.roles.items():
+            usage = [json.loads(line) for line in runtime.usage.path.read_text().splitlines()]
+            sent = [row['body'] for row in usage if row['event'] == 'http_request']
+            assert sent == [row['body'] for row in team.test_wire if row['role'] == role]
+            assert all(not row.get('error') for row in usage)
+            for question in (m for m in questions if m.sender == role):
+                assert any('ANSWER-' + question.text in str(message.get('content', ''))
+                    for body in sent for message in body['messages'] if message['role'] == 'tool')
 
 
 def test_inprocess_model_reply_keeps_first_logical_request_identity(monkeypatch):
