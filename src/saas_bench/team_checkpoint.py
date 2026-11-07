@@ -67,6 +67,12 @@ def validate_runtime_data(snapshot, state):
         missing.append('private/evidence.sqlite')
     if missing:
         raise CheckpointDataError(f'Selected checkpoint {snapshot} lacks ' + ', '.join(missing))
+    if state['configuration'].get('workspace_protocol') == 'snapshot-v1':
+        from .workspace_publication import WorkspacePublication, PublicationHold
+        try:
+            WorkspacePublication.validate_checkpoint(snapshot / 'private/workspace-publication', state.get('workspace_publication'))
+        except PublicationHold as exc:
+            raise CheckpointDataError(str(exc)) from exc
     for saved in state['messages']:
         absent = {field.name for field in fields(TeamMessage)} - saved.keys()
         if absent:
@@ -237,6 +243,10 @@ def checkpoint(runtime, destination=None):
             if server._advance_outcome is not None:
                 raise RuntimeError('World advancement failed or timed out; restore a previous checkpoint')
             raise BusinessOutcomeUnknown('World operation outcome unknown; HOLD for manual checkpoint resume')
+        publication = getattr(runtime, 'workspace_publication', None)
+        if publication:
+            stack.enter_context(publication.lock())
+            publication.assert_quiescent()
         for role in runtime.roles.values():
             if role.store:
                 role.store.assert_healthy(settle=timeout_value('checkpoint_wait', 600,
@@ -292,6 +302,8 @@ def _freeze(runtime, directory):
     save_session_db(server.conn, directory / 'world.nmdb')
     copy_workspace(runtime.root / 'roles', directory / 'roles', exact=True)
     copy_workspace(runtime.root / 'private', directory / 'private')
+    publication = getattr(runtime, 'workspace_publication', None)
+    workspace_state = publication.snapshot(directory / 'private/workspace-publication') if publication else None
     runtime.public_refs.snapshot(directory / 'private' / 'public-refs.sqlite')
     evidence = None
     if runtime.roles['ceo'].store:
@@ -337,6 +349,8 @@ def _freeze(runtime, directory):
         source_sha256=tree_hash(Path(__file__).parent),
         sources=text_sources(dict(week=runtime._week, role_weeks=role_weeks, dashboard=server._last_dashboard,
             script_results=server.role_script_results)))
+    if workspace_state is not None:
+        state['workspace_publication'] = workspace_state
     if server.shock_manager:
         state['scenario'] = asdict(server.shock_manager.scenario)
     customer = server.simulator.customer_simulator
@@ -464,6 +478,8 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     configuration = dict(state['configuration'])
     if options.get('workspace_layout', configuration.get('workspace_layout', 'role-v1')) != configuration.get('workspace_layout', 'role-v1'):
         raise CheckpointDataError('Workspace layout cannot be converted during checkpoint recovery')
+    if options.get('workspace_protocol', configuration.get('workspace_protocol', 'direct-v1')) != configuration.get('workspace_protocol', 'direct-v1'):
+        raise CheckpointDataError('Workspace publication protocol cannot be converted during checkpoint recovery')
     if 'capabilities' in options:
         from .agent_capabilities import AgentCapabilities
         options['capabilities'] = AgentCapabilities.resolve(options['capabilities']).to_dict()

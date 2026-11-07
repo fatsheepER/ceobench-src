@@ -364,7 +364,8 @@ class RelationQuery:
                     producer_role=meta.get('producer_role') if namespace else role,
                     source_role=meta.get('producer_role') if namespace else role,
                     storage_role=None if namespace else role,
-                    **({key: meta[key] for key in ('workspace_namespace', 'collector_role') if key in meta} if namespace else {}),
+                    **({key: meta[key] for key in ('workspace_namespace', 'collector_role', 'publisher_role', 'writer_role') if key in meta} if namespace else {}),
+                    **({'publication_metadata': meta} if meta.get('workspace_publication') else {}),
                     sha256=row['content_hash'], content_ref=version, event_ref=row['event_id'],
                     capture=dict(layer=meta['layer'], source_truncated=meta.get('truncated'),
                                  reading_scope='unknown'))
@@ -473,6 +474,7 @@ class RelationQuery:
                 break
             try:
                 self.store.readable_event(self.conn, parent)
+                self.store.authorize_event_metadata(self.conn, parent)
             except PermissionError:
                 break
             root = parent
@@ -480,6 +482,7 @@ class RelationQuery:
         return root
 
     def _execution_endpoint(self, event):
+        self.store.authorize_event_metadata(self.conn, event)
         saved = self.events[event]
         request = saved['request']
         role = request.get('role', request.get('author', self.role))
@@ -511,13 +514,27 @@ class RelationQuery:
             meta = row['meta']
             event = row['event_id']
             if self.events[event]['request']['kind'] in EXECUTION_KINDS:
-                root_event = self._execution_root(event)
-                rows.append(dict(source=self._capture_endpoint(target), target=self._execution_endpoint(event),
-                                 assertion='execution_observation', origin='automatic_capture', relation=None,
-                                 relation_revision=None, kind='execution_membership', basis='execution_membership',
-                                 author_role=None, current=None, purpose='current', event_ref=event,
-                                 content_ref=target, member_role=self._member_role(target, meta),
-                                 root_event_ref=root_event, navigation='pf candidates --history --role all --event ' + root_event))
+                try:
+                    execution = self._execution_endpoint(event)
+                except PermissionError:
+                    execution = None
+                if execution is not None:
+                    root_event = self._execution_root(event)
+                    rows.append(dict(source=self._capture_endpoint(target), target=execution,
+                                     assertion='execution_observation', origin='automatic_capture', relation=None,
+                                     relation_revision=None, kind='execution_membership', basis='execution_membership',
+                                     author_role=None, current=None, purpose='current', event_ref=event,
+                                     content_ref=target, member_role=self._member_role(target, meta),
+                                     root_event_ref=root_event, navigation='pf candidates --history --role all --event ' + root_event))
+            for source in meta.get('publication_sources', []):
+                version = source.get('version_id')
+                if version in self.captures:
+                    rows.append(dict(source=self._capture_endpoint(version), target=self._capture_endpoint(target),
+                        assertion='execution_observation', origin='workspace_publication', relation=None,
+                        relation_revision=None, kind='publication_' + source['kind'],
+                        author_role=None, current=None, purpose='current', event_ref=event,
+                        source_event_ref=self.captures[version]['event_id'],
+                        source_content_ref=version, target_content_ref=target))
             links = []
             if meta.get('derived_from'):
                 links.append((meta['derived_from'], 'derived_from', {}))
@@ -612,6 +629,7 @@ class RelationQuery:
         if 'event_ref' in ref:
             event = ref['event_ref']
             self.store.readable_event(self.conn, event)
+            self.store.authorize_event_metadata(self.conn, event)
             self.validations['event:' + event] = dict(kind='event', event=event,
                 request_sha256=_hash(self.events[event]['request']))
             return
@@ -699,6 +717,7 @@ class RelationQuery:
                     if row is None or _hash(json.loads(row['request'])) != validation['request_sha256']:
                         raise PublicPFError('Relation snapshot event is unavailable or changed; start a new query')
                     self.store.readable_event(conn, validation['event'])
+                    self.store.authorize_event_metadata(conn, validation['event'])
                 elif kind == 'git':
                     raw = self._git_bytes(validation['role'], validation['path'], validation['commit'])
                     if hashlib.sha256(raw).hexdigest() != validation['sha256']:

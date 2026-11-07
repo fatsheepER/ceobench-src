@@ -68,6 +68,7 @@ class ShellService:
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
                 service.connection = self.connection
+                response = None
                 try:
                     budget = Budget(service.deadline, cancelled=service.cancelled,
                                     check=service.check_cancelled)
@@ -83,9 +84,13 @@ class ShellService:
                             raise PublicPFError('PF request too large')
                         response = service.call(json.loads(bytes(data)), budget)
                 except Exception as exc:
-                    logging.getLogger(__name__).exception('PF request failed')
-                    response = dict(stdout='', stderr='pf: ' + public_exception_message(exc) + '\n',
-                                    code=124 if isinstance(exc, TimeoutError) else 2)
+                    completed = response is not None and service.calls and service.calls[-1].get('mutation_completed')
+                    if isinstance(exc, TimeoutError) and completed:
+                        logging.getLogger(__name__).info('PF mutation completed before delivery budget check; retaining its receipt')
+                    else:
+                        logging.getLogger(__name__).exception('PF request failed')
+                        response = dict(stdout='', stderr='pf: ' + public_exception_message(exc) + '\n',
+                                        code=124 if isinstance(exc, TimeoutError) else 2)
                 try:
                     self.wfile.write(json.dumps(response).encode())
                 except OSError:
@@ -152,6 +157,8 @@ class ShellService:
         audit['event_id'] = capture.event
         token = CURRENT_EVENT.set(capture.event)
         code, outcome = 0, 'succeeded'
+        mutation = operation == 'pf_workspace' and (args.get('against') or args.get('confirm_finish') or args.get('operation') == 'discard')
+        mutation_started = False
         try:
             if error:
                 result, code, outcome = error, 2, 'usage_error'
@@ -164,20 +171,23 @@ class ShellService:
                     result = shared_workspace_history(result).replace('MEMORY.md', 'memory/' + self.executor.role + '.md')
             else:
                 try:
+                    if budget:
+                        budget.check()
                     if operation == 'pf_workspace':
                         if not self.executor.workspace_publication:
                             raise PublicPFError('Workspace commands require snapshot-v1')
                         self.executor.workspace_private_output = True
+                        mutation_started = bool(mutation)
                         result = self.executor.workspace_publication.workspace_command(self.executor.role, args,
                             day=self.executor.workspace_day(), store=self.executor.evidence_store)
                     else:
                         result = self.executor.pf_queries.execute(operation, args)
-                    if budget:
+                    # A completed mutation keeps its durable result if only delivery expires.
+                    if budget and not mutation:
                         budget.check()
                 except Exception as exc:
                     from .workspace_publication import PublicationHold
-                    mutation = operation == 'pf_workspace' and (args.get('against') or args.get('confirm_finish') or args.get('operation') == 'discard')
-                    if isinstance(exc, PublicationHold) or mutation and not isinstance(exc, PublicPFError):
+                    if isinstance(exc, PublicationHold) or mutation_started and not isinstance(exc, PublicPFError):
                         self.executor.workspace_publication_error = PublicationHold('Workspace command state could not be saved; manual recovery required')
                     capture.facts['private_error'] = dict(type=type(exc).__name__, message=str(exc))
                     if not isinstance(exc, (PublicPFError, PublicPFPermissionError, TimeoutError)):
@@ -191,6 +201,8 @@ class ShellService:
         finally:
             CURRENT_EVENT.reset(token)
         audit.update(outcome=outcome, exit_code=code)
+        if mutation_started:
+            audit['mutation_completed'] = code == 0
         self.outputs.append((result, request.get('stdout_sink'), code))
         return dict(stdout=str(result) if code == 0 else '', stderr=str(result) + '\n' if code else '', code=code)
 

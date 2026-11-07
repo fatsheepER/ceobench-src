@@ -85,6 +85,7 @@ class CandidateQuery:
         return name
 
     def _event_allowed(self, conn, event):
+        self.store.authorize_event_metadata(conn, event['event_id'])
         if not self.store.identity.get('role'):
             self.store._visible(conn, event['event_id'])
         else:
@@ -99,6 +100,10 @@ class CandidateQuery:
             for item in items:
                 check()
                 sql_access.authorize_projection(item.get('sql_access'))
+                request = conn.execute('SELECT request FROM requests WHERE event_id=?', (item['event_ref'],)).fetchone()
+                if request is None:
+                    raise PublicPFError('Candidate snapshot event is unavailable')
+                self._event_allowed(conn, json.loads(request[0]))
                 if item['content_ref']:
                     row = conn.execute('SELECT event_id,content_hash,metadata FROM versions WHERE version_id=?',
                                        (item['content_ref'],)).fetchone()
@@ -212,6 +217,7 @@ class CandidateQuery:
                         '__pycache__' in meta.get('object_id', '').split('/') or meta.get('object_id') == '.tool-notes.jsonl'):
                     continue
                 try:
+                    self._event_allowed(conn, request)
                     self.store.authorize_version(conn, row['event_id'], meta, public=True)
                 except (KeyError, PermissionError):
                     continue

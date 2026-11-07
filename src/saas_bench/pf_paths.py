@@ -88,7 +88,9 @@ def _shared_name(registry, value):
             return value
         handles = evidence_handles.index(registry.store) if registry.store is not None else None
         versions = (handles.lookup(value) or handles.latest(value) or []) if handles else []
-        if versions and all(handles.key(version)[0] != 'file' for version in versions):
+        if versions and (all(handles.key(version)[0] != 'file' for version in versions) or
+                evidence_handles.VERSIONED.fullmatch(rest) and
+                all(handles.key(version)[-1] == prefix for version in versions)):
             return value
         raise PublicPFPermissionError('Role-prefixed file paths belong to the legacy layout; use shared:path or /workspace/path')
     if separator and prefix == namespace:

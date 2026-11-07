@@ -39,6 +39,9 @@ def _worker(spec_path, argv):
 
     spec = batch.read(spec_path)
     proof = dict(wire=[], checkpoints={}, errors=[], closed=None, retry_waits=[])
+    hooks = __import__(spec['hooks']) if spec.get('hooks') else None
+    if hooks:
+        hooks.setup(spec)
     if spec.get('record_retry_waits'):
         from saas_bench.run_lifecycle import WorkerLifecycle
         sleep = WorkerLifecycle.sleep
@@ -116,6 +119,8 @@ def _worker(spec_path, argv):
                 ready['log_prefixes_equal'] = all(
                     (team.root / name).read_bytes()[:cutoff] == (snapshot / name).read_bytes()[:cutoff]
                     for name, cutoff in batch.read(snapshot / 'checkpoint.json')['log_cutoffs'].items())
+            elif hooks:
+                hooks.scripts(team)
             else:
                 for role in ROLES:
                     register_cli(team, role, 'once.py',
@@ -124,6 +129,8 @@ def _worker(spec_path, argv):
                         "print(n.infrastructure.get_cost_info())\n"
                         + f"print('SAVED-SCRIPT-{role}')\n")
             proof['ready'] = ready
+        if hooks:
+            hooks.checkpoint(team, attempt, record, boundary, spec, proof)
         snapshot = save(team, attempt, record, boundary)
         if snapshot:
             proof['checkpoints'].setdefault(boundary, str(snapshot))
@@ -132,6 +139,8 @@ def _worker(spec_path, argv):
     def close_team(team, record=None):
         sockets = [*team.server.role_sockets.values(), *team.server.script_role_sockets.values()]
         try:
+            if hooks:
+                hooks.inspect(team, record, spec, proof)
             proof['finished'] = dict(day=team.server.tools.current_day,
                 messages=[asdict(message) for message in team.messages],
                 weeks={role: runtime.week.snapshot() if runtime.week else None
@@ -159,6 +168,8 @@ def _worker(spec_path, argv):
                 public_requests=team.server.public_request_state())
 
     def response(team, role, body):
+        if hooks:
+            return hooks.response(team, role, body, spec)
         if role == 'ceo':
             if team.phase == 'ceo_opening':
                 if not any(message.get('name') == 'ask_analyst' for message in body['messages']):
@@ -320,7 +331,7 @@ class Driver:
         self.policies.append(policy)
         return policy, entry
 
-    def run(self, policy, entry, *, checkpoint=None, week=None, resume=False, expected=0):
+    def run(self, policy, entry, *, checkpoint=None, week=None, resume=False, expected=0, killed=False):
         before = {path: tree_hash(path, exact=True) for path in batch.attempts(entry)}
         start = len(self.children)
         self.monkeypatch.setenv('CEOBENCH_RECOVERY_CHECKPOINTS', json.dumps(
@@ -344,6 +355,10 @@ class Driver:
         assert {path: tree_hash(path, exact=True) for path in before} == before, 'Recovery changed an old attempt tree'
         assert len(self.children) == start + 1, 'An explicit driver invocation must launch exactly one worker'
         assert len(batch.attempts(entry)) == len(before) + 1, 'Each selection must allocate exactly one new attempt'
+        if killed:
+            assert not proofs and code == expected
+            attempt = batch.attempts(entry)[-1]
+            return attempt, batch.read(attempt / 'attempt.json'), {}
         assert len(proofs) == 1, 'Worker must publish resource-closure evidence'
         proof, = proofs
         assert proof['errors'] == []

@@ -13,6 +13,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -59,6 +60,7 @@ class WorkspacePublication:
         self.public = Path(public)
         self.private = Path(private)
         self.namespace, self.timeout, self.lifecycle = namespace, timeout, lifecycle
+        self._settlement = threading.local()
         self.private.mkdir(parents=True, exist_ok=True)
         for name in ('blobs', 'manifests', 'candidates', 'executions', 'projections', 'git-repositories'):
             (self.private / name).mkdir(exist_ok=True)
@@ -86,9 +88,40 @@ class WorkspacePublication:
                 with closing(self.connect()) as conn, conn:
                     conn.execute('INSERT INTO head VALUES (1,?)', (manifest,))
                     conn.execute('INSERT INTO initial VALUES (?)', (manifest,))
+            self.initialize_sources()
+
+    def initialize_sources(self):
+        with closing(self.connect()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            version = conn.execute('PRAGMA user_version').fetchone()[0]
+            if version > 2:
+                raise PublicationHold('Unsupported workspace source authority version')
+            if {'source_head', 'source_bases'} <= tables:
+                conn.execute('PRAGMA user_version=2')
+                return
+            if version == 2 or tables & {'source_head', 'source_bases'}:
+                raise PublicationHold('Workspace publication source authority is incomplete')
+            conn.execute('CREATE TABLE source_head (path TEXT PRIMARY KEY, execution TEXT)')
+            conn.execute('CREATE TABLE source_bases (actor TEXT PRIMARY KEY, sources BLOB NOT NULL)')
+            initial = conn.execute('SELECT manifest FROM initial').fetchone()[0]
+            sources = {path: 'initial' for path in self.tree(initial)}
+            for row in conn.execute("SELECT id,outcome FROM executions WHERE outcome IS NOT NULL ORDER BY json_extract(outcome,'$.sequence')"):
+                result = json.loads(row['outcome'])
+                if result['status'] in ('published', 'merged'):
+                    sources.update({path: row['id'] for path in result['paths']})
+            for path in self.tree(conn.execute('SELECT manifest FROM head WHERE id=1').fetchone()[0]):
+                sources.setdefault(path, None)
+            conn.executemany('INSERT INTO source_head VALUES (?,?)', sources.items())
+            for row in conn.execute('SELECT actor,bases FROM authors'):
+                conn.execute('INSERT INTO source_bases VALUES (?,?)',
+                    (row['actor'], encoded({path: None for path in json.loads(row['bases'])})))
+            conn.execute('PRAGMA user_version=2')
 
     def connect(self):
-        conn = sqlite3.connect(self.database, timeout=self.timeout)
+        deadline = getattr(self._settlement, 'deadline', None)
+        timeout = self.timeout if deadline is None else max(.001, deadline - time.monotonic())
+        conn = sqlite3.connect(self.database, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA synchronous=FULL')
         return conn
@@ -96,9 +129,9 @@ class WorkspacePublication:
     @contextmanager
     def lock(self):
         with (self.private / 'publish.lock').open('a+b') as stream:
-            deadline = time.monotonic() + self.timeout
+            deadline = getattr(self._settlement, 'deadline', None) or time.monotonic() + self.timeout
             while True:
-                if self.lifecycle:
+                if self.lifecycle and getattr(self._settlement, 'deadline', None) is None:
                     self.lifecycle.check()
                 try:
                     fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -111,6 +144,151 @@ class WorkspacePublication:
                 yield
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
+
+    @classmethod
+    def validate_checkpoint(cls, private, expected=None):
+        private = Path(private)
+        database = private / 'authority.sqlite'
+        if not database.is_file():
+            raise PublicationHold('Workspace publication authority is missing')
+        checked, trees, source_trees = set(), {}, {}
+        def object_value(collection, key):
+            if not isinstance(key, str) or len(key) != 64 or any(c not in '0123456789abcdef' for c in key):
+                raise PublicationHold('Invalid workspace publication object reference')
+            data = (private / collection / key).read_bytes()
+            if checksum(data) != key:
+                raise PublicationHold('Workspace publication object is corrupt')
+            return data
+        def entries(tree):
+            for path, entry in tree.items():
+                FileKey('shared', path)
+                if entry and entry.get('kind') == 'file' and ('blob', entry['blob']) not in checked:
+                    object_value('blobs', entry['blob'])
+                    checked.add(('blob', entry['blob']))
+        def manifest(key):
+            if key not in trees:
+                tree = json.loads(object_value('manifests', key))
+                entries(tree)
+                trees[key] = tree
+            return trees[key]
+        def sources(mapping, tree):
+            for path, identity in mapping.items():
+                FileKey('shared', path)
+                if identity is None:
+                    continue
+                if identity not in source_trees:
+                    if identity == 'initial':
+                        initial = conn.execute('SELECT manifest FROM initial').fetchone()[0]
+                        source_trees[identity] = manifest(initial)
+                    else:
+                        row = conn.execute('SELECT outcome FROM executions WHERE id=?', (identity,)).fetchone()
+                        if row is None or row[0] is None:
+                            raise PublicationHold('Workspace publication source outcome is missing')
+                        result = json.loads(row[0])
+                        if result['status'] not in ('published', 'merged'):
+                            raise PublicationHold('Workspace source is not a published execution')
+                        published = manifest(result['head'])
+                        source_trees[identity] = {name: published.get(name) for name in result['paths']}
+                if path not in source_trees[identity] or source_trees[identity][path] != tree.get(path):
+                    raise PublicationHold('Workspace publication source and file identity conflict')
+        def candidate(key):
+            if ('candidate', key) in checked:
+                return
+            value = json.loads(object_value('candidates', key))
+            checked.add(('candidate', key))
+            for name in ('public', 'before', 'after'):
+                manifest(value[name])
+            for name in ('files', 'bases', 'host_outputs'):
+                entries(value.get(name, {}))
+            sources(value.get('base_sources', {}), value['bases'])
+            sources(value.get('public_sources', {}), manifest(value['public']))
+            sources(value.get('before_sources', {}), manifest(value['before']))
+            for revision in value['inherited'].values():
+                candidate(revision)
+        try:
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as conn:
+                if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise PublicationHold('Workspace publication authority is corrupt')
+                heads = conn.execute('SELECT manifest FROM head WHERE id=1').fetchall()
+                if len(heads) != 1:
+                    raise PublicationHold('Workspace publication head is missing')
+                head = heads[0][0]
+                manifest(head)
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                source_tables = tables & {'source_head', 'source_bases'}
+                schema_version = conn.execute('PRAGMA user_version').fetchone()[0]
+                if schema_version > 2:
+                    raise PublicationHold('Unsupported workspace source authority version')
+                if (source_tables and len(source_tables) != 2) or (schema_version == 2 and len(source_tables) != 2):
+                    raise PublicationHold('Workspace publication source authority is incomplete')
+                if source_tables:
+                    shared_sources = dict(conn.execute('SELECT path,execution FROM source_head'))
+                    if not manifest(head).keys() <= shared_sources.keys():
+                        raise PublicationHold('Workspace publication source head is incomplete')
+                    sources(shared_sources, manifest(head))
+                    authors = {actor: json.loads(bases) for actor, bases in conn.execute('SELECT actor,bases FROM authors')}
+                    author_sources = {actor: json.loads(mapping) for actor, mapping in conn.execute('SELECT actor,sources FROM source_bases')}
+                    if authors.keys() != author_sources.keys():
+                        raise PublicationHold('Workspace publication author sources are incomplete')
+                    for actor, bases in authors.items():
+                        if not bases.keys() <= author_sources[actor].keys():
+                            raise PublicationHold('Workspace comparison source coverage is incomplete')
+                        sources(author_sources[actor], bases)
+                for (initial,) in conn.execute('SELECT manifest FROM initial'):
+                    manifest(initial)
+                for (bases,) in conn.execute('SELECT bases FROM authors'):
+                    entries(json.loads(bases))
+                for record, revision, outcome in conn.execute('SELECT record,candidate,outcome FROM executions'):
+                    if outcome is None:
+                        raise PublicationHold('Workspace publication execution is unfinished')
+                    value = json.loads(record)
+                    for name in ('public', 'before'):
+                        if name in value:
+                            manifest(value[name])
+                    entries(value.get('bases', {}))
+                    sources(value.get('base_sources', {}), value.get('bases', {}))
+                    for name, tree_name in (('public_sources', 'public'), ('before_sources', 'before')):
+                        if name in value:
+                            sources(value[name], manifest(value[tree_name]))
+                    candidate(revision)
+                    result = json.loads(outcome)
+                    if result['candidate'] != revision:
+                        raise PublicationHold('Workspace publication candidate and outcome conflict')
+                    for name in ('head', 'previous_head', 'author_after'):
+                        manifest(result[name])
+                    sources(result.get('previous_sources', {}), manifest(result['previous_head']))
+                for (revision,) in conn.execute('SELECT candidate FROM drafts UNION SELECT candidate FROM discards'):
+                    candidate(revision)
+                for (record,) in conn.execute('SELECT record FROM resolutions'):
+                    value = json.loads(record)
+                    manifest(value['against'])
+                    candidate(value['revision'])
+                for (entry,) in conn.execute('SELECT entry FROM host_outputs'):
+                    entries({'output': json.loads(entry)})
+                for (snapshot,) in conn.execute('SELECT snapshot FROM private_git'):
+                    repository = private / 'git-repositories' / snapshot
+                    if repository.parent != private / 'git-repositories':
+                        raise PublicationHold('Invalid workspace Git snapshot reference')
+                    cls.safe_git(repository)
+                conn.execute('SELECT actor,day,signature,confirmed FROM finish_confirmations').fetchall()
+                conn.execute('SELECT actor,day FROM draft_reminders').fetchall()
+            result = dict(version=2 if source_tables else 1, namespace='shared', protocol='snapshot-v1', head=head)
+            if expected is not None and expected != result:
+                raise PublicationHold('Workspace publication checkpoint identity conflicts')
+            return result
+        except (OSError, sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise PublicationHold('Workspace publication recovery data is incomplete: ' + str(exc)) from exc
+
+    def assert_quiescent(self):
+        with closing(self.connect()) as conn:
+            if conn.execute('SELECT 1 FROM executions WHERE outcome IS NULL LIMIT 1').fetchone():
+                raise PublicationHold('Workspace publication execution is unfinished')
+
+    def snapshot(self, target):
+        self.assert_quiescent()
+        with closing(self.connect()) as conn, closing(sqlite3.connect(Path(target) / 'authority.sqlite')) as backup:
+            conn.backup(backup)
+        return self.validate_checkpoint(target)
 
     def stage(self, name, execution=None):
         """Persistence fault boundary used by real-process recovery tests."""
@@ -222,25 +400,35 @@ class WorkspacePublication:
                     raise PublicationHold('Unfinished prior process execution; restore a selected checkpoint')
             public = conn.execute('SELECT manifest FROM head WHERE id=1').fetchone()[0]
             tree = self.tree(public)
+            public_sources = dict(conn.execute('SELECT path,execution FROM source_head'))
+            before_sources = dict(public_sources)
             author = conn.execute('SELECT bases FROM authors WHERE actor=?', (actor,)).fetchone()
             bases = json.loads(author[0]) if author and not automatic else dict(tree)
             if author is None:
                 conn.execute('INSERT INTO authors VALUES (?,?)', (actor, encoded(bases)))
+                conn.execute('INSERT INTO source_bases VALUES (?,?)', (actor, encoded(public_sources)))
+            stored_sources = conn.execute('SELECT sources FROM source_bases WHERE actor=?', (actor,)).fetchone()
+            if stored_sources is None:
+                raise PublicationHold('Workspace author source authority is missing')
+            base_sources = dict(public_sources) if automatic else json.loads(stored_sources[0])
             drafts = []
             for row in ([] if automatic else conn.execute('SELECT * FROM drafts WHERE actor=? ORDER BY rowid', (actor,))):
                 candidate = json.loads(self.get('candidates', row['candidate']))
                 drafts.append(dict(id=row['id'], candidate=row['candidate']))
                 original = self.tree(candidate['after'])
                 for path, entry in sorted(candidate['files'].items(), key=lambda item: (len(Path(item[0]).parts), item[0])):
+                    before_sources[path] = None
                     if entry is None or entry['kind'] != 'directory':
                         for child in list(tree):
                             if child.startswith(path + '/'):
                                 tree.pop(child)
+                                before_sources[child] = None
                     if entry is not None:
                         for parent in Path(path).parents:
                             name = parent.as_posix()
                             if name != '.' and tree.get(name, {}).get('kind') != 'directory':
                                 tree[name] = original[name]
+                                before_sources[name] = None
                     if entry is None:
                         tree.pop(path, None)
                     else:
@@ -251,6 +439,7 @@ class WorkspacePublication:
             private_git = conn.execute('SELECT private FROM private_git WHERE actor=?', (actor,)).fetchone()
             private_inputs = bool(drafts) or any(row['private'] for row in outputs) or bool(inspect_git and not automatic and private_git and private_git[0])
             record = dict(id=identity, actor=actor, public=public, before=before, bases=bases, drafts=drafts,
+                          public_sources=public_sources, base_sources=base_sources, before_sources=before_sources,
                           private_inputs=private_inputs, output_before=output_before, automatic=automatic,
                           pid=os.getpid(), owner=self.process_owner(os.getpid()))
             conn.execute('INSERT INTO executions(id,record) VALUES (?,?)', (identity, encoded(record)))
@@ -369,10 +558,13 @@ class WorkspacePublication:
                     blob=self.put('blobs', result.stdout)), False
 
     def _candidate(self, execution, after, status, closure):
+        with closing(self.connect()) as conn:
+            record = json.loads(conn.execute('SELECT record FROM executions WHERE id=?', (execution.id,)).fetchone()[0])
         before = self.tree(execution.before)
         changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
         files = {path: after.get(path) for path in changed}
         bases = {path: execution.bases.get(path) for path in changed}
+        base_sources = {path: record.get('base_sources', {}).get(path) for path in changed}
         inherited = {}
         for draft in execution.drafts:
             old = json.loads(self.get('candidates', draft['candidate']))
@@ -381,14 +573,31 @@ class WorkspacePublication:
                 for path in old['files']:
                     files[path] = after.get(path)
                     bases[path] = old['bases'][path]
+                    base_sources[path] = old.get('base_sources', {}).get(path)
         outputs = self.scan(execution.root / 'tool-outputs')
         outputs = {path: entry for path, entry in outputs.items() if execution.output_before.get(path) != entry}
         return dict(execution=execution.id, actor=execution.actor, public=execution.public,
                     before=execution.before, after=self.manifest(after), files=files, bases=bases,
+                    base_sources=base_sources,
+                    public_sources={path: record.get('public_sources', {}).get(path) for path in files},
+                    before_sources={path: record.get('before_sources', {}).get(path) for path in files},
                     changed=changed, inherited=inherited, status=status, closure=closure,
                     host_outputs=outputs, private_inputs=execution.private_inputs, automatic=execution.automatic)
 
-    def finish(self, execution, *, status='succeeded', closure, store=None, capture_event=None, private_output=False):
+    def finish(self, execution, **options):
+        from .run_lifecycle import RunCancelled
+        from .runtime_options import timeout_value
+        try:
+            return self._finish(execution, **options)
+        except RunCancelled:
+            self._settlement.deadline = time.monotonic() + min(timeout_value('completion_wait', 30) or 30, 30)
+            try:
+                self._finish(execution, **options)
+            finally:
+                del self._settlement.deadline
+            raise
+
+    def _finish(self, execution, *, status='succeeded', closure, store=None, capture_event=None, private_output=False):
         with closing(self.connect()) as conn:
             row = conn.execute('SELECT candidate,outcome FROM executions WHERE id=?', (execution.id,)).fetchone()
         if row is None:
@@ -413,6 +622,11 @@ class WorkspacePublication:
             self.stage('candidate_durable', execution.id)
             with closing(self.connect()) as conn, conn:
                 conn.execute('UPDATE executions SET candidate=? WHERE id=? AND candidate IS NULL', (candidate_id, execution.id))
+                row = conn.execute('SELECT candidate,outcome FROM executions WHERE id=?', (execution.id,)).fetchone()
+            candidate_id = row['candidate']
+            candidate = json.loads(self.get('candidates', candidate_id))
+            if candidate['status'] != status or candidate['closure'] != closure:
+                raise PublicationHold('Conflicting execution finalization')
             self.stage('intent_durable', execution.id)
         if row['outcome']:
             self.recover_projections(store)
@@ -428,7 +642,7 @@ class WorkspacePublication:
             return result
 
     def _publish(self, execution, candidate_id, candidate, against=None, store=None):
-        deadline = time.monotonic() + self.timeout
+        deadline = getattr(self._settlement, 'deadline', None) or time.monotonic() + self.timeout
         while True:
             if time.monotonic() >= deadline:
                 raise PublicationHold('Publication deadline exceeded')
@@ -440,7 +654,7 @@ class WorkspacePublication:
             conflicts, merged = [], dict(current)
             if not files:
                 state = 'unchanged'
-            elif candidate['status'] != 'succeeded':
+            elif candidate['status'] != 'succeeded' or self.lifecycle and self.lifecycle.reason:
                 state = 'retained_partial'
             elif against is not None and head != against:
                 state = 'needs_confirmation'
@@ -491,11 +705,18 @@ class WorkspacePublication:
                     if projection:
                         shutil.rmtree(projection)
                         projection = None
+                previous_sources = dict(conn.execute('SELECT path,execution FROM source_head'))
+                result['previous_sources'] = {path: previous_sources.get(path) for path in files}
                 if published:
                     conn.execute('UPDATE head SET manifest=? WHERE id=1', (target,))
+                    conn.executemany('INSERT OR REPLACE INTO source_head VALUES (?,?)',
+                        ((path, execution.id) for path in files))
                     bases = json.loads(conn.execute('SELECT bases FROM authors WHERE actor=?', (execution.actor,)).fetchone()[0])
                     if not candidate.get('automatic'):
                         bases.update(files)
+                        source_bases = json.loads(conn.execute('SELECT sources FROM source_bases WHERE actor=?', (execution.actor,)).fetchone()[0])
+                        source_bases.update({path: execution.id if entry == merged.get(path) else None for path, entry in files.items()})
+                        conn.execute('UPDATE source_bases SET sources=? WHERE actor=?', (encoded(source_bases), execution.actor))
                     conn.execute('UPDATE authors SET bases=? WHERE actor=?', (encoded(bases), execution.actor))
                 if revisions_valid:
                     for identity in candidate['inherited']:
@@ -549,6 +770,9 @@ class WorkspacePublication:
 
     def recover_projections(self, store=None):
         while True:
+            deadline = getattr(self._settlement, 'deadline', None)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise PublicationHold('Publication cleanup deadline exceeded')
             head = self.head()
             projection = self.materialize(self.tree(head), self.private / 'projections' / uuid.uuid4().hex)
             self.copy_managed(projection)
@@ -608,12 +832,45 @@ class WorkspacePublication:
             self.publish_evidence(store, 'initial', head, self.tree(head), None)
             self.project_pending_evidence(store)
 
+    def _publication_source(self, store, path, execution):
+        if execution is None:
+            return None
+        with closing(self.connect()) as conn:
+            saved = conn.execute('SELECT event FROM evidence WHERE id=?', (execution,)).fetchone()
+        if saved is None:
+            raise PublicationHold('Exact publication source event is missing')
+        with closing(store.connect()) as conn:
+            rows = conn.execute("SELECT version_id FROM versions WHERE event_id=? AND json_extract(metadata,'$.workspace_publication')=1 AND json_extract(metadata,'$.workspace_namespace')=? AND json_extract(metadata,'$.object_id')=?",
+                                (saved['event'], self.namespace, path)).fetchall()
+        if len(rows) != 1:
+            raise PublicationHold('Exact publication source capture is missing or ambiguous')
+        return rows[0]['version_id']
+
+    @staticmethod
+    def _publication_summary(entry):
+        if entry is None:
+            return dict(kind='deleted')
+        return {key: entry[key] for key in ('kind', 'mode') if key in entry} | dict(
+            sha256=entry.get('blob') or checksum(encoded(entry)))
+
+    def _publication_origin(self, candidate, path):
+        if path in candidate['changed'] and candidate.get('capture_event'):
+            return candidate['capture_event']
+        for revision in candidate['inherited'].values():
+            previous = json.loads(self.get('candidates', revision))
+            if path in previous['files']:
+                return self._publication_origin(previous, path)
+        return None
+
     def publish_evidence(self, store, identity, head, files, actor):
         with closing(self.connect()) as conn, conn:
             row = conn.execute('SELECT event FROM evidence WHERE id=?', (identity,)).fetchone()
             event = row[0] if row else store.begin_event('workspace_publication', dict(execution=identity, head=head))
             if row is None:
                 conn.execute('INSERT INTO evidence VALUES (?,?)', (identity, event))
+            saved = conn.execute('SELECT candidate,outcome FROM executions WHERE id=?', (identity,)).fetchone()
+        candidate = json.loads(self.get('candidates', saved['candidate'])) if saved else None
+        outcome = json.loads(saved['outcome']) if saved else None
         from copy import copy
         with closing(store.connect()) as conn:
             request = json.loads(conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()[0])
@@ -622,15 +879,32 @@ class WorkspacePublication:
         tree = self.tree(head)
         with writer.batch():
             for index, path in enumerate(sorted(files)):
-                entry = tree.get(path)
-                entry = entry or {'kind': 'deleted'}
+                entry = tree.get(path) or {'kind': 'deleted'}
                 slot = 'published_' + str(index)
                 try:
                     writer.get_content(event + ':' + slot)
                 except KeyError:
+                    provenance = {}
+                    producer = actor
+                    if candidate:
+                        sources = []
+                        for kind, mapping in (('base', candidate.get('base_sources', {})),
+                                              ('execution_before', candidate.get('before_sources', {})),
+                                              ('current', outcome.get('previous_sources', {}))):
+                            version = self._publication_source(store, path, mapping.get(path))
+                            sources.append(dict(kind=kind, version_id=version,
+                                                state='known' if version else 'unknown'))
+                        origin = self._publication_origin(candidate, path)
+                        provenance = dict(publication_origin_event=origin, publication_sources=sources,
+                            publication=dict(status=outcome['status'],
+                                candidate=self._publication_summary(candidate['files'].get(path)),
+                                result=self._publication_summary(tree.get(path))))
+                        if entry != (candidate['files'].get(path) or {'kind': 'deleted'}):
+                            producer = None
                     writer.version(event, slot, self.get('blobs', entry['blob']) if entry['kind'] == 'file' else b'', layer='file_bytes',
                         object_id=path, workspace_namespace=self.namespace, workspace_publication=True,
-                        publication_head=head, producer_role=actor, workspace_entry=entry,
+                        publication_head=head, producer_role=producer, publisher_role=actor, writer_role=actor,
+                        workspace_entry=entry, **provenance,
                         extent='full' if entry['kind'] == 'file' else 'metadata_only')
             if writer.read_event(event)['result']['status'] == 'result_unknown':
                 writer.complete(event)

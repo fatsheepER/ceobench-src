@@ -738,6 +738,8 @@ class PFQueries:
             result.pop('owner', None)
             result.update(workspace_namespace=meta['workspace_namespace'], collector_role=meta.get('collector_role'),
                           producer_role=meta.get('producer_role'))
+            from .public_evidence import PublicEvidence
+            result.update(PublicEvidence(self.store).publication(meta))
         if meta['source_truncated']:
             result['truncated'] = True
         if meta['extent'] != 'full':
@@ -791,7 +793,7 @@ class PFQueries:
         full = self._describe(version)
         return {k: full[k] for k in ('version', 'day', 'what', 'owner', 'truncated', 'extent',
                                     'snapshot_day', 'refresh_hint', 'note', 'note_context',
-                                    'workspace_namespace', 'collector_role', 'producer_role') if k in full} | (
+                                    'workspace_namespace', 'collector_role', 'producer_role', 'publisher_role', 'writer_role') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
     def _node(self, version):

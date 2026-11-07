@@ -387,7 +387,7 @@ class RelationRegistry:
             raise Rejected('not_found', 'No readable exact content version was resolved')
         meta, raw = self.texts.resolver.content(binding['version_id'])
         producer = meta.get('producer_role') if meta.get('workspace_namespace') else meta.get('owner_role')
-        location = dict(workspace_namespace=meta['workspace_namespace'], collector_role=meta.get('collector_role')) if meta.get('workspace_namespace') else {}
+        location = {key: meta[key] for key in ('workspace_namespace', 'collector_role', 'publisher_role', 'writer_role') if key in meta} if meta.get('workspace_namespace') else {}
         kind = 'file' if meta['layer'] in ('file_bytes', 'file_text') else 'output'
         return dict(kind=kind, ref=dict(cite=self.texts.resolver.handle(binding['version_id'])),
                     source_state='available', readable=True, producer_role=producer, source_role=producer,

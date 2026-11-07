@@ -125,7 +125,11 @@ def _literal_bases(store, source, available):
         if not item['full_source']:
             continue
         version = item['version_id']
-        meta, raw = store.get_content(version)
+        try:
+            meta, raw = store.get_content(version, public=True)
+        except PermissionError:
+            # Owner-only input stays literal; it is never a public read base.
+            continue
         if meta['layer'] not in PUBLIC_LAYERS or meta['source_truncated'] or meta['extent'] != 'full':
             continue
         text = raw.decode('utf-8')
@@ -134,7 +138,10 @@ def _literal_bases(store, source, available):
             continue
         if meta['layer'] == 'file_text':
             version = meta['derived_from']
-            meta, original = store.get_content(version)
+            try:
+                meta, original = store.get_content(version, public=True)
+            except PermissionError:
+                continue
             if original != raw:
                 continue  # Universal-newline projections cannot recover original bytes.
         event = store.read_event(meta['created_by_event'], evidence=True)

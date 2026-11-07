@@ -659,18 +659,41 @@ class SQLEvidenceStore:
         with closing(self.connect()) as conn:
             return conn.execute("SELECT count(*) FROM private_state WHERE name LIKE 'workspace_output:%'").fetchone()[0]
 
+    def authorize_workspace_event(self, conn, event, *, public=False, graph=False):
+        ancestors = conn.execute("""WITH RECURSIVE parents(event_id,request) AS (
+            SELECT event_id,request FROM requests WHERE event_id=?
+            UNION ALL SELECT r.event_id,r.request FROM requests r JOIN parents p
+            ON r.event_id=json_extract(p.request,'$.parent_event_id'))
+            SELECT event_id,request FROM parents WHERE json_extract(request,'$.workspace_execution') IS NOT NULL""", (event,)).fetchall()
+        for ancestor in ancestors:
+            visibility = conn.execute('SELECT value FROM private_state WHERE name=?', ('workspace_output:' + ancestor['event_id'],)).fetchone()
+            author = json.loads(ancestor['request']).get('role')
+            if (visibility is None or not json.loads(visibility[0])) and (public or graph or author != self.identity.get('role')):
+                raise PermissionError('Private workspace execution output is unavailable')
+
+    def authorize_event_metadata(self, conn, event):
+        try:
+            self.authorize_workspace_event(conn, event, public=True)
+            return
+        except PermissionError:
+            row = conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()
+            if row is None or json.loads(row[0]).get('kind') != 'sql_query':
+                raise
+            # A public SQL response has its own request; it does not expose the
+            # private outer Bash arguments. Keep discovery aligned with byte access.
+            for row in conn.execute('SELECT metadata FROM versions WHERE event_id=?', (event,)):
+                meta = json.loads(row[0])
+                if meta.get('layer') == 'server_public_response':
+                    try:
+                        self.authorize_version(conn, event, meta, public=True)
+                        return
+                    except PermissionError:
+                        pass
+            raise
+
     def authorize_version(self, conn, event, meta, *, public=False, graph=False):
         if meta['layer'] in ('stdout', 'stderr', 'tool_return', 'executed_code', 'registered_script'):
-            ancestors = conn.execute("""WITH RECURSIVE parents(event_id,request) AS (
-                SELECT event_id,request FROM requests WHERE event_id=?
-                UNION ALL SELECT r.event_id,r.request FROM requests r JOIN parents p
-                ON r.event_id=json_extract(p.request,'$.parent_event_id'))
-                SELECT event_id,request FROM parents WHERE json_extract(request,'$.workspace_execution') IS NOT NULL""", (event,)).fetchall()
-            for ancestor in ancestors:
-                visibility = conn.execute('SELECT value FROM private_state WHERE name=?', ('workspace_output:' + ancestor['event_id'],)).fetchone()
-                author = json.loads(ancestor['request']).get('role')
-                if (visibility is None or not json.loads(visibility[0])) and (public or graph or author != self.identity.get('role')):
-                    raise PermissionError('Private workspace execution output is unavailable')
+            self.authorize_workspace_event(conn, event, public=public, graph=graph)
         from .public_records import private_framework_path
         if meta.get('workspace_candidate'):
             author = conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()

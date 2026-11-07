@@ -7,7 +7,7 @@ import re
 TEXT_FIELDS = ('id', 'version', 'revision', 'status', 'text', 'objects', 'applies_at', 'reason', 'sim_day', 'author')
 RELATION_FIELDS = ('id', 'revision', 'status', 'relation', 'relation_revision', 'author_role', 'sim_day', 'assertion', 'reason')
 ENDPOINT_FIELDS = ('kind', 'source_state', 'readable', 'producer_role', 'source_role', 'storage_role',
-                   'workspace_namespace', 'collector_role')
+                   'workspace_namespace', 'collector_role', 'publisher_role', 'writer_role')
 
 
 def fields(record, names):

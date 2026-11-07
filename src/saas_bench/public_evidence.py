@@ -90,6 +90,30 @@ class PublicEvidence:
             result['derived_from'] = self.ref('capture', value['derived_from'])
         return result
 
+    def publication(self, meta):
+        if not meta.get('workspace_publication'):
+            return {}
+        result = fields(meta, ('publisher_role', 'writer_role'))
+        if meta.get('publication'):
+            value = fields(meta['publication'], ('status',))
+            for key in ('candidate', 'result'):
+                entry = meta['publication'].get(key)
+                if entry is not None:
+                    value[key] = fields(entry, ('kind', 'mode', 'sha256'))
+                    if entry.get('blob'):
+                        value[key]['sha256'] = entry['blob']
+            value['sources'] = []
+            for source in meta.get('publication_sources', []):
+                item = dict(kind=source['kind'], state='known' if source.get('version_id') else 'unknown')
+                if source.get('version_id'):
+                    item.update(capture_ref=self.ref('capture', source['version_id']),
+                                version=evidence_handles.index(self.store).name(source['version_id']))
+                value['sources'].append(item)
+            if meta.get('publication_origin_event'):
+                value['writer_event'] = self.ref('event', meta['publication_origin_event'])
+            result['publication'] = value
+        return result
+
     def candidate(self, item):
         result = fields(item, ('version', 'kind', 'name', 'day', 'status', 'initiator_role', 'initiator',
                               'producer_role', 'source_role', 'storage_role', 'association', 'sql_access',
@@ -126,7 +150,9 @@ class PublicEvidence:
             return None
         from .public_records import public_relation_endpoint, public_text
         result = public_relation_endpoint(endpoint, self.registry.public_commit)
-        result.update(fields(endpoint, ('availability', 'reason', 'text', 'event_kind')))
+        result.update(fields(endpoint, ('availability', 'reason', 'text', 'event_kind', 'publisher_role', 'writer_role')))
+        if endpoint.get('publication_metadata'):
+            result.update(self.publication(endpoint['publication_metadata']))
         if endpoint.get('record'):
             result['record'] = public_text(endpoint['record'], self.registry.public_commit)
         for key, kind in (('content_ref', 'capture'), ('event_ref', 'event'), ('parent_event_ref', 'event')):

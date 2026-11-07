@@ -380,22 +380,27 @@ class EvidenceResolver:
     def _current_write(self, version, scope):
         handles = evidence_handles.index(self.store)
         meta, _ = self.content(version)
-        if self.store.identity.get('role'):
-            request = self.store.read_event(meta['created_by_event'], evidence=True)['request']
-            if (meta.get('producer_role') if meta.get('workspace_namespace') else meta.get('owner_role')) != self.store.identity['role'] or request.get('role') != self.store.identity['role'] or request.get('session_id') != self.store.identity['session_id']:
-                return False
-        kind, facts, day = handles.events[meta['created_by_event']]
+        publication = meta.get('workspace_publication')
+        origin = meta.get('publication_origin_event') if publication else meta['created_by_event']
+        if not origin or meta['layer'] != 'file_bytes' or not (publication or version.endswith('_after')):
+            return False
+        role = self.store.identity.get('role')
+        if role and (meta.get('producer_role') if meta.get('workspace_namespace') else meta.get('owner_role')) != role:
+            return False
+        event = self.store.read_event(origin, evidence=not publication)
+        request = event['request']
+        if role and (request.get('role') != role or request.get('session_id') != self.store.identity['session_id']):
+            return False
+        kind, facts, day = handles.events[origin]
         context = facts.get('model_context_id')
         outside = context != scope['context_id'] if context is not None else day != handles.day
         if outside:
             return False
-        # Only successful writes count; a before-snapshot is not authored evidence.
-        if meta['layer'] != 'file_bytes' or not version.endswith('_after'):
-            return False
-        event = self.store.read_event(meta['created_by_event'], evidence=True)
-        return (event['result'].get('status') == 'succeeded' and
-                meta.get('object_id') in event['result'].get('changed_paths',
-                                                          event['result'].get('written_paths', [])))
+        result = event['result']
+        paths = result.get('workspace_publication', {}).get('changed') if publication else None
+        if paths is None:
+            paths = result.get('changed_paths', result.get('written_paths', []))
+        return result.get('status') == 'succeeded' and meta.get('object_id') in paths
 
     def _delivery_error(self, candidates, scope, message):
         for version in scope['sources']:
@@ -530,7 +535,7 @@ class EvidenceResolver:
                     return self._whole_binding(candidate, latest, [], 'written', fully_known=authored)
                 meta, raw = self.content(candidate)
                 return dict(version_id=candidate, latest_version_id=latest, source_truncated=False,
-                            delivered_in=[], authored_by=meta['created_by_event'],
+                            delivered_in=[], authored_by=meta.get('publication_origin_event') or meta['created_by_event'],
                             selected_ranges=selected_ranges(raw.decode(), reference.get('select'),
                                                             'csv' if str(object_id).endswith('.csv') else 'json'))
             if not matches:
@@ -576,7 +581,7 @@ class EvidenceResolver:
                     reading_scope='full' if full else 'authored' if fully_known else 'partial' if ranges else 'not_in_request',
                     read_ranges=[item['source_range'] for item in ranges])
         if fully_known:
-            result['authored_by'] = meta['created_by_event']
+            result['authored_by'] = meta.get('publication_origin_event') or meta['created_by_event']
         return result
 
     def authored(self, version):
@@ -594,11 +599,14 @@ class EvidenceResolver:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
             return False
-        event = self.store.read_event(meta['created_by_event'], evidence=True)
+        publication = meta.get('workspace_publication')
+        if publication and (not meta.get('producer_role') or not meta.get('publication_origin_event')):
+            return False
+        event = self.store.read_event(meta['publication_origin_event'] if publication else meta['created_by_event'], evidence=not publication)
         request = event['request']
         args = request.get('request') or {}
         if request['kind'] == 'edit_file':
-            return (version.endswith('_after') and event['result'].get('status') == 'succeeded'
+            return ((publication or version.endswith('_after')) and event['result'].get('status') == 'succeeded'
                     and meta['object_id'] in event['result'].get('written_paths', []))
         if request['kind'] == 'write_file':
             return args.get('content') == text
