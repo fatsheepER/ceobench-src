@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 import uuid
@@ -20,6 +21,8 @@ from test_preflight_team_flow import completion, final
 from test_preflight_team_observer import observer
 
 def test_worker_warns_about_scope_identity_without_stopping_peer(observer, controller, monkeypatch, tmp_path):
+    monkeypatch.setattr(os, 'environ', dict(os.environ))
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.tempdir)
     observer.poll()
     monkeypatch.setenv('OPENCODE_API_KEY', 'offline')
     monkeypatch.setenv('CEOBENCH_WORKER_SCOPE_POLICY', '{}')
