@@ -38,7 +38,16 @@ def _worker(spec_path, argv):
     from saas_bench.agents.bash_agent import run_test
 
     spec = batch.read(spec_path)
-    proof = dict(wire=[], checkpoints={}, errors=[], closed=None)
+    proof = dict(wire=[], checkpoints={}, errors=[], closed=None, retry_waits=[])
+    if spec.get('record_retry_waits'):
+        from saas_bench.run_lifecycle import WorkerLifecycle
+        sleep = WorkerLifecycle.sleep
+
+        def retry_wait(lifecycle, seconds):
+            proof['retry_waits'].append(seconds)
+            return sleep(lifecycle, .001)
+
+        WorkerLifecycle.sleep = retry_wait
     clients, holder = [], {}
     lock = threading.Lock()
     connect = socket.socket.connect
@@ -181,7 +190,8 @@ def _worker(spec_path, argv):
                 if spec.get('stop_on_day') == team.server.tools.current_day:
                     (Path(argv[argv.index('--policy') + 1]).parent / 'STOP').touch()
                 if spec.get('reject_run') == argv[argv.index('--worker') + 1]:
-                    payload = json.dumps({'error': {'message': 'offline permanent rejection', 'code': spec.get('reject_code')}}).encode()
+                    payload = json.dumps(spec.get('reject_body') or {'error': {
+                        'message': 'offline permanent rejection', 'code': spec.get('reject_code')}}).encode()
                     content_type, status = 'application/json', spec.get('reject_status', 400)
                 else:
                     if 'input' in body:

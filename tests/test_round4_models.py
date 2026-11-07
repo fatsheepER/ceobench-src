@@ -7,15 +7,20 @@ from openai import OpenAI
 from saas_bench.model_usage import ModelUsage
 from saas_bench.run_lifecycle import RunCancelled
 from test_preflight_usage import reply
+from test_preflight_team_batch import frozen
 
 
-@pytest.mark.parametrize('code', ['credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached'])
+@pytest.mark.parametrize('code', ['credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached',
+                                  'GoUsageLimitError'])
 def test_permanent_quota_holds_without_retry_and_next_call_continues(tmp_path, monkeypatch, code):
     requests, waits = [], []
     def respond(request):
         requests.append(request)
         if len(requests) == 1:
-            return httpx.Response(429, json={'error': {'code': code, 'type': code, 'message': 'quota exhausted'}})
+            body = ({'type': 'error', 'error': {'type': code, 'message': 'Go usage limit exceeded'},
+                     'metadata': {'limitName': 'monthly'}} if code == 'GoUsageLimitError' else
+                    {'error': {'code': code, 'type': code, 'message': 'quota exhausted'}})
+            return httpx.Response(429, json=body)
         return httpx.Response(200, json=reply('responses'))
     client = OpenAI(api_key='offline-secret', max_retries=0,
                     http_client=httpx.Client(transport=httpx.MockTransport(respond)))
@@ -158,3 +163,56 @@ def test_sol_public_agent_real_http_disconnect_and_cancel(tmp_path, monkeypatch,
         server.server_close()
         serving.join(3)
     assert client._client.is_closed and not serving.is_alive()
+
+
+@pytest.mark.parametrize('group', ['git', 'pf'])
+def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(frozen, tmp_path, monkeypatch, group):
+    from pathlib import Path
+    from saas_bench import team_batch as batch
+    from saas_bench.team_checkpoint import validate_snapshot
+    from saas_bench.team_recovery import latest_checkpoint
+    from test_checkpoint_driver import Driver, _finished, _jsonl
+
+    monkeypatch.delenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', raising=False)
+    monkeypatch.delenv('CEOBENCH_MODEL_RETRY_DELAYS', raising=False)
+    monkeypatch.delenv('CEOBENCH_MODEL_ATTEMPT_SECONDS', raising=False)
+    body = {'type': 'error', 'error': {'type': 'GoUsageLimitError', 'message': 'Go usage limit exceeded'},
+            'metadata': {'limitName': 'monthly'}}
+    driver = Driver(frozen, tmp_path, monkeypatch, budget_seconds=120)
+    policy, entry = driver.policy('quota', group)
+    driver.worker_options = dict(reject_run=entry['run_id'], reject_status=429, reject_body=body,
+                                 record_retry_waits=True, max_requests=1)
+    try:
+        attempt, record, proof = driver.run(policy, entry, expected=3)
+        assert record['status'] == 'paused' and record['hold']
+        assert record['runtime_failure'] == 'model_request_failed'
+        assert 'GoUsageLimitError' in record['hold_detail']
+        assert len(proof['wire']) == 1 and proof['retry_waits'] == []
+        assert record['recovery_validation']['eligible']
+        checkpoint = Path(proof['checkpoints']['ready'])
+        _, state = validate_snapshot(checkpoint)
+        assert state['day'] == 0 and state['stage'] == 'boundary'
+        assert latest_checkpoint(entry, week=1) == checkpoint
+        hold = batch.read(attempt / 'HOLD')
+        assert hold['manual_resume_required'] and hold['reason'] == 'model_request_failed'
+        terminal = batch.read(policy.parent / 'controller-terminal.json')[entry['run_id']]
+        assert terminal['disposition'] == 'hold' and terminal['manual_resume_required']
+        controller = batch.read(policy.parent / 'controller-exit.json')
+        assert controller['hold'] and not controller['auto_resume'] and not controller['operator_stopped']
+        events = _jsonl(policy.parent / 'controller-events.jsonl')
+        assert len([row for row in events if row['event'] == 'worker_launched']) == 1
+        usage = _jsonl(attempt / 'runtime/private/ceo/model-usage.jsonl')
+        logical, = [row for row in usage if row['event'] == 'response']
+        request, = [row for row in usage if row['event'] == 'request']
+        http, = [row for row in usage if row['event'] == 'http_response']
+        assert request['retry_policy'] == dict(attempts=0, delays=[10, 20, 40, 80], first_byte_seconds=600)
+        assert http['status'] == 429 and json.loads(http['body']) == body
+        assert logical['model_attempts'] == 1 and logical['retried_http_attempts'] == 0
+        assert logical['cost_usd'] is None and all(value is None for value in logical['usage'].values())
+        assert 'GoUsageLimitError' in logical['last_model_error']
+        driver.worker_options = {}
+        resumed_attempt, resumed, restored = driver.run(policy, entry, week=1, resume=True)
+        _finished(resumed, restored, source=checkpoint)
+        assert resumed_attempt != attempt and len(batch.attempts(entry)) == 2
+    finally:
+        driver.close()
