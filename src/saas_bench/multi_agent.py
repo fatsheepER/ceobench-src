@@ -94,7 +94,7 @@ class MultiAgentRuntime:
                  simulator=None, public_dir=None, run_id=None, world_id=None, public_refs_path=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
-                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, model_configs=None, workspace_layout='role-v1', **server_options):
+                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, model_configs=None, workspace_layout='role-v1', workspace_protocol='direct-v1', **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
@@ -102,12 +102,17 @@ class MultiAgentRuntime:
         from .workspace_layout import SHARED, workspace_names
         workspace_names(workspace_layout)
         self.workspace_layout = workspace_layout
+        if workspace_protocol not in ('direct-v1', 'snapshot-v1'):
+            raise ValueError('Unknown workspace protocol')
+        if workspace_protocol == 'snapshot-v1' and (workspace_layout != SHARED or mode != 'pf'):
+            raise ValueError('snapshot-v1 requires a shared PF workspace')
+        self.workspace_protocol = workspace_protocol
         self.shared_workspace = workspace_layout == SHARED
         self._history_lock = threading.RLock()
         self._projection_lock = threading.RLock()
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
-            total_days=total_days, model_pricing=model_pricing, workspace_layout=workspace_layout)
+            total_days=total_days, model_pricing=model_pricing, workspace_layout=workspace_layout, workspace_protocol=workspace_protocol)
         if model_configs is not None:
             from .team_models import validate_models
             validate_models(model_configs)
@@ -328,6 +333,12 @@ class MultiAgentRuntime:
                 if (not _restored_state or _restored_state.get('_legacy_history_unavailable')) and runtime.workspace not in history_initialized:
                     self._initialize_history(runtime)
                     history_initialized.add(runtime.workspace)
+            if workspace_protocol == 'snapshot-v1':
+                from .workspace_publication import WorkspacePublication
+                self.workspace_publication = WorkspacePublication(workspaces['ceo'], private / 'workspace-publication', lifecycle=self._lifecycle)
+                for runtime in self.roles.values():
+                    runtime.executor.workspace_publication = self.workspace_publication
+                self.workspace_publication.seed_evidence(self.roles['ceo'].store)
             if _restored_state:
                 from .team_checkpoint import restore_runtime_state
                 restore_runtime_state(self, _restored_state)

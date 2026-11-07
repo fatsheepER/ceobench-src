@@ -295,7 +295,7 @@ class SQLEvidenceStore:
                     if parent is not None:
                         source = json.loads(parent[0])
                         object_id = source.get('object_id', object_id)
-                        for field in ('workspace_namespace', 'producer_role'):
+                        for field in ('workspace_namespace', 'producer_role', 'public_visibility', 'workspace_candidate'):
                             if field in source:
                                 metadata[field] = source[field]
                 FileKey(namespace, object_id)
@@ -319,6 +319,8 @@ class SQLEvidenceStore:
                                 (object_id, layer, layer)):
             try:
                 meta = json.loads(row['metadata'])
+                if meta.get('workspace_candidate'):
+                    continue
                 scope = owner or (self.identity.get('workspace_namespace')
                                   if meta['layer'] in ('file_bytes', 'file_text') else None) or self.identity.get('role')
                 if self.identity.get('role') and evidence_namespace(meta, self.identity['role']) != scope:
@@ -643,8 +645,37 @@ class SQLEvidenceStore:
                 pass
         raise PermissionError('Evidence is inaccessible')
 
+    def workspace_output_visibility(self, event, visible):
+        with self._writer() as conn:
+            name = 'workspace_output:' + event
+            old = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
+            if old is not None:
+                if json.loads(old[0]) != visible:
+                    raise ValueError('Conflicting workspace output visibility')
+                return
+            conn.execute('INSERT INTO private_state VALUES (?,?)', (name, encoded(visible)))
+
+    def workspace_visibility_epoch(self):
+        with closing(self.connect()) as conn:
+            return conn.execute("SELECT count(*) FROM private_state WHERE name LIKE 'workspace_output:%'").fetchone()[0]
+
     def authorize_version(self, conn, event, meta, *, public=False, graph=False):
+        if meta['layer'] in ('stdout', 'stderr', 'tool_return', 'executed_code', 'registered_script'):
+            ancestors = conn.execute("""WITH RECURSIVE parents(event_id,request) AS (
+                SELECT event_id,request FROM requests WHERE event_id=?
+                UNION ALL SELECT r.event_id,r.request FROM requests r JOIN parents p
+                ON r.event_id=json_extract(p.request,'$.parent_event_id'))
+                SELECT event_id,request FROM parents WHERE json_extract(request,'$.workspace_execution') IS NOT NULL""", (event,)).fetchall()
+            for ancestor in ancestors:
+                visibility = conn.execute('SELECT value FROM private_state WHERE name=?', ('workspace_output:' + ancestor['event_id'],)).fetchone()
+                author = json.loads(ancestor['request']).get('role')
+                if (visibility is None or not json.loads(visibility[0])) and (public or graph or author != self.identity.get('role')):
+                    raise PermissionError('Private workspace execution output is unavailable')
         from .public_records import private_framework_path
+        if meta.get('workspace_candidate'):
+            author = conn.execute('SELECT request FROM requests WHERE event_id=?', (event,)).fetchone()
+            if public or graph or not author or json.loads(author[0]).get('role') != self.identity.get('role'):
+                raise PermissionError('Unpublished workspace candidate is private')
         if public or graph:
             if meta.get('public_visibility') == 'private' or (meta['layer'] in ('file_bytes', 'file_text') and
                     private_framework_path(meta.get('object_id', ''))):

@@ -52,8 +52,10 @@ def one_line(sql):
 def index(store):
     """The handle index shared by every reader of this store instance."""
     value = getattr(store, '_handle_index', None)
-    if value is None:
+    epoch = store.workspace_visibility_epoch()
+    if value is None or getattr(value, 'visibility_epoch', None) != epoch:
         value = store._handle_index = HandleIndex(store)
+        value.visibility_epoch = epoch
     return value
 
 
@@ -192,6 +194,8 @@ class HandleIndex:
             key = (*key, evidence_namespace(meta, event_id.split('/')[1]))
         signature = (comparisons.get(event_id) or row['content_hash'] if key[0] == 'query' else
                      meta.get('body_sha256') or row['content_hash'])
+        if meta.get('workspace_publication'):
+            signature = digest(encoded(meta['workspace_entry']))
         groups = self.groups[key]
         previous = groups[-1]['members'][-1] if groups and groups[-1]['signature'] == signature else None
         if groups and groups[-1]['signature'] == signature:

@@ -135,6 +135,7 @@ class ExecutionCapture:
         self.origins = []
         self.facts = {}
         self.before_stamps = {}
+        self.workspace_execution = None
 
     def safe(self, fn, *args, **kwargs):
         try:
@@ -157,6 +158,13 @@ class ExecutionCapture:
         from .public_records import private_framework_path
         visibility = {'public_visibility': 'private'} if private_framework_path(path) else {}
         self.slots += 1
+        if self.workspace_execution:
+            with closing(self.store.connect()) as conn:
+                rows = conn.execute("SELECT version_id,metadata FROM versions WHERE content_hash=? AND json_extract(metadata,'$.object_id')=? AND json_extract(metadata,'$.workspace_publication')=1 AND json_extract(metadata,'$.workspace_entry.kind')='file' ORDER BY rowid DESC", (digest(raw), str(path)))
+                for row in rows:
+                    if json.loads(row['metadata']).get('workspace_namespace') == self.store.identity.get('workspace_namespace'):
+                        return row['version_id']
+            visibility = {'public_visibility': 'private', 'workspace_candidate': True}
         identity = ({'workspace_namespace': self.store.identity['workspace_namespace'],
                      'collector_role': self.store.identity.get('role', 'ceo')}
                     if self.store.identity.get('workspace_namespace') else {'owner_role': owner} if owner else {})

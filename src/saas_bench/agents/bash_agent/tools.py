@@ -386,6 +386,8 @@ class BashAgentToolExecutor:
         self.workspace_layout = workspace_layout
         self.shared_workspace = workspace_layout == SHARED
         self.observer = None
+        self.workspace_publication = None
+        self.workspace_execution = None
         self.audit = audit
         self.identity = identity
         self.role = identity.role if identity else 'ceo'
@@ -481,9 +483,25 @@ class BashAgentToolExecutor:
             if self.preserved_process:
                 raise ProcessBoundaryError('Previous process boundary remains open')
             observation = self.observer.begin(self, tool_name, args, model_request_event, model_context_id, tool_call_id) if self.observer else None
+            from saas_bench.execution_capture import CURRENT_EVENT
+            outer_event = CURRENT_EVENT.set(None)
+            original_workspace, original_peers = self.workspace_path, self.readable_workspaces
             try:
                 return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
+            except BaseException as exc:
+                if self.workspace_publication:
+                    from saas_bench.workspace_publication import PublicationHold
+                    if isinstance(exc, PublicationHold):
+                        self.last_status = 'result_unknown'
+                        if lifecycle:
+                            lifecycle.cancel('workspace_publication_unknown')
+                        if self.evidence_store:
+                            self.evidence_store.fail(str(exc))
+                raise
             finally:
+                self.workspace_path, self.readable_workspaces = original_workspace, original_peers
+                self.workspace_execution = None
+                CURRENT_EVENT.reset(outer_event)
                 if self.observer:
                     self.observer.finish(self, observation)
 
@@ -540,9 +558,15 @@ class BashAgentToolExecutor:
             return f"Error: Unknown tool '{tool_name}'"
         if self.evidence_store:
             self.evidence_store.assert_healthy(quiescent=False)
+        if self.workspace_publication:
+            self.workspace_execution = self.workspace_publication.begin(self.role, store=self.evidence_store)
+            self.workspace_path = self.workspace_execution.root
+            self.readable_workspaces = ()
         from saas_bench.execution_capture import ExecutionCapture, CURRENT_EVENT
         capture = ExecutionCapture(self.evidence_store) if self.evidence_store else None
         self.capture = capture
+        if capture:
+            capture.workspace_execution = self.workspace_execution
         previous_env = dict(self.extra_env)
         token = None
         before = None
@@ -555,6 +579,7 @@ class BashAgentToolExecutor:
                 capture.begin(tool_name, args, call=call_identity(self.workspace_path, tool_name, args, self.guest_root),
                               model_request_event=model_request_event, model_context_id=model_context_id,
                               tool_call_id=tool_call_id,
+                              **({'workspace_execution': self.workspace_execution.id} if self.workspace_execution else {}),
                               **{k: v for k, v in facts.items() if k == 'command'})
                 capture.facts.update(facts)
                 token = CURRENT_EVENT.set(capture.event)
@@ -644,9 +669,28 @@ class BashAgentToolExecutor:
                         capture.facts['changed_paths'] = sorted(k for k in before.keys() | after.keys()
                             if {x:v for x,v in before.get(k, {}).items() if x != 'version'} !=
                                {x:v for x,v in after.get(k, {}).items() if x != 'version'})
+                if self.workspace_execution:
+                    from saas_bench.workspace_publication import PublicationHold
+                    from saas_bench.execution_capture import closed_execution, join_text
+                    closure = dict(self._bash_facts)
+                    if tool_name == 'bash' and closure.get('process_started') and not closed_execution(closure):
+                        raise PublicationHold('Bash descendants or output closure is unproven')
+                    try:
+                        outcome = self.workspace_publication.finish(self.workspace_execution, status=status,
+                            closure=closure, store=capture.store, capture_event=capture.event)
+                    except Exception as exc:
+                        self.last_capture_event = capture.event
+                        raise PublicationHold(str(exc)) from exc
+                    capture.facts['workspace_publication'] = outcome
+                    receipt = self.workspace_publication.receipt(outcome)
+                    if receipt and result is not None:
+                        result = join_text(result, '\n', receipt)
+                    after = None
+                    capture.facts['changed_paths'] = []
                 # A failed or timed-out Bash command may still have delivered SQL output or
                 # written files; decorate whatever this execution actually captured.
-                if self.pf_queries and result is not None and status != 'result_unknown':
+                if (self.pf_queries and result is not None and status != 'result_unknown'
+                        and (not self.workspace_execution or outcome['outputs_public'])):
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                     if tool_name in DELTA_READ_TOOLS and not getattr(result, 'pf_read', None):
                         read_key = capture.safe(read_identity, capture.store, capture.event,
@@ -727,7 +771,8 @@ class BashAgentToolExecutor:
             # edits keep their own read version as the observed edit input.
             latest, sha = self.capture.safe(self.capture.store.latest_version,
                                             self._file_name(path), 'file_bytes', self._file_owner(path)) or (None, None)
-            if latest and sha == digest(raw):
+            if (latest and sha == digest(raw) and (not self.workspace_execution or
+                    self.capture.store.get_content(latest)[0].get('workspace_entry', {}).get('kind') == 'file')):
                 self.capture.slots += 1
                 raw_version = latest
         if self.capture and raw_version is None:
@@ -760,7 +805,7 @@ class BashAgentToolExecutor:
         path = self._contained(self._host_path(path_str), path_str)
         if write and self.shared_workspace:
             from saas_bench.workspace_layout import managed_path
-            if managed_path(path.relative_to(self.workspace_path).as_posix()):
+            if managed_path(path.relative_to(self.workspace_path).as_posix()) or (self.workspace_execution and path.relative_to(self.workspace_path).parts[0] == 'tool-outputs'):
                 raise ValueError('Runtime-managed workspace files are read-only')
         if write and not path.is_relative_to(self.workspace_path):
             raise ValueError('Only the owned workspace is writable')
@@ -931,6 +976,8 @@ class BashAgentToolExecutor:
             for name in MANAGED:
                 if (self.workspace_path / name).exists():
                     cmd.extend(['--ro-bind', str(self.workspace_path / name), self.guest_root + '/' + name])
+        if self.workspace_execution:
+            cmd.extend(['--ro-bind', str(self.workspace_path / 'tool-outputs'), self.guest_root + '/tool-outputs'])
         if source_mount := getattr(self, 'script_source_mount', None):
             cmd.extend(['--ro-bind', str(source_mount[0]), str(source_mount[1])])
         if self.api_socket:

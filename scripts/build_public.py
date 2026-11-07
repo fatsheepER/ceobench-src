@@ -56,6 +56,7 @@ _ENGINE_MODULES = [
     "role_policy",
     "workspace_io",
     "workspace_layout",
+    "workspace_publication",
     "public_sql",
     "sql_access",
     "sql_evidence",

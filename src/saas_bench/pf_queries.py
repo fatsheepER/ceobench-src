@@ -208,6 +208,10 @@ class PFQueries:
                  for label, versions in groups if versions]
         if record['kind'] == 'read_file':
             for item in capture.origins:
+                if capture.workspace_execution:
+                    meta, _ = self.store.get_content(item['version_id'])
+                    if meta.get('workspace_candidate'):
+                        continue
                 meta, _ = self.resolver.content(item['version_id'])
                 if meta['layer'] == 'file_text':
                     return str(text) + '\n[pf: ' + self.resolver.handle(meta['derived_from']) + \
@@ -461,7 +465,9 @@ class PFQueries:
     def _index(self, cutoff):
         check()
         started = time.monotonic()
-        reset = not hasattr(self, '_indexed') or (cutoff is not None and cutoff < self._indexed)
+        epoch = self.store.workspace_visibility_epoch()
+        reset = not hasattr(self, '_indexed') or (cutoff is not None and cutoff < self._indexed) or getattr(self, '_visibility_epoch', None) != epoch
+        self._visibility_epoch = epoch
         if reset:
             self.events, self.nodes, self.records = {}, {}, {}
             self.outgoing, self.incoming = defaultdict(list), defaultdict(list)
@@ -746,6 +752,8 @@ class PFQueries:
             result['refresh_hint'] = 'research_group completes a new survey; calling get_group_insights again only retrieves it'
         if meta['layer'] == 'file_bytes':
             result['path'] = meta['object_id']
+            if meta.get('workspace_entry'):
+                result['file_state'] = meta['workspace_entry']['kind']
         if query:
             result.update(sql=query[5], bound_parameters=query[6],
                           result_coverage=event['result'].get('result_coverage', 'unknown'))
@@ -1104,6 +1112,9 @@ class PFQueries:
 
     def _read(self, target, offset, baseline=None):
         meta, raw = self.resolver.content(target, public=True)
+        kind = meta.get('workspace_entry', {}).get('kind', 'file')
+        if kind != 'file':
+            raise PublicPFError('Published path is ' + kind + ' in this version; use an exact historical file version for content')
         try:
             content = raw.decode('utf-8')
         except UnicodeDecodeError as exc:
