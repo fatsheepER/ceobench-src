@@ -973,13 +973,29 @@ def registered_script_source(executor, name, code):
         raise ValueError('Registered script name must be a relative file path inside the owner workspace')
     source = executor.workspace_path / name
     number = executor.public_refs.ordinal('registered_script', executor.role, uuid.uuid4().hex)
-    snapshot = source.with_name(f'.registered-{number}.py')
+    snapshot = source.with_name(f'.registered-{executor.role}-{number}-{uuid.uuid4().hex}.py')
+    shared = executor.shared_workspace
+    storage = executor.private_root / 'script-sources' if shared else executor.workspace_path
+    stored = storage / snapshot.name if shared else snapshot
+    guest = Path(executor.guest_root) / snapshot.relative_to(executor.workspace_path)
     with ExitStack() as resources:
+        placeholder_created = False
         try:
-            directory, filename = resources.enter_context(parent_fd(executor.workspace_path, snapshot, create=True))
+            if shared:
+                storage.mkdir(exist_ok=True)
+                placeholder_dir, placeholder = resources.enter_context(parent_fd(executor.workspace_path, snapshot, create=True))
+                fd = os.open(placeholder, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=placeholder_dir)
+                os.close(fd)
+                placeholder_created = True
+            directory, filename = resources.enter_context(parent_fd(storage, stored, create=True))
             descriptor = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                  0o600, dir_fd=directory)
         except OSError as error:
+            if placeholder_created:
+                try:
+                    os.unlink(placeholder, dir_fd=placeholder_dir)
+                except FileNotFoundError:
+                    pass
             raise RegisteredScriptPreparationError(error) from error
         try:
             with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
@@ -988,13 +1004,22 @@ def registered_script_source(executor, name, code):
                     stream.flush()
                 except OSError as error:
                     raise RegisteredScriptPreparationError(error) from error
-            yield Path(executor.guest_root) / snapshot.relative_to(executor.workspace_path)
+            if shared:
+                executor.script_source_mount = (stored, guest)
+            yield guest
         finally:
+            if shared:
+                executor.script_source_mount = None
             if executor._bash_facts.get('boundary_closed') is True:
                 try:
                     os.unlink(filename, dir_fd=directory)
                 except FileNotFoundError:
                     pass
+                if shared:
+                    try:
+                        os.unlink(placeholder, dir_fd=placeholder_dir)
+                    except FileNotFoundError:
+                        pass
 
 
 def registered_script_classification(facts, error=None):
@@ -1224,7 +1249,7 @@ class NovaMindAPIServer:
 
     def execute_tool(self, tool_name: str, args: Dict[str, Any], *, role='ceo', initiator='host') -> Any:
         """Execute a tool call with thread safety."""
-        require_call(role, tool_name, initiator=initiator)
+        require_call(role, tool_name, initiator=initiator, responsibility=getattr(self, 'responsibility_authority', False))
         with self._lock:
             self.authorize_team(role, CALL_POLICY[tool_name])
             dispatch_fn = _TOOL_DISPATCH[tool_name]

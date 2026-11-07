@@ -19,6 +19,7 @@ from .public_errors import PublicPFError
 from .sql_evidence import digest, encoded
 from .role_policy import READABLE_ROLES
 from .pf_deadline import check
+from .workspace_layout import evidence_namespace
 
 
 # Private state name of the per-kind object number table, e.g. {"query": {key: 7}}.
@@ -188,7 +189,7 @@ class HandleIndex:
             return
         key = self._object(version, event_id, kind, record, layer, meta, row['definition'])
         if self.store.identity.get('role'):
-            key = (*key, meta.get('owner_role', event_id.split('/')[1]))
+            key = (*key, evidence_namespace(meta, event_id.split('/')[1]))
         signature = (comparisons.get(event_id) or row['content_hash'] if key[0] == 'query' else
                      meta.get('body_sha256') or row['content_hash'])
         groups = self.groups[key]
@@ -203,7 +204,9 @@ class HandleIndex:
         self.bases[self.base(key)] = key
         # The note of the call that produced this content: its outputs and the files it wrote,
         # not versions it merely observed (a read, or the before-snapshot of a later command).
-        produced = layer != 'file_bytes' or version.endswith('_after')
+        produced = (layer != 'file_bytes' or
+                    (meta.get('producer_role') is not None
+                     if meta.get('workspace_namespace') else version.endswith('_after')))
         self.note_sources[version] = version if produced else self.note_sources.get(previous)
         if produced and event_id in self.notes:
             group.setdefault('note', self.notes[event_id])
@@ -258,7 +261,8 @@ class HandleIndex:
 
     def object_key(self, kind, name, owner=None):
         key = (kind, name)
-        return (*key, owner or self.store.identity['role']) if self.store.identity.get('role') else key
+        scope = owner or (self.store.identity.get('workspace_namespace') if kind == 'file' else None)
+        return (*key, scope or self.store.identity['role']) if self.store.identity.get('role') else key
 
     def base(self, key, allocate=True):
         if self.store.identity.get('role'):
@@ -376,7 +380,11 @@ class HandleIndex:
 
     def _key_for(self, base):
         role = self.store.identity.get('role')
-        if role and base.split(':', 1)[0] not in READABLE_ROLES:
+        namespace = self.store.identity.get('workspace_namespace')
+        if role and base.split(':', 1)[0] not in (*READABLE_ROLES, 'shared'):
+            shared = self.bases.get(namespace + ':' + base) if namespace else None
+            if shared is not None and shared[0] == 'file':
+                return shared
             base = role + ':' + base
         return self.bases.get(base)
 

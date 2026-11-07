@@ -153,21 +153,125 @@ class ExecutionCapture:
             return None
         return self.safe(self.store.version, self.event, slot, value, layer=layer, **metadata)
 
-    def file(self, path, raw, text=None, phase='read', owner=None):
+    def file(self, path, raw, text=None, phase='read', owner=None, producer=None):
         from .public_records import private_framework_path
         visibility = {'public_visibility': 'private'} if private_framework_path(path) else {}
         self.slots += 1
-        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **visibility, **({'owner_role': owner} if owner else {}))
+        identity = ({'workspace_namespace': self.store.identity['workspace_namespace'],
+                     'collector_role': self.store.identity.get('role', 'ceo')}
+                    if self.store.identity.get('workspace_namespace') else {'owner_role': owner} if owner else {})
+        if producer is not None:
+            identity['producer_role'] = producer
+        raw_version = self.blob(f'file_{self.slots}_{phase}', raw, 'file_bytes', object_id=str(path), **visibility, **identity)
         if text is None:
             return raw_version
         version = self.blob(f'file_{self.slots}_text', text, 'file_text', derived_from=raw_version,
-                            transformation='decode_universal_newlines', **visibility, **({'owner_role': owner} if owner else {}))
+                            transformation='decode_universal_newlines', **visibility, **identity)
         return version
 
     def snapshot(self, workspace, phase):
         started = time.monotonic()
-        items = self._snapshot(workspace, phase)
+        items = (self._snapshot_shared(workspace, phase) if self.store.identity.get('workspace_namespace')
+                 else self._snapshot(workspace, phase))
         self.facts[phase + '_scan_seconds'] = time.monotonic() - started
+        return items
+
+    def _snapshot_shared(self, workspace, phase):
+        from .workspace_io import open_file
+        from .workspace_layout import managed_path
+        root = Path(workspace).resolve()
+        items, stamps, gaps = {}, {}, []
+        reused = 0
+
+        def stamp(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        def skip(relative):
+            return (excluded(relative) or managed_path(relative) or
+                    any(part.startswith('.registered-') for part in Path(relative).parts))
+
+        def gap(relative, reason):
+            gaps.append(dict(path=relative, reason=reason))
+            items[relative] = dict(type='unavailable', reason=reason)
+
+        def walk_error(exc):
+            try:
+                relative = Path(exc.filename).relative_to(root).as_posix()
+            except (ValueError, TypeError):
+                relative = '.'
+            gap(relative, type(exc).__name__)
+
+        try:
+            root_stamp = stamp(root.lstat())
+        except OSError as exc:
+            root_stamp = None
+            gap('.', type(exc).__name__)
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+            parent = Path(directory)
+            dirs[:] = [name for name in dirs if not skip((parent / name).relative_to(root).as_posix())]
+            for name in sorted(dirs + files):
+                path = parent / name
+                relative = path.relative_to(root).as_posix()
+                if skip(relative):
+                    continue
+                try:
+                    info = path.lstat()
+                    signature = stamp(info)
+                    item = dict(mode=info.st_mode, size=info.st_size)
+                    raw = None
+                    if stat.S_ISLNK(info.st_mode):
+                        item.update(type='symlink', target=os.readlink(path))
+                    elif stat.S_ISREG(info.st_mode):
+                        with open_file(root, path) as stream:
+                            if stamp(os.fstat(stream.fileno())) != signature:
+                                gap(relative, 'changed_before_read')
+                                continue
+                            raw = stream.read()
+                            if stamp(os.fstat(stream.fileno())) != signature:
+                                gap(relative, 'changed_during_read')
+                                continue
+                        item['type'] = 'file'
+                    else:
+                        item['type'] = 'directory' if stat.S_ISDIR(info.st_mode) else 'special'
+                    if stamp(path.lstat()) != signature:
+                        gap(relative, 'changed_after_read')
+                        continue
+                except (OSError, ValueError) as exc:
+                    gap(relative, type(exc).__name__)
+                    continue
+                if raw is not None:
+                    sha = digest(raw)
+                    version, latest_sha = self.store.latest_version(relative, 'file_bytes') if self.event else (None, None)
+                    if phase == 'before':
+                        self.before_stamps[relative] = signature
+                    written = phase == 'after' and (relative in self.facts.get('written_paths', []) or
+                                                    self.before_stamps.get(relative) != signature)
+                    if version and latest_sha == sha and not written:
+                        reused += 1
+                    else:
+                        producer = (self.store.identity.get('role') if phase == 'after' and
+                                    self.facts.get('written_content_hashes', {}).get(relative) == sha else None)
+                        version = self.file(relative, raw, phase=phase, producer=producer)
+                    item.update(sha256=sha, version=version)
+                items[relative], stamps[relative] = item, signature
+        for relative, signature in stamps.items():
+            try:
+                stable = stamp((root / relative).lstat()) == signature
+            except OSError:
+                stable = False
+            if not stable:
+                gap(relative, 'changed_during_tree_scan')
+        try:
+            root_changed = root_stamp is not None and stamp(root.lstat()) != root_stamp
+        except OSError:
+            root_changed = True
+        if root_changed:
+            gap('.', 'directory_changed_during_tree_scan')
+        self.facts.setdefault('workspace_scan_gaps', []).extend(dict(phase=phase, **item) for item in gaps)
+        self.facts['workspace_scan_coverage'] = 'file_acquisitions_not_atomic_tree'
+        self.blob('workspace_' + phase, encoded(items), 'workspace_boundary',
+                  exclusions=[*EXCLUSIONS, '.git/', 'managed_paths', '.registered-*'],
+                  scan_gaps=gaps, scan_coverage='file_acquisitions_not_atomic_tree', reused_file_versions=reused)
         return items
 
     def _snapshot(self, workspace, phase):
@@ -211,7 +315,11 @@ class ExecutionCapture:
                     if version and latest_sha == sha and not written:
                         reused += 1
                     else:
-                        version = self.file(rel, raw, phase=phase)
+                        producer = None
+                        if (self.store.identity.get('workspace_namespace') and phase == 'after' and
+                                self.facts.get('written_content_hashes', {}).get(rel) == sha):
+                            producer = self.store.identity.get('role')
+                        version = self.file(rel, raw, phase=phase, producer=producer)
                     item.update(type='file', sha256=sha, version=version)
                 else:
                     item['type'] = 'directory' if stat.S_ISDIR(info.st_mode) else 'special'

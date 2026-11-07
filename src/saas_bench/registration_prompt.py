@@ -359,12 +359,12 @@ MEMORY_HEADER = ('\n\n## Your MEMORY.md (auto-loaded)\n\n'
                  'This is automatically loaded into your context at the start of every week.\n')
 
 
-def git_memory_line(workspace, run=None):
+def git_memory_line(workspace, run=None, path='MEMORY.md'):
     """[git: MEMORY.md last committed in week-7 (3f9a2c1) | ...], or None before any commit."""
     import re
     import subprocess
     try:
-        result = (run or subprocess.run)(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', 'MEMORY.md'],
+        result = (run or subprocess.run)(['git', '-C', str(workspace), 'log', '-1', '--format=%H %s', '--', path],
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -373,10 +373,10 @@ def git_memory_line(workspace, run=None):
     full, subject = (result.stdout.strip().split(' ', 1) + [''])[:2]
     week = re.search(r'\[(week-[1-9][0-9]*)\]$', subject)
     where = f'{week.group(1)} ({full[:7]})' if week else full[:7]
-    return f'[git: MEMORY.md last committed in {where} | git log -p -- MEMORY.md]'
+    return f'[git: {path} last committed in {where} | git log -p -- {path}]'
 
 
-def pf_memory_line(store, version):
+def pf_memory_line(store, version, path='MEMORY.md'):
     """[pf: MEMORY.md@v9, written day 49, note: "..." | 9 versions: pf log MEMORY.md]."""
     from . import evidence_handles
     from .pf_render import plural, short
@@ -388,4 +388,28 @@ def pf_memory_line(store, version):
     if note := handles.note(version):
         head += f', note: "{short(note[1], 200)}"'
     count = len(handles.groups[group['key']])
-    return f"[pf: {head} | {plural(count, 'version')}: pf log MEMORY.md]"
+    return f"[pf: {head} | {plural(count, 'version')}: pf log {path}]"
+
+
+def shared_workspace_history(prompt):
+    prompt = prompt.replace(PF_PEER_HISTORY, """## Shared file evidence
+
+All roles use /workspace. File handles use shared:PATH@vN, for example
+shared:plans/forecast.md@v3. `pf log plans/forecast.md` locates versions;
+`pf show shared:plans/forecast.md@v3 --full` reads the exact saved bytes.
+Role-prefixed names still identify captured outputs and operations, not shared files.
+A collector observed bytes; that does not by itself establish who produced them.
+
+""")
+    prompt = prompt.replace(PF_PEER_DECLARATIONS, """For a plan based on a shared forecast, use exact returned shared file handles:
+
+```json
+{"items":[{"item_id":"forecast-basis","op":"create","target":{"cite":"shared:plans/cash.md@v2"},"sources":[{"ref":{"cite":"shared:plans/forecast.md@v3"}}],"assertion":"inferred","reason":"The saved forecast supplies this plan's acquisition assumption."}]}
+```
+
+Use author_declared only when the saved target has your role as its known producer.
+Use inferred when production is unknown or another role produced the target.
+
+""")
+    prompt = prompt.replace('growth:report.md', 'shared:report.md')
+    return prompt.replace('source role and storage role may differ.', 'file namespace, collector and producer are separate.').replace('Source role and storage role may differ.', 'File namespace, collector and producer are separate.')

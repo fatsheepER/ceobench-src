@@ -17,6 +17,7 @@ from . import evidence_handles, pf_render
 from .registration_evidence import covered
 from .registration_schema import Input, Text
 from .sql_evidence import PUBLIC_LAYERS, encoded
+from .workspace_layout import evidence_namespace
 
 
 class Target(Input):
@@ -197,8 +198,14 @@ class PFQueries:
                  if note else [])
         written = [after[path]['version'] for path in capture.facts.get('changed_paths', [])
                    if after and after.get(path, {}).get('version') and not noise(path)]
-        wrote = ['wrote ' + ', '.join(self.resolver.handle(v) for v in written[:6]) +
-                 (f' and {len(written) - 6} more' if len(written) > 6 else '')] if written else []
+        groups = [('wrote', written)]
+        if getattr(self.registry, 'workspace_namespace', None):
+            authored = [version for version in written
+                        if self.resolver.content(version)[0].get('producer_role') == record.get('role')]
+            groups = [('wrote', authored), ('observed changed', [version for version in written if version not in authored])]
+        wrote = [label + ' ' + ', '.join(self.resolver.handle(version) for version in versions[:6]) +
+                 (f' and {len(versions) - 6} more' if len(versions) > 6 else '')
+                 for label, versions in groups if versions]
         if record['kind'] == 'read_file':
             for item in capture.origins:
                 meta, _ = self.resolver.content(item['version_id'])
@@ -552,7 +559,7 @@ class PFQueries:
                     self._edge(version, segment['version_id'], 'public_field_range',
                                source_range=segment['source_range'], field=field['pointer'])
             if meta['layer'] == 'file_bytes':
-                key = (meta.get('owner_role'), meta['object_id'])
+                key = (evidence_namespace(meta), meta['object_id'])
                 previous = files.get(key)
                 if previous and self.nodes[previous]['content_hash'] == row['content_hash']:
                     self._edge(version, previous, 'same_content_observation')
@@ -620,7 +627,10 @@ class PFQueries:
         for event in touched:
             for output in sorted(execution_outputs[event]):
                 for source in sorted(execution_inputs[event]):
-                    self._edge(output, source, 'observed_edit_input' if self.nodes[source]['meta']['layer'] == 'file_bytes' else 'same_execution')
+                    output_meta = self.nodes[output]['meta']
+                    known_edit = (self.nodes[source]['meta']['layer'] == 'file_bytes' and
+                                  (not output_meta.get('workspace_namespace') or output_meta.get('producer_role') is not None))
+                    self._edge(output, source, 'observed_edit_input' if known_edit else 'same_execution')
         self._indexed = self.cutoff
         self.index_stats = dict(seconds=time.monotonic()-started, new_events=added_events,
                                 new_versions=len(versions), cold=reset)
@@ -629,7 +639,7 @@ class PFQueries:
         row = self.nodes[version]
         meta, event = row['meta'], self.events[row['event_id']]
         key = evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'), event['request'])
-        return (*key, meta.get('owner_role')) if self.store.identity.get('role') else key
+        return (*key, evidence_namespace(meta)) if self.store.identity.get('role') else key
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
         if target not in self.nodes and origin != 'agent_declaration':
@@ -661,12 +671,12 @@ class PFQueries:
             if target['version'] not in self.nodes:
                 raise PublicPFError('Captured version is unavailable in this cursor')
             return target['version']
-        owner = self.store.identity.get('role')
+        owner = (self.store.identity.get('workspace_namespace') if 'path' in target else None) or self.store.identity.get('role')
         target = dict(target)
         if 'version' in target and evidence_handles.RECORD.fullmatch(target['version']):
             target = {'record': target['version']}
         for field in ('path', 'record'):
-            if owner and field in target and target[field].split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in target[field]:
+            if owner and field in target and target[field].split(':', 1)[0] in ('ceo', 'growth', 'ops_finance', 'shared') and ':' in target[field]:
                 owner, target[field] = target[field].split(':', 1)
         if 'path' in target and evidence_handles.VERSIONED.fullmatch(target['path']) and not any(
                 row['meta'].get('object_id') == target['path'] for row in self.nodes.values()):
@@ -687,7 +697,7 @@ class PFQueries:
         matches = []
         for version, row in self.nodes.items():
             meta, event = row['meta'], self.events[row['event_id']]
-            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path'] and (not owner or meta.get('owner_role') == owner):
+            if 'path' in target and meta['layer'] == 'file_bytes' and meta['object_id'] == target['path'] and (not owner or evidence_namespace(meta) == owner):
                 matches.append(version)
             elif 'sql' in target and meta['layer'] == 'server_public_response' and event['query'] and event['query'][5] == target['sql']:
                 matches.append(version)
@@ -698,7 +708,7 @@ class PFQueries:
         if not matches:
             if owner and self.store.identity.get('role'):
                 from .role_policy import READABLE_ROLES
-                if owner not in READABLE_ROLES[self.store.identity['role']]:
+                if owner != self.store.identity.get('workspace_namespace') and owner not in READABLE_ROLES[self.store.identity['role']]:
                     raise PublicPFPermissionError('Evidence is inaccessible')
             from .pf_paths import missing
             raise PublicPFError(missing(self.registry, target.get('path')))
@@ -718,6 +728,10 @@ class PFQueries:
             layer=meta['layer'], operation=event['request']['kind'],
             status=event['result'].get('status', 'result_unknown'), objects=self._objects(version),
             relation_origin='agent_declaration' if record else 'automatic_capture', owner=meta.get('owner_role', 'ceo'))
+        if meta.get('workspace_namespace'):
+            result.pop('owner', None)
+            result.update(workspace_namespace=meta['workspace_namespace'], collector_role=meta.get('collector_role'),
+                          producer_role=meta.get('producer_role'))
         if meta['source_truncated']:
             result['truncated'] = True
         if meta['extent'] != 'full':
@@ -768,7 +782,8 @@ class PFQueries:
     def _brief(self, version):
         full = self._describe(version)
         return {k: full[k] for k in ('version', 'day', 'what', 'owner', 'truncated', 'extent',
-                                    'snapshot_day', 'refresh_hint', 'note', 'note_context') if k in full} | (
+                                    'snapshot_day', 'refresh_hint', 'note', 'note_context',
+                                    'workspace_namespace', 'collector_role', 'producer_role') if k in full} | (
             {'status': full['status']} if full['status'] != 'succeeded' else {})
 
     def _node(self, version):

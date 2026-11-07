@@ -325,6 +325,7 @@ class CandidateQuery:
         event_id, layer = request['event_id'], meta.get('layer')
         actor = request.get('role', request.get('author', 'ceo'))
         owner = meta.get('owner_role', actor)
+        namespace = meta.get('workspace_namespace') if layer in ('file_bytes', 'file_text') else None
         kind = 'sql' if request['kind'] == 'sql_query' and layer in (None, 'server_public_response') else LAYERS.get(layer, 'execution')
         if layer is None and request['kind'] == 'public_http':
             kind = 'api'
@@ -336,6 +337,9 @@ class CandidateQuery:
             source_request = events[source['event_id']]['request']
             source_actor = source_request.get('role', source_request.get('author', 'ceo'))
             producer = source_actor if source['version_id'].endswith('_after') and owner == source_actor else None
+        if namespace:
+            producer = meta.get('producer_role')
+            owner = producer
         gaps = set(result.get('capture_gaps', [])) | set(event['stream_gaps'])
         ancestor, visited = request.get('parent_event_id'), set()
         while ancestor in events and ancestor not in visited:
@@ -360,7 +364,8 @@ class CandidateQuery:
                         events[parent]['request']['kind'] == 'registered_script_execution' for parent in visited) else
                         'model' if request.get('model_request_event') or any(
                         events[parent]['request'].get('model_request_event') for parent in visited) else 'unknown',
-                    producer_role=producer, source_role=owner, storage_role=actor if version else None,
+                    producer_role=producer, source_role=owner, storage_role=actor if version and not meta.get('workspace_namespace') else None,
+                    **({key: meta[key] for key in ('workspace_namespace', 'collector_role') if key in meta} if namespace else {}),
                     sha256=row['content_hash'] if row else None,
                     capture=dict(state='available' if version else 'missing', layer=layer,
                                  extent=meta.get('extent', 'unknown'), source_truncated=meta.get('source_truncated'),

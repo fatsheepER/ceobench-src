@@ -382,7 +382,7 @@ class EvidenceResolver:
         meta, _ = self.content(version)
         if self.store.identity.get('role'):
             request = self.store.read_event(meta['created_by_event'], evidence=True)['request']
-            if meta.get('owner_role') != self.store.identity['role'] or request.get('role') != self.store.identity['role'] or request.get('session_id') != self.store.identity['session_id']:
+            if (meta.get('producer_role') if meta.get('workspace_namespace') else meta.get('owner_role')) != self.store.identity['role'] or request.get('role') != self.store.identity['role'] or request.get('session_id') != self.store.identity['session_id']:
                 return False
         kind, facts, day = handles.events[meta['created_by_event']]
         context = facts.get('model_context_id')
@@ -467,7 +467,7 @@ class EvidenceResolver:
         elif 'path' in evidence:
             object_id, kind = evidence['path'], 'file'
             owner = evidence.get('owner')
-            if self.store.identity.get('role') and ':' in object_id and object_id.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance'):
+            if self.store.identity.get('role') and ':' in object_id and object_id.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance', 'shared'):
                 owner, object_id = object_id.split(':', 1)
             groups = handles.groups.get(handles.object_key('file', object_id, owner), [])
         elif 'record' in evidence:

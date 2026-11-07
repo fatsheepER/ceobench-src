@@ -19,6 +19,8 @@ def normalize(registry, value):
         raise PublicPFError('Reference must not contain a NUL character')
     if evidence_handles.RAW_VERSION.fullmatch(value) or evidence_handles.EXACT.fullmatch(value):
         return value  # Opaque capture/event identity; the store rechecks visibility.
+    if getattr(registry, 'workspace_namespace', None):
+        return _shared_name(registry, value)
     owner, path = registry.role, value
     qualified = ':' in value and value.split(':', 1)[0] in ROLES
     if qualified:
@@ -78,12 +80,72 @@ def normalize(registry, value):
     return (owner + ':' if registry.identity else '') + '/'.join(parts) + suffix
 
 
+def _shared_name(registry, value):
+    namespace = registry.workspace_namespace
+    prefix, separator, rest = value.partition(':')
+    if prefix in ROLES and separator:
+        if evidence_handles.RECORD.fullmatch(value):
+            return value
+        handles = evidence_handles.index(registry.store) if registry.store is not None else None
+        versions = (handles.lookup(value) or handles.latest(value) or []) if handles else []
+        if versions and all(handles.key(version)[0] != 'file' for version in versions):
+            return value
+        raise PublicPFPermissionError('Role-prefixed file paths belong to the legacy layout; use shared:path or /workspace/path')
+    if separator and prefix == namespace:
+        path = rest
+    else:
+        path = value
+        handles = evidence_handles.index(registry.store) if registry.store is not None else None
+        versions = (handles.lookup(value) or handles.latest(value) or []) if handles else []
+        if versions and all(handles.key(version)[0] != 'file' for version in versions):
+            return registry.role + ':' + value
+    suffix = ''
+    if match := evidence_handles.VERSIONED.fullmatch(path):
+        path, suffix = match.group(1), '@v' + match.group(2)
+    root = registry.repository(namespace)
+    if PurePosixPath(path).is_absolute():
+        roots = (PurePosixPath('/workspace'), PurePosixPath(root))
+        source = next((candidate for candidate in roots if PurePosixPath(path).is_relative_to(candidate)), None)
+        if source is None:
+            raise PublicPFPermissionError('Path is outside the shared workspace; use /workspace/path')
+        path = str(PurePosixPath(path).relative_to(source))
+    if root.resolve() != root:
+        raise PublicPFPermissionError('Path is outside the shared workspace')
+    parts = []
+    for part in path.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if not parts:
+                raise PublicPFPermissionError('Path escapes the shared workspace')
+            parts.pop()
+            continue
+        parts.append(part)
+        relative = '/'.join(parts)
+        if '.git' in parts or parts[0] == 'sessions' or private_framework_path(relative):
+            raise PublicPFPermissionError('Only public workspace files may be referenced')
+        if suffix:
+            continue
+        try:
+            is_link = (root / relative).is_symlink()
+        except OSError as exc:
+            if exc.errno != errno.ENAMETOOLONG:
+                raise
+            raise PublicPFError('Reference path component is too long; use a captured handle or a shorter public path') from exc
+        if is_link:
+            raise PublicPFPermissionError('Symbolic links are not public PF file references; use the original shared:path')
+    if not parts:
+        raise PublicPFError('Reference must name a public file inside /workspace')
+    return namespace + ':' + '/'.join(parts) + suffix
+
+
 def missing(registry, value=None, *, prefix='No captured version matches'):
     message = prefix + '; use a captured file/output handle or public SQL'
     if registry.capabilities.text_tools:
         message += ', or a registered text revision'
     if value:
-        message += peer_hint(value) or '. For a peer file use ROLE:path (for example growth:reports/forecast.txt)'
+        message += ('. For a shared file use shared:path or /workspace/path' if getattr(registry, 'workspace_namespace', None)
+                    else peer_hint(value) or '. For a peer file use ROLE:path (for example growth:reports/forecast.txt)')
     return message
 
 

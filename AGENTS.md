@@ -55,6 +55,7 @@
 - 第三轮三角色旧名拒绝后纠正、非文本采集短引用、私有记录隔离、准确旧版本与真实 ModelUsage 输入的公共闭环从 `tests/test_round3_acceptance.py` 定位。
 - 第四轮 PF 同伴路径归一、精确旧版本、越界与私有文件拒绝、逐端点错误及纠正、超过六项的执行捕获清单和实际 ModelUsage 输入从 `tests/test_round4_pf_contracts.py` 定位；来源持久化未知与重复回执仍从 `tests/test_relation_recovery.py` 定位。
 - 第四轮六条 D56 分配、显式 agent/模拟器配置、Responses 推理与工具续传、独立 STOP/HOLD/恢复及无请求启动检查从 `tests/test_round4_batch.py` 定位；永久额度错误、普通限流、真实 HTTP 断连/取消与冻结请求监测从 `tests/test_round4_models.py` 定位。
+- 第五轮 A01/A17 的 shared-v1 共享目录、职责权限、namespace 文件来源、Git 并发和三类保存、宿主撞名、私有观察缺口与角色记忆恢复，从 `tests/test_shared_workspace.py`、`tests/test_shared_identity.py` 定位；旧布局默认保留，checkpoint 不跨布局转换。
 - 第五轮 A26 永久额度拒绝 `GoUsageLimitError` 的真实模型回执、controller HOLD、资源关闭与人工选点恢复从 `tests/test_round4_models.py` 定位；普通限流、持续重试和独立 STOP 仍从 `tests/test_model_recovery_retry.py`、`tests/test_continuous_run.py`、`tests/test_continuous_stop.py` 定位。
 - 第四轮按能力的提示、PF help、跨角色精确来源示例、空反向查询，以及三角色首次/恢复的公开资料与定向研发公式回执从 `tests/test_round4_guidance.py` 定位；旧能力提示与外层 Bash 捕获仍从 `tests/test_round3_prompts.py`、`tests/test_pf_capture_guidance.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。

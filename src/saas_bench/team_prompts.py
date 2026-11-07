@@ -244,9 +244,11 @@ days such as 49, 49-55 or 49-. Registration is optional.
 GIT_CEO_HISTORY += registration_prompt.GIT_CALL_NOTES
 GIT_ANALYST_HISTORY += registration_prompt.GIT_CALL_NOTES
 
-def system_prompt(base, role, mode, total_days, effective_end, workspace, readable, capabilities=None):
+def system_prompt(base, role, mode, total_days, effective_end, workspace, readable, capabilities=None, *, shared=False):
     from .agent_capabilities import AgentCapabilities
     capabilities = AgentCapabilities.resolve(capabilities)
+    if shared:
+        readable = ['/workspace']
     common_history = registration_prompt.capability_history(mode == 'pf', capabilities)
     if role == 'ceo':
         old_history = common_history
@@ -309,4 +311,18 @@ requests, finish the current batch and answer them before retrying advancement.
     if not capabilities.tool_notes or not capabilities.git_extra_saves:
         prompt = prompt.replace(registration_prompt.GIT_CALL_NOTES, '')
         history = history.replace(registration_prompt.GIT_CALL_NOTES, '')
-    return with_registered_script_contract(prompt + handoff + '\n' + history)
+    prompt = with_registered_script_contract(prompt + handoff + '\n' + history)
+    if shared:
+        prompt = registration_prompt.shared_workspace_history(prompt)
+        prompt = prompt.replace('MEMORY.md', 'memory/' + role + '.md')
+        prompt = prompt.replace('Write only your own workspace.', 'All roles may write ordinary files in the shared workspace.')
+        prompt = prompt.replace('Write only in your workspace.', 'Write ordinary business files in /workspace.')
+        old = """All roles can set model tiers, operations/development daily spend, targeted
+advertising, capacity, quotas, targeted operations/development spend, ad strength,
+lead promotion and promotion. CEO and Growth can post social media."""
+        new = """Growth and CEO can set targeted advertising, lead promotion, renewal promotion,
+ad strength and social posts. OpsFinance and CEO can set model tiers, capacity,
+quotas and operations/development spending."""
+        prompt = prompt.replace(old, new)
+        prompt += "\n/workspace is one shared business directory. Anyone may edit scripts/, plans/, data/, outputs/ and memory/. Only memory/" + role + ".md is auto-loaded for you. docs/, novamind-operation and documents/ are managed read-only material. A shared Git snapshot contains the public tree at that time; it does not attribute all files to the sender.\n"
+    return prompt

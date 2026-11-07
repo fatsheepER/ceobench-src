@@ -18,12 +18,15 @@ from .sql_evidence import encoded
 
 
 class TextRegistry:
-    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None, private_root=None, capabilities=None):
+    def __init__(self, workspace, mode, store=None, sim_day=lambda: None, identity=None, private_root=None, capabilities=None, workspace_namespace=None):
         from .agent_capabilities import AgentCapabilities
         self.capabilities = AgentCapabilities.resolve(capabilities)
         if mode not in ('git', 'prefix', 'pf'):
             raise ValueError('Invalid registration mode')
         self.git_run = subprocess.run
+        self.workspace_namespace = workspace_namespace
+        self.projection_lock = None
+        self.peer_registries = ()
         self.identity = identity
         self.role = identity.role if identity else "ceo"
         self.workspace = Path(workspace).resolve()
@@ -250,6 +253,10 @@ class TextRegistry:
         return result.stdout.decode().strip() if result.returncode == 0 else None
 
     def repository(self, owner=None):
+        if self.workspace_namespace:
+            if owner not in (None, self.workspace_namespace):
+                raise PermissionError('Role-qualified file paths belong to the legacy workspace layout')
+            return self.workspace
         if not self.identity:
             return self.workspace
         from .role_policy import READABLE_ROLES
@@ -267,11 +274,17 @@ class TextRegistry:
     def authority_path(self, owner, filename):
         if filename not in ('registrations.json', 'relations.json'):
             raise ValueError('Unknown private registry')
-        self.repository(owner)
+        from .role_policy import READABLE_ROLES
+        if self.identity and owner not in READABLE_ROLES[self.role]:
+            raise PermissionError('Evidence is inaccessible')
         return (self.private_root if owner == self.role or not self.identity else self.private_root.parent / owner) / filename
 
     def _reference_owner(self, evidence):
-        owner = evidence.get('owner', self.role)
+        owner = evidence.get('owner', self.workspace_namespace or self.role)
+        if self.workspace_namespace and 'path' in evidence:
+            from .pf_paths import _shared_name
+            normalized = _shared_name(self, evidence['path'])
+            owner, evidence['path'] = normalized.split(':', 1)
         if self.identity and 'path' in evidence:
             value = evidence['path']
             if value.split(':', 1)[0] in ('ceo', 'growth', 'ops_finance') and ':' in value:

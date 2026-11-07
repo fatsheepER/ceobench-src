@@ -55,6 +55,7 @@ _ENGINE_MODULES = [
     "agent_capabilities",
     "role_policy",
     "workspace_io",
+    "workspace_layout",
     "public_sql",
     "sql_access",
     "sql_evidence",

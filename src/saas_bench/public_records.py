@@ -6,7 +6,8 @@ import re
 
 TEXT_FIELDS = ('id', 'version', 'revision', 'status', 'text', 'objects', 'applies_at', 'reason', 'sim_day', 'author')
 RELATION_FIELDS = ('id', 'revision', 'status', 'relation', 'relation_revision', 'author_role', 'sim_day', 'assertion', 'reason')
-ENDPOINT_FIELDS = ('kind', 'source_state', 'readable', 'producer_role', 'source_role', 'storage_role')
+ENDPOINT_FIELDS = ('kind', 'source_state', 'readable', 'producer_role', 'source_role', 'storage_role',
+                   'workspace_namespace', 'collector_role')
 
 
 def fields(record, names):
@@ -57,7 +58,7 @@ def _reference(reference, commit_ref, owner=None):
     result = fields(reference, ('cite', 'operation_ref'))
     if 'missing' in reference:
         result['missing'] = fields(reference['missing'], ('description', 'reason', 'last_known_ref'))
-    if match := re.fullmatch(r'(?:(ceo|growth|ops_finance):)?(.+)@([0-9a-fA-F]{40})', result.get('cite', '')):
+    if match := re.fullmatch(r'(?:(ceo|growth|ops_finance|shared):)?(.+)@([0-9a-fA-F]{40})', result.get('cite', '')):
         role, path, commit = match.groups()
         short = commit_ref(role or owner, commit)
         if short is None:
@@ -71,7 +72,7 @@ def _reference(reference, commit_ref, owner=None):
 
 def public_relation_endpoint(endpoint, commit_ref):
     result = fields(endpoint, ENDPOINT_FIELDS)
-    result['ref'] = _reference(endpoint.get('ref', {}), commit_ref, endpoint.get('storage_role'))
+    result['ref'] = _reference(endpoint.get('ref', {}), commit_ref, endpoint.get('workspace_namespace') or endpoint.get('storage_role'))
     if endpoint.get('snapshot_source'):
         source = endpoint['snapshot_source']
         result['snapshot_source'] = (public_evidence_reference(source, commit_ref, endpoint.get('source_role'))

@@ -93,7 +93,7 @@ class PublicEvidence:
     def candidate(self, item):
         result = fields(item, ('version', 'kind', 'name', 'day', 'status', 'initiator_role', 'initiator',
                               'producer_role', 'source_role', 'storage_role', 'association', 'sql_access',
-                              'access_match_bases', 'note'))
+                              'access_match_bases', 'note', 'workspace_namespace', 'collector_role'))
         result.update(event_ref=self.ref('event', item['event_ref']),
                       content_ref=self.ref('capture', item['content_ref']),
                       capture=self.capture(item['capture']), model_delivery=self.delivery(item['model_delivery']))

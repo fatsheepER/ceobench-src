@@ -99,10 +99,15 @@ def render_guides(mode, capabilities=None):
     return {'workspace-history.md': history, 'business-ledger.md': ledger}
 
 
-def write_guides(workspace, mode, capabilities=None):
+def write_guides(workspace, mode, capabilities=None, *, shared=False):
     """Replace only runtime-owned guides; never follow a restored file symlink."""
     workspace = Path(workspace)
     for name, content in render_guides(mode, capabilities).items():
+        if shared:
+            from .registration_prompt import shared_workspace_history
+            content = shared_workspace_history(content).replace('MEMORY.md', 'memory/ROLE.md')
+            content += '\nAll roles share /workspace. Ordinary business files are writable by every role. Docs, the client and documents/ projections are managed read-only material. Shared Git commits save the public tree, not sole authorship by the role named in a handoff.\n'
+
         with parent_fd(workspace, workspace / 'docs' / name, create=True) as (directory, target):
             temporary = '.workspace-guide-' + uuid.uuid4().hex
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,

@@ -157,6 +157,9 @@ class ShellService:
                 result, code, outcome = error, 2, 'usage_error'
             elif operation == 'pf_help':
                 result = pf_cli.command_help(self.executor.capabilities)
+                if self.executor.shared_workspace:
+                    from .registration_prompt import shared_workspace_history
+                    result = shared_workspace_history(result).replace('MEMORY.md', 'memory/' + self.executor.role + '.md')
             else:
                 try:
                     result = self.executor.pf_queries.execute(operation, args)

@@ -73,8 +73,16 @@ class RelationRegistry:
     def _publish(self, state):
         from .private_storage import publish_json
         from .public_records import public_relation_state
-        publish_json(self.private_root, self.path, state, prefix='.relation-')
-        publish_json(self.workspace, self.public_path, public_relation_state(state, self.texts.public_commit), prefix='.public-relation-')
+        from contextlib import nullcontext
+        with self.texts.projection_lock or nullcontext():
+            publish_json(self.private_root, self.path, state, prefix='.relation-')
+            if self.texts.workspace_namespace:
+                records = {}
+                for registry in self.texts.peer_registries:
+                    for history in registry.relations._load()['records'].values():
+                        records[history[-1]['relation']] = history
+                state = dict(format=FORMAT, records=records)
+            publish_json(self.workspace, self.public_path, public_relation_state(state, self.texts.public_commit), prefix='.public-relation-')
 
     def _summary(self, items, results, status=None):
         counts = Counter(item['status'] for item in results)
@@ -310,7 +318,9 @@ class RelationRegistry:
             if operation is None:
                 raise Rejected('not_found', 'Unknown operation_ref in this world')
             actor = operation['operation']['actor']
-            self.texts.repository(actor)
+            from .role_policy import READABLE_ROLES
+            if actor not in READABLE_ROLES[self.role]:
+                raise PermissionError('Operation evidence is inaccessible')
             if operation['operation']['outcome'] == 'unfinished':
                 raise Rejected('not_terminal', 'The operation has not reached a recorded outcome; query its receipt later')
             return dict(kind='operation', ref=endpoint, source_state='available', readable=True,
@@ -349,7 +359,7 @@ class RelationRegistry:
                         producer_role=producer, source_role=owner, storage_role=owner,
                         sha256=hashlib.sha256(encode(record).encode()).hexdigest()), []
         if binding.get('git_commit'):
-            owner = evidence.get('owner', self.role)
+            owner = evidence.get('owner', self.texts.workspace_namespace or self.role)
             workspace = self.texts.repository(owner)
             full, path = binding['git_commit'], evidence['path']
             parts = PurePosixPath(path).parts
@@ -357,32 +367,37 @@ class RelationRegistry:
                 raise Rejected('permission_denied', 'Only public business files may be cited')
             raw = self.texts._git_output(['git', '--no-replace-objects', '-C', str(workspace), 'show', full + ':' + path])
             source = ref.get('snapshot_source')
-            producer = source.get('owner', self.role) if source else self._git_producer(owner, path, full)
+            producer = None if self.texts.workspace_namespace else source.get('owner', self.role) if source else self._git_producer(owner, path, full)
             original = dict(cite=cite_text(source)) if source else dict(cite=owner + ':' + path + '@' + full)
             retained_by_owner = self.texts.git_run(['git', '-C', str(workspace), 'show-ref', '--verify', '--quiet',
                 'refs/ceobench/snapshots/' + full], capture_output=True, timeout=10).returncode == 0
-            source_role = producer if producer is not None else owner
-            if owner != self.role and not retained_by_owner and self.texts.capabilities.git_extra_saves:
+            source_role = None if self.texts.workspace_namespace else producer if producer is not None else owner
+            if not self.texts.workspace_namespace and owner != self.role and not retained_by_owner and self.texts.capabilities.git_extra_saves:
                 # Preserve the requested old bytes without writing retention refs in the peer's repository.
                 full = self._copy_git_bytes(path, raw, original['cite'])
                 owner = self.role
             bound = dict(kind='file', ref=dict(cite=owner + ':' + path + '@' + full),
                          source_state='available', readable=True, producer_role=producer,
-                         source_role=source_role, storage_role=owner, snapshot_source=original,
+                         source_role=source_role, storage_role=None if self.texts.workspace_namespace else owner,
+                         **(dict(workspace_namespace=owner, collector_role=self.role) if self.texts.workspace_namespace else {}),
+                         snapshot_source=original,
                          sha256=hashlib.sha256(raw).hexdigest())
-            return bound, [full] if owner == self.role else []
+            return bound, [full] if owner in (self.role, self.texts.workspace_namespace) else []
         if not self.texts.resolver or 'version_id' not in binding:
             raise Rejected('not_found', 'No readable exact content version was resolved')
         meta, raw = self.texts.resolver.content(binding['version_id'])
-        producer = meta.get('owner_role')
+        producer = meta.get('producer_role') if meta.get('workspace_namespace') else meta.get('owner_role')
+        location = dict(workspace_namespace=meta['workspace_namespace'], collector_role=meta.get('collector_role')) if meta.get('workspace_namespace') else {}
         kind = 'file' if meta['layer'] in ('file_bytes', 'file_text') else 'output'
         return dict(kind=kind, ref=dict(cite=self.texts.resolver.handle(binding['version_id'])),
                     source_state='available', readable=True, producer_role=producer, source_role=producer,
-                    storage_role=producer, sha256=hashlib.sha256(raw).hexdigest(),
+                    storage_role=None if location else producer, **location, sha256=hashlib.sha256(raw).hexdigest(),
                     capture=dict(reading_scope=binding.get('reading_scope', 'unknown'),
                                  source_truncated=binding.get('source_truncated'), layer=meta['layer'])), []
 
     def _git_producer(self, owner, path, commit):
+        if self.texts.workspace_namespace:
+            return None
         workspace = self.texts.repository(owner)
         producers = set()
         registry = self.texts.authority_path(owner, 'registrations.json')

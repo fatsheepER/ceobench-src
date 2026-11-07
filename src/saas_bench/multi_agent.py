@@ -94,14 +94,20 @@ class MultiAgentRuntime:
                  simulator=None, public_dir=None, run_id=None, world_id=None, public_refs_path=None,
                  model="deepseek-v4.1-flash", reasoning_effort="high", total_days=500, token_counter=None,
                  model_pricing=None, _restored_state=None, analyst_bash_timeout=1200,
-                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, model_configs=None, **server_options):
+                 analyst_bash_warn_after=None, ceo_bash_timeout=1200, ceo_bash_warn_after=None, capabilities=None, model_configs=None, workspace_layout='role-v1', **server_options):
         if mode not in ('git', 'pf'):
             raise ValueError('Team supports git and pf modes')
         if type(total_days) is not int or total_days < 7:
             raise ValueError('total_days must include at least one full week')
+        from .workspace_layout import SHARED, workspace_names
+        workspace_names(workspace_layout)
+        self.workspace_layout = workspace_layout
+        self.shared_workspace = workspace_layout == SHARED
+        self._history_lock = threading.RLock()
+        self._projection_lock = threading.RLock()
         self.total_days = total_days
         self.configuration = dict(mode=mode, model=model, reasoning_effort=reasoning_effort,
-            total_days=total_days, model_pricing=model_pricing)
+            total_days=total_days, model_pricing=model_pricing, workspace_layout=workspace_layout)
         if model_configs is not None:
             from .team_models import validate_models
             validate_models(model_configs)
@@ -175,19 +181,28 @@ class MultiAgentRuntime:
         self._sockets = tempfile.TemporaryDirectory(prefix='ceobench-team-', dir=self._temp_root)
         public = Path(public_dir or Path(__file__).resolve().parents[2] / 'public')
         self._public_dir = public
-        workspaces = {role: self.root / 'roles' / role for role in ROLES}
+        workspaces = {role: self.root / 'roles' / ('shared' if self.shared_workspace else role) for role in ROLES}
+        initialized_workspaces = set()
         sockets = {role: Path(self._sockets.name) / role / 'api.sock' for role in ROLES}
         script_sockets = {role: Path(self._sockets.name) / role / 'script.sock' for role in ROLES}
         stores, runtimes, script_executors, audits = {}, {}, {}, {}
         for role in ROLES:
             workspace = workspaces[role]
-            workspace.mkdir(parents=True, exist_ok=bool(_restored_state))
-            if not _restored_state:
-                shutil.copytree(public / 'docs', workspace / 'docs')
-                shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
-                (workspace / 'MEMORY.md').write_text('')
-            from .workspace_guides import write_guides
-            write_guides(workspace, mode, self.capabilities)
+            if workspace not in initialized_workspaces:
+                workspace.mkdir(parents=True, exist_ok=bool(_restored_state))
+                if not _restored_state:
+                    shutil.copytree(public / 'docs', workspace / 'docs')
+                    shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
+                    if self.shared_workspace:
+                        for directory in ('memory', 'scripts', 'plans', 'data', 'outputs', 'documents'):
+                            (workspace / directory).mkdir()
+                        for actor in ROLES:
+                            (workspace / 'memory' / (actor + '.md')).write_text('')
+                    else:
+                        (workspace / 'MEMORY.md').write_text('')
+                from .workspace_guides import write_guides
+                write_guides(workspace, mode, self.capabilities, shared=self.shared_workspace)
+                initialized_workspaces.add(workspace)
             identity = (AgentIdentity(**_restored_state['roles'][role]['identity']) if _restored_state else
                 AgentIdentity(run_id, world_id, role, uuid.uuid4().hex, uuid.uuid4().hex))
             role_private = private / role
@@ -195,18 +210,19 @@ class MultiAgentRuntime:
             write_json(role_private / 'identity.json', identity.fields())
             store = stores[role] = SQLEvidenceStore(private / 'evidence.sqlite', dict(
                 identity.fields(), branch_id=role, data_source_id=world_id, format=FORMAT,
-                capture_scope='execution')) if mode == 'pf' else None
+                capture_scope='execution', **({'workspace_namespace': 'shared'} if self.shared_workspace else {}))) if mode == 'pf' else None
             if store is not None:
                 store.public_refs = self.public_refs
             audit = audits[role] = RoleAudit(role_private / 'audit.jsonl', identity)
             registry = TextRegistry(workspace, mode, store, sim_day=lambda: tools.current_day,
-                identity=identity, private_root=role_private, capabilities=self.capabilities)
+                identity=identity, private_root=role_private, capabilities=self.capabilities,
+                workspace_namespace='shared' if self.shared_workspace else None)
             registry.public_refs = self.public_refs
             env = dict(NOVAMIND_API_PORT='1', NOVAMIND_API_SOCKET='/run/novamind-api/api.sock',
                        PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(workspace / 'docs'))
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
                 require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role], private_root=role_private,
-                public_refs=self.public_refs,
+                public_refs=self.public_refs, workspace_layout=workspace_layout,
                 readable_workspaces=tuple(workspaces[r] for r in READABLE_ROLES[role]))
             settings = (dict(bash_timeout=analyst_bash_timeout, bash_warn_after=analyst_bash_warn_after) if role != 'ceo'
                         else dict(bash_timeout=ceo_bash_timeout, bash_warn_after=ceo_bash_warn_after))
@@ -242,8 +258,11 @@ class MultiAgentRuntime:
                 text_registration=True, pf=mode == 'pf', identity=identity, capabilities=self.capabilities,
                 allow_final_text=role != 'ceo', model_config=model_configs['agent'] if model_configs else None,
                 **generation_policy)
+            if self.shared_workspace:
+                agent.memory_file = 'memory/' + role + '.md'
             agent.system_prompt = system_prompt(agent.system_prompt, role, mode, total_days,
-                self.effective_end, workspace, [workspaces[r] for r in READABLE_ROLES[role]], self.capabilities)
+                self.effective_end, executor.guest_root, [workspaces[r] for r in READABLE_ROLES[role]], self.capabilities,
+                shared=self.shared_workspace)
             agent.lifecycle = self._lifecycle
             registry.git_run = executor.run_private
             agent.git_run = executor.run_private
@@ -278,6 +297,14 @@ class MultiAgentRuntime:
         for runtime in self.roles.values():
             runtime.registry.relations.operation_lookup = operation_lookup
             runtime.registry.relations.attempt_id = attempt_id
+        self.server.responsibility_authority = self.shared_workspace
+        if self.shared_workspace:
+            from .workspace_observation import WorkspaceObserver
+            self._workspace_observer = WorkspaceObserver(private / 'file-observations')
+            for runtime in self.roles.values():
+                runtime.registry.projection_lock = self._projection_lock
+                runtime.registry.peer_registries = tuple(r.registry for r in self.roles.values())
+                runtime.executor.observer = script_executors[runtime.identity.role].observer = self._workspace_observer
         self.server.team_permission = self._team_permission
         self.server.script_check = self._check_model_send
         for role, runtime in self.roles.items():
@@ -295,10 +322,12 @@ class MultiAgentRuntime:
             executor.authorize = self.server.authorize_team
         try:
             self.server.start()
+            history_initialized = set()
             for runtime in self.roles.values():
                 runtime.executor.verify_sandbox()
-                if not _restored_state or _restored_state.get('_legacy_history_unavailable'):
+                if (not _restored_state or _restored_state.get('_legacy_history_unavailable')) and runtime.workspace not in history_initialized:
                     self._initialize_history(runtime)
+                    history_initialized.add(runtime.workspace)
             if _restored_state:
                 from .team_checkpoint import restore_runtime_state
                 restore_runtime_state(self, _restored_state)
@@ -323,9 +352,15 @@ class MultiAgentRuntime:
         self._git(runtime, 'update-ref', '--no-deref', 'HEAD', commit)
 
     def _snapshot_history(self, runtime, title):
-        self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**')
-        self._git(runtime, 'commit', '--allow-empty', '-m', title)
-        return self._git(runtime, 'rev-parse', 'HEAD')
+        while not self._history_lock.acquire(timeout=.1):
+            self._lifecycle.check()
+        try:
+            self._lifecycle.check()
+            self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**', ':(exclude)**/.registered-*')
+            self._git(runtime, 'commit', '--allow-empty', '-m', title)
+            return self._git(runtime, 'rev-parse', 'HEAD')
+        finally:
+            self._history_lock.release()
 
     @property
     def phase(self):
@@ -490,7 +525,7 @@ class MultiAgentRuntime:
         server = self.server
         execute, advance = server.execute_tool, server.advance_week
         def guarded_execute(tool, args, *, role='ceo', initiator='host'):
-            require_call(role, tool, initiator=initiator)
+            require_call(role, tool, initiator=initiator, responsibility=self.shared_workspace)
             if CALL_POLICY[tool] == 'read':
                 return execute(tool, args, role=role, initiator=initiator)
             with server._lock:
@@ -961,12 +996,12 @@ class MultiAgentRuntime:
             capture_output=True, text=True, check=True, timeout=10).stdout.strip()
         header = (f'Analyst handoff | role={request.receiver} | day={request.day} | '
                   f'request_id={self._request_ref(request)}\n'
-                  f'Workspace: {runtime.workspace}\n'
+                  f'Workspace: {runtime.executor.guest_root}\n'
                   f'Snapshot commit: {commit}\n')
         if request.kind == 'question':
             header = (f'Team reply | from={request.receiver} | to={request.sender} | day={request.day} | '
                       f'request_id={self._request_ref(request)}\n'
-                      f'Workspace: {runtime.workspace}\n'
+                      f'Workspace: {runtime.executor.guest_root}\n'
                       f'Snapshot commit: {commit}\n')
         return join_text(header, '\n', request.reply)
 
@@ -1124,7 +1159,7 @@ class MultiAgentRuntime:
                 with self._team_condition:
                     self._advancing = False
                 self._rotate_sessions()
-                self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING),
+                self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING.replace('MEMORY.md', getattr(self.roles['ceo'].agent, 'memory_file', 'MEMORY.md'))),
                     ceo_started=False)
                 self._stage = 'ceo_opening'
                 self._set_phase('ceo_opening')
@@ -1164,9 +1199,12 @@ class MultiAgentRuntime:
         while self.roles['ceo'].agent._pending_tool_calls:
             self.roles['ceo'].agent.record_tool_result('Cancelled because this tool batch crossed a week boundary.')
         closed_day = self.server.tools.current_day
+        from .registration_evidence import week_commit_subject
+        saved_workspaces = set()
         for runtime in self.roles.values():
-            from .registration_evidence import week_commit_subject
-            self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
+            if runtime.workspace not in saved_workspaces:
+                self._snapshot_history(runtime, week_commit_subject(f'week-{closed_day // 7}'))
+                saved_workspaces.add(runtime.workspace)
         if self.roles['ceo'].week is not None:
             self._update_role_week('ceo', weekly_status='completed')
         self._stage = 'boundary'

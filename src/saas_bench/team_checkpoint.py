@@ -41,7 +41,8 @@ def validate_runtime_data(snapshot, state):
             required_week.extend(['directions', 'weekly_request_ids'])
         missing.extend(f'team.json:week.{name}' for name in required_week if name not in state['week'])
     for role in ROLES:
-        for name in (f'roles/{role}', f'private/{role}/conversation.json'):
+        workspace = 'shared' if state['configuration'].get('workspace_layout') == 'shared-v1' else role
+        for name in (f'roles/{workspace}', f'private/{role}/conversation.json'):
             path = snapshot / name
             if not (path.is_dir() if name.startswith('roles/') else path.is_file()):
                 missing.append(name)
@@ -381,13 +382,14 @@ def validate_snapshot(snapshot):
     return snapshot, json.loads((snapshot / 'team.json').read_text())
 
 
-def refresh_registered_script_client(root, public):
+def refresh_registered_script_client(root, public, layout='role-v1'):
     import hashlib
     import stat
     from .role_policy import ROLES
     from .workspace_io import parent_fd
+    from .workspace_layout import workspace_names
     updates = []
-    for role in ROLES:
+    for role in workspace_names(layout):
         for source, relative in ((public / 'novamind-client', 'novamind-operation'),
                                  (public / 'docs/cli.md', 'docs/cli.md'),
                                  (public / 'docs/api/analytics.json', 'docs/api/analytics.json'),
@@ -460,6 +462,8 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     source_changed = tree_hash(Path(__file__).parent) != state.get('source_sha256')
     public_changed = artifact_hashes(public) != state.get('public_artifacts')
     configuration = dict(state['configuration'])
+    if options.get('workspace_layout', configuration.get('workspace_layout', 'role-v1')) != configuration.get('workspace_layout', 'role-v1'):
+        raise CheckpointDataError('Workspace layout cannot be converted during checkpoint recovery')
     if 'capabilities' in options:
         from .agent_capabilities import AgentCapabilities
         options['capabilities'] = AgentCapabilities.resolve(options['capabilities']).to_dict()
@@ -513,7 +517,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .legacy_privacy import PUBLIC_HISTORY_FORMAT, quarantine_legacy_runtime
     if state.get('public_history_format') != PUBLIC_HISTORY_FORMAT:
         quarantine_legacy_runtime(root, public, state)
-    client_updates = refresh_registered_script_client(root, public)
+    client_updates = refresh_registered_script_client(root, public, configuration.get('workspace_layout', 'role-v1'))
     write_json(root / 'recovery.json', dict(snapshot=str(snapshot),
         source_root=str(source), attempt_id=uuid.uuid4().hex,
         checkpoint_sha256=optional_hash(snapshot / 'checkpoint.json'),
@@ -606,10 +610,10 @@ def _relocate_prompt(text, original, destination):
     return CapturedText(''.join(parts), origins, text.pf_read, reads)
 
 
-def _with_frozen_memory(prompt, saved):
+def _with_frozen_memory(prompt, saved, memory_file='MEMORY.md'):
     """Replace capability instructions without rereading this week's MEMORY."""
     from .execution_capture import CapturedText, slice_origins, slice_read_spans
-    start = saved.find('\n\n## Your MEMORY.md (auto-loaded)\n\n')
+    start = saved.find('\n\n## Your ' + memory_file + ' (auto-loaded)\n\n')
     if start < 0:
         return prompt
     return CapturedText(prompt + saved[start:],
@@ -669,7 +673,7 @@ def restore_runtime_state(runtime, state):
             message.content = _relocate_prompt(message.content, before, after)
             if message.role == 'system':
                 if 'capabilities' in runtime.configuration:
-                    message.content = _with_frozen_memory(role.agent.system_prompt, message.content)
+                    message.content = _with_frozen_memory(role.agent.system_prompt, message.content, getattr(role.agent, 'memory_file', 'MEMORY.md'))
                 else:
                     message.content = (role.agent._get_system_prompt_with_memory() if regenerate_prompt
                         else with_registered_script_contract(message.content))

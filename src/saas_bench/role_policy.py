@@ -25,6 +25,10 @@ CALL_SPECS = MappingProxyType({
                      'set_targeted_dev_spend', 'set_ads_strength', 'set_lead_promotion', 'set_promotion'),
                    CallSpec('write', frozenset(ROLES))),
 })
+RESPONSIBILITY = {
+    **dict.fromkeys(('set_targeted_ad_spend', 'set_lead_promotion', 'set_promotion', 'post_social_media', 'set_ads_strength'), frozenset(('ceo', 'growth'))),
+    **dict.fromkeys(('set_model_tiers', 'set_capacity_tier', 'set_usage_quotas', 'set_daily_spend', 'set_targeted_ops_spend', 'set_targeted_dev_spend'), frozenset(('ceo', 'ops_finance'))),
+}
 CALL_POLICY = MappingProxyType({tool: spec.category for tool, spec in CALL_SPECS.items()})
 
 
@@ -55,14 +59,15 @@ def require_script_observation(initiator, operation):
                               'after reviewing the current instructions to change business settings or scripts.')
 
 
-def require_call(role, tool, *, initiator='host'):
+def require_call(role, tool, *, initiator='host', responsibility=False):
     require_role(role)
     spec = CALL_SPECS.get(tool)
     if spec is None:
         raise PermissionError(f'Unknown tool: {tool}')
     require_script_observation(initiator, spec.category)
-    if role not in spec.roles:
-        permitted = 'CEO' if spec.roles == frozenset(('ceo',)) else 'CEO and Growth'
+    roles = RESPONSIBILITY.get(tool, spec.roles) if responsibility else spec.roles
+    if role not in roles:
+        permitted = ' and '.join({'ceo': 'CEO', 'growth': 'Growth', 'ops_finance': 'OpsFinance'}[name] for name in ROLES if name in roles)
         raise PermissionError(f'Only {permitted} can call {tool}')
 
 

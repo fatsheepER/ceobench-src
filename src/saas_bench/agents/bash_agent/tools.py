@@ -370,7 +370,7 @@ class BashAgentToolExecutor:
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
                  text_registry=None,
                  identity=None, readable_workspaces=(), api_socket=None, audit=None, bash_warn_after=None,
-                 bash_memory_limit_bytes=None, private_root=None, public_refs=None, capabilities=None):
+                 bash_memory_limit_bytes=None, private_root=None, public_refs=None, capabilities=None, workspace_layout='role-v1'):
         """Initialize the tool executor.
 
         Args:
@@ -381,6 +381,11 @@ class BashAgentToolExecutor:
             bash_memory_limit_bytes: Per-process address-space limit, default 8 GiB or
                 CEOBENCH_BASH_MEMORY_MAX_BYTES. Zero leaves the inherited limit unchanged.
         """
+        from saas_bench.workspace_layout import SHARED, workspace_names
+        workspace_names(workspace_layout)
+        self.workspace_layout = workspace_layout
+        self.shared_workspace = workspace_layout == SHARED
+        self.observer = None
         self.audit = audit
         self.identity = identity
         self.role = identity.role if identity else 'ceo'
@@ -450,7 +455,7 @@ class BashAgentToolExecutor:
     @property
     def guest_root(self) -> str:
         """The workspace path as the agent sees it."""
-        return GUEST_WORKSPACE if self._bwrap() and not self.identity else str(self.workspace_path)
+        return GUEST_WORKSPACE if self._bwrap() and (not self.identity or self.shared_workspace) else str(self.workspace_path)
 
     @property
     def python(self) -> str:
@@ -475,7 +480,12 @@ class BashAgentToolExecutor:
                 self._pf_service = None
             if self.preserved_process:
                 raise ProcessBoundaryError('Previous process boundary remains open')
-            return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
+            observation = self.observer.begin(self, tool_name, args, model_request_event, model_context_id, tool_call_id) if self.observer else None
+            try:
+                return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
+            finally:
+                if self.observer:
+                    self.observer.finish(self, observation)
 
     def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None, tool_call_id=None):
         disabled = None
@@ -536,6 +546,7 @@ class BashAgentToolExecutor:
         previous_env = dict(self.extra_env)
         token = None
         before = None
+        self._note_gaps = []
         note_before = self._note_files() if tool_name in NOTE_TOOLS and args.get('note', '').strip() else None
         result, status = '', 'succeeded'
         self._note_output = None
@@ -571,7 +582,9 @@ class BashAgentToolExecutor:
                 note_after = self._note_files()
                 note = dict(tool=tool_name, note=args['note'], author=self.role, status=status,
                             output_sha256=hashlib.sha256(str(result).encode()).hexdigest(),
-                            files=sorted(path for path in note_before.keys() | note_after.keys() if note_before.get(path) != note_after.get(path)),
+                            files=sorted(path for path in note_before.keys() | note_after.keys() if note_before.get(path) != note_after.get(path)
+                                         and path not in {gap['path'] for gap in self._note_gaps}),
+                            **(dict(file_observation_gaps=self._note_gaps) if self.shared_workspace else {}),
                             **(self.identity.fields() if self.identity else {}))
                 if self.capabilities.git_extra_saves and self.text_registry and self.text_registry.mode in ('git', 'prefix'):
                     from saas_bench.tool_notes import record_git_note
@@ -662,6 +675,7 @@ class BashAgentToolExecutor:
             if token is not None:
                 CURRENT_EVENT.reset(token)
             self.extra_env = previous_env
+            self.last_capture_event = capture.event if capture else None
             self.capture = None
             self.last_status = status
             if self.audit:
@@ -678,9 +692,24 @@ class BashAgentToolExecutor:
         return result
 
     def _note_files(self):
-        return {str(path.relative_to(self.workspace_path)): (path.stat().st_size, path.stat().st_mtime_ns)
-                for path in self.workspace_path.rglob('*') if path.is_file() and not path.is_symlink()
-                and path.relative_to(self.workspace_path).parts[0] not in ('.git', '.tool-notes.jsonl', *HIDDEN_WORKSPACE_DIRS)}
+        files = {}
+        for path in self.workspace_path.rglob('*'):
+            relative = path.relative_to(self.workspace_path)
+            if relative.parts[0] in ('.git', '.tool-notes.jsonl', *HIDDEN_WORKSPACE_DIRS):
+                continue
+            if self.shared_workspace:
+                from saas_bench.workspace_layout import managed_path
+                if managed_path(relative.as_posix()) or any(part.startswith('.registered-') for part in relative.parts):
+                    continue
+            try:
+                if path.is_file() and not path.is_symlink():
+                    info = path.stat()
+                    files[relative.as_posix()] = (info.st_size, info.st_mtime_ns)
+            except OSError as exc:
+                if not self.shared_workspace:
+                    raise
+                self._note_gaps.append(dict(path=relative.as_posix(), reason=type(exc).__name__))
+        return files
 
     def _roots(self):
         """Paths by which the agent may name its workspace, e.g. in a leading cd."""
@@ -724,11 +753,15 @@ class BashAgentToolExecutor:
         return self._file_name(path) if self._read_root(path) == self.workspace_path else str(path)
 
     def _file_owner(self, path):
-        return self._read_root(path).name if self.identity else self.role
+        return None if self.shared_workspace else self._read_root(path).name if self.identity else self.role
 
     def _resolve_path(self, path_str: str, *, write=False) -> Path:
         """Resolve a workspace-relative or agent-visible absolute path, preventing escape."""
         path = self._contained(self._host_path(path_str), path_str)
+        if write and self.shared_workspace:
+            from saas_bench.workspace_layout import managed_path
+            if managed_path(path.relative_to(self.workspace_path).as_posix()):
+                raise ValueError('Runtime-managed workspace files are read-only')
         if write and not path.is_relative_to(self.workspace_path):
             raise ValueError('Only the owned workspace is writable')
         return path
@@ -736,7 +769,7 @@ class BashAgentToolExecutor:
     def _host_path(self, path_str: str) -> Path:
         """Map an agent-visible path onto the host workspace."""
         p = Path(path_str)
-        if self.identity:
+        if self.identity and not self.shared_workspace:
             return p if p.is_absolute() else self.workspace_path / p
         if p.is_absolute():
             p = Path(os.path.normpath(p))
@@ -760,7 +793,7 @@ class BashAgentToolExecutor:
 
     def _guest_paths(self, value: str) -> str:
         """Rewrite host workspace paths in a path-list value to their sandbox location."""
-        if self.identity:
+        if self.identity and not self.shared_workspace:
             return value
         hosts = {str(self.workspace_path), str(self.workspace_path.resolve())}
         parts = value.split(os.pathsep)
@@ -893,6 +926,13 @@ class BashAgentToolExecutor:
             for name in HIDDEN_WORKSPACE_DIRS:
                 if os.path.isdir(os.path.join(host, name)):
                     cmd.extend(['--tmpfs', guest + '/' + name])
+        if self.shared_workspace:
+            from saas_bench.workspace_layout import MANAGED
+            for name in MANAGED:
+                if (self.workspace_path / name).exists():
+                    cmd.extend(['--ro-bind', str(self.workspace_path / name), self.guest_root + '/' + name])
+        if source_mount := getattr(self, 'script_source_mount', None):
+            cmd.extend(['--ro-bind', str(source_mount[0]), str(source_mount[1])])
         if self.api_socket:
             cmd.extend(['--ro-bind', str(self.api_socket), '/run/novamind-api/api.sock'])
         if getattr(self, '_boundary_socket_dir', None):
@@ -918,6 +958,8 @@ class BashAgentToolExecutor:
         import shlex
         env = dict(PATH=GUEST_PYTHON_ROOT + '/bin:' + os.defpath,
                    HOME=self.guest_root, GIT_CONFIG_NOSYSTEM='1', LANG='C.UTF-8')
+        if self.shared_workspace:
+            argv = [self._guest_paths(str(value)) for value in argv]
         command = self._build_bwrap_cmd(shlex.join(argv), str(self.workspace_path), env)
         return subprocess.run(command, env=env, **kwargs)
 
@@ -1256,7 +1298,7 @@ class BashAgentToolExecutor:
         from saas_bench.workspace_io import open_file
         raw = text.encode()
         number = self.public_refs.ordinal('tool_output', self.role, hashlib.sha256(raw).hexdigest())
-        relative = Path('tool-outputs') / f'output{number}.txt'
+        relative = Path('tool-outputs') / f'{self.role}-output{number}.txt'
         with open_file(self.workspace_path, self.workspace_path / relative, 'wb') as stream:
             stream.write(raw)
         return relative.as_posix()
@@ -1331,6 +1373,7 @@ class BashAgentToolExecutor:
             stream.write(args['content'].encode())
         if self.capture:
             self.capture.facts['written_paths'] = [self._file_name(path)]
+            self.capture.facts['written_content_hashes'] = {self._file_name(path): hashlib.sha256(args['content'].encode()).hexdigest()}
         return f"File written: {args['path']} ({path.stat().st_size} bytes)"
 
     def _exec_edit_file(self, args: Dict) -> str:
@@ -1355,6 +1398,7 @@ class BashAgentToolExecutor:
             stream.write(new_content.encode())
         if self.capture:
             self.capture.facts['written_paths'] = [self._file_name(path)]
+            self.capture.facts['written_content_hashes'] = {self._file_name(path): hashlib.sha256(new_content.encode()).hexdigest()}
         return f"File edited: {args['path']}"
 
     def _exec_search_files(self, args: Dict) -> str:

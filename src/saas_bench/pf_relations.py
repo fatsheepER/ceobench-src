@@ -18,6 +18,7 @@ from .registration_schema import cite_text
 from .relation_registry import encode
 from .sql_evidence import PUBLIC_LAYERS, now
 from .workspace_io import open_file
+from .workspace_layout import evidence_namespace
 
 
 FORMAT = 'pf.relations.v1'
@@ -26,8 +27,8 @@ TEXT_FORMAT = 'ceobench.text-register.v1'
 RELATION_FORMAT = 'ceobench.relations.v1'
 ROLES = ('ceo', 'growth', 'ops_finance')
 EXACT_TEXT = re.compile(r'(?:(ceo|growth|ops_finance):)?(r[1-9][0-9]*\.[1-9][0-9]*)')
-GIT_REF = re.compile(r'(?:(ceo|growth|ops_finance):)?(.+)@([0-9a-fA-F]{40})')
-GIT_INPUT = re.compile(r'(?:(ceo|growth|ops_finance):)?(.+)@([0-9a-fA-F]{1,40})')
+GIT_REF = re.compile(r'(?:(ceo|growth|ops_finance|shared):)?(.+)@([0-9a-fA-F]{40})')
+GIT_INPUT = re.compile(r'(?:(ceo|growth|ops_finance|shared):)?(.+)@([0-9a-fA-F]{1,40})')
 EXECUTION_KINDS = frozenset(('bash', 'cli_python', 'sql_query', 'public_http', 'read_file',
                              'write_file', 'edit_file', 'registered_script_execution', 'dashboard_generation'))
 
@@ -54,7 +55,8 @@ def _label(endpoint):
 
 def _path_endpoint(endpoint):
     return None if endpoint is None else dict(ref=deepcopy(endpoint['ref']),
-                                             storage_role=endpoint.get('storage_role'))
+                                             storage_role=endpoint.get('storage_role'),
+                                             workspace_namespace=endpoint.get('workspace_namespace'))
 
 
 class RelationQuery:
@@ -256,7 +258,7 @@ class RelationQuery:
     def _qualify(self, cite, role=None):
         if not self.registry.identity:
             return cite if GIT_INPUT.fullmatch(cite) else cite.removeprefix(self.role + ':')
-        if cite.split(':', 1)[0] in ROLES:
+        if cite.split(':', 1)[0] in (*ROLES, 'shared'):
             return cite
         return (role or self.role) + ':' + cite
 
@@ -289,7 +291,7 @@ class RelationQuery:
             value = self._qualify(value)
         if value and evidence_handles.RECORD.fullmatch(value):
             owner, name = value.split(':', 1) if ':' in value else (self.role, value)
-            self.registry.repository(owner)
+            self._authorize_role(owner)
             history = self.registries.get((owner, 'registrations.json'), {}).get(name.split('.')[0], [])
             record = next((r for r in history if r['version'] == name), None) if '.' in name else history[-1] if history else None
             if record is None:
@@ -297,7 +299,7 @@ class RelationQuery:
             return self._text_endpoint(owner, record)
         if value and (match := GIT_INPUT.fullmatch(value)):
             owner, path, commit = match.groups()
-            owner = owner or self.role
+            owner = owner or getattr(self.registry, 'workspace_namespace', None) or self.role
             self._public_path(owner, path)
             workspace = self.registry.repository(owner)
             native_repository(workspace)
@@ -312,7 +314,9 @@ class RelationQuery:
                                 return deepcopy(endpoint)
             raw = self._git_bytes(owner, path, commit)
             return dict(kind='file', ref=dict(cite=cite), source_state='available', readable=True,
-                        producer_role=None, source_role=owner, storage_role=owner,
+                        producer_role=None, source_role=None if owner == 'shared' else owner,
+                        storage_role=None if owner == 'shared' else owner,
+                        **({'workspace_namespace': owner} if owner == 'shared' else {}),
                         sha256=hashlib.sha256(raw).hexdigest())
         if 'sql' in target:
             matches = [version for version, row in self.captures.items()
@@ -326,10 +330,11 @@ class RelationQuery:
                 name = self._qualify(value) if self.registry.identity else value
                 matches = [v for v in evidence_handles.index(self.store).latest(name) or [] if v in self.captures]
             if not matches:
-                owner, path = value.split(':', 1) if ':' in value and value.split(':', 1)[0] in ROLES else (self.role, value)
+                owner, path = (value.split(':', 1) if ':' in value and value.split(':', 1)[0] in (*ROLES, 'shared')
+                               else (getattr(self.registry, 'workspace_namespace', None) or self.role, value))
                 self._public_path(owner, path)
                 matches = [v for v, row in self.captures.items() if row['meta']['layer'] == 'file_bytes'
-                           and row['meta'].get('object_id') == path and row['meta'].get('owner_role', self.role) == owner]
+                           and row['meta'].get('object_id') == path and evidence_namespace(row['meta'], self.role) == owner]
         if not matches:
             from .pf_paths import missing
             raise PublicPFError(missing(self.registry, value, prefix='No saved exact endpoint matches') +
@@ -352,9 +357,14 @@ class RelationQuery:
                     if record:
                         return self._text_endpoint(role, record)
         role = meta.get('owner_role', self.role)
+        namespace = meta.get('workspace_namespace') if meta['layer'] in ('file_bytes', 'file_text') else None
         return dict(kind='file' if meta['layer'] in ('file_bytes', 'file_text') else 'output',
-                    ref=dict(cite=self._qualify(self.resolver.handle(version), role)),
-                    source_state='available', readable=True, producer_role=role, source_role=role, storage_role=role,
+                    ref=dict(cite=self._qualify(self.resolver.handle(version), namespace or role)),
+                    source_state='available', readable=True,
+                    producer_role=meta.get('producer_role') if namespace else role,
+                    source_role=meta.get('producer_role') if namespace else role,
+                    storage_role=None if namespace else role,
+                    **({key: meta[key] for key in ('workspace_namespace', 'collector_role') if key in meta} if namespace else {}),
                     sha256=row['content_hash'], content_ref=version, event_ref=row['event_id'],
                     capture=dict(layer=meta['layer'], source_truncated=meta.get('truncated'),
                                  reading_scope='unknown'))
@@ -415,12 +425,16 @@ class RelationQuery:
                         commit = None
                 if commit:
                     return dict(kind='file', ref=dict(cite=owner + ':' + evidence['path'] + '@' + commit),
-                                source_state='available', readable=True, producer_role=original.get('owner'),
-                                source_role=original.get('owner', owner), storage_role=owner,
+                                source_state='available', readable=True, producer_role=None if owner == 'shared' else original.get('owner'),
+                                source_role=None if owner == 'shared' else original.get('owner', owner),
+                                storage_role=None if owner == 'shared' else owner,
+                                **({'workspace_namespace': owner} if owner == 'shared' else {}),
                                 snapshot_source=deepcopy(original) or None, binding=deepcopy(binding),
                                 original_reference=deepcopy(evidence))
             return dict(kind='unknown', ref=dict(cite=cite_text(evidence)), source_state='unknown', readable=False,
-                        producer_role=None, source_role=original.get('owner', owner), storage_role=owner,
+                        producer_role=None, source_role=None if owner == 'shared' else original.get('owner', owner),
+                        storage_role=None if owner == 'shared' else owner,
+                        **({'workspace_namespace': owner} if owner == 'shared' else {}),
                         availability='exact_binding_unavailable',
                         reason='No saved exact Git commit; a weekly label was not rebound', binding=deepcopy(binding))
         if bound in self.captures and binding.get('status') == 'resolved' and binding.get('git_content_matches') is not False:
@@ -438,11 +452,14 @@ class RelationQuery:
             exact = evidence.get('version')
             return dict(kind='output', ref=dict(cite=self._qualify(exact, role) if exact else bound),
                         source_state='available', readable=False, producer_role=None,
-                        source_role=evidence.get('owner', role), storage_role=None, content_ref=bound,
+                        source_role=None if evidence.get('owner') == 'shared' else evidence.get('owner', role),
+                        storage_role=None, content_ref=bound,
+                        **({'workspace_namespace': 'shared'} if evidence.get('owner') == 'shared' else {}),
                         availability='saved_content_unavailable', reason='Exact saved binding remains; captured bytes are unavailable',
                         binding=deepcopy(binding))
         return dict(kind='unknown', ref=dict(cite=cite), source_state='unknown', readable=False,
-                    producer_role=None, source_role=evidence.get('owner', role), storage_role=None,
+                    producer_role=None, source_role=None if evidence.get('owner') == 'shared' else evidence.get('owner', role),
+                    storage_role=None, **({'workspace_namespace': 'shared'} if evidence.get('owner') == 'shared' else {}),
                     availability='exact_binding_unavailable', reason=binding.get('reason', 'No exact saved binding; reference was not rebound'),
                     binding=deepcopy(binding))
 
@@ -477,7 +494,8 @@ class RelationQuery:
         layer = meta['layer']
         if layer == 'file_bytes':
             if version.endswith('_after'):
-                return 'written_file'
+                return ('observed_file' if meta.get('workspace_namespace') and not meta.get('producer_role')
+                        else 'written_file')
             if version.endswith('_read'):
                 return 'read_file'
             return 'observed_file'
@@ -559,10 +577,17 @@ class RelationQuery:
         if history:
             self.validations['revision:' + item['relation_revision']] = dict(kind='revision', **history)
 
+    def _authorize_role(self, role):
+        if self.registry.identity:
+            from .role_policy import READABLE_ROLES
+            if role not in READABLE_ROLES[self.role]:
+                raise PublicPFPermissionError('Evidence is inaccessible')
+
     def _public_path(self, owner, path):
         self.registry.repository(owner)
+        from .public_records import private_framework_path
         parts = PurePosixPath(path).parts
-        if not parts or PurePosixPath(path).is_absolute() or '..' in parts or '.git' in parts or parts[0] == 'sessions' or '\x00' in path:
+        if private_framework_path(path) or not parts or PurePosixPath(path).is_absolute() or '..' in parts or '.git' in parts or parts[0] == 'sessions' or '\x00' in path:
             raise PublicPFPermissionError('Only public business files may be queried')
 
     def _git_bytes(self, owner, path, commit):
@@ -580,7 +605,7 @@ class RelationQuery:
         check()
         for role in (endpoint.get('source_role'), endpoint.get('producer_role'), endpoint.get('storage_role')):
             if role:
-                self.registry.repository(role)
+                self._authorize_role(role)
         if endpoint['source_state'] in ('missing', 'unknown'):
             return
         ref = endpoint['ref']
@@ -607,7 +632,7 @@ class RelationQuery:
                 id=record['id'], revision=record['revision'], sha256=_hash(record))
         elif match := GIT_REF.fullmatch(cite):
             owner, path, commit = match.groups()
-            owner = owner or self.role
+            owner = owner or getattr(self.registry, 'workspace_namespace', None) or self.role
             try:
                 raw = self._git_bytes(owner, path, commit)
                 digest = hashlib.sha256(raw).hexdigest()
@@ -646,7 +671,7 @@ class RelationQuery:
         for endpoint in [snapshot['root'], *(endpoint for item in snapshot['items'] for endpoint in (item['source'], item['target']) if endpoint)]:
             for role in (endpoint.get('source_role'), endpoint.get('producer_role'), endpoint.get('storage_role')):
                 if role:
-                    self.registry.repository(role)
+                    self._authorize_role(role)
         loaded = {}
         with closing(self.store.connect()) as conn:
             for validation in snapshot['validations']:

@@ -19,6 +19,8 @@ import time
 import traceback
 import uuid
 
+from .workspace_layout import FileKey, evidence_namespace
+
 FORMAT = 'ceobench.evidence-records.v1'
 
 PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registered_text',
@@ -82,6 +84,8 @@ class SQLEvidenceStore:
     def __init__(self, path, identity):
         self.path = Path(path).resolve()
         self.identity = identity
+        if identity.get('workspace_namespace') not in (None, 'shared'):
+            raise ValueError('Unsupported workspace namespace')
         for key in ('run_id', 'branch_id', 'data_source_id'):
             if not re.fullmatch(r'[A-Za-z0-9_-]+', identity.get(key, '')):
                 raise ValueError('Invalid evidence identity: ' + key)
@@ -124,7 +128,10 @@ class SQLEvidenceStore:
                 CREATE INDEX IF NOT EXISTS versions_event_id ON versions(event_id);
                 CREATE INDEX IF NOT EXISTS client_calls_event_id ON client_calls(event_id);
             ''')
-            source = encoded({k: identity[k] for k in ('run_id', 'data_source_id', 'format')})
+            source_identity = {k: identity[k] for k in ('run_id', 'data_source_id', 'format')}
+            if identity.get('workspace_namespace'):
+                source_identity['workspace_namespace'] = identity['workspace_namespace']
+            source = encoded(source_identity)
             existing = conn.execute('SELECT value FROM identity').fetchone()
             if existing and existing[0] != source:
                 raise ValueError('Evidence database identity mismatch')
@@ -277,12 +284,28 @@ class SQLEvidenceStore:
         with self._writer() as conn:
             self._visible(conn, event)
             owner = metadata.get('owner_role', self.identity.get('role', 'ceo'))
-            previous = self._latest(conn, object_id, owner=owner)[0] if object_id else None
+            namespace = self.identity.get('workspace_namespace') if layer in ('file_bytes', 'file_text') else None
+            if namespace:
+                metadata.pop('owner_role', None)
+                metadata['workspace_namespace'] = namespace
+                metadata['collector_role'] = self.identity.get('role', 'ceo')
+                if layer == 'file_text' and metadata.get('derived_from'):
+                    parent = conn.execute('SELECT metadata FROM versions WHERE version_id=?',
+                                          (metadata['derived_from'],)).fetchone()
+                    if parent is not None:
+                        source = json.loads(parent[0])
+                        object_id = source.get('object_id', object_id)
+                        for field in ('workspace_namespace', 'producer_role'):
+                            if field in source:
+                                metadata[field] = source[field]
+                FileKey(namespace, object_id)
+            previous = self._latest(conn, object_id, layer=layer if namespace else None, owner=namespace or owner)[0] if object_id else None
             record = dict(layer=layer, object_id=object_id, created_by_event=event, extent='full',
                           source_truncated=False, acquired_at=now(),
                           content_time={'status': 'unknown', 'reason': 'not_declared'})
             record.update(metadata)
-            record['owner_role'] = owner
+            if not namespace:
+                record['owner_role'] = owner
             conn.execute('INSERT OR IGNORE INTO blobs VALUES (?,?,?)', (sha, len(payload), payload))
             conn.execute('INSERT INTO versions VALUES (?,?,?,?,?)',
                          (version, event, previous, sha, encoded(record)))
@@ -296,7 +319,9 @@ class SQLEvidenceStore:
                                 (object_id, layer, layer)):
             try:
                 meta = json.loads(row['metadata'])
-                if self.identity.get('role') and meta.get('owner_role', self.identity['role']) != (owner or self.identity['role']):
+                scope = owner or (self.identity.get('workspace_namespace')
+                                  if meta['layer'] in ('file_bytes', 'file_text') else None) or self.identity.get('role')
+                if self.identity.get('role') and evidence_namespace(meta, self.identity['role']) != scope:
                     continue
                 self.authorize_version(conn, row['event_id'], meta)
                 return row['version_id'], row['content_hash']
@@ -641,7 +666,9 @@ class SQLEvidenceStore:
         request = json.loads(row[0])
         owner = meta.get('owner_role', request.get('role', request.get('author', 'ceo')))
         layer = meta['layer']
-        shared = layer in ('server_public_response', 'dashboard') or meta.get('public_observation') is True
+        shared = (layer in ('server_public_response', 'dashboard') or meta.get('public_observation') is True or
+                  layer in ('file_bytes', 'file_text') and meta.get('workspace_namespace') == 'shared' and
+                  self.identity.get('workspace_namespace') == 'shared')
         allowed = owner in READABLE_ROLES[self.identity['role']] or shared
         if layer not in PUBLIC_LAYERS:
             if graph and layer == 'comparison':

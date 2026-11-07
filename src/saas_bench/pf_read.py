@@ -141,7 +141,8 @@ def _literal_bases(store, source, available):
         key = evidence_key(version, meta, event['query_definition'], event['result'], event['request'].get('request'),
                            event['request'])
         if store.identity.get('role'):
-            key = (*key, meta.get('owner_role'))
+            from .workspace_layout import evidence_namespace
+            key = (*key, evidence_namespace(meta))
         available[version] = dict(text=text, key=list(key),
             chain=[dict(version=version, pointer=source['pointer'], range=[a, b])])
 

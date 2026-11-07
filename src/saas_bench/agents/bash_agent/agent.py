@@ -309,7 +309,8 @@ class BashAgent(BaseAgent):
     def _get_system_prompt_with_memory(self) -> str:
         """Read MEMORY.md once when building a new week's system prompt."""
         prompt = self.system_prompt
-        memory_path = self.workspace_path / 'MEMORY.md'
+        memory_name = getattr(self, 'memory_file', 'MEMORY.md')
+        memory_path = self.workspace_path / memory_name
         if not memory_path.resolve().is_relative_to(self.workspace_path.resolve()):
             raise ValueError('MEMORY.md must stay within the agent workspace')
         if memory_path.exists():
@@ -323,8 +324,8 @@ class BashAgent(BaseAgent):
                 memory_origin = memory_version = None
                 if self.evidence_store:
                     capture = ExecutionCapture(self.evidence_store)
-                    capture.begin('memory_read', {'path': 'MEMORY.md'})
-                    memory_version = capture.file('MEMORY.md', original_memory, memory_text)
+                    capture.begin('memory_read', {'path': memory_name})
+                    memory_version = capture.file(memory_name, original_memory, memory_text)
                     if memory_version and memory_content:
                         begin = len(memory_text) - len(memory_text.lstrip())
                         limit = self.memory_max_chars or len(memory_content)
@@ -342,7 +343,7 @@ class BashAgent(BaseAgent):
                     if getattr(self, 'history_enabled', False):
                         from saas_bench.registration_prompt import MEMORY_HEADER
                         history = self._memory_history(memory_version)
-                        prompt += MEMORY_HEADER + (history + '\n' if history else '') + '\n' + memory_content
+                        prompt += MEMORY_HEADER.replace('MEMORY.md', memory_name) + (history + '\n' if history else '') + '\n' + memory_content
                     else:
                         prompt += (
                             "\n\n## Your MEMORY.md (auto-loaded)\n\n"
@@ -365,8 +366,8 @@ class BashAgent(BaseAgent):
         Git the last weekly commit that changed the file."""
         from saas_bench import registration_prompt
         if self.pf:
-            return registration_prompt.pf_memory_line(self.evidence_store, version) if version else None
-        return registration_prompt.git_memory_line(self.workspace_path, run=getattr(self, 'git_run', None))
+            return registration_prompt.pf_memory_line(self.evidence_store, version, getattr(self, 'memory_file', 'MEMORY.md')) if version else None
+        return registration_prompt.git_memory_line(self.workspace_path, run=getattr(self, 'git_run', None), path=getattr(self, 'memory_file', 'MEMORY.md'))
 
     def _context_system_prompt(self) -> str:
         """Reuse the frozen prompt, including its private source ranges."""
