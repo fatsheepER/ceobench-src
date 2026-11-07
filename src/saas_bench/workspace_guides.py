@@ -69,7 +69,7 @@ The ledger travels with the world database through checkpoints. Restoring a chec
 
 PUBLIC_HISTORY = """# Saved business work
 
-Ordinary files, MEMORY.md, SQL, full handoffs, direct questions and automatic
+Ordinary files, MEMORY.md, SQL, messages, direct questions and automatic
 observation scripts remain available. The runtime supplies this workspace guide
 for the run's enabled history mode and capabilities at initialization and recovery.
 Use your system instructions for mode-specific commands.
@@ -81,7 +81,7 @@ def render_guides(mode, capabilities=None):
         raise ValueError('Workspace guides require git or pf mode')
     caps = AgentCapabilities.resolve(capabilities)
     history = '# Saved business work\n\n'
-    history += ('Use ordinary files, MEMORY.md, SQL, full handoffs, direct questions and '
+    history += ('Use ordinary files, MEMORY.md, SQL, messages, direct questions and '
                 'automatic observation scripts for business work.\n\n')
     if caps.text_tools:
         history += REGISTERED_TEXTS
@@ -105,8 +105,11 @@ def write_guides(workspace, mode, capabilities=None, *, shared=False):
     for name, content in render_guides(mode, capabilities).items():
         if shared:
             from .registration_prompt import shared_workspace_history
+            from .workspace_layout import shared_work_instructions
             content = shared_workspace_history(content).replace('MEMORY.md', 'memory/ROLE.md')
             content += '\nAll roles share /workspace. Ordinary business files are writable by every role. Docs, the client and documents/ projections are managed read-only material. Shared Git commits save the public tree, not sole authorship by the role named in a handoff.\n'
+            if name == 'workspace-history.md':
+                content += '\n' + shared_work_instructions()
 
         with parent_fd(workspace, workspace / 'docs' / name, create=True) as (directory, target):
             temporary = '.workspace-guide-' + uuid.uuid4().hex
@@ -131,3 +134,7 @@ def build_guides(directory):
     directory = Path(directory)
     (directory / 'workspace-history.md').write_text(PUBLIC_HISTORY)
     (directory / 'business-ledger.md').write_text(BUSINESS_LEDGER)
+    from .workspace_layout import shared_work_instructions
+    (directory / 'shared-workspace.md').write_text('# Shared business workspace\n\n'
+        'This guide applies only to shared-v1 teams. Other layouts use the workspace and memory paths in their system instructions.\n\n'
+        + shared_work_instructions())

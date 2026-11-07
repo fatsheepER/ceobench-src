@@ -18,9 +18,9 @@ OPS_WRITES = {'set_model_tiers', 'set_daily_spend', 'set_capacity_tier',
               'set_usage_quotas', 'set_targeted_ops_spend', 'set_targeted_dev_spend'}
 
 
-def shared_team(mode, label):
+def shared_team(mode, label, **options):
     return make_team(mode, lambda *args: final('unused'), label,
-                     workspace_layout='shared-v1', capabilities=AgentCapabilities.round_three(mode))
+                     workspace_layout='shared-v1', capabilities=AgentCapabilities.round_three(mode), **options)
 
 
 def bash(runtime, command):
@@ -33,11 +33,11 @@ def write(runtime, path, content):
     return result
 
 
-@pytest.mark.parametrize('mode', ['git', 'pf'])
+@pytest.mark.parametrize('mode,protocol', [('git', 'direct-v1'), ('pf', 'direct-v1'), ('pf', 'snapshot-v1')])
 @pytest.mark.parametrize('gateway', ['http', 'sdk', 'cli', 'bash-child'])
-def test_shared_directory_keeps_responsibility_and_socket_identity(mode, gateway):
+def test_shared_directory_keeps_responsibility_and_socket_identity(mode, protocol, gateway):
     for role in ('growth', 'ops_finance', 'ceo'):
-        with shared_team(mode, 'shared-authority-' + gateway + '-' + role) as team:
+        with shared_team(mode, 'shared-authority-' + gateway + '-' + role, workspace_protocol=protocol) as team:
             prepare(team)
             team._set_phase('ceo' if role == 'ceo' else 'analysis')
             allowed = set(ACTIONS) if role == 'ceo' else READS | (GROWTH_WRITES if role == 'growth' else OPS_WRITES)

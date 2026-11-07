@@ -199,10 +199,13 @@ class MultiAgentRuntime:
                     shutil.copytree(public / 'docs', workspace / 'docs')
                     shutil.copy2(public / 'novamind-client', workspace / 'novamind-operation')
                     if self.shared_workspace:
+                        from .workspace_layout import SHARED_PLANS
                         for directory in ('memory', 'scripts', 'plans', 'data', 'outputs', 'documents'):
                             (workspace / directory).mkdir()
                         for actor in ROLES:
                             (workspace / 'memory' / (actor + '.md')).write_text('')
+                        for path, plan in SHARED_PLANS.items():
+                            (workspace / path).write_text(plan.template())
                     else:
                         (workspace / 'MEMORY.md').write_text('')
                 from .workspace_guides import write_guides
@@ -224,7 +227,8 @@ class MultiAgentRuntime:
                 workspace_namespace='shared' if self.shared_workspace else None)
             registry.public_refs = self.public_refs
             env = dict(NOVAMIND_API_PORT='1', NOVAMIND_API_SOCKET='/run/novamind-api/api.sock',
-                       PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(workspace / 'docs'))
+                       PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1',
+                       PYTHONPATH='/workspace/docs' if self.shared_workspace else str(workspace / 'docs'))
             executor_options = dict(workspace_path=workspace, identity=identity, env=env,
                 require_sandbox=True, evidence_store=store, audit=audit, api_socket=sockets[role], private_root=role_private,
                 public_refs=self.public_refs, workspace_layout=workspace_layout,
@@ -706,6 +710,10 @@ class MultiAgentRuntime:
 
     def _role_input(self, role, observation, *, day):
         runtime = self.roles[role]
+        if role in ('ceo', 'ops_finance') and runtime.week is not None and not runtime.week.initialized:
+            review = self._week.get('forecast_review', '')
+            if review:
+                observation = join_text(observation, '\n\n', review)
         publication = getattr(self, 'workspace_publication', None)
         if publication:
             reminder = publication.week_reminder(role, day)
@@ -1198,6 +1206,9 @@ class MultiAgentRuntime:
                 self._rotate_sessions()
                 self._week = dict(observation=join_text(self.server.public_dashboard(), '\n\n', CEO_OPENING.replace('MEMORY.md', getattr(self.roles['ceo'].agent, 'memory_file', 'MEMORY.md'))),
                     ceo_started=False)
+                if self.shared_workspace:
+                    from .scoring import due_forecast_summary
+                    self._week['forecast_review'] = due_forecast_summary(self.server.conn, day)
                 self._stage = 'ceo_opening'
                 self._set_phase('ceo_opening')
             if self._stage == 'ceo_opening':

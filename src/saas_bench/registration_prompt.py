@@ -6,13 +6,9 @@ original prompt, so a change to the original template fails loudly instead of si
 dropping an edit. The original group never passes through here.
 """
 
-RELATIONS = '''Use full handoffs and focused questions to coordinate work. When a shared setting
+RELATIONS = '''Use messages and focused questions to coordinate work. When a shared setting
 may be changed by more than one role, agree who will make the final change and
 check its current value before replacing it. Your normal write permissions remain.
-
-In your handoff, distinguish actions actually completed, proposals, withdrawals,
-observed facts and estimates. Give the relevant day, coverage, units, assumptions,
-locatable evidence and unresolved questions. Brief free prose is enough.
 
 Register sources selectively for important judgments, files or actions that will
 be reused or handed off. Use escalate for several targets at once. Known

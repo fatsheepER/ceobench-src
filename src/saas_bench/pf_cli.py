@@ -393,6 +393,10 @@ WORKSPACE_HELP = """
 PF workspace (snapshot-v1):
 Each tool starts from the latest published files; its tree stays stable while running.
 Your drafts stay private. Reading new files does not confirm a comparison base.
+Clean paths refresh silently; this sends no file changes to you or other roles.
+Edits publish automatically unless version confirmation or conflict handling is needed.
+Submission receipts report versions and the result. Draft receipts distinguish VERSION CHANGED
+from a text conflict and include a short diff. A truncated diff includes a full reading command.
   pf workspace status
   pf workspace resolve DRAFT@REVISION [--full]
   pf workspace resolve DRAFT@REVISION --against PUBLISHED_HEAD
@@ -407,4 +411,7 @@ File conflicts never undo successful business calls. Do not repeat business call
 When Bash mixes file work and next-week, finish the Bash first, then run only:
   ./novamind-operation next-week RATIONALE <12 prediction values>
 No automatic broadcast is sent to other roles.
+Automatic registered scripts use their saved code with the public files at each run's
+start. Those files stay stable during that run; old failed drafts are separate.
+Re-register to change saved code. Queries and source declarations remain optional.
 """

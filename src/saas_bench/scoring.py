@@ -19,6 +19,28 @@ def cash_at_advance(conn, day):
                         (day, day, *WEEK_START_PURCHASES)).fetchone()[0]
 
 
+def due_cash_forecasts(conn, day):
+    rows = [dict(prediction, target_day=day) for prediction in get_predictions(conn)
+            if prediction['horizon_days'] in (7, 28) and prediction['submit_day'] + prediction['horizon_days'] == day]
+    if rows:
+        actual = cash_at_advance(conn, day)
+        for row in rows:
+            row['actual_cash'] = actual
+    return rows
+
+
+def due_forecast_summary(conn, day):
+    rows = due_cash_forecasts(conn, day)
+    if not rows:
+        return ''
+    fields = ('submit_day', 'target_day', 'horizon_days', 'predicted_value',
+              'predicted_lower', 'predicted_upper', 'actual_cash')
+    lines = ['Due CEO cash forecasts (USD; actual at completed advance, before new-week purchases)',
+             ' | '.join(fields)]
+    lines.extend(' | '.join('missing' if row[key] is None else str(row[key]) for key in fields) for row in rows)
+    return '\n'.join(lines)
+
+
 def interval_score(lower, upper, actual):
     if not all(math.isfinite(v) for v in (lower, upper, actual)) or lower > upper:
         raise ValueError('Finite ordered interval and actual cash are required')

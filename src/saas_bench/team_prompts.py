@@ -14,25 +14,41 @@ operations and development spending. Execute capacity, model tiers, quotas, and 
 Provide a financial baseline under current settings, constraints and risks. Keep MRR separate from actual cash receipts.
 Forecast cash in USD at +7, +28, +84 and +182 days, each with a point estimate and
 95% lower and upper bounds, 12 numbers in horizon order with lower <= point <= upper.
+You may save the forecasts in a shared file; your message need not repeat the numbers.
 State assumptions and revise the baseline when the CEO supplies candidate actions.
 Read Growth's saved work when useful; concurrent work may still be changing.''',
 }
 
+WEEKLY_MESSAGE = '''Finish your weekly work with a message to the CEO in your final response.
+Choose its content, length and format. You may share details directly,
+refer to shared files and evidence, or use both.'''
+
 WEEKLY_TASKS = {
     'growth': 'Assess this week\'s commercial changes by group and channel, including pending enterprise deals. '
               'Give the CEO actionable growth recommendations, their resource needs and supporting evidence. '
-              'Report actions taken, returned results and remaining recommendations. Keep unchanged findings brief.',
+              + WEEKLY_MESSAGE,
     'ops_finance': 'Assess this week\'s cash flows, costs, capacity and quality. Give the CEO constraints, risks '
                    'and a baseline under current settings, with 12 USD cash forecast numbers for +7, +28, +84 '
-                   'and +182 days. Report actions taken, returned results and remaining recommendations. Keep unchanged findings brief.',
+                   'and +182 days. You may save those numbers in a shared file. ' + WEEKLY_MESSAGE,
 }
+
+FORECAST_REVIEW = '''Review the due +7 and +28 day cash forecasts in plans/cash.md.
+Keep the analyst baseline and its exact file source separate from the CEO's final
+submission in predictions. Mark a missing baseline as missing. Record submit day,
+target day, horizon, point and interval, actual cash in USD, point error, interval
+coverage and width. Compare the original assumptions with confirmed operations
+and later changes. Revise the affected plans or scripts and note remaining gaps.
+Use actual cash at the completed target-day advance, before new-week purchases.
+Find earlier assumptions through files, history, SQL or questions when needed.
+Longer forecasts remain pending until due. No review task runs after the endpoint.
+'''
 
 CEO_OPENING = '''Open this week with goals, constraints and priority questions for Growth and OpsFinance.
 Use the prior week's results, your MEMORY.md and current cash and settings. Ask focused questions if needed.
 Finish with your directions in final text. Registered scripts and the analysts' weekly work run afterward.
 Do not advance time during opening.'''
 
-CEO_CLOSING = '''Continue your opening conversation with the updated dashboard and both full analyst handoffs below.
+CEO_CLOSING = '''Continue your opening conversation with the updated dashboard and both analyst messages below.
 Resolve material gaps or disagreements, coordinate final actions and cash forecasts, then advance through next-week.'''
 
 REGISTERED_SCRIPT_CONTRACT = '''## Automatic registered scripts
@@ -48,7 +64,7 @@ Registration freezes the Python source, not adjacent data or imported modules.
 Registry names are paths relative to your workspace; older filename-only names
 refer to the workspace root. Execution keeps that root as cwd. __file__ and
 sys.argv[0] name a temporary snapshot file beside the registered path. Its basename
-can change between runs. Use its parent for adjacent files; those files stay live.
+can change between runs. Use its parent for adjacent files. File inputs follow your workspace mode.
 Editing the original source does not update the snapshot. Re-register to replace
 it and use the name returned by the receipt to list or remove it.
 '''
@@ -63,11 +79,7 @@ def with_registered_script_contract(prompt):
     return prompt if REGISTERED_SCRIPT_CONTRACT in prompt else prompt + '\n' + REGISTERED_SCRIPT_CONTRACT
 
 
-HANDOFF = '''For conclusions that affect a decision, distinguish observed facts from estimates.
-Include data coverage and units, assumptions, specific recommendations and their
-conditions, locatable supporting evidence, and missing information. Use concise
-free prose. A brief update is enough when nothing material changes.
-Save reusable scripts, results and MEMORY.md. Register only judgments you expect
+HANDOFF = '''Save reusable scripts, results and MEMORY.md. Register only judgments you expect
 to rely on later, not every temporary number. Share registered texts as exact
 role-qualified versions such as growth:r16.1. Bare r16 is local; growth:r16 is
 the latest revision. Keep local IDs for text_revise and text_retire.
@@ -175,10 +187,10 @@ Open each week with goals, constraints and priority questions using the previous
 week's results, your MEMORY.md and current cash and settings. Give directions in
 final text; do not advance yet. Registered scripts then run and Growth and OpsFinance
 complete their weekly work in parallel. Continue this same conversation to close
-the week with their full handoffs and an updated dashboard. Use their existing
+the week with their messages and an updated dashboard. Use their existing
 evidence where it supports the decision. For a specific gap, open the evidence,
 ask the responsible analyst, or verify it yourself. Avoid repeating a full
-investigation already covered by the handoffs. Independent public queries,
+investigation already covered by their work. Independent public queries,
 scripts and the history tools for your mode remain available for uncovered issues,
 material conflicts, necessary calculations and checks around execution.
 Coordinate recommendations and resources, choose and execute business actions,
@@ -231,7 +243,6 @@ re-register after editing.
 Scripts run in insertion order, must import novamind_api explicitly, and deliver
 printed output only to their owner. Each role gets one automatic batch per week, even when its registry is empty.
 Registration after that batch starts takes effect next week. Questions and wakeups do not rerun scripts.
-Return actions taken, their results and remaining advice in final text when finished.
 
 Use text_create, text_revise, text_retire and text_list for lasting judgments.
 Records persist but are not auto-loaded; keep useful references in MEMORY.md.
@@ -313,6 +324,7 @@ requests, finish the current batch and answer them before retrying advancement.
         history = history.replace(registration_prompt.GIT_CALL_NOTES, '')
     prompt = with_registered_script_contract(prompt + handoff + '\n' + history)
     if shared:
+        from .workspace_layout import shared_work_instructions
         prompt = registration_prompt.shared_workspace_history(prompt)
         prompt = prompt.replace('MEMORY.md', 'memory/' + role + '.md')
         prompt = prompt.replace('Write only your own workspace.', 'All roles may write ordinary files in the shared workspace.')
@@ -325,4 +337,7 @@ ad strength and social posts. OpsFinance and CEO can set model tiers, capacity,
 quotas and operations/development spending."""
         prompt = prompt.replace(old, new)
         prompt += "\n/workspace is one shared business directory. Anyone may edit scripts/, plans/, data/, outputs/ and memory/. Only memory/" + role + ".md is auto-loaded for you. docs/, novamind-operation and documents/ are managed read-only material. A shared Git snapshot contains the public tree at that time; it does not attribute all files to the sender.\n"
+        prompt += '\n' + shared_work_instructions()
+        if role == 'ops_finance':
+            prompt += '\n' + FORECAST_REVIEW
     return prompt
