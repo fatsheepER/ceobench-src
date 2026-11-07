@@ -257,6 +257,28 @@ def _worker(spec_path, argv):
         write_json(spec['proof'], proof)
 
 
+def _request_sample(row):
+    body = row['body']
+    if 'messages' in body:
+        messages = body['messages']
+    else:
+        messages = [dict(role='system', content=body['instructions'])] if 'instructions' in body else []
+        for item in body['input']:
+            if 'role' in item:
+                messages.append(item)
+            elif item['type'] == 'function_call':
+                messages.append(dict(role='assistant', name=item['name'], content=item['arguments']))
+            elif item['type'] == 'function_call_output':
+                messages.append(dict(role='tool', content=item['output']))
+            elif item['type'] != 'reasoning':
+                raise AssertionError(f"Unsupported Responses input item: {item['type']}")
+    content = json.dumps(messages)
+    return dict(role=row['role'], day=row['day'], phase=row['phase'],
+                message_roles=[message['role'] for message in messages],
+                script_marker_count=content.count('SAVED-SCRIPT-' + row['role']),
+                opening_answer_count=content.count('SAVED-OPENING-ANSWER'))
+
+
 class Driver:
     def __init__(self, frozen, root, monkeypatch, *, worker_options=None, budget_seconds=240):
         self.frozen, self.root, self.monkeypatch = frozen, root, monkeypatch
@@ -387,11 +409,7 @@ class Driver:
                 workers = []
                 for proof in sample['workers']:
                     workers.append({key: value for key, value in proof.items() if key != 'wire'} | dict(
-                        requests=[dict(role=row['role'], day=row['day'], phase=row['phase'],
-                            message_roles=[message['role'] for message in row['body']['messages']],
-                            script_marker_count=json.dumps(row['body']['messages']).count('SAVED-SCRIPT-' + row['role']),
-                            opening_answer_count=json.dumps(row['body']['messages']).count('SAVED-OPENING-ANSWER'))
-                            for row in proof['wire']]))
+                        requests=[_request_sample(row) for row in proof['wire']]))
                 samples.append(dict(sample, workers=workers))
             write_json(Path(destination) / (self.root.name + '.json'), dict(invocations=samples,
                        children_reaped=all(child.returncode is not None for child, _ in self.children),
