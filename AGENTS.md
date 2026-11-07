@@ -61,6 +61,7 @@
 - 第五轮 A18–A20 发布静止点、必要权威与对象闭包、真实 driver 发布阶段杀进程/断连、controller 发布锁等待 STOP、含草稿/确认/脚本源码的历史选点恢复、已成功 API/脚本零重放、缺失发布权威零模型请求 HOLD，从 `tests/test_round5_checkpoint.py`、`tests/round5_checkpoint_fixture.py` 和 `tests/test_checkpoint_driver.py` 定位。
 - 第五轮 A21 精确发布事件、跨调用比较基底、同内容回退来源、当前/历史/依赖与旧 namespace、私有候选事件及历史元数据隔离、真实 ModelUsage 作者来源绑定，从 `tests/test_round5_sources.py` 定位；私有原文与公共读取同请求的发送/记录继续从 `tests/test_round5_checkpoint.py` 定位。
 - 第五轮 A01/A07/A22/A23 的共同主文件空模板、两组三角色首次/恢复/问答 ModelUsage、普通消息原样投递与文件内预测、+7/+28 到期现金摘要、问答及交接检查点的摘要去重、D56 零请求/脚本，从 `tests/test_round5_prompts.py` 定位；PF 快照中的 HTTP/SDK/CLI/Bash 子进程职责权限从 `tests/test_shared_identity.py` 定位。
+- 第五轮 A20/A23/A26 四条 shared-v1 D56 主批、真实启动包装与零请求预检、实际执行源码/SDK/tokenizer 漂移拒绝、D28 全量保留和人工选点恢复、D56 零新增请求/脚本、独立 STOP/HOLD 与组队列，从 `tests/test_round5_batch.py`、`tests/round5_batch_fixture.py` 定位；保留/waste/pending/未知归属的分角色 tokens、费用和耗时表从 `tests/test_round5_results.py`、`tests/test_checkpoint_usage_gaps.py`、`tests/test_recovery_waste.py` 定位。
 - 第五轮 A26 永久额度拒绝 `GoUsageLimitError` 的真实模型回执、controller HOLD、资源关闭与人工选点恢复从 `tests/test_round4_models.py` 定位；普通限流、持续重试和独立 STOP 仍从 `tests/test_model_recovery_retry.py`、`tests/test_continuous_run.py`、`tests/test_continuous_stop.py` 定位。
 - 第四轮按能力的提示、PF help、跨角色精确来源示例、空反向查询，以及三角色首次/恢复的公开资料与定向研发公式回执从 `tests/test_round4_guidance.py` 定位；旧能力提示与外层 Bash 捕获仍从 `tests/test_round3_prompts.py`、`tests/test_pf_capture_guidance.py` 定位。
 - CEO 周初开场、同会话收尾、开场追问、脚本顺序、更新看板与全文交接一次投递，以及开场追问和交接就绪检查点恢复从 `tests/test_ceo_weekly_opening.py` 定位。

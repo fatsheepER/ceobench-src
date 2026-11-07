@@ -41,8 +41,14 @@ def round_four_models(profile, pricing):
             contract=dict(source='https://developers.openai.com/api/docs/models/gpt-6.1-sol',
                 verification='official_responses_contract', live_verified=False),
             store=False, include=['reasoning.encrypted_content'])
+    elif profile == 'r5-d56':
+        for config in (agent, simulator):
+            config['base_url'] = 'https://opencode.ai/inference/go/openai/v1/'
+            config['contract'] = dict(source='https://opencode.ai/docs/console/go/',
+                parameter_source='https://api-docs.deepseek.com/guides/thinking_mode/',
+                verification='documented_route_offline_request_contract', live_verified=False)
     elif profile != 'r4-d56':
-        raise ValueError('Unknown round-four model profile')
+        raise ValueError('Unknown explicit model profile')
     return dict(agent=agent, simulator=simulator)
 
 

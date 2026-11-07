@@ -36,6 +36,7 @@ from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
 from .team_models import ROUND_FOUR_PROFILES, round_four_models, validate_profile_models
+from .team_round5 import PROFILE as ROUND_FIVE_PROFILE
 from .team_checkpoint import CheckpointDataError, retention_lock
 from .run_lifecycle import BusinessOutcomeUnknown
 from .run_warnings import AttemptWarnings, advisory, optional_hash
@@ -72,14 +73,16 @@ BATCH_PROFILES = {
     'r2-git-exploration': BatchProfile('formal', (2,), 1, ('git',), 56),
     'r2-paired-pilot': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r3-d70': BatchProfile('formal', (2,), 1, ('git', 'pf'), 70),
+    'r5-d56': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r4-d56': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r4-flash-max-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
     'r4-sol-high-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
 }
 ROUND_TWO_PROFILES = ('r2-git-exploration', 'r2-paired-pilot')
 ROUND_THREE_PROFILE = 'r3-d70'
-EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES)
-FIXED_PROFILES = (ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES)
+EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES, ROUND_FIVE_PROFILE)
+EXPLICIT_MODEL_PROFILES = (*ROUND_FOUR_PROFILES, ROUND_FIVE_PROFILE)
+FIXED_PROFILES = (ROUND_THREE_PROFILE, *EXPLICIT_MODEL_PROFILES)
 ROUND_THREE_SEEDS = (1048, 1049)
 
 
@@ -336,6 +339,8 @@ def make_team(manifest, entry, root, *, client_factory=None, simulator_factory=N
             public_refs_path=Path(entry['output_dir']) / 'private' / 'public-refs.sqlite',
             model=config.agent_llm_model, reasoning_effort=config.agent_llm_reasoning_effort, total_days=500,
             model_configs=models,
+            **{key: entry['workspace_contract'][key] for key in ('workspace_layout', 'workspace_protocol')
+               if 'workspace_contract' in entry},
             capabilities=entry.get('capabilities', manifest['parameters'].get('capabilities', {}).get(entry['group'])),
             model_pricing=manifest['pricing'], token_counter=token_counter,
             **(analyst_bash_settings(manifest) | explicit_bash_settings()))
@@ -407,10 +412,10 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if category == 'engineering' and seeds != [42]:
         raise ValueError('D28 engineering verification uses seed 42')
     check_prices(prices, price_source)
-    if profile in ROUND_FOUR_PROFILES:
+    if profile in EXPLICIT_MODEL_PROFILES:
         model_configs = validate_profile_models(profile, model_configs or round_four_models(profile, prices), prices)
     elif model_configs is not None:
-        raise ValueError('Explicit model configurations require a round-four profile')
+        raise ValueError('Explicit model configurations require an explicit-model profile')
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
     d0 = {str(seed): verify_d0(path, seed=seed) for seed, path in d0_sources.items()}
     destination.mkdir(parents=True, exist_ok=False)
@@ -437,6 +442,14 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
                                       for group in layout.groups}
         for entry in runs:
             entry['capabilities'] = parameters['capabilities'][entry['group']]
+    if profile == ROUND_FIVE_PROFILE:
+        from .team_round5 import workspace_contract, retention_contract
+        parameters['workspace_contracts'] = {group: workspace_contract(group) for group in layout.groups}
+        parameters['checkpoint_retention'] = retention_contract()
+        from .runtime_options import runtime_environment_snapshot
+        parameters['runtime_limits'] = runtime_environment_snapshot()
+        for entry in runs:
+            entry['workspace_contract'] = parameters['workspace_contracts'][entry['group']]
     if model_configs:
         parameters['model_configs'] = canonical(model_configs)
         agent = model_configs['agent']
@@ -446,8 +459,9 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
         for entry in runs:
             entry['comparison_role'] = 'exploration' if profile in ROUND_FOUR_PROFILES[1:] else 'paired'
     controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
-    if profile in ROUND_FOUR_PROFILES:
-        controllers = (*controllers, 'scripts/round4.py')
+    if profile in EXPLICIT_MODEL_PROFILES:
+        launcher = 'scripts/round5_main.py' if profile == ROUND_FIVE_PROFILE else 'scripts/round4.py'
+        controllers = (*controllers, launcher)
         from importlib.metadata import version
         parameters['openai_sdk_version'] = version('openai')
     manifest = dict(version=1, category=category, batch_id=batch_id, seeds=seeds,
@@ -524,6 +538,9 @@ def validate_manifest(path):
                 logging.warning('Third-round model parameters or capabilities mismatch')
             if any(row.get('capabilities') != expected_capabilities.get(row['group']) for row in manifest['runs']):
                 logging.warning('Third-round run capabilities mismatch')
+        if profile == ROUND_FIVE_PROFILE:
+            from .team_round5 import validate_contract
+            validate_contract(manifest)
         if profile in ROUND_FOUR_PROFILES:
             validate_profile_models(profile, manifest['parameters']['model_configs'], manifest['pricing'])
             expected_seeds = [1048] if profile in ROUND_FOUR_PROFILES[1:] else [1048, 1049]
@@ -1220,6 +1237,9 @@ def summarize(path, resource_paths=None):
         row.update(wall_time(history))
         usage, waste = run_usage(entry, manifest['pricing'])
         row.update(usage=usage, waste=waste, pending=usage['pending'])
+        if manifest.get('profile') == ROUND_FIVE_PROFILE:
+            from .team_round5 import retained_d28
+            row['d28_retention'] = retained_d28(entry)
         rows.append(row)
         for category, paths in usage['retained_logs'].items():
             categorized[category].extend(Path(value) for value in paths)

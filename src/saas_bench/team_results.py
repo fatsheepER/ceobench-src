@@ -1,10 +1,12 @@
 """Offline team outcomes and paired comparisons with explicit missing values."""
 
 from .database import get_cash
+from .model_usage import FIELDS
+from .role_policy import ROLES
 from .scoring import score_predictions
 
 
-PRIMARY_METRICS = ('input_tokens', 'output_tokens', 'total_tokens', 'uniform_cost_usd', 'wall_seconds')
+PRIMARY_METRICS = (*FIELDS, 'total_tokens', 'uniform_cost_usd', 'wall_seconds')
 
 
 def summarize_run(conn, *, run_id, group, seed, repeat, day, reason, usage,
@@ -30,6 +32,33 @@ def summarize_run(conn, *, run_id, group, seed, repeat, day, reason, usage,
         cash_at_advance=last_week_result.cash if last_week_result is not None else None,
         mrr=last_week_result.mrr if last_week_result is not None else None, wall_seconds=wall_seconds,
         usage=usage, predictions=predictions, unexpired_predictions=unexpired)
+
+
+def usage_table(runs):
+    """One accounting scope per row; unknown totals stay separate from known subtotals."""
+    from .team_usage import METRICS
+    rows = []
+    for run in runs:
+        for scope, field, timing in (('retained', 'usage', ''), ('waste', 'waste', 'waste_'),
+                                     ('pending', 'pending', 'pending_'),
+                                     ('unclassified', 'unclassified', 'unclassified_')):
+            usage = ((run.get('usage') or {}).get('unclassified') if scope == 'unclassified' else run.get(field)) or {}
+            for role in ('team', *ROLES, 'simulator'):
+                summary = (usage.get('team', {}) if role == 'team' else
+                           usage.get('resources', {}).get('simulator', {}) if role == 'simulator' else
+                           usage.get('roles', {}).get(role, {}))
+                rows.append(dict(seed=run['seed'], repeat=run['repeat'], group=run['group'],
+                    run_id=run['run_id'], scope=scope, role=role, classification_status=usage.get('status'),
+                    **{metric: summary.get('complete', {}).get(metric) for metric in METRICS},
+                    known={metric: summary.get('known', {}).get(metric) for metric in METRICS},
+                    missing={metric: summary.get('missing', {}).get(metric) for metric in METRICS},
+                    model_wall_seconds=summary.get('wall_seconds'),
+                    model_wall_seconds_known=summary.get('wall_seconds_known'),
+                    model_wall_seconds_missing_calls=summary.get('wall_seconds_missing_calls'),
+                    group_wall_seconds=run.get(timing + 'wall_seconds') if role == 'team' else None,
+                    group_wall_seconds_known=run.get(timing + 'wall_seconds_known') if role == 'team' else None,
+                    costs=summary.get('costs')))
+    return rows
 
 
 def summarize_pairs(runs):
@@ -78,7 +107,7 @@ def summarize_pairs(runs):
                 usage=run.get('waste')) for group, run in pair.items()},
             common_completed_week_end=common_day,
             comparison=comparison, missing_groups=[g for g in ('git', 'pf') if g not in pair]))
-    return dict(runs=runs, pairs=pairs, allocated_runs=len(runs), complete_d112_pairs=sum(p['complete_d112'] for p in pairs),
+    return dict(runs=runs, pairs=pairs, usage_table=usage_table(runs), allocated_runs=len(runs), complete_d112_pairs=sum(p['complete_d112'] for p in pairs),
         complete_observation_pairs=sum(p['complete_observation'] for p in pairs),
         status_counts={status: sum(r['status'] == status for r in runs) for status in sorted({r['status'] for r in runs})},
         by_seed={str(seed): [p for p in pairs if p['seed'] == seed] for seed in sorted({key[0] for key in indexed})})

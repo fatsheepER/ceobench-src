@@ -58,6 +58,10 @@ def _main(argv, warnings):
     if args.run_id is not None:
         manifest = dict(manifest, runs=[batch.selected(manifest, args.run_id)])
     if args.check:
+        contract = {}
+        if manifest.get('profile') == batch.ROUND_FIVE_PROFILE:
+            from saas_bench.team_round5 import check_launch
+            contract = dict(contract_check=check_launch(args.policy, driver_path=__file__))
         print(json.dumps(dict(status='validated', batch_id=manifest['batch_id'],
             scheduling='group_independent', profile=manifest.get('profile'),
             runs=[row['run_id'] for row in manifest['runs']], assignments=manifest['runs'],
@@ -65,7 +69,7 @@ def _main(argv, warnings):
             runtime_limits=runtime_environment(args),
             model_configs=manifest['parameters'].get('model_configs'),
             tokenizer=manifest.get('tokenizer'), source_commit=manifest.get('source_commit'),
-            model_requests=0, credential_read=False, new_attempts=0)))
+            model_requests=0, business_operations=0, credential_read=False, new_attempts=0, **contract)))
         return 0
     directory = args.policy.resolve().parent
     outcome = 2
