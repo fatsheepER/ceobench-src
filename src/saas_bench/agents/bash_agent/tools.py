@@ -5,6 +5,7 @@ and file manipulation (read, write, edit, search, glob).
 """
 
 import fnmatch
+from contextlib import ExitStack
 import hashlib
 import json
 import logging
@@ -387,6 +388,11 @@ class BashAgentToolExecutor:
         self.shared_workspace = workspace_layout == SHARED
         self.observer = None
         self.workspace_publication = None
+        self.workspace_day = lambda: 0
+        self.workspace_private_output = False
+        self.registered_source = None
+        self.workspace_publication_error = None
+        self.workspace_advance_only = False
         self.workspace_execution = None
         self.audit = audit
         self.identity = identity
@@ -486,11 +492,24 @@ class BashAgentToolExecutor:
             from saas_bench.execution_capture import CURRENT_EVENT
             outer_event = CURRENT_EVENT.set(None)
             original_workspace, original_peers = self.workspace_path, self.readable_workspaces
+            self.workspace_resources = ExitStack()
             try:
                 return self._execute(tool_name, args, model_request_event=model_request_event, model_context_id=model_context_id, tool_call_id=tool_call_id)
             except BaseException as exc:
+                from saas_bench.api_server import RegisteredScriptPreparationError
+                from saas_bench.workspace_publication import PublicationHold
+                if isinstance(exc, RegisteredScriptPreparationError) and self.workspace_execution:
+                    try:
+                        self.workspace_publication.finish(self.workspace_execution, status='failed',
+                            closure=dict(self._bash_facts), store=self.evidence_store)
+                    except Exception as failure:
+                        exc = PublicationHold(str(failure))
+                        if self.evidence_store:
+                            self.evidence_store.fail(exc)
+                        if lifecycle:
+                            lifecycle.cancel('workspace_publication_unknown')
+                        raise exc from failure
                 if self.workspace_publication:
-                    from saas_bench.workspace_publication import PublicationHold
                     if isinstance(exc, PublicationHold):
                         self.last_status = 'result_unknown'
                         if lifecycle:
@@ -499,11 +518,26 @@ class BashAgentToolExecutor:
                             self.evidence_store.fail(str(exc))
                 raise
             finally:
+                self.workspace_resources.close()
                 self.workspace_path, self.readable_workspaces = original_workspace, original_peers
                 self.workspace_execution = None
+                self.workspace_advance_only = False
                 CURRENT_EVENT.reset(outer_event)
                 if self.observer:
                     self.observer.finish(self, observation)
+
+    def standalone_advance(self, command):
+        import shlex
+        if any(c in command for c in '$`\n'):
+            return False
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
+            lexer.whitespace_split = True
+            words = list(lexer)
+        except ValueError:
+            return False
+        return (len(words) == 15 and words[0] in ('./novamind-operation', '/workspace/novamind-operation')
+                and words[1] == 'next-week' and not any(all(c in ';&|<>()' for c in word) for word in words))
 
     def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None, tool_call_id=None):
         disabled = None
@@ -558,10 +592,19 @@ class BashAgentToolExecutor:
             return f"Error: Unknown tool '{tool_name}'"
         if self.evidence_store:
             self.evidence_store.assert_healthy(quiescent=False)
+        self.workspace_advance_only = tool_name == 'bash' and self.standalone_advance(args.get('command', ''))
         if self.workspace_publication:
-            self.workspace_execution = self.workspace_publication.begin(self.role, store=self.evidence_store)
+            self.workspace_private_output = False
+            self.workspace_execution = self.workspace_publication.begin(self.role, store=self.evidence_store,
+                automatic=getattr(self, 'registered_execution', False), inspect_git=True)
             self.workspace_path = self.workspace_execution.root
             self.readable_workspaces = ()
+        if self.registered_source:
+            from saas_bench.api_server import registered_script_source
+            import shlex
+            source = self.workspace_resources.enter_context(registered_script_source(self, *self.registered_source))
+            self.last_registered_path = source
+            args = dict(args, command=shlex.join((self.python, str(source))))
         from saas_bench.execution_capture import ExecutionCapture, CURRENT_EVENT
         capture = ExecutionCapture(self.evidence_store) if self.evidence_store else None
         self.capture = capture
@@ -672,12 +715,15 @@ class BashAgentToolExecutor:
                 if self.workspace_execution:
                     from saas_bench.workspace_publication import PublicationHold
                     from saas_bench.execution_capture import closed_execution, join_text
+                    if self.workspace_publication_error:
+                        raise self.workspace_publication_error
                     closure = dict(self._bash_facts)
                     if tool_name == 'bash' and closure.get('process_started') and not closed_execution(closure):
                         raise PublicationHold('Bash descendants or output closure is unproven')
                     try:
                         outcome = self.workspace_publication.finish(self.workspace_execution, status=status,
-                            closure=closure, store=capture.store, capture_event=capture.event)
+                            closure=closure, store=capture.store, capture_event=capture.event,
+                            private_output=self.workspace_private_output)
                     except Exception as exc:
                         self.last_capture_event = capture.event
                         raise PublicationHold(str(exc)) from exc

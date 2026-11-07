@@ -157,15 +157,28 @@ class ShellService:
                 result, code, outcome = error, 2, 'usage_error'
             elif operation == 'pf_help':
                 result = pf_cli.command_help(self.executor.capabilities)
+                if self.executor.workspace_publication:
+                    result += pf_cli.WORKSPACE_HELP
                 if self.executor.shared_workspace:
                     from .registration_prompt import shared_workspace_history
                     result = shared_workspace_history(result).replace('MEMORY.md', 'memory/' + self.executor.role + '.md')
             else:
                 try:
-                    result = self.executor.pf_queries.execute(operation, args)
+                    if operation == 'pf_workspace':
+                        if not self.executor.workspace_publication:
+                            raise PublicPFError('Workspace commands require snapshot-v1')
+                        self.executor.workspace_private_output = True
+                        result = self.executor.workspace_publication.workspace_command(self.executor.role, args,
+                            day=self.executor.workspace_day(), store=self.executor.evidence_store)
+                    else:
+                        result = self.executor.pf_queries.execute(operation, args)
                     if budget:
                         budget.check()
                 except Exception as exc:
+                    from .workspace_publication import PublicationHold
+                    mutation = operation == 'pf_workspace' and (args.get('against') or args.get('confirm_finish') or args.get('operation') == 'discard')
+                    if isinstance(exc, PublicationHold) or mutation and not isinstance(exc, PublicPFError):
+                        self.executor.workspace_publication_error = PublicationHold('Workspace command state could not be saved; manual recovery required')
                     capture.facts['private_error'] = dict(type=type(exc).__name__, message=str(exc))
                     if not isinstance(exc, (PublicPFError, PublicPFPermissionError, TimeoutError)):
                         logging.getLogger(__name__).exception('PF execution failed')

@@ -1710,9 +1710,19 @@ class NovaMindAPIServer:
                     capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
                     token = CURRENT_EVENT.set(capture.event)
                 try:
-                    with registered_script_source(executor, name, code) as execution_path:
-                        command = shlex.join((executor.python, str(execution_path)))
-                        output = executor.execute('bash', {'command': command})
+                    if executor.workspace_publication:
+                        executor.registered_source = (name, code)
+                        executor.last_registered_path = None
+                        try:
+                            command = 'registered script: ' + name
+                            output = executor.execute('bash', {'command': command})
+                        finally:
+                            execution_path = executor.last_registered_path
+                            executor.registered_source = None
+                    else:
+                        with registered_script_source(executor, name, code) as execution_path:
+                            command = shlex.join((executor.python, str(execution_path)))
+                            output = executor.execute('bash', {'command': command})
                 except RegisteredScriptPreparationError as failure:
                     executor._bash_error = failure.error
                     executor.last_status = 'failed'

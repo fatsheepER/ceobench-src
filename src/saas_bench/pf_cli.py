@@ -310,6 +310,16 @@ def parse_argv(words):
     if not words or words[0] in ('help', '--help', '-h'):
         return 'pf_help', {}
     verb, words = words[0], words[1:]
+    if verb == 'workspace':
+        if not words or words[0] not in ('status', 'resolve', 'discard'):
+            raise Usage('pf workspace: use status, resolve or discard')
+        operation, words = words[0], words[1:]
+        allowed = {'confirm-finish': True} if operation == 'status' else {'against': True, 'full': False} if operation == 'resolve' else {}
+        flags, rest = _flags(words, allowed)
+        if len(rest) != (0 if operation == 'status' else 1):
+            raise Usage('pf workspace ' + operation + ': wrong number of arguments')
+        return 'pf_workspace', dict(operation=operation, **({'candidate': rest[0]} if rest else {}),
+                                   **{k.replace('-', '_'): v for k, v in flags.items()})
     if verb not in VERBS:
         raise Usage(f'pf: unknown command {verb}')
     options = dict(show={'full': False, 'captures': False}, depend={'detail': False, 'history': False, 'all-revisions': False, 'include-candidates': False, 'depth': True},
@@ -378,3 +388,23 @@ def apply_view(text, view):
     lines = str(text).splitlines(keepends=True)
     kind, count = view
     return ''.join(lines[:count] if kind == 'head' else lines[-count:])
+
+WORKSPACE_HELP = """
+PF workspace (snapshot-v1):
+Each tool starts from the latest published files; its tree stays stable while running.
+Your drafts stay private. Reading new files does not confirm a comparison base.
+  pf workspace status
+  pf workspace resolve DRAFT@REVISION [--full]
+  pf workspace resolve DRAFT@REVISION --against PUBLISHED_HEAD
+  pf workspace discard DRAFT@REVISION
+Use the exact references returned by status or resolve. Resolve without --against only reads.
+--against confirms that exact candidate revision against that fixed public tree.
+A later public update retains the draft and requires a new choice. Discard retains audit history.
+At weekly finish, resolve/discard or use the exact command in your finish reminder:
+  pf workspace status --confirm-finish TOKEN
+Then send the weekly final message or run next-week separately. New drafts require new confirmation.
+File conflicts never undo successful business calls. Do not repeat business calls to fix files.
+When Bash mixes file work and next-week, finish the Bash first, then run only:
+  ./novamind-operation next-week RATIONALE <12 prediction values>
+No automatic broadcast is sent to other roles.
+"""

@@ -337,7 +337,11 @@ class MultiAgentRuntime:
                 from .workspace_publication import WorkspacePublication
                 self.workspace_publication = WorkspacePublication(workspaces['ceo'], private / 'workspace-publication', lifecycle=self._lifecycle)
                 for runtime in self.roles.values():
-                    runtime.executor.workspace_publication = self.workspace_publication
+                    for executor in (runtime.executor, script_executors[runtime.identity.role]):
+                        executor.workspace_publication = self.workspace_publication
+                        executor.workspace_day = lambda: self.server.tools.current_day
+                    from .pf_cli import WORKSPACE_HELP
+                    runtime.agent.system_prompt += '\n' + WORKSPACE_HELP
                 self.workspace_publication.seed_evidence(self.roles['ceo'].store)
             if _restored_state:
                 from .team_checkpoint import restore_runtime_state
@@ -367,9 +371,12 @@ class MultiAgentRuntime:
             self._lifecycle.check()
         try:
             self._lifecycle.check()
-            self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**', ':(exclude)**/.registered-*')
-            self._git(runtime, 'commit', '--allow-empty', '-m', title)
-            return self._git(runtime, 'rev-parse', 'HEAD')
+            with ExitStack() as guards:
+                if publication := getattr(self, 'workspace_publication', None):
+                    guards.enter_context(publication.lock())
+                self._git(runtime, 'add', '--force', '--all', '--', '.', ':(exclude)sessions', ':(exclude)**/__pycache__/**', ':(exclude)**/.registered-*')
+                self._git(runtime, 'commit', '--allow-empty', '-m', title)
+                return self._git(runtime, 'rev-parse', 'HEAD')
         finally:
             self._history_lock.release()
 
@@ -556,6 +563,15 @@ class MultiAgentRuntime:
                 server.authorize_team(role, 'advance')
                 if server._operation_failed or server._step_day_timed_out:
                     return advance(*args, role=role, initiator=initiator, **kwargs)
+                publication = getattr(self, 'workspace_publication', None)
+                if publication:
+                    if (self.roles[role].executor.workspace_execution is not None
+                            and not self.roles[role].executor.workspace_advance_only):
+                        return dict(success=False, error='workspace_tool_pending', day=server.tools.current_day,
+                            message='Week not advanced. Finish this Bash and its file publication first. Then run only ./novamind-operation next-week with rationale and predictions in a separate Bash. Do not repeat successful business calls.')
+                    reminder = publication.check_finish(role, server.tools.current_day)
+                    if reminder:
+                        return dict(success=False, error='draft_confirmation_required', day=server.tools.current_day, message=reminder)
                 with self._team_condition:
                     if self._questions_pending():
                         raise PermissionError('Team requests are pending. Finish this tool batch, answer them, then retry next-week.')
@@ -690,6 +706,11 @@ class MultiAgentRuntime:
 
     def _role_input(self, role, observation, *, day):
         runtime = self.roles[role]
+        publication = getattr(self, 'workspace_publication', None)
+        if publication:
+            reminder = publication.week_reminder(role, day)
+            if reminder:
+                observation = join_text(observation, '\n\n', reminder)
         runtime.agent.add_input(observation, day=day)
         if runtime.week is not None and not runtime.week.initialized:
             runtime.week = replace(runtime.week, initialized=True)
@@ -987,7 +1008,7 @@ class MultiAgentRuntime:
                 request.input_accepted = True
                 self._transition(request, 'running')
                 self._update_role_week(role)
-                answer = self._drive_role(role, completion='answer')
+                answer = self._drive_role(role, completion='answer', weekly_finish=request.kind == 'weekly_task')
                 observation = None
                 request.handoff_commit = self._snapshot_history(runtime, f'Analyst handoff {self._request_ref(request)} (day {request.day})')
                 self._transition(request, 'completed', answer)
@@ -1047,7 +1068,7 @@ class MultiAgentRuntime:
             self._update_role_week('ceo', weekly_status='interrupted')
             raise
 
-    def _drive_role(self, role, *, completion, question=None):
+    def _drive_role(self, role, *, completion, question=None, weekly_finish=False):
         runtime = self.roles[role]
         previous_policy = runtime.agent.allow_final_text
         runtime.agent.allow_final_text = completion == 'answer'
@@ -1063,6 +1084,11 @@ class MultiAgentRuntime:
                         if request.status == 'completed' and request.request_id in self._week.get('weekly_request_ids', []):
                             self._transition(request, 'delivered')
                 if isinstance(action, FinalText) and completion == 'answer':
+                    publication = getattr(self, 'workspace_publication', None)
+                    reminder = publication.check_finish(role, day) if publication and weekly_finish else ''
+                    if reminder:
+                        self._role_input(role, reminder, day=day)
+                        continue
                     return action.text
                 if action is None or isinstance(action, FinalText):
                     raise RuntimeError('CEO must advance through the weekly API' if role == 'ceo' else 'Analyst returned no answer')

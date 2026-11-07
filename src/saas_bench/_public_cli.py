@@ -269,6 +269,8 @@ def cmd_next_week(args):
     else:
         error = result.get("error", "Unknown error")
         print(f"Error: {error}", file=sys.stderr)
+        if error in ("workspace_tool_pending", "draft_confirmation_required"):
+            print(result.get("message", ""), file=sys.stderr)
         if error in ("step_week_timeout", "step_day_timeout"):
             print("The simulation week took too long; the run will be terminated.", file=sys.stderr)
         sys.exit(1)

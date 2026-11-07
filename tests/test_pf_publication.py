@@ -275,6 +275,10 @@ def test_resolve_cannot_publish_an_obsolete_candidate_revision(publication, monk
     assert result['status'] == 'not_published'
     assert (publication.public / 'plan').read_text() == 'B'
     assert (publication.begin('a').root / 'plan').read_text() == 'A revised'
+    assert len(publication.draft_rows('a')) == 1
+    receipt = publication.receipt(result)
+    assert 'no longer current' in receipt and 'Run pf workspace status' in receipt
+    assert 'Draft saved' not in receipt
 
 
 def test_private_draft_output_and_automatic_full_output_remain_private():
