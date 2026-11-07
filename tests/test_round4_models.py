@@ -210,8 +210,11 @@ def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(froze
         assert logical['model_attempts'] == 1 and logical['retried_http_attempts'] == 0
         assert logical['cost_usd'] is None and all(value is None for value in logical['usage'].values())
         assert 'GoUsageLimitError' in logical['last_model_error']
+        driver.samples[-1].update(attempt=record, quota_http=http, logical_response=logical,
+                                  retry_policy=request['retry_policy'], hold=hold)
         driver.worker_options = {}
         resumed_attempt, resumed, restored = driver.run(policy, entry, week=1, resume=True)
+        driver.samples[-1]['attempt'] = resumed
         _finished(resumed, restored, source=checkpoint)
         assert resumed_attempt != attempt and len(batch.attempts(entry)) == 2
     finally:

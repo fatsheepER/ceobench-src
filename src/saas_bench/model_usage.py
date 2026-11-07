@@ -80,7 +80,7 @@ def is_network_error(exc):
                 detail = body.get('error', body)
                 if isinstance(detail, dict) and any(detail.get(key) in {
                         'credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached',
-                        'billing_not_active'} for key in ('code', 'type')):
+                        'billing_not_active', 'GoUsageLimitError'} for key in ('code', 'type')):
                     return False
             return status in (408, 409, 429) or 500 <= status < 600
     if any(isinstance(error, (ValueError, httpx.LocalProtocolError, httpx.UnsupportedProtocol,
