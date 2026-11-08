@@ -13,6 +13,124 @@ from test_public_sql import server, request
 from test_sql_evidence import settled
 
 
+def capture_call_command(endpoint, body, call_key, *, unix_socket=False):
+    command = ['curl', '--silent', '--show-error', '--max-time', '5',
+               '--write-out', '\nHTTP_STATUS=%{http_code}\n',
+               '--header', 'Content-Type: application/json', '--data-raw', body]
+    if call_key is not None:
+        command += ['--header', 'X-Capture-Call: ' + call_key if call_key else 'X-Capture-Call;']
+    command = shlex.join(command) + ' --header "X-Capture-Context: $NOVAMIND_CAPTURE_CONTEXT"'
+    if unix_socket:
+        return command + ' --unix-socket "$NOVAMIND_API_SOCKET" http://localhost' + endpoint
+    return command + ' "http://127.0.0.1:$NOVAMIND_API_PORT' + endpoint + '"'
+
+
+@pytest.mark.parametrize('endpoint,body,call_key', [
+    pytest.param('/call', '{}', 'testcall1', id='actual-call'),
+    pytest.param('/query', '{"sql":"SELECT 42 AS n"}', 'testcall1', id='query'),
+    pytest.param('/query', '{"sql":"SELECT 42 AS n"}', '', id='empty-header'),
+])
+def test_invalid_capture_call_is_rejected_and_next_model_request_continues(captured, endpoint, body, call_key):
+    import httpx
+    from openai import OpenAI
+    from saas_bench.model_usage import ModelUsage
+    from test_preflight_usage import reply
+    api, store, executor = captured
+    output = executor.execute('bash', {'command': capture_call_command(endpoint, body, call_key)})
+    response, status = output.split('\nHTTP_STATUS=')
+    assert status.strip() == '400', (output, store.fault)
+    rejected = json.loads(response)
+    assert rejected['success'] is False
+    assert 'X-Capture-Call' in rejected['error'] and '32' in rejected['error']
+    settled(api)
+    bash, event = records(store)
+    assert event['request']['parent_event_id'] == bash['request']['event_id']
+    saved_body = (event['request']['raw_request_hex'] if endpoint == '/query'
+                  else event['request']['request']['body_hex'])
+    assert bytes.fromhex(saved_body).decode() == body
+    assert json.loads(store.get_content(event['request']['event_id'] + ':public_response')[1]) == rejected
+    assert event['result']['http_status'] == 400 and event['result']['completed_at'] is not None
+    assert event['result']['permanent_error'] is True
+    assert event['delivery']['send_state'] == 'sent'
+    assert event['client_receipt'] == {'receive_state': 'unknown'}
+    assert store.fault is None and not store.fault_path.exists()
+
+    succeeded = executor.execute('bash', {'command':
+        'python -c ' + shlex.quote('import novamind_api as nm; print(nm.query("SELECT 43 AS n"))')})
+    assert '43' in succeeded and '[exit code:' not in succeeded, succeeded
+    settled(api)
+    with api._request_lock:
+        assert api._request_lock.wait_for(lambda: not api._active_requests, timeout=5)
+    queries = [row for row in records(store) if row['request']['kind'] == 'sql_query']
+    assert len(queries) == (2 if endpoint == '/query' else 1)
+    assert queries[-1]['result']['status'] == 'succeeded'
+    assert queries[-1]['client_receipt']['receive_state'] == 'received'
+    for row in records(store):
+        if row['request']['kind'] == 'bash':
+            assert row['result']['process_boundary']['phase'] == 'closed'
+            assert row['result']['process_boundary']['children'] == []
+    assert executor.preserved_process is None
+    sent = []
+
+    def transport(request):
+        sent.append(json.loads(request.read()))
+        return httpx.Response(200, json=reply('chat'))
+
+    usage = ModelUsage(None, 'agent', evidence_store=store)
+    with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
+        payload = dict(model='test-model', messages=[dict(role='user', content=value)
+            for value in (output, succeeded)])
+        result = usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+    assert result.choices[0].message.content == 'hello'
+    assert len(sent) == 1 and [m['content'] for m in sent[0]['messages']] == [output, succeeded]
+    store.assert_healthy()
+    store.snapshot(executor.workspace_path.parent / 'settled.sqlite')
+
+
+@pytest.mark.parametrize('failure', ['binding-conflict', 'persistence'])
+def test_valid_capture_call_integrity_failures_still_block_model_transport(captured, monkeypatch, failure):
+    import httpx
+    from openai import OpenAI
+    from saas_bench.model_usage import ModelUsage
+    from saas_bench.run_lifecycle import RunCancelled
+    api, store, executor = captured
+    command = capture_call_command('/query', '{"sql":"SELECT 42 AS n"}', 'a' * 32)
+    expected = 'Conflicting client call binding'
+    if failure == 'binding-conflict':
+        command += '\n' + command
+    else:
+        expected = 'injected response persistence failure'
+
+        def broken_finish(*args, **kwargs):
+            raise OSError(expected)
+
+        monkeypatch.setattr(store, 'finish', broken_finish)
+    executor.execute('bash', {'command': command})
+    settled(api)
+    with api._request_lock:
+        assert api._request_lock.wait_for(lambda: not api._active_requests, timeout=5)
+    assert store.fault['reason'] == expected
+    assert store.fault_path.exists()
+    assert executor.preserved_process is None
+    assert request(api, {'sql': 'SELECT 43 AS n'})[0] == 503
+    sent = []
+
+    def transport(request):
+        sent.append(request.read())
+        raise AssertionError('An unhealthy evidence store reached model transport')
+
+    usage = ModelUsage(None, 'agent', evidence_store=store)
+    with usage.attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(transport)))) as client:
+        payload = dict(model='test-model', messages=[dict(role='user', content='continue')])
+        with pytest.raises(RunCancelled, match='capture failed'):
+            usage.call('chat', payload, lambda: client.chat.completions.create(**payload))
+    assert sent == []
+    with pytest.raises(RuntimeError, match='capture failed'):
+        store.snapshot(executor.workspace_path.parent / 'unsafe.sqlite')
+
+
 def test_incomplete_body_has_terminal_failure_and_releases_admission(captured):
     api, store, _ = captured
     api.QUERY_TIMEOUT_SECONDS = .08

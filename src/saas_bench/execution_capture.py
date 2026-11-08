@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import time
 import uuid
@@ -503,6 +504,9 @@ def public_handler(method):
         try:
             raw = handler._read_request_bytes()
             handler.rfile = io.BytesIO(raw)
+            client = handler.headers.get('X-Capture-Call')
+            if client is not None and not re.fullmatch('[a-f0-9]{32}', client):
+                raise RequestRejected('Invalid X-Capture-Call header; expected 32 lowercase hexadecimal characters')
             try:
                 if handler.path == '/query':
                     from .public_sql import PUBLIC_POLICY_VERSION
@@ -511,7 +515,6 @@ def public_handler(method):
                             store.parent(handler.headers.get('X-Capture-Context')))
                 else:
                     handler._sql_event = capture_http(handler, raw)
-                client = handler.headers.get('X-Capture-Call')
                 if client:
                     store.bind_client(handler._sql_event, client)
                 token = CURRENT_EVENT.set(handler._sql_event)

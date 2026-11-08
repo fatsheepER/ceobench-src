@@ -7,7 +7,7 @@ import shlex
 import pytest
 
 from saas_bench.agent_capabilities import AgentCapabilities
-from test_preflight_team_flow import final, make_team, raw
+from test_preflight_team_flow import calls, final, make_team, raw
 from test_relation_batch import batch, create
 from test_responsibility_authority import ACTIONS, READS, operations, prepare, world
 
@@ -31,6 +31,56 @@ def write(runtime, path, content):
     result = runtime.executor.execute('write_file', dict(path=path, content=content))
     assert result.startswith('File written:'), result
     return result
+
+
+@pytest.mark.parametrize('mode', ['git', 'pf'])
+def test_shared_capture_call_validation_precedes_business_write_and_allows_continuation(mode):
+    from test_execution_capture import records
+    from test_public_request_limits import capture_call_command
+    from test_sql_evidence import settled
+    with make_team(mode, lambda *args: calls(('bash', {'command': 'echo capture-call-continuation'})),
+                   'shared-capture-call', workspace_layout='shared-v1',
+                   capabilities=AgentCapabilities.round_three(mode),
+                   workspace_protocol='snapshot-v1' if mode == 'pf' else 'direct-v1') as team:
+        team._set_phase('ceo')
+        runtime = team.roles['ceo']
+        before = world(team)
+        body = '{"tool":"set_daily_spend","args":{"operations":555}}'
+        output = bash(runtime, capture_call_command('/call', body, 'testcall1', unix_socket=True))
+        assert '[exit code:' not in output, output
+        settled(team.server)
+        if mode == 'pf':
+            assert 'HTTP_STATUS=400' in output and 'X-Capture-Call' in output, output
+            assert world(team) == before
+            assert operations(team) == []
+            events = [row for row in records(runtime.store) if row['request']['kind'] == 'public_http']
+            event, = events
+            assert event['request']['request']['body_hex'] == body.encode().hex()
+            assert event['result']['http_status'] == 400
+            assert event['delivery']['send_state'] == 'sent'
+            assert event['client_receipt'] == {'receive_state': 'unknown'}
+            assert runtime.store.fault is None
+        else:
+            assert 'HTTP_STATUS=200' in output, output
+            assert runtime.store is None
+            assert team.server.conn.execute('SELECT spend_operations FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 555
+        succeeded = bash(runtime, './novamind-operation python-c ' + shlex.quote(
+            'import novamind_api as nm; print(nm.marketing.set_daily_spend(operations=556)); print(nm.query("SELECT 43 AS n"))'))
+        assert '43' in succeeded and '[exit code:' not in succeeded, succeeded
+        assert team.server.conn.execute('SELECT spend_operations FROM config_history ORDER BY day DESC LIMIT 1').fetchone()[0] == 556
+        writes = [row for row in operations(team) if row['kind'] == 'api:set_daily_spend']
+        assert len(writes) == (1 if mode == 'pf' else 2)
+        assert all(row['status'] == 'completed' for row in writes)
+        runtime.agent.act(output + '\n' + succeeded, 0, False, {'day': 0})
+        assert len(team.test_wire) == 1
+        assert team.test_wire[0]['body']['messages'][-1]['content'] == output + '\n' + succeeded
+        settled(team.server)
+        with team.server._request_lock:
+            assert team.server._request_lock.wait_for(lambda: not team.server._active_requests, timeout=5)
+        assert runtime.executor._bash_facts['process_boundary']['children'] == []
+        assert runtime.executor.preserved_process is None
+        if mode == 'pf':
+            runtime.store.assert_healthy()
 
 
 @pytest.mark.parametrize('mode,protocol', [('git', 'direct-v1'), ('pf', 'direct-v1'), ('pf', 'snapshot-v1')])
