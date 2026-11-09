@@ -228,11 +228,15 @@ Recovery retains that endpoint unless `OPENDESIGN_BASE_URL` overrides it.
 
 OpenDesign's [external API guide](https://open-design.ai/help/cloud-api/) documents
 Chat Completions and the endpoint. Its [model page](https://go.open-design.ai/)
-lists Flash Eco. A [first-hand user issue](https://github.com/nexu-io/open-design/issues/9368)
-corroborates the candidate `deepseek-v4.1-flash-eco` identifier above. Authenticated
-official catalog validation is pending. Paid inference, account
-access, accepted `high` and `none` behavior, and the served model have not been
-verified live. No price or tokenizer mapping is assumed. Missing prices produce
+lists Flash Eco. On 2026-11-09, the authenticated model catalog and one minimal
+Chat Completions request confirmed the exact `deepseek-v4.1-flash-eco` model ID.
+The request used `reasoning_effort=none`, a 32-token output limit, and one inert
+tool definition. HTTP 200 and SDK parsing succeeded, including valid tool-call
+arguments. The response omitted `finish_reason`; the existing agent consumed
+that recorded tool response in an offline SDK and `ModelUsage` replay.
+Live `high` behavior, a tool-result roundtrip, and final-text completion remain
+unverified. The response provided token usage but no billed-cost field.
+No price or tokenizer mapping is assumed. Missing prices produce
 `null` cost in usage receipts, while provider-reported usage and the served model
 remain recorded.
 
