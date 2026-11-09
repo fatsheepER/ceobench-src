@@ -149,8 +149,10 @@ class BashAgentRunner:
             run_kind, text_registration, sql_capture, execution_capture = (
                 effective[k] for k in ('run_kind', 'text_registration', 'sql_capture', 'execution_capture'))
             if pricing_file is None:
-                self.pricing_registration = saved_manifest.get('pricing')
-            elif self.pricing_registration != saved_manifest.get('pricing'):
+                self.pricing_registration = (dict(source=None,
+                    basis='Provider changed; no current price registered; cost remains unknown', rates={})
+                    if provider_changed else saved_manifest.get('pricing'))
+            if self.pricing_registration != saved_manifest.get('pricing'):
                 self.configuration_overrides.append(dict(field='pricing', old=saved_manifest.get('pricing'),
                     new=self.pricing_registration, effective_at='new_recovery_attempt'))
         self._source_manifest = saved_manifest if continue_from else None
