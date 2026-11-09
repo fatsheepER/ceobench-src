@@ -33,9 +33,30 @@ def completion(*, tool=False, reasoning_field=None, usage=True):
     body = dict(id='chat1', object='chat.completion', created=1, model='served-opendesign-fixture',
         choices=[dict(index=0, finish_reason='tool_calls' if tool else 'stop', message=message)])
     if usage:
-        body['usage'] = dict(prompt_tokens=10, completion_tokens=2,
+        body['usage'] = dict(prompt_tokens=10, completion_tokens=2, total_tokens=12,
             prompt_tokens_details=dict(cached_tokens=3), completion_tokens_details=dict(reasoning_tokens=1))
     return body
+
+
+def stream_chunks(body):
+    base = {key: body[key] for key in ('id', 'created', 'model')}
+    base['object'] = 'chat.completion.chunk'
+    chunks = []
+    for choice in body['choices']:
+        message = copy.deepcopy(choice['message'])
+        for index, tool in enumerate(message.get('tool_calls', [])):
+            tool['index'] = index
+        for field in ('reasoning_content', 'reasoning'):
+            reasoning = message.pop(field, None)
+            if reasoning is not None:
+                for part in (reasoning[:12], reasoning[12:]):
+                    chunks.append(dict(base, choices=[dict(index=choice['index'], delta={field: part})]))
+        chunks.append(dict(base, choices=[dict(index=choice['index'], delta=message)]))
+        chunks.append(dict(base, choices=[dict(index=choice['index'],
+            finish_reason=choice.get('finish_reason'), delta={})]))
+    if 'usage' in body:
+        chunks.append(dict(base, choices=[], usage=body['usage']))
+    return chunks
 
 
 @pytest.fixture
@@ -48,9 +69,16 @@ def endpoint():
         def do_POST(self):
             requests.append(dict(path=self.path, headers=dict(self.headers),
                 body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-            payload = json.dumps(responses.pop(0) if responses else completion()).encode()
+            response = responses.pop(0) if responses else completion()
+            if requests[-1]['body'].get('stream'):
+                payload = (''.join('data: ' + json.dumps(chunk) + '\n\n' for chunk in stream_chunks(response))
+                    + 'data: [DONE]\n\n').encode()
+                content_type = 'text/event-stream'
+            else:
+                payload = json.dumps(response).encode()
+                content_type = 'application/json'
             self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -98,7 +126,8 @@ def test_opendesign_agent_wire_and_restored_tool_history(tmp_path, monkeypatch, 
         assert requests[0]['path'] == '/v1/chat/completions'
         assert body.get('max_tokens') == 1234
         assert body['reasoning_effort'] == effort
-        assert not {'max_completion_tokens', 'thinking', 'stream', 'stream_options'} & body.keys()
+        assert not {'max_completion_tokens', 'thinking'} & body.keys()
+        assert body['stream'] is True and body['stream_options'] == {'include_usage': True}
         assert requests[0]['headers']['Authorization'] == 'Bearer ' + SECRET
         assert not any(name.lower().startswith('x-opencode') for name in requests[0]['headers'])
         first.record_tool_result('fixture tool result')
@@ -177,7 +206,7 @@ def test_runner_selects_both_opendesign_roles(tmp_path, monkeypatch, endpoint, c
             body = requests[-1]['body']
             assert requests[-1]['path'] == '/v1/chat/completions'
             assert body['model'] == MODEL and body['max_tokens'] == 321
-            assert body['reasoning_effort'] == 'none' and 'thinking' not in body
+            assert body['reasoning_effort'] == 'none' and not {'thinking', 'stream', 'stream_options'} & body.keys()
             assert sim.usage_recorder.summary['missing_cost'] == 1
             sim.conn.close()
         config.enterprise_llm_provider = 'openai'
@@ -305,7 +334,8 @@ def test_direct_team_all_roles_use_explicit_chat_config(tmp_path, monkeypatch, e
             assert sent['body'] == requests[-1]['body']
             assert sent['body']['reasoning_effort'] == 'high'
             assert sent['body']['max_tokens'] == 1234
-            assert 'thinking' not in sent['body'] and 'stream' not in sent['body']
+            assert 'thinking' not in sent['body'] and sent['body']['stream'] is True
+            assert sent['body']['stream_options'] == {'include_usage': True}
             assert requests[-1]['path'] == '/v1/chat/completions'
             assert SECRET not in value.usage.path.read_text()
             assert value.usage.summary['known']['cached_tokens'] == 3

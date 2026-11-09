@@ -48,7 +48,7 @@ NO_TOOL_FEEDBACK = ("Call a tool to proceed. To advance the week, use next-week 
 _DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
 
 
-def _stream_chat_completion(client, request, check=lambda: None):
+def _stream_chat_completion(client, request, check=lambda: None, *, require_success=False):
     import httpx
     from openai import LengthFinishReasonError
     from openai.lib.streaming.chat import ChatCompletionStreamState
@@ -121,6 +121,20 @@ def _stream_chat_completion(client, request, check=lambda: None):
                             invalid = 'Chat completion stream ended with incomplete tool metadata'
         if invalid is not None:
             raise InvalidModelResponse(invalid, api='chat', response=raw, phase='stream_schema')
+        if require_success:
+            snapshot = state.current_completion_snapshot
+            status_error = None
+            if len(snapshot.choices) != 1:
+                status_error = 'OpenDesign requires exactly one completed choice'
+            else:
+                choice = snapshot.choices[0]
+                expected = 'tool_calls' if choice.message.tool_calls else 'stop'
+                if choice.message.refusal:
+                    status_error = 'OpenDesign returned a refusal'
+                elif choice.finish_reason != expected:
+                    status_error = f'OpenDesign returned finish_reason={choice.finish_reason}; expected {expected}'
+            if status_error:
+                raise InvalidModelResponse(status_error, api='chat', response=plain(snapshot), phase='completion_status')
         try:
             return state.get_final_completion()
         except LengthFinishReasonError as exc:
@@ -802,9 +816,8 @@ class BashAgent(BaseAgent):
                                 'opencode.ai' in _base_url)
                 _is_opendesign = (self.model_config['provider'] == 'opendesign' if self.model_config else
                                   'amr-link.open-design.ai' in _base_url)
-                _is_deepseek_compat = (
-                    'api.deepseek.com' in _base_url or _is_opencode
-                ) and not _is_opendesign
+                _is_deepseek_compat = (self.model_config['provider'] in ('deepseek', 'opencode')
+                    if self.model_config else 'api.deepseek.com' in _base_url or _is_opencode)
                 api_kwargs = {
                     'model': self.model,
                     'messages': messages,
@@ -837,14 +850,14 @@ class BashAgent(BaseAgent):
 
                 if not (_is_opencode and self.identity):
                     api_kwargs['timeout'] = httpx.Timeout(60 if _is_opencode else 600, read=600)
-                if _is_opencode:
+                if _is_opencode or _is_opendesign:
                     api_kwargs.update(stream=True, stream_options={'include_usage': True})
                 def invoke():
-                    if not _is_opencode:
+                    if not (_is_opencode or _is_opendesign):
                         return self.client.chat.completions.create(**api_kwargs)
                     lifecycle = getattr(self, 'lifecycle', None)
                     return _stream_chat_completion(self.client, api_kwargs,
-                        lifecycle.check if lifecycle else lambda: None)
+                        lifecycle.check if lifecycle else lambda: None, require_success=_is_opendesign)
                 response = self._request_model('chat', api_kwargs, invoke)
                 self.total_turns += 1
                 self._consecutive_errors = 0

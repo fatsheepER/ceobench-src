@@ -79,7 +79,7 @@ def is_network_error(exc):
             if isinstance(body, dict):
                 detail = body.get('error', body)
                 if isinstance(detail, dict) and any(detail.get(key) in {
-                        'credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached',
+                        'credit_balance_exhausted', 'insufficient_quota', 'insufficient_balance', 'billing_hard_limit_reached',
                         'billing_not_active', 'GoUsageLimitError'} for key in ('code', 'type')):
                     return False
             return status in (408, 409, 429) or 500 <= status < 600

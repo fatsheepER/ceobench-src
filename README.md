@@ -216,9 +216,15 @@ uv run python -m saas_bench.agents.bash_agent.run_test \
 ```
 
 The adapter sends `max_tokens` and `reasoning_effort` set to `high` or `none`.
-It omits the provider-specific `thinking` body. Tool history preserves returned
-`reasoning_content`, including the `reasoning` fallback, through snapshot restore.
-The simulator sends `reasoning_effort=none`. `--base-url` changes the agent endpoint
+It omits the provider-specific `thinking` body. The agent streams responses with
+`stream_options.include_usage=true`: a gateway probe split nonstream commentary
+and the actual tool call across two choices, while streaming returned one complete
+choice. The agent requires `[DONE]` and a successful `stop` or `tool_calls` finish
+before accepting text or executing tools. Refusals and incomplete or truncated
+responses enter the existing correction or network retry path with their receipts
+preserved. Tool history preserves returned `reasoning_content`, including the
+`reasoning` fallback, through snapshot restore.
+The simulator uses nonstream text with `reasoning_effort=none`. `--base-url` changes the agent endpoint
 and the automatically selected OpenDesign simulator endpoint.
 `OPENDESIGN_BASE_URL` can set the OpenDesign endpoint independently, including
 when you explicitly select OpenDesign for the simulator. If both options are
@@ -228,14 +234,17 @@ Recovery retains that endpoint unless `OPENDESIGN_BASE_URL` overrides it.
 
 OpenDesign's [external API guide](https://open-design.ai/help/cloud-api/) documents
 Chat Completions and the endpoint. Its [model page](https://go.open-design.ai/)
-lists Flash Eco. On 2026-11-09, the authenticated model catalog and one minimal
-Chat Completions request confirmed the exact `deepseek-v4.1-flash-eco` model ID.
-The request used `reasoning_effort=none`, a 32-token output limit, and one inert
-tool definition. HTTP 200 and SDK parsing succeeded, including valid tool-call
-arguments. The response omitted `finish_reason`; the existing agent consumed
-that recorded tool response in an offline SDK and `ModelUsage` replay.
-Live `high` behavior, a tool-result roundtrip, and final-text completion remain
-unverified. The response provided token usage but no billed-cost field.
+lists Flash Eco. On 2026-11-09, the authenticated model catalog confirmed the
+exact `deepseek-v4.1-flash-eco` model ID. Isolated streaming probes completed text
+and inert tool-result roundtrips with both `none` and `high`, explicit terminal
+reasons and `[DONE]`. The `high` probes returned reasoning, and replaying that
+exact reasoning with the tool result succeeded. Local HTTP regressions exercise
+the SDK, `ModelUsage`, exact conversation restore, incomplete streams and rejected
+terminal states. These checks cover the transport contract; they do not establish
+that a full multiweek OpenDesign batch is ready. The responses provided token
+usage but no billed-cost field. The observed `insufficient_balance` wallet refusal
+is treated as a permanent error that requires manual recovery rather than a
+transient rate limit ([provider issue](https://github.com/nexu-io/open-design/issues/5246)).
 No price or tokenizer mapping is assumed. Missing prices produce
 `null` cost in usage receipts, while provider-reported usage and the served model
 remain recorded.

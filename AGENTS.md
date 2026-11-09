@@ -57,6 +57,7 @@
 - 第三轮三角色旧名拒绝后纠正、非文本采集短引用、私有记录隔离、准确旧版本与真实 ModelUsage 输入的公共闭环从 `tests/test_round3_acceptance.py` 定位。
 - 第四轮 PF 同伴路径归一、精确旧版本、越界与私有文件拒绝、逐端点错误及纠正、超过六项的执行捕获清单和实际 ModelUsage 输入从 `tests/test_round4_pf_contracts.py` 定位；来源持久化未知与重复回执仍从 `tests/test_relation_recovery.py` 定位。
 - 第四轮六条 D56 分配、显式 agent/模拟器配置、Responses 推理与工具续传、独立 STOP/HOLD/恢复及无请求启动检查从 `tests/test_round4_batch.py` 定位；永久额度错误、普通限流、真实 HTTP 断连/取消与冻结请求监测从 `tests/test_round4_models.py` 定位。
+- OpenDesign 双 choice 工具遗漏、流式结束证明、异常终态拒绝、原始回执与推理恢复从 `tests/test_opendesign_transport.py`、`tests/test_opendesign.py` 定位；`insufficient_balance` 永久余额拒绝与真实 controller HOLD/人工恢复从 `tests/test_round4_models.py` 定位。
 - 第五轮 A01/A17 的 shared-v1 共享目录、职责权限、namespace 文件来源、Git 并发和三类保存、宿主撞名、私有观察缺口与角色记忆恢复，从 `tests/test_shared_workspace.py`、`tests/test_shared_identity.py` 定位；旧布局默认保留，checkpoint 不跨布局转换。
 - 第五轮 A02/A03/A04/A05/A06/A09/A10/A11/A18 的 PF 稳定执行快照、独立比较基底、多文件原子发布、候选私有性、重复收尾及真实进程持久化故障，从 `tests/test_pf_edit_base.py`、`tests/test_pf_publication.py`、`tests/test_pf_publication_recovery.py` 定位；checkpoint 全链路留待 R5-1.4。
 - 第五轮 A07/A08/A12–A16/A22 的版本确认、精确修订与权限差异、同 Bash 草稿处理后再编辑、作者周初提醒与周末显式确认、CEO 独立推进、三 provider 真实 ModelUsage、注册源码与当前公共快照、API 成功后零重放、私有 Git 对象隔离与持久化故障，从 `tests/test_round5_workflows.py` 定位。

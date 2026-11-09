@@ -11,13 +11,16 @@ from test_preflight_team_batch import frozen
 
 
 @pytest.mark.parametrize('code', ['credit_balance_exhausted', 'insufficient_quota', 'billing_hard_limit_reached',
-                                  'GoUsageLimitError'])
+                                  'GoUsageLimitError', 'insufficient_balance'])
 def test_permanent_quota_holds_without_retry_and_next_call_continues(tmp_path, monkeypatch, code):
     requests, waits = [], []
     def respond(request):
         requests.append(request)
         if len(requests) == 1:
-            body = ({'type': 'error', 'error': {'type': code, 'message': 'Go usage limit exceeded'},
+            # Actual AMR wallet refusal: https://github.com/nexu-io/open-design/issues/5246
+            body = ({'error': {'code': code, 'message': '[code=insufficient_balance] insufficient wallet balance',
+                              'type': code}} if code == 'insufficient_balance' else
+                    {'type': 'error', 'error': {'type': code, 'message': 'Go usage limit exceeded'},
                      'metadata': {'limitName': 'monthly'}} if code == 'GoUsageLimitError' else
                     {'error': {'code': code, 'type': code, 'message': 'quota exhausted'}})
             return httpx.Response(429, json=body)
@@ -166,7 +169,8 @@ def test_sol_public_agent_real_http_disconnect_and_cancel(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize('group', ['git', 'pf'])
-def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(frozen, tmp_path, monkeypatch, group):
+@pytest.mark.parametrize('code', ['GoUsageLimitError', 'insufficient_balance'])
+def test_permanent_quota_real_driver_holds_once_and_manual_resume_continues(frozen, tmp_path, monkeypatch, group, code):
     from pathlib import Path
     from saas_bench import team_batch as batch
     from saas_bench.team_checkpoint import validate_snapshot
@@ -176,8 +180,10 @@ def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(froze
     monkeypatch.delenv('CEOBENCH_MODEL_REQUEST_ATTEMPTS', raising=False)
     monkeypatch.delenv('CEOBENCH_MODEL_RETRY_DELAYS', raising=False)
     monkeypatch.delenv('CEOBENCH_MODEL_ATTEMPT_SECONDS', raising=False)
-    body = {'type': 'error', 'error': {'type': 'GoUsageLimitError', 'message': 'Go usage limit exceeded'},
-            'metadata': {'limitName': 'monthly'}}
+    body = ({'error': {'code': code, 'message': '[code=insufficient_balance] insufficient wallet balance',
+                      'type': code}} if code == 'insufficient_balance' else
+            {'type': 'error', 'error': {'type': code, 'message': 'Go usage limit exceeded'},
+             'metadata': {'limitName': 'monthly'}})
     driver = Driver(frozen, tmp_path, monkeypatch, budget_seconds=120)
     policy, entry = driver.policy('quota', group)
     driver.worker_options = dict(reject_run=entry['run_id'], reject_status=429, reject_body=body,
@@ -186,7 +192,7 @@ def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(froze
         attempt, record, proof = driver.run(policy, entry, expected=3)
         assert record['status'] == 'paused' and record['hold']
         assert record['runtime_failure'] == 'model_request_failed'
-        assert 'GoUsageLimitError' in record['hold_detail']
+        assert code in record['hold_detail']
         assert len(proof['wire']) == 1 and proof['retry_waits'] == []
         assert record['recovery_validation']['eligible']
         checkpoint = Path(proof['checkpoints']['ready'])
@@ -209,7 +215,7 @@ def test_go_usage_limit_real_driver_holds_once_and_manual_resume_continues(froze
         assert http['status'] == 429 and json.loads(http['body']) == body
         assert logical['model_attempts'] == 1 and logical['retried_http_attempts'] == 0
         assert logical['cost_usd'] is None and all(value is None for value in logical['usage'].values())
-        assert 'GoUsageLimitError' in logical['last_model_error']
+        assert code in logical['last_model_error']
         driver.samples[-1].update(attempt=record, quota_http=http, logical_response=logical,
                                   retry_policy=request['retry_policy'], hold=hold)
         driver.worker_options = {}
