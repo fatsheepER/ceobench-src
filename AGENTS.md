@@ -56,6 +56,7 @@
 - 公开来源工具 `escalate` 的改名、非文本逐项回执入模、旧名拒绝和历史声明恢复去重从 `tests/test_escalate.py` 定位；历史关系分类字段继续保留。
 - 第三轮三角色旧名拒绝后纠正、非文本采集短引用、私有记录隔离、准确旧版本与真实 ModelUsage 输入的公共闭环从 `tests/test_round3_acceptance.py` 定位。
 - 第四轮 PF 同伴路径归一、精确旧版本、越界与私有文件拒绝、逐端点错误及纠正、超过六项的执行捕获清单和实际 ModelUsage 输入从 `tests/test_round4_pf_contracts.py` 定位；来源持久化未知与重复回执仍从 `tests/test_relation_recovery.py` 定位。
+- OpenDesign 模拟器非空文本与明确完成状态、有限纠错和后续调用，从 `tests/test_opendesign_simulator.py` 定位；跨 provider 的 standalone 同模型别名恢复须清除旧活动价格并保留历史费用回执，从 `tests/test_standalone_provider_pricing.py` 定位。
 - 三个 Chat provider 的默认模型/端点/凭证隔离、独立模拟器与 standalone 恢复从 `tests/test_chat_provider_switching.py` 定位；工程批次显式配置、三角色 SDK 请求、无请求启动检查与 controller HOLD/人工恢复从 `tests/test_chat_provider_teams.py` 定位；公共团队恢复的新模型/模拟器/预算/未知价格、旧快照不变及零重放从 `tests/test_chat_provider_restore.py` 定位。旧冻结 R4/R5 合约保持原样。
 - 第四轮六条 D56 分配、显式 agent/模拟器配置、Responses 推理与工具续传、独立 STOP/HOLD/恢复及无请求启动检查从 `tests/test_round4_batch.py` 定位；永久额度错误、普通限流、真实 HTTP 断连/取消与冻结请求监测从 `tests/test_round4_models.py` 定位。
 - OpenDesign 双 choice 工具遗漏、流式结束证明、异常终态拒绝、原始回执与推理恢复从 `tests/test_opendesign_transport.py`、`tests/test_opendesign.py` 定位；`insufficient_balance` 永久余额拒绝与真实 controller HOLD/人工恢复从 `tests/test_round4_models.py` 定位。
