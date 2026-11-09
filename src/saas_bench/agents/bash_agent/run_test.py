@@ -192,7 +192,7 @@ class BashAgentRunner:
         self.reasoning_effort = reasoning_effort or ('high' if self.provider in CHAT_PROVIDERS
                                                     else default_config.agent_llm_reasoning_effort)
         if self.provider == 'opendesign' and self.reasoning_effort not in ('high', 'none'):
-            raise ValueError('OpenDesign adapter supports --reasoning-effort high or none; live acceptance is unverified')
+            raise ValueError('OpenDesign adapter supports --reasoning-effort high or none')
         self.continue_from = continue_from
         self.label = label  # Optional human-readable variant tag — surfaced on the dashboard
         self.anthropic_fallback_model = (

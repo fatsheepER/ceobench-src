@@ -187,75 +187,84 @@ uv run python -m saas_bench.agents.bash_agent.run_test \
     --workspace bash_agent_runs
 ```
 
-DeepSeek V4 Flash (thinking off) via the official API or OpenCode Go:
+Select any of the three Chat providers using `--provider`. New runs default to
+`high` for the agent and disabled thinking for the simulator. These commands make
+paid model requests; `--days` must cover at least one whole week.
 
-```bash
-# Official DeepSeek
-uv run python -m saas_bench.agents.bash_agent.run_test \
-    --provider deepseek --model deepseek-v4-flash \
-    --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
-
-# OpenCode Go (same provider and model for the simulator)
-uv run python -m saas_bench.agents.bash_agent.run_test \
-    --provider opencode --model deepseek-v4-flash \
-    --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
-```
-
-Or `bash scripts/start_deepseek_flash_smoke.sh official` / `opencode`.
-`--days` rounds down to a whole week, so use at least 7.
-
-OpenDesign DeepSeek V4.1 Flash Eco uses Chat Completions at
-`https://amr-link.open-design.ai/v1/`. Set `OPENDESIGN_API_KEY` in the shell or the
-repository `.env` file before running.
-This command makes paid requests for both the agent and simulator:
+| Provider | Default model | API base URL | Credential variable |
+|---|---|---|---|
+| `deepseek` | `deepseek-flash` | `https://api.deepseek.com/` | `DEEPSEEK_API_KEY` |
+| `opencode` | `deepseek-v4.1-flash` | `https://opencode.ai/inference/go/openai/v1/` | `OPENCODE_API_KEY` |
+| `opendesign` | `deepseek-v4.1-flash-eco` | `https://amr-link.open-design.ai/v1/` | `OPENDESIGN_API_KEY` |
 
 ```bash
 uv run python -m saas_bench.agents.bash_agent.run_test \
-    --provider opendesign --model deepseek-v4.1-flash-eco \
-    --reasoning-effort high --days 7 --seed 42 --workspace opendesign_runs
+    --provider deepseek --days 7 --seed 42 --workspace deepseek_runs
+uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider opencode --days 7 --seed 42 --workspace opencode_runs
+uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider opendesign --days 7 --seed 42 --workspace opendesign_runs
 ```
 
-The adapter sends `max_tokens` and `reasoning_effort` set to `high` or `none`.
-It omits the provider-specific `thinking` body. The agent streams responses with
-`stream_options.include_usage=true`: a gateway probe split nonstream commentary
-and the actual tool call across two choices, while streaming returned one complete
-choice. The agent requires `[DONE]` and a successful `stop` or `tool_calls` finish
-before accepting text or executing tools. Refusals and incomplete or truncated
-responses enter the existing correction or network retry path with their receipts
-preserved. Tool history preserves returned `reasoning_content`, including the
-`reasoning` fallback, through snapshot restore.
-The simulator uses nonstream text with `reasoning_effort=none`. `--base-url` changes the agent endpoint
-and the automatically selected OpenDesign simulator endpoint.
-`OPENDESIGN_BASE_URL` can set the OpenDesign endpoint independently, including
-when you explicitly select OpenDesign for the simulator. If both options are
-set, the agent uses `--base-url` and the simulator uses `OPENDESIGN_BASE_URL`.
-The manifest preserves the simulator endpoint in `simulator_opendesign_base_url`.
-Recovery retains that endpoint unless `OPENDESIGN_BASE_URL` overrides it.
+`--model`, `--base-url`, and `--api-key` explicitly override agent settings.
+`DEEPSEEK_BASE_URL`, `OPENCODE_BASE_URL`, and `OPENDESIGN_BASE_URL` override only
+the named provider's default address. Model IDs were checked against authenticated
+catalogs on 2026-11-09; see the official [DeepSeek docs](https://api-docs.deepseek.com/),
+[OpenCode Go docs](https://opencode.ai/docs/console/go/), and
+[OpenDesign API guide](https://open-design.ai/help/cloud-api/).
 
-OpenDesign's [external API guide](https://open-design.ai/help/cloud-api/) documents
-Chat Completions and the endpoint. Its [model page](https://go.open-design.ai/)
-lists Flash Eco. On 2026-11-09, the authenticated model catalog confirmed the
-exact `deepseek-v4.1-flash-eco` model ID. Isolated streaming probes completed text
-and inert tool-result roundtrips with both `none` and `high`, explicit terminal
-reasons and `[DONE]`. The `high` probes returned reasoning, and replaying that
-exact reasoning with the tool result succeeded. Local HTTP regressions exercise
-the SDK, `ModelUsage`, exact conversation restore, incomplete streams and rejected
-terminal states. These checks cover the transport contract; they do not establish
-that a full multiweek OpenDesign batch is ready. The responses provided token
-usage but no billed-cost field. The observed `insufficient_balance` wallet refusal
-is treated as a permanent error that requires manual recovery rather than a
-transient rate limit ([provider issue](https://github.com/nexu-io/open-design/issues/5246)).
-No price or tokenizer mapping is assumed. Missing prices produce
-`null` cost in usage receipts, while provider-reported usage and the served model
-remain recorded.
+A new standalone simulator follows the agent unless selected independently:
 
-Direct `MultiAgentRuntime` callers can supply separate `model_configs` with
-`provider='opendesign'`, `api='chat'`, `credential_env='OPENDESIGN_API_KEY'`,
-`thinking=None`, and `reasoning_effort='high'` for the agent or `'none'` for the
-simulator. Include the existing required endpoint, output limit, memory,
-temperature, tokenizer, pricing, and contract fields. Frozen R4 and R5 profiles
-retain their original provider contracts. The frozen batch driver does not
-provide an OpenDesign batch profile.
+```bash
+CEOBENCH_SIMULATOR_LLM_PROVIDER=deepseek \
+  uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider opendesign --days 7 --workspace mixed_provider_runs
+```
+
+Changing only the simulator provider selects that provider's default model.
+`CEOBENCH_SIMULATOR_LLM_MODEL` overrides its model, and
+`CEOBENCH_SIMULATOR_LLM_BASE_URL` overrides its address, taking precedence over
+the provider's address variable. The simulator needs its own credential variable;
+agent `--api-key` is not passed to it.
+
+Same-provider recovery preserves the exact checkpoint model and endpoint.
+Explicitly changing `--provider` selects the new provider's defaults for omitted
+model, endpoint and reasoning options. The simulator retains its independent
+checkpoint settings unless explicitly overridden with its environment variables.
+Old standalone OpenCode checkpoints without a serialized simulator address keep
+their historical `/zen/go/v1/` route.
+
+For direct teams, generate credential-free contracts with
+`make_chat_models('opendesign', simulator_provider='deepseek')` from
+`saas_bench.team_models`, and pass them as `model_configs`. This factory keeps
+agent and simulator choices independent; simulator thinking is disabled.
+`MultiAgentRuntime.restore(..., model_configs=new_models)` explicitly changes the
+new attempt's providers, budgets and price configuration while preserving the
+selected snapshot. Client factories must use each selected contract's `base_url`
+and `credential_env`; simulator factories receive the updated `BenchmarkConfig`.
+Unknown prices remain `null` rather than inheriting another provider's price.
+Unprofiled `engineering` batch manifests accept the same JSON through
+`python -m saas_bench.team_batch freeze --category engineering --model-configs models.json`
+with the usual required D0/output arguments. `prepare(live=False)` and
+`team_driver.py --check` perform zero-request preparation; `start`/`run` start workers.
+Frozen R4/R5 profiles and their model contracts remain unchanged.
+
+OpenDesign sends `max_tokens` and `reasoning_effort=high|none`, without a
+`thinking` body. Its agent uses streaming with `include_usage=true`: actual
+nonstream responses split commentary and a tool call into separate choices,
+whereas streaming returned one complete choice and native `reasoning_content`.
+The adapter requires `[DONE]` plus successful `stop` or `tool_calls` before
+accepting text or executing tools, and preserves reasoning through tool results
+and conversation restore. The simulator uses nonstream `none` replies and requires
+one nonempty, non-refusal text choice with `finish_reason=stop`. Invalid generations
+use the existing bounded correction path; network failures use the existing retry
+and independent STOP paths. The provider's `insufficient_balance` wallet refusal
+is permanent and enters HOLD for manual recovery
+([provider issue](https://github.com/nexu-io/open-design/issues/5246)).
+Token usage and served models are recorded. Missing tokenizer mappings, cache
+fields and billed costs remain unknown; OpenCode Go's visible allowance/list-cost
+fields do not establish a cash invoice. Transport probes establish protocol
+compatibility rather than reasoning quality or benchmark performance.
 
 **4. Output.** Each run lands at `bash_agent_runs/run_<id>/`: `world.nmdb`
 (encrypted ledger), `config.json`, `checkpoint.json`, `agent_workspace/` (the
