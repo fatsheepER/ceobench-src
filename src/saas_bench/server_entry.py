@@ -138,7 +138,7 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         config.social_post_llm_model = override_model
         config.enterprise_llm_model = override_model
 
-    valid_providers = {"bedrock", "anthropic", "openai", "deepseek", "opencode"}
+    valid_providers = {"bedrock", "anthropic", "openai", "deepseek", "opencode", "opendesign"}
     for attr in ("social_post_llm_provider", "enterprise_llm_provider"):
         provider = getattr(config, attr)
         if provider not in valid_providers:
@@ -180,6 +180,11 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
 
     if 'opencode' in (config.social_post_llm_provider, config.enterprise_llm_provider) and not os.environ.get('OPENCODE_API_KEY'):
         raise ValueError('Simulator OpenCode provider requires OPENCODE_API_KEY')
+    if 'opendesign' in (config.social_post_llm_provider, config.enterprise_llm_provider):
+        if not os.environ.get('OPENDESIGN_API_KEY'):
+            raise ValueError('Simulator OpenDesign provider requires OPENDESIGN_API_KEY')
+        config.simulator_opendesign_base_url = (os.environ.get('OPENDESIGN_BASE_URL')
+                                               or config.simulator_opendesign_base_url)
 
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
@@ -217,7 +222,7 @@ def _session_config(seed, total_days, initial_cash, meta=None):
 
 def _create_simulator_openai_client(config: BenchmarkConfig):
     providers = {config.social_post_llm_provider, config.enterprise_llm_provider}
-    compatible = providers.intersection({"openai", "deepseek", "opencode"})
+    compatible = providers.intersection({"openai", "deepseek", "opencode", "opendesign"})
     if not compatible:
         return None
     if len(compatible) > 1:
@@ -225,6 +230,11 @@ def _create_simulator_openai_client(config: BenchmarkConfig):
 
     from openai import OpenAI
 
+    if 'opendesign' in providers:
+        key = os.environ.get('OPENDESIGN_API_KEY')
+        if not key:
+            raise ValueError('Simulator OpenDesign provider requires OPENDESIGN_API_KEY')
+        return OpenAI(api_key=key, base_url=config.simulator_opendesign_base_url)
     if "opencode" in providers:
         return OpenAI(
             api_key=os.environ.get('OPENCODE_API_KEY'),

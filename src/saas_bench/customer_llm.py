@@ -205,7 +205,7 @@ class CustomerSimulator:
             return self.anthropic_client
         raise ValueError(
             f"social_post_client only supports 'bedrock' or 'anthropic'; got {provider!r}. "
-            f"Use complete_text() for openai/deepseek/opencode providers."
+            f"Use complete_text() for openai/deepseek/opencode/opendesign providers."
         )
 
     def complete_text(
@@ -234,11 +234,13 @@ class CustomerSimulator:
             if self.client is None:
                 raise RuntimeError(f'{provider} simulator client is not configured')
             messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
-            if provider in ('deepseek', 'opencode'):
+            if provider in ('deepseek', 'opencode', 'opendesign'):
                 api = 'chat'
                 kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
-                              temperature=temperature, extra_body={"thinking": {"type": "disabled"}})
-                if provider == 'opencode':
+                              temperature=temperature)
+                if provider != 'opendesign':
+                    kwargs['extra_body'] = {"thinking": {"type": "disabled"}}
+                if provider in ('opencode', 'opendesign'):
                     kwargs['reasoning_effort'] = 'none'
                 invoke = lambda: self.client.chat.completions.create(**kwargs)
             else:

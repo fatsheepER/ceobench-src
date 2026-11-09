@@ -33,7 +33,7 @@ if str(package_root) not in sys.path:
     sys.path.insert(0, str(package_root))
 
 from openai import OpenAI
-from saas_bench.config import BenchmarkConfig
+from saas_bench.config import BenchmarkConfig, OPENDESIGN_BASE_URL
 from saas_bench.execution_capture import join_text as _joined
 from saas_bench.model_usage import physical_usage_summary, usage_delta
 
@@ -179,7 +179,10 @@ class BashAgentRunner:
                                            stop_after_day >= self.total_days):
             raise ValueError('stop_after_day must be a whole week before the configured end')
         self.stop_after_day = stop_after_day
-        self.reasoning_effort = reasoning_effort or default_config.agent_llm_reasoning_effort
+        self.reasoning_effort = reasoning_effort or ('high' if self.provider == 'opendesign'
+                                                    else default_config.agent_llm_reasoning_effort)
+        if self.provider == 'opendesign' and self.reasoning_effort not in ('high', 'none'):
+            raise ValueError('OpenDesign adapter supports --reasoning-effort high or none; live acceptance is unverified')
         self.continue_from = continue_from
         self.label = label  # Optional human-readable variant tag — surfaced on the dashboard
         self.anthropic_fallback_model = (
@@ -328,6 +331,8 @@ class BashAgentRunner:
             self.api_key = env_vars.get("DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
         elif self.provider == "opencode":
             self.api_key = env_vars.get("OPENCODE_API_KEY") or os.environ.get("OPENCODE_API_KEY")
+        elif self.provider == "opendesign":
+            self.api_key = env_vars.get("OPENDESIGN_API_KEY") or os.environ.get("OPENDESIGN_API_KEY")
         elif self.provider == "ai_sandbox":
             self.api_key = env_vars.get("AI_SANDBOX_KEY") or os.environ.get("AI_SANDBOX_KEY")
         else:
@@ -350,6 +355,8 @@ class BashAgentRunner:
             self.base_url = "https://api.deepseek.com"
         elif self.provider == "opencode":
             self.base_url = "https://opencode.ai/zen/go/v1"
+        elif self.provider == "opendesign":
+            self.base_url = os.environ.get('OPENDESIGN_BASE_URL') or OPENDESIGN_BASE_URL
         else:
             self.base_url = None
 
@@ -719,9 +726,12 @@ __pycache__/
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
         # Use the selected account for both roles unless explicitly overridden.
-        if not self.continue_from and self.provider in ("deepseek", "opencode"):
+        if not self.continue_from and self.provider in ("deepseek", "opencode", "opendesign"):
             env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", self.provider)
             env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", self.model)
+        if self.provider == 'opendesign':
+            saved_url = (self._source_manifest or {}).get('benchmark_config', {}).get('simulator_opendesign_base_url')
+            env.setdefault('OPENDESIGN_BASE_URL', saved_url or self.base_url)
         return env
 
     def _prepare_manifest(self):
@@ -743,6 +753,7 @@ __pycache__/
         config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
         config.simulator_anthropic_base_url = os.environ.get('ANTHROPIC_BASE_URL', config.simulator_anthropic_base_url)
         env = self._server_environment()
+        config.simulator_opendesign_base_url = env.get('OPENDESIGN_BASE_URL', config.simulator_opendesign_base_url)
         for suffix in ('provider', 'model'):
             value = env.get('CEOBENCH_SIMULATOR_LLM_' + suffix.upper())
             if value:
@@ -750,7 +761,8 @@ __pycache__/
                     setattr(config, prefix + suffix, value)
         if self._source_manifest:
             for field in ('social_post_llm_provider', 'social_post_llm_model', 'enterprise_llm_provider',
-                    'enterprise_llm_model', 'simulator_openai_base_url', 'simulator_anthropic_base_url'):
+                    'enterprise_llm_model', 'simulator_openai_base_url', 'simulator_anthropic_base_url',
+                    'simulator_opendesign_base_url'):
                 old, new = self._source_manifest['benchmark_config'].get(field), getattr(config, field)
                 if old != new:
                     row = dict(field=field, old=old, new=new, effective_at='simulator_start_in_new_recovery_attempt')
@@ -1243,6 +1255,7 @@ __pycache__/
                                       self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
             pf=self.text_registration == 'pf',
+            model_config=dict(provider='opendesign', api='chat') if self.provider == 'opendesign' else None,
             **self.generation_policy,
         )
 
@@ -1764,7 +1777,7 @@ def main():
     parser.add_argument("--model", default=None,
                         help=f"Model name (default: BenchmarkConfig.agent_llm_model={default_config.agent_llm_model})")
     parser.add_argument("--provider", default=None,
-                        choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "ai_sandbox"],
+                        choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "opendesign", "ai_sandbox"],
                         help=f"API provider (default: BenchmarkConfig.agent_llm_provider={default_config.agent_llm_provider})")
     parser.add_argument("--base-url", help="Custom API base URL")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (new run: 42)")

@@ -7,6 +7,9 @@ import math
 import numpy as np
 
 
+OPENDESIGN_BASE_URL = 'https://amr-link.open-design.ai/v1/'
+
+
 # === V2.1: CHURN REASON ENUM ===
 # Structured churn reasons tracked internally (hidden from agent).
 # Agent must infer from LLM-generated churn message.
@@ -729,7 +732,7 @@ class BenchmarkConfig:
     # Social Post LLM (for generating social media posts).
     # Local Opus benchmark runs use direct Anthropic here so the simulator does
     # not require Bedrock credentials.
-    # Supported providers: "bedrock", "anthropic", "openai", "deepseek", "opencode".
+    # Supported providers: "bedrock", "anthropic", "openai", "deepseek", "opencode", "opendesign".
     #   - "bedrock":   AnthropicBedrock SDK; requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
     #                  Use a Bedrock model id (e.g. "us.anthropic.claude-haiku-4-5-20251001-v1:0").
     #   - "anthropic": Direct Anthropic SDK; requires ANTHROPIC_API_KEY.
@@ -739,6 +742,7 @@ class BenchmarkConfig:
     #                  Thinking is disabled. Override via CEOBENCH_SIMULATOR_LLM_PROVIDER /
     #                  CEOBENCH_SIMULATOR_LLM_MODEL (used by DeepSeek / OpenCode agent runs).
     #   - "opencode":  OpenCode Go Chat Completions; requires OPENCODE_API_KEY.
+    #   - "opendesign": OpenDesign Chat Completions; requires OPENDESIGN_API_KEY.
     social_post_llm_model: str = "claude-haiku-4-5"
     social_post_llm_provider: str = "anthropic"
     social_post_llm_temperature: float = 0.9  # Higher for creative variety
@@ -760,6 +764,7 @@ class BenchmarkConfig:
     model_pricing: Dict[str, Dict[str, float | str]] = field(default_factory=dict)
     simulator_model_config: Dict | None = None
     simulator_openai_base_url: str = 'https://api.openai.com/v1'
+    simulator_opendesign_base_url: str = OPENDESIGN_BASE_URL
     simulator_anthropic_base_url: str = 'https://api.anthropic.com'
 
     # Temperature settings

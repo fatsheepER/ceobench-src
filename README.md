@@ -164,15 +164,16 @@ AWS_REGION="us-east-2"
 ```
 
 Other providers read `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,
-`XAI_API_KEY`, `TOGETHER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`,
+`XAI_API_KEY`, `TOGETHER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`, `OPENDESIGN_API_KEY`,
 or `MODAL_TOKEN_*`. No `NMDB_KEY` is needed: the SQLCipher key is embedded
 in the engine.
 
 If you configure simulator LLMs to use direct `anthropic` or `openai`, export
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in the shell before running. The
-simulator does not receive the agent-only `--api-key`. DeepSeek / OpenCode
-agent runs automatically point the simulator at official DeepSeek
-(`deepseek-v4-flash`, thinking off) so they do not need Anthropic.
+simulator does not receive the agent-only `--api-key`. DeepSeek, OpenCode,
+and OpenDesign agent runs select the same provider and model for the simulator,
+with reasoning disabled, unless `CEOBENCH_SIMULATOR_LLM_PROVIDER` and
+`CEOBENCH_SIMULATOR_LLM_MODEL` override that selection.
 
 **3. Run.** `public/` ships prebuilt, so there is no build step:
 
@@ -194,7 +195,7 @@ uv run python -m saas_bench.agents.bash_agent.run_test \
     --provider deepseek --model deepseek-v4-flash \
     --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
 
-# OpenCode Go (same model; simulator still uses official DeepSeek)
+# OpenCode Go (same provider and model for the simulator)
 uv run python -m saas_bench.agents.bash_agent.run_test \
     --provider opencode --model deepseek-v4-flash \
     --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
@@ -202,6 +203,46 @@ uv run python -m saas_bench.agents.bash_agent.run_test \
 
 Or `bash scripts/start_deepseek_flash_smoke.sh official` / `opencode`.
 `--days` rounds down to a whole week, so use at least 7.
+
+OpenDesign DeepSeek V4.1 Flash Eco uses Chat Completions at
+`https://amr-link.open-design.ai/v1/`. Set `OPENDESIGN_API_KEY` in the shell or the
+repository `.env` file before running.
+This command makes paid requests for both the agent and simulator:
+
+```bash
+uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider opendesign --model deepseek-v4.1-flash-eco \
+    --reasoning-effort high --days 7 --seed 42 --workspace opendesign_runs
+```
+
+The adapter sends `max_tokens` and `reasoning_effort` set to `high` or `none`.
+It omits the provider-specific `thinking` body. Tool history preserves returned
+`reasoning_content`, including the `reasoning` fallback, through snapshot restore.
+The simulator sends `reasoning_effort=none`. `--base-url` changes the agent endpoint
+and the automatically selected OpenDesign simulator endpoint.
+`OPENDESIGN_BASE_URL` can set the OpenDesign endpoint independently, including
+when you explicitly select OpenDesign for the simulator. If both options are
+set, the agent uses `--base-url` and the simulator uses `OPENDESIGN_BASE_URL`.
+The manifest preserves the simulator endpoint in `simulator_opendesign_base_url`.
+Recovery retains that endpoint unless `OPENDESIGN_BASE_URL` overrides it.
+
+OpenDesign's [external API guide](https://open-design.ai/help/cloud-api/) documents
+Chat Completions and the endpoint. Its [model page](https://go.open-design.ai/)
+lists Flash Eco. A [first-hand user issue](https://github.com/nexu-io/open-design/issues/9368)
+corroborates the candidate `deepseek-v4.1-flash-eco` identifier above. Authenticated
+official catalog validation is pending. Paid inference, account
+access, accepted `high` and `none` behavior, and the served model have not been
+verified live. No price or tokenizer mapping is assumed. Missing prices produce
+`null` cost in usage receipts, while provider-reported usage and the served model
+remain recorded.
+
+Direct `MultiAgentRuntime` callers can supply separate `model_configs` with
+`provider='opendesign'`, `api='chat'`, `credential_env='OPENDESIGN_API_KEY'`,
+`thinking=None`, and `reasoning_effort='high'` for the agent or `'none'` for the
+simulator. Include the existing required endpoint, output limit, memory,
+temperature, tokenizer, pricing, and contract fields. Frozen R4 and R5 profiles
+retain their original provider contracts. The frozen batch driver does not
+provide an OpenDesign batch profile.
 
 **4. Output.** Each run lands at `bash_agent_runs/run_<id>/`: `world.nmdb`
 (encrypted ledger), `config.json`, `checkpoint.json`, `agent_workspace/` (the

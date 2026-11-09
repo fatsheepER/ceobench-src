@@ -68,10 +68,13 @@ def validate_models(models):
             raise ValueError('Model endpoint must be credential-free HTTPS (loopback HTTP allowed for tests)')
         if not re.fullmatch(r'[A-Z][A-Z0-9_]*', config['credential_env']):
             raise ValueError('Freeze a credential environment variable name, never its value')
-        if (config['provider'], config['api']) not in {('opencode', 'chat'), ('openai', 'responses')}:
+        if (config['provider'], config['api']) not in {('opencode', 'chat'), ('openai', 'responses'), ('opendesign', 'chat')}:
             raise ValueError('Unsupported explicit provider/API contract')
         if not config['model'] or config['reasoning_effort'] not in ('none', 'low', 'medium', 'high', 'xhigh', 'max'):
             raise ValueError('Invalid model or reasoning effort')
+        if config['provider'] == 'opendesign' and (config['thinking'] is not None
+                or config['reasoning_effort'] not in ('high', 'none')):
+            raise ValueError('OpenDesign adapter supports reasoning_effort high or none without a thinking body; live acceptance is unverified')
         if type(config['max_output_tokens']) is not int or config['max_output_tokens'] <= 0:
             raise ValueError('Invalid model output limit')
         if type(config['memory_characters']) is not int or config['memory_characters'] < 0:
@@ -94,7 +97,9 @@ def model_issue(row, models):
             if ((body.get('reasoning') or {}).get('effort') != config['reasoning_effort'] or
                     body.get('store') is not False or body.get('include') != config['include']):
                 return thinking_issue
-        elif body.get('reasoning_effort') != config['reasoning_effort'] or body.get('thinking') != {'type': config['thinking']}:
+        elif (body.get('reasoning_effort') != config['reasoning_effort'] or
+              ('thinking' in body if config['provider'] == 'opendesign'
+               else body.get('thinking') != {'type': config['thinking']})):
             return thinking_issue
         if body.get('max_output_tokens' if config['api'] == 'responses' else 'max_tokens') != config['max_output_tokens']:
             return 'model_output_limit_changed'

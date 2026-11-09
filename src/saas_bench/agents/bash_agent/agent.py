@@ -184,6 +184,9 @@ class BashAgent(BaseAgent):
         self.response_callback = response_callback
         self.before_request_callback = before_request_callback
         self.reasoning_effort = reasoning_effort
+        if (model_config and model_config['provider'] == 'opendesign'
+                and reasoning_effort not in ('high', 'none')):
+            raise ValueError('OpenDesign adapter supports reasoning_effort high or none; live acceptance is unverified')
         self.tool_result_callback = tool_result_callback
         self.workspace_path = workspace_path or Path('.')
         self.total_days = total_days
@@ -207,6 +210,7 @@ class BashAgent(BaseAgent):
             'api.together.xyz',
             'api.deepseek.com',
             'opencode.ai',
+            'amr-link.open-design.ai',
         )
         self.supports_responses_api = (model_config['api'] == 'responses' if model_config else
                                        not any(h in base_url for h in _non_responses_hosts))
@@ -796,9 +800,11 @@ class BashAgent(BaseAgent):
                 _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
                 _is_opencode = (self.model_config['provider'] == 'opencode' if self.model_config else
                                 'opencode.ai' in _base_url)
+                _is_opendesign = (self.model_config['provider'] == 'opendesign' if self.model_config else
+                                  'amr-link.open-design.ai' in _base_url)
                 _is_deepseek_compat = (
                     'api.deepseek.com' in _base_url or _is_opencode
-                )
+                ) and not _is_opendesign
                 api_kwargs = {
                     'model': self.model,
                     'messages': messages,
@@ -806,15 +812,15 @@ class BashAgent(BaseAgent):
                     'tool_choice': 'auto',
                     'temperature': 1.0,
                 }
-                # OpenAI-compat gateways (DeepSeek, OpenCode Go) reject
-                # max_completion_tokens; native OpenAI accepts both.
-                if _is_deepseek_compat:
+                if _is_deepseek_compat or _is_opendesign:
                     api_kwargs['max_tokens'] = self.max_output_tokens
                 else:
                     api_kwargs['max_completion_tokens'] = self.max_output_tokens
                 if self._wants_reasoning():
                     api_kwargs['reasoning_effort'] = self.reasoning_effort
-                if _is_together_deepseek:
+                if _is_opendesign:
+                    api_kwargs['reasoning_effort'] = self.reasoning_effort or 'none'
+                elif _is_together_deepseek:
                     # Together's DeepSeek-V4 thinking is gated on the chat-template flag,
                     # not on `reasoning_effort` (which Together rejects with 400 for max,
                     # 500 for medium, and silently ignores for low/high). The flag below
@@ -922,7 +928,8 @@ class BashAgent(BaseAgent):
                     content=assistant_msg.content or '',
                     tool_calls=tool_calls_data,
                     # DeepSeek-compatible thinking requires the field on every later assistant turn.
-                    reasoning_content=(reasoning_content or '') if (_is_deepseek_compat and self._wants_reasoning()) else None,
+                    reasoning_content=(reasoning_content or '') if (
+                        (_is_deepseek_compat or _is_opendesign) and self._wants_reasoning()) else None,
                 ))
 
                 if not assistant_msg.tool_calls:
