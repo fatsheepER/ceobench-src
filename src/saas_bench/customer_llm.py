@@ -246,6 +246,8 @@ class CustomerSimulator:
                     response = self.client.chat.completions.create(**kwargs)
                     if provider == 'opendesign':
                         raw = plain(response)
+                        if isinstance(raw, dict) and raw.get('error'):
+                            return response
                         choices = raw.get('choices') if isinstance(raw, dict) else None
                         choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else {}
                         message = choice.get('message') if isinstance(choice, dict) else None

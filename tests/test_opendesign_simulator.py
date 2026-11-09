@@ -134,3 +134,34 @@ def test_other_chat_simulators_keep_existing_terminal_behavior(endpoint, simulat
     assert len(requests) == 1 and waits == []
     logical, = rows(simulator, 'response')
     assert logical['error'] is None
+
+
+@pytest.mark.parametrize('usage', [False, True])
+def test_http_200_provider_error_holds_once_and_next_independent_call_continues(
+        endpoint, simulator_factory, usage):
+    _, requests, responses = endpoint
+    error = {'error': {'code': 'insufficient_balance', 'type': 'insufficient_balance',
+        'message': '[code=insufficient_balance] insufficient wallet balance'}}
+    if usage:
+        error['usage'] = completion()['usage']
+    responses.extend([error, completion(usage=usage)])
+    simulator, waits = simulator_factory()
+    with pytest.raises(RunCancelled, match='model_request_failed') as failure:
+        simulator.complete_text(provider='opendesign', model=MODEL, user='original task', max_tokens=321)
+    assert 'ValueError: Provider error:' in failure.value.detail
+    assert 'insufficient_balance' in failure.value.detail
+    assert len(requests) == 1 and waits == []
+    logical, = rows(simulator, 'response')
+    assert logical['error'] == 'RunCancelled' and logical['model_attempts'] == 1
+    assert logical['response'] == error and logical['usage']['input_tokens'] == (10 if usage else None)
+    assert logical['cost_usd'] is None and 'insufficient_balance' in logical['last_model_error']
+    http, = rows(simulator, 'http_response')
+    assert http['status'] == 200 and json.loads(http['body']) == error
+    assert 'insufficient_balance' in http['error']
+    assert simulator.complete_text(provider='opendesign', model=MODEL, user='new task', max_tokens=321) == (
+        'hello', 10 if usage else None, 2 if usage else None)
+    assert len(requests) == 2 and waits == []
+    assert requests[-1]['body']['messages'] == [dict(role='user', content='new task')]
+    assert [row['error'] for row in rows(simulator, 'response')] == ['RunCancelled', None]
+    assert simulator.usage_recorder.summary['known']['input_tokens'] == (20 if usage else None)
+    assert simulator.usage_recorder.summary['known_cost_usd'] is None
