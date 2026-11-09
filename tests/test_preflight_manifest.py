@@ -182,7 +182,7 @@ def test_opencode_routes_both_roles_without_deepseek_credentials(tmp_path, monke
     config = BenchmarkConfig()
     _apply_simulator_llm_config(config)
     client = _create_simulator_openai_client(config)
-    assert str(client.base_url) == str(runner.client.base_url) == 'https://opencode.ai/zen/go/v1/'
+    assert str(client.base_url) == str(runner.client.base_url) == 'https://opencode.ai/inference/go/openai/v1/'
     assert client.api_key == 'go-only-test-key'
     assert client.default_headers['User-Agent'] == runner.client.default_headers['User-Agent'] == 'CEO-Bench/1.0'
     assert client.default_headers['x-opencode-session'] == runner.client.default_headers['x-opencode-session'] + ':simulator'

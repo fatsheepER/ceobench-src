@@ -202,18 +202,26 @@ def poll(manifest_path, output, expected, state, *, quota_fn=None,
         checks.append('freeze:' + str(exc))
     for key in ('quota_retry_at', 'quota_outage_started'):
         state.pop(key, None)
-    try:
-        quota = quota_fn()
-        if set(quota) != {'rolling', 'weekly', 'monthly'}:
-            checks.append('quota_windows_changed')
-        if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
-            checks.append('quota_exhausted')
-    except Exception as exc:
-        quota_error = 'quota_unavailable:' + type(exc).__name__
-        checks.append(quota_error)
-        state.update(quota_failures=state.get('quota_failures', 0) + 1, quota_error=quota_error)
+    models = (manifest or {}).get('parameters', {}).get('model_configs')
+    quota_not_applicable = (manifest is not None and manifest.get('category') == 'engineering'
+        and not manifest.get('profile') and models
+        and not any(config['provider'] == 'opencode' for config in models.values()))
+    if quota_not_applicable:
+        # Other providers expose no verified balance API here. Keep their balance unknown.
+        state.update(quota_failures=0, quota_error=None)
     else:
-        state.update(quota_failures=0, quota_error=None, quota_last_success=time.time())
+        try:
+            quota = quota_fn()
+            if set(quota) != {'rolling', 'weekly', 'monthly'}:
+                checks.append('quota_windows_changed')
+            if any(row.get('status') != 'ok' or row.get('percent', 100) >= 100 for row in quota.values()):
+                checks.append('quota_exhausted')
+        except Exception as exc:
+            quota_error = 'quota_unavailable:' + type(exc).__name__
+            checks.append(quota_error)
+            state.update(quota_failures=state.get('quota_failures', 0) + 1, quota_error=quota_error)
+        else:
+            state.update(quota_failures=0, quota_error=None, quota_last_success=time.time())
     physical_requests = state.setdefault('physical_request_meta', {})
     cursors = state.setdefault('cursors', {})
     seen = state.setdefault('receipt_hashes', {})
@@ -400,7 +408,10 @@ def poll(manifest_path, output, expected, state, *, quota_fn=None,
         runs=[{key: run[key] for key in ('run_id', 'output_dir')} for run in manifest['runs']] if manifest else [],
         batch_id=expected['batch_id'], status='pending' if pending else 'healthy',
         historical_hold=hold.exists(),
-        quota=quota, quota_error=quota_error, checks=checks, sql_service_errors=sql, route_errors=routes,
+        quota=quota, quota_error=quota_error,
+        opencode_quota_monitor='not_applicable' if quota_not_applicable else 'applicable',
+        other_provider_balance='unknown' if models and any(config['provider'] != 'opencode' for config in models.values()) else None,
+        checks=checks, sql_service_errors=sql, route_errors=routes,
         billing_warnings=bill_warnings,
         billing_coverage=state['billing_coverage'],
         run_faults=[dict(run_id=run_id, path=path) for path, run_id in sorted(faults.items())],

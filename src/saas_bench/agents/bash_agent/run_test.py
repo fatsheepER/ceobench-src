@@ -33,7 +33,8 @@ if str(package_root) not in sys.path:
     sys.path.insert(0, str(package_root))
 
 from openai import OpenAI
-from saas_bench.config import BenchmarkConfig, OPENDESIGN_BASE_URL
+from saas_bench.config import BenchmarkConfig
+from saas_bench.chat_providers import CHAT_PROVIDERS, apply_simulator_overrides, chat_base_url, saved_simulator_base_url
 from saas_bench.execution_capture import join_text as _joined
 from saas_bench.model_usage import physical_usage_summary, usage_delta
 
@@ -104,6 +105,7 @@ class BashAgentRunner:
         self.configuration_overrides = []
         explicit_sql_capture, explicit_execution_capture = sql_capture, execution_capture
         default_config = BenchmarkConfig()
+        provider_changed = False
         if continue_from:
             from saas_bench.run_state import recover_run
             source = Path(continue_from).resolve()
@@ -120,6 +122,13 @@ class BashAgentRunner:
                 sql_capture=bool(saved_manifest.get('sql_evidence')),
                 execution_capture=(saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution')
             effective = dict(saved)
+            provider_changed = provider is not None and provider != saved['provider']
+            if provider_changed:
+                settings = CHAT_PROVIDERS.get(provider)
+                for field, value in dict(model=settings.default_model if settings else default_config.agent_llm_model,
+                        base_url=None, reasoning_effort='high' if settings else default_config.agent_llm_reasoning_effort).items():
+                    if supplied[field] is None:
+                        effective[field] = value
             for key, value in supplied.items():
                 if key == 'total_days' and value is not None:
                     value = value // 7 * 7
@@ -165,8 +174,9 @@ class BashAgentRunner:
         scenario = 'default' if scenario is None else scenario
         total_days = default_config.total_days if total_days is None else total_days
         initial_cash = 1_000_000.0 if initial_cash is None else initial_cash
-        self.model = model or default_config.agent_llm_model
         self.provider = provider or default_config.agent_llm_provider
+        settings = CHAT_PROVIDERS.get(self.provider)
+        self.model = model or (settings.default_model if settings else default_config.agent_llm_model)
         self.seed = seed
         self.scenario = scenario
         # Round down to nearest full week so the simulation always ends on a
@@ -179,7 +189,7 @@ class BashAgentRunner:
                                            stop_after_day >= self.total_days):
             raise ValueError('stop_after_day must be a whole week before the configured end')
         self.stop_after_day = stop_after_day
-        self.reasoning_effort = reasoning_effort or ('high' if self.provider == 'opendesign'
+        self.reasoning_effort = reasoning_effort or ('high' if self.provider in CHAT_PROVIDERS
                                                     else default_config.agent_llm_reasoning_effort)
         if self.provider == 'opendesign' and self.reasoning_effort not in ('high', 'none'):
             raise ValueError('OpenDesign adapter supports --reasoning-effort high or none; live acceptance is unverified')
@@ -327,12 +337,9 @@ class BashAgentRunner:
             self.api_key = env_vars.get("MODAL_API_KEY") or os.environ.get("MODAL_API_KEY")
         elif self.provider == "together":
             self.api_key = env_vars.get("TOGETHER_API_KEY") or os.environ.get("TOGETHER_API_KEY")
-        elif self.provider == "deepseek":
-            self.api_key = env_vars.get("DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
-        elif self.provider == "opencode":
-            self.api_key = env_vars.get("OPENCODE_API_KEY") or os.environ.get("OPENCODE_API_KEY")
-        elif self.provider == "opendesign":
-            self.api_key = env_vars.get("OPENDESIGN_API_KEY") or os.environ.get("OPENDESIGN_API_KEY")
+        elif self.provider in CHAT_PROVIDERS:
+            credential_env = CHAT_PROVIDERS[self.provider].credential_env
+            self.api_key = env_vars.get(credential_env) or os.environ.get(credential_env)
         elif self.provider == "ai_sandbox":
             self.api_key = env_vars.get("AI_SANDBOX_KEY") or os.environ.get("AI_SANDBOX_KEY")
         else:
@@ -351,12 +358,8 @@ class BashAgentRunner:
             self.base_url = os.environ.get("MODAL_BASE_URL")
         elif self.provider == "together":
             self.base_url = "https://api.together.xyz/v1"
-        elif self.provider == "deepseek":
-            self.base_url = "https://api.deepseek.com"
-        elif self.provider == "opencode":
-            self.base_url = "https://opencode.ai/zen/go/v1"
-        elif self.provider == "opendesign":
-            self.base_url = os.environ.get('OPENDESIGN_BASE_URL') or OPENDESIGN_BASE_URL
+        elif self.provider in CHAT_PROVIDERS:
+            self.base_url = chat_base_url(self.provider)
         else:
             self.base_url = None
 
@@ -398,6 +401,12 @@ class BashAgentRunner:
             self.client = OpenAI(**client_kwargs)
 
         self.base_url = str(self.client.base_url)
+        if provider_changed:
+            for field in ('model', 'base_url', 'reasoning_effort'):
+                if supplied[field] is None and (value := getattr(self, field)) != saved[field]:
+                    logging.warning('Resume selects %s defaults for %s: %r -> %r', self.provider, field, saved[field], value)
+                    self.configuration_overrides.append(dict(field=field, old=saved[field], new=value,
+                        effective_at='new_recovery_attempt'))
 
         # Components (initialized in setup)
         self.agent = None
@@ -725,13 +734,19 @@ __pycache__/
             env.pop('CEOBENCH_SQL_EVIDENCE', None)
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
-        # Use the selected account for both roles unless explicitly overridden.
-        if not self.continue_from and self.provider in ("deepseek", "opencode", "opendesign"):
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", self.provider)
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", self.model)
-        if self.provider == 'opendesign':
-            saved_url = (self._source_manifest or {}).get('benchmark_config', {}).get('simulator_opendesign_base_url')
-            env.setdefault('OPENDESIGN_BASE_URL', saved_url or self.base_url)
+        # A new run follows the agent only when no simulator provider was selected.
+        if not self.continue_from and self.provider in CHAT_PROVIDERS and not env.get('CEOBENCH_SIMULATOR_LLM_PROVIDER'):
+            env['CEOBENCH_SIMULATOR_LLM_PROVIDER'] = self.provider
+            env.setdefault('CEOBENCH_SIMULATOR_LLM_MODEL', self.model)
+        saved = (self._source_manifest or {}).get('benchmark_config', {})
+        simulator_provider = env.get('CEOBENCH_SIMULATOR_LLM_PROVIDER') or saved.get('social_post_llm_provider')
+        if simulator_provider in CHAT_PROVIDERS:
+            settings = CHAT_PROVIDERS[simulator_provider]
+            saved_url = saved_simulator_base_url(saved, simulator_provider)
+            if saved_url:
+                env.setdefault(settings.base_url_env, saved_url)
+            elif not self.continue_from and simulator_provider == self.provider:
+                env.setdefault(settings.base_url_env, self.base_url)
         return env
 
     def _prepare_manifest(self):
@@ -753,16 +768,11 @@ __pycache__/
         config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
         config.simulator_anthropic_base_url = os.environ.get('ANTHROPIC_BASE_URL', config.simulator_anthropic_base_url)
         env = self._server_environment()
-        config.simulator_opendesign_base_url = env.get('OPENDESIGN_BASE_URL', config.simulator_opendesign_base_url)
-        for suffix in ('provider', 'model'):
-            value = env.get('CEOBENCH_SIMULATOR_LLM_' + suffix.upper())
-            if value:
-                for prefix in ('social_post_llm_', 'enterprise_llm_'):
-                    setattr(config, prefix + suffix, value)
+        apply_simulator_overrides(config, env)
         if self._source_manifest:
             for field in ('social_post_llm_provider', 'social_post_llm_model', 'enterprise_llm_provider',
                     'enterprise_llm_model', 'simulator_openai_base_url', 'simulator_anthropic_base_url',
-                    'simulator_opendesign_base_url'):
+                    'simulator_deepseek_base_url', 'simulator_opencode_base_url', 'simulator_opendesign_base_url'):
                 old, new = self._source_manifest['benchmark_config'].get(field), getattr(config, field)
                 if old != new:
                     row = dict(field=field, old=old, new=new, effective_at='simulator_start_in_new_recovery_attempt')
@@ -1255,7 +1265,7 @@ __pycache__/
                                       self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
             pf=self.text_registration == 'pf',
-            model_config=dict(provider='opendesign', api='chat') if self.provider == 'opendesign' else None,
+            model_config=dict(provider=self.provider, api='chat') if self.provider in CHAT_PROVIDERS else None,
             **self.generation_policy,
         )
 
@@ -1775,7 +1785,7 @@ def main():
     default_config = BenchmarkConfig()
     parser = argparse.ArgumentParser(description="Run bash agent for SaaS Bench")
     parser.add_argument("--model", default=None,
-                        help=f"Model name (default: BenchmarkConfig.agent_llm_model={default_config.agent_llm_model})")
+                        help=f"Model name (default: selected Chat provider default, otherwise {default_config.agent_llm_model})")
     parser.add_argument("--provider", default=None,
                         choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "opendesign", "ai_sandbox"],
                         help=f"API provider (default: BenchmarkConfig.agent_llm_provider={default_config.agent_llm_provider})")
@@ -1790,7 +1800,7 @@ def main():
     parser.add_argument("--reasoning-effort",
                         choices=["none", "low", "medium", "high", "xhigh", "max"],
                         help="Reasoning effort for reasoning models "
-                             f"(default: BenchmarkConfig.agent_llm_reasoning_effort={default_config.agent_llm_reasoning_effort})")
+                             f"(default: high for DeepSeek/OpenCode/OpenDesign, otherwise {default_config.agent_llm_reasoning_effort})")
     parser.add_argument("--continue-from", type=Path,
                         help="Path to previous run directory to resume from")
     parser.add_argument("--api-key", help="API key (overrides .env and environment)")

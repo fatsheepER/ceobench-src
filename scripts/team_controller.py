@@ -209,16 +209,19 @@ def _worker(policy, run_id, *, resume, parent_pid, week, force_resume, warnings)
     import tempfile
     os.environ['TMPDIR'] = str(prepare_tmpdir(Path(gate.expected['host_logs']) / 'tmp' / launch_id))
     tempfile.tempdir = os.environ['TMPDIR']
-    key = os.environ.get('OPENCODE_API_KEY')
-    if not key:
-        logging.warning('Existing OPENCODE_API_KEY is unavailable')
+    models = manifest['parameters'].get('model_configs')
+    credentials = {config['credential_env'] for config in models.values()} if models else {'OPENCODE_API_KEY'}
+    for name in sorted(credentials):
+        if not os.environ.get(name):
+            logging.warning('Existing %s is unavailable', name)
     for name in ('BOSSBENCH_LLM_REPLAY_DB', 'ORACLE_MODE', 'CEOBENCH_READ_ONLY_TASK',
                  'CEOBENCH_TEST_PUBLIC', 'CEOBENCH_PUBLIC_DIR', 'NOVAMIND_PUBLIC_DIR',
                  'CEOBENCH_DASHBOARD_URL', 'CEOBENCH_SIMULATOR_USAGE_LOG', 'CEOBENCH_MODEL_SESSION'):
         if os.environ.get(name):
             logging.warning('Worker environment override is set: %s', name)
-    os.environ['CEOBENCH_SIMULATOR_LLM_PROVIDER'] = 'opencode'
-    os.environ['CEOBENCH_SIMULATOR_LLM_MODEL'] = batch.MODEL
+    world = models['simulator'] if models else dict(provider='opencode', model=batch.MODEL)
+    os.environ['CEOBENCH_SIMULATOR_LLM_PROVIDER'] = world['provider']
+    os.environ['CEOBENCH_SIMULATOR_LLM_MODEL'] = world['model']
     options = dict(resume=resume, live=True, request_guard=gate,
                    response_guard=gate.response, parent_pid=parent_pid, force_resume=force_resume,
                    startup_warnings=warnings.rows)

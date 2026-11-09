@@ -764,6 +764,8 @@ class BenchmarkConfig:
     model_pricing: Dict[str, Dict[str, float | str]] = field(default_factory=dict)
     simulator_model_config: Dict | None = None
     simulator_openai_base_url: str = 'https://api.openai.com/v1'
+    simulator_deepseek_base_url: str = 'https://api.deepseek.com/'
+    simulator_opencode_base_url: str = 'https://opencode.ai/inference/go/openai/v1/'
     simulator_opendesign_base_url: str = OPENDESIGN_BASE_URL
     simulator_anthropic_base_url: str = 'https://api.anthropic.com'
 

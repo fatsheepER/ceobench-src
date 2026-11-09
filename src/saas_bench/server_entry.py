@@ -29,6 +29,7 @@ from numpy.random import Generator, PCG64
 from saas_bench.config import (
     BenchmarkConfig, SCENARIO_PACKS, ScenarioPack, RUNTIME_CONFIG_FIELDS, normalize_runtime_config,
 )
+from saas_bench.chat_providers import CHAT_PROVIDERS, apply_simulator_overrides, saved_simulator_base_url
 from saas_bench.database import init_database
 from saas_bench.simulation import Simulator
 from saas_bench.customer_llm import CustomerSimulator
@@ -129,14 +130,7 @@ def _resolve_session(base: Path, session_id: Optional[str]) -> str:
 
 def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
     """Validate and serialize simulator-side LLM provider/model config."""
-    override_provider = os.environ.get("CEOBENCH_SIMULATOR_LLM_PROVIDER")
-    override_model = os.environ.get("CEOBENCH_SIMULATOR_LLM_MODEL")
-    if override_provider:
-        config.social_post_llm_provider = override_provider
-        config.enterprise_llm_provider = override_provider
-    if override_model:
-        config.social_post_llm_model = override_model
-        config.enterprise_llm_model = override_model
+    apply_simulator_overrides(config, os.environ)
 
     valid_providers = {"bedrock", "anthropic", "openai", "deepseek", "opencode", "opendesign"}
     for attr in ("social_post_llm_provider", "enterprise_llm_provider"):
@@ -183,8 +177,6 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
     if 'opendesign' in (config.social_post_llm_provider, config.enterprise_llm_provider):
         if not os.environ.get('OPENDESIGN_API_KEY'):
             raise ValueError('Simulator OpenDesign provider requires OPENDESIGN_API_KEY')
-        config.simulator_opendesign_base_url = (os.environ.get('OPENDESIGN_BASE_URL')
-                                               or config.simulator_opendesign_base_url)
 
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
@@ -212,6 +204,10 @@ def _session_config(seed, total_days, initial_cash, meta=None):
         setattr(config, name, value)
     if meta and not frozen:
         _restore_simulator_llm_config(config, meta)
+    saved = frozen or (meta or {}).get('simulator_llm', {})
+    for provider in CHAT_PROVIDERS:
+        if url := saved_simulator_base_url(saved, provider):
+            setattr(config, 'simulator_' + provider + '_base_url', url)
     before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
     effective = _apply_simulator_llm_config(config)
     if frozen and effective != before:
@@ -230,23 +226,17 @@ def _create_simulator_openai_client(config: BenchmarkConfig):
 
     from openai import OpenAI
 
-    if 'opendesign' in providers:
-        key = os.environ.get('OPENDESIGN_API_KEY')
+    selected = compatible.pop()
+    if selected in CHAT_PROVIDERS:
+        settings = CHAT_PROVIDERS[selected]
+        key = os.environ.get(settings.credential_env)
         if not key:
-            raise ValueError('Simulator OpenDesign provider requires OPENDESIGN_API_KEY')
-        return OpenAI(api_key=key, base_url=config.simulator_opendesign_base_url)
-    if "opencode" in providers:
-        return OpenAI(
-            api_key=os.environ.get('OPENCODE_API_KEY'),
-            base_url='https://opencode.ai/zen/go/v1',
-            default_headers={'User-Agent': 'CEO-Bench/1.0',
-                             'x-opencode-session': os.environ.get('CEOBENCH_MODEL_SESSION') or uuid.uuid4().hex},
-        )
-    if "deepseek" in providers:
-        return OpenAI(
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com",
-        )
+            raise ValueError(f'Simulator {selected} provider requires {settings.credential_env}')
+        headers = ({'User-Agent': 'CEO-Bench/1.0',
+                    'x-opencode-session': os.environ.get('CEOBENCH_MODEL_SESSION') or uuid.uuid4().hex}
+                   if selected == 'opencode' else {})
+        return OpenAI(api_key=key, base_url=getattr(config, 'simulator_' + selected + '_base_url'),
+            default_headers=headers)
     return OpenAI(base_url=config.simulator_openai_base_url)
 
 

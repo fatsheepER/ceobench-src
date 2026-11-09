@@ -4,6 +4,7 @@ import re
 from urllib.parse import urlsplit
 
 from .payload_tokens import tokenizer_config
+from .chat_providers import CHAT_PROVIDERS, chat_base_url
 
 FLASH = 'deepseek-v4.1-flash'
 OPENCODE_URL = 'https://opencode.ai/zen/go/v1/'
@@ -52,6 +53,64 @@ def round_four_models(profile, pricing):
     return dict(agent=agent, simulator=simulator)
 
 
+def make_chat_models(agent_provider, *, simulator_provider=None, agent_model=None, simulator_model=None,
+                     agent_base_url=None, simulator_base_url=None, agent_reasoning_effort='high',
+                     environment=None):
+    """Credential-free settings for new engineering runs; simulator thinking stays off."""
+    simulator_provider = simulator_provider or agent_provider
+
+    def config(provider, model, base_url, *, simulator=False):
+        settings = CHAT_PROVIDERS[provider]
+        model = model or settings.default_model
+        effort = 'none' if simulator else agent_reasoning_effort
+        if effort not in ('high', 'none'):
+            raise ValueError('New Chat configurations support reasoning_effort high or none')
+        thinking = ('disabled' if effort == 'none' else 'enabled') if settings.supports_thinking_body else None
+        return dict(provider=provider, model=model, api='chat',
+            base_url=chat_base_url(provider, explicit=base_url, environment=environment),
+            credential_env=settings.credential_env, reasoning_effort=effort, thinking=thinking,
+            max_output_tokens=32768, memory_characters=100000, temperature=None if simulator else 1.0,
+            tokenizer=tokenizer_config(provider, model),
+            pricing=dict(source=None, basis='No registered price; usage retained and cost unknown', rates=None),
+            contract=dict(source=settings.contract_source,
+                verification='documented_route_offline_request_contract', live_verified=False))
+
+    return validate_models(dict(agent=config(agent_provider, agent_model, agent_base_url),
+        simulator=config(simulator_provider, simulator_model, simulator_base_url, simulator=True)))
+
+
+def apply_model_configs(config, models):
+    """Keep the agent identity and both simulator jobs on the selected contracts."""
+    agent, world = models['agent'], models['simulator']
+    config.agent_llm_provider, config.agent_llm_model = agent['provider'], agent['model']
+    config.agent_llm_reasoning_effort = agent['reasoning_effort']
+    config.social_post_llm_provider = config.enterprise_llm_provider = world['provider']
+    config.social_post_llm_model = config.enterprise_llm_model = world['model']
+    config.simulator_model_config = copy.deepcopy(world)
+    endpoint_field = 'simulator_' + world['provider'] + '_base_url'
+    if hasattr(config, endpoint_field):
+        setattr(config, endpoint_field, world['base_url'])
+
+
+def pricing_from_model_configs(models):
+    """Never carry a previous provider's price into an explicitly changed contract."""
+    rates, unavailable, sources = {}, set(), set()
+    for config in models.values():
+        model, pricing = config['model'], config['pricing']
+        selected = pricing.get('rates')
+        if selected is None:
+            unavailable.add(model)
+            continue
+        if model in rates and rates[model] != selected:
+            raise ValueError(f'Conflicting prices for model alias {model!r}; provide explicit model_pricing')
+        rates[model] = copy.deepcopy(selected)
+        if source := pricing.get('source'):
+            sources.add(source)
+    return dict(source='; '.join(sorted(sources)) or None,
+        basis='Selected model configuration rates in USD/1000 tokens; unavailable rates stay unknown',
+        rates={model: price for model, price in rates.items() if model not in unavailable})
+
+
 def validate_models(models):
     """Allow only public configuration fields, including local HTTP test endpoints."""
     if not isinstance(models, dict) or set(models) != {'agent', 'simulator'}:
@@ -68,7 +127,7 @@ def validate_models(models):
             raise ValueError('Model endpoint must be credential-free HTTPS (loopback HTTP allowed for tests)')
         if not re.fullmatch(r'[A-Z][A-Z0-9_]*', config['credential_env']):
             raise ValueError('Freeze a credential environment variable name, never its value')
-        if (config['provider'], config['api']) not in {('opencode', 'chat'), ('openai', 'responses'), ('opendesign', 'chat')}:
+        if (config['provider'], config['api']) not in {('deepseek', 'chat'), ('opencode', 'chat'), ('openai', 'responses'), ('opendesign', 'chat')}:
             raise ValueError('Unsupported explicit provider/API contract')
         if not config['model'] or config['reasoning_effort'] not in ('none', 'low', 'medium', 'high', 'xhigh', 'max'):
             raise ValueError('Invalid model or reasoning effort')
@@ -97,10 +156,14 @@ def model_issue(row, models):
             if ((body.get('reasoning') or {}).get('effort') != config['reasoning_effort'] or
                     body.get('store') is not False or body.get('include') != config['include']):
                 return thinking_issue
-        elif (body.get('reasoning_effort') != config['reasoning_effort'] or
-              ('thinking' in body if config['provider'] == 'opendesign'
-               else body.get('thinking') != {'type': config['thinking']})):
-            return thinking_issue
+        else:
+            effort = body.get('reasoning_effort')
+            optional_official_none = (config['provider'] == 'deepseek' and row.get('role') == 'simulator'
+                and config['reasoning_effort'] == 'none' and effort is None)
+            if ((effort != config['reasoning_effort'] and not optional_official_none) or
+                    ('thinking' in body if config['provider'] == 'opendesign'
+                     else body.get('thinking') != {'type': config['thinking']})):
+                return thinking_issue
         if body.get('max_output_tokens' if config['api'] == 'responses' else 'max_tokens') != config['max_output_tokens']:
             return 'model_output_limit_changed'
     if event == 'http_error':

@@ -74,6 +74,7 @@ _ENGINE_MODULES = [
     "runtime_options",
     "systemd_guard",
     "config",
+    "chat_providers",
     "customer_llm",
     "database",
     "db_protection",

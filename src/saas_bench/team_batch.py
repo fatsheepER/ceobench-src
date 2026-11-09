@@ -35,7 +35,7 @@ from .run_state import file_hash, tree_hash, verify_build, write_json
 from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
-from .team_models import ROUND_FOUR_PROFILES, round_four_models, validate_profile_models
+from .team_models import ROUND_FOUR_PROFILES, apply_model_configs, round_four_models, validate_models, validate_profile_models
 from .team_round5 import PROFILE as ROUND_FIVE_PROFILE
 from .team_checkpoint import CheckpointDataError, retention_lock
 from .run_lifecycle import BusinessOutcomeUnknown
@@ -108,12 +108,7 @@ def configuration(seed, prices, models=None):
         social_post_llm_provider='opencode', social_post_llm_model=MODEL,
         enterprise_llm_provider='opencode', enterprise_llm_model=MODEL)
     if models:
-        agent, world = models['agent'], models['simulator']
-        config.agent_llm_provider, config.agent_llm_model = agent['provider'], agent['model']
-        config.agent_llm_reasoning_effort = agent['reasoning_effort']
-        config.social_post_llm_provider = config.enterprise_llm_provider = world['provider']
-        config.social_post_llm_model = config.enterprise_llm_model = world['model']
-        config.simulator_model_config = world
+        apply_model_configs(config, models)
     for name, value in normalize_runtime_config(
             {name: getattr(config, name) for name in RUNTIME_CONFIG_FIELDS}).items():
         setattr(config, name, value)
@@ -415,7 +410,9 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if profile in EXPLICIT_MODEL_PROFILES:
         model_configs = validate_profile_models(profile, model_configs or round_four_models(profile, prices), prices)
     elif model_configs is not None:
-        raise ValueError('Explicit model configurations require an explicit-model profile')
+        if category != 'engineering' or profile is not None:
+            raise ValueError('Explicit model configurations require an explicit-model profile or unprofiled engineering category')
+        model_configs = validate_models(model_configs)
     build, source = verify_build(public, root=root), tree_hash(root / 'src')
     d0 = {str(seed): verify_d0(path, seed=seed) for seed, path in d0_sources.items()}
     destination.mkdir(parents=True, exist_ok=False)
@@ -549,6 +546,10 @@ def validate_manifest(path):
             from .agent_capabilities import AgentCapabilities
             if any(row.get('capabilities') != AgentCapabilities.round_three(row['group']).to_dict() for row in manifest['runs']):
                 logging.warning('Fourth-round capabilities mismatch')
+        if manifest['parameters'].get('model_configs') is not None and profile not in EXPLICIT_MODEL_PROFILES:
+            if category != 'engineering' or profile is not None:
+                raise ValueError('Explicit model configurations require an explicit-model profile or unprofiled engineering category')
+            validate_models(manifest['parameters']['model_configs'])
         actual, ids, outputs = set(), set(), set()
         for entry in manifest['runs']:
             key = entry['seed'], entry['repeat'], entry['group']
@@ -1287,7 +1288,7 @@ def main(argv=None):
     shape = frozen.add_mutually_exclusive_group()
     shape.add_argument('--category', choices=('formal', 'engineering'), default='formal')
     shape.add_argument('--profile', choices=EXPERIMENT_PROFILES)
-    frozen.add_argument('--model-configs', type=Path, help='Credential-free agent/simulator JSON for round four.')
+    frozen.add_argument('--model-configs', type=Path, help='Credential-free agent/simulator JSON for explicit-model profiles or unprofiled engineering batches.')
     frozen.add_argument('--exploration-manifest', type=Path,
         help='Prior Git exploration manifest, required for the paired pilot seed exclusions.')
     frozen.add_argument('--excluded-debug-seed', '--excluded-seed', action='append', type=int, default=[])

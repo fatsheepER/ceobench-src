@@ -461,6 +461,17 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
     from .simulation import Simulator
     from .shocks import ShockManager
     from .tools import AgentTools
+    from .team_models import apply_model_configs, pricing_from_model_configs, validate_models
+    selected_models = options.get('model_configs')
+    if selected_models is not None:
+        validate_models(selected_models)
+        agent = selected_models['agent']
+        for key, value in dict(model=agent['model'], reasoning_effort=agent['reasoning_effort']).items():
+            if key in options and options[key] != value:
+                raise ValueError(f'Explicit {key} differs from selected model configuration')
+            options.setdefault(key, value)
+        if 'model_pricing' not in options:
+            options['model_pricing'] = pricing_from_model_configs(selected_models)
     snapshot, state = validate_snapshot(snapshot)
     try:
         validate_runtime_data(snapshot, state)
@@ -496,7 +507,7 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
             value = runtime_value(key, None)
             options[key] = value or None if key.endswith('_warn_after') else value
     for key in list(options):
-        if key in configuration or key in policy_keys or key == 'capabilities':
+        if key in configuration or key in policy_keys or key in ('capabilities', 'model_configs'):
             requested = options.pop(key)
             previous = configuration.get(key)
             configuration[key] = requested
@@ -509,6 +520,16 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
                     if (name == 'ceo') == key.startswith('ceo_'):
                         saved['executor'][field] = requested
     state['_configuration_changes'] = changes
+    if 'model_configs' in changes and selected_models is not None:
+        selected_policy = dict(memory_max_chars=selected_models['agent']['memory_characters'],
+                               max_output_tokens=selected_models['agent']['max_output_tokens'])
+        for role, saved in state['roles'].items():
+            policy = saved.setdefault('generation_policy', {})
+            for key, new in selected_policy.items():
+                old = policy.get(key)
+                if old != new:
+                    changes[f'{role}.{key}'] = dict(old=old, new=new, effective_at='new_attempt')
+                policy[key] = new
     for role, saved in state['roles'].items():
         for key, option in dict(memory_max_chars='memory_max_chars', max_output_tokens='model_max_output_tokens',
                                 invalid_generation_attempts='invalid_generation_attempts').items():
@@ -565,7 +586,9 @@ def restore(cls, snapshot, root, *, client_factory, public_dir=None, token_count
             if key in changes:
                 for field in fields:
                     setattr(config, field, configuration[key])
-        if 'model_pricing' in changes:
+        if 'model_configs' in changes and selected_models is not None:
+            apply_model_configs(config, selected_models)
+        if 'model_pricing' in changes or 'model_configs' in changes:
             config.model_pricing = (configuration['model_pricing'] or {}).get('rates', {})
         rng = default_rng(config.seed)
         simulator = simulator_factory(conn, config, rng) if simulator_factory else Simulator(conn, config, rng)
@@ -644,6 +667,7 @@ def restore_runtime_state(runtime, state):
     from .team_prompts import with_registered_script_contract
     server = runtime.server
     original = state['source_root']
+    identity_changed = bool({'model', 'model_configs'} & state.get('_configuration_changes', {}).keys())
     old_workspace, new_workspace = 'Workspace: ' + original + '/roles/', 'Workspace: ' + str(runtime.root) + '/roles/'
     runtime._stage, runtime._week = state['stage'], state['week']
     server.team_phase = state['phase']
@@ -668,7 +692,7 @@ def restore_runtime_state(runtime, state):
         role.usage.summary = saved['usage']
         role.usage.context_id = saved['context_id']
         role.usage.last_request_event = saved['last_request_event']
-        role.usage.expected_model = role.agent.model if 'model' in state.get('_configuration_changes', {}) else saved['expected_model']
+        role.usage.expected_model = role.agent.model if identity_changed else saved['expected_model']
         regenerate_prompt = bool('capabilities' in runtime.configuration or
             state.get('_configuration_changes') or state.get('_legacy_history_unavailable'))
         if not regenerate_prompt:
@@ -708,9 +732,9 @@ def restore_runtime_state(runtime, state):
             logging.warning('Recovery simulator client configuration differs from checkpoint')
         usage.path = runtime.root / 'private' / 'simulator-model-usage.jsonl'
         usage.summary, usage.context_id = saved['summary'], saved['context_id']
-        if 'model_pricing' not in state.get('_configuration_changes', {}):
+        if not {'model_pricing', 'model_configs'} & state.get('_configuration_changes', {}).keys():
             usage.pricing = saved['pricing']
-        usage.expected_model = (server.tools.config.social_post_llm_model if 'model' in state.get('_configuration_changes', {})
+        usage.expected_model = (server.tools.config.social_post_llm_model if identity_changed
                                 else saved['expected_model'])
     if 'event_logger' in state:
         from .event_logger import EventLogger, RunMetadata
