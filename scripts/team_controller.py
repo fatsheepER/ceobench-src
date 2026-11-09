@@ -5,14 +5,17 @@ Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 supervision/resour
 """
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import fcntl
+import errno
 import json
 import logging
 import math
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -34,6 +37,22 @@ COOPERATIVE_STOP_SECONDS = 660
 FORCE_STOP_SECONDS = COOPERATIVE_STOP_SECONDS + 30
 
 
+def system_hold(path, reason, **fields):
+    try:
+        with Path(path).open('x') as stream:
+            json.dump(dict(reason=reason, time=datetime.now(timezone.utc).isoformat(),
+                manual_resolution_required=True, **fields), stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = os.open(Path(path).parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except FileExistsError:
+        pass
+
+
 def scope_state(saved, *, exit_code=None):
     unit = saved['unit']
     record = unit_status(unit, invocation_id=saved.get('invocation_id'), exit_code=exit_code)
@@ -47,6 +66,9 @@ def scope_state(saved, *, exit_code=None):
     if ((invocation and saved.get('invocation_id') and invocation != saved['invocation_id']) or
             (group and saved.get('control_group') and group != saved['control_group'])):
         logging.warning('Worker scope identity changed')
+        record['scope_identity_conflict'] = True
+        if saved.get('strict_identity'):
+            return dict(saved, scope_empty=False, scope_identity_conflict=True, scope_observation_unknown=True)
     if invocation and record.get('invocation_id') not in (None, invocation):
         logging.warning('Worker scope observations disagree on invocation')
     record['invocation_id'] = invocation or saved.get('invocation_id') or record.get('invocation_id')
@@ -82,6 +104,8 @@ def signal_scope(saved, signum):
         current = dict(saved, scope_empty=False, scope_observation_unknown=True)
     if current['scope_empty'] and not current.get('scope_observation_unknown'):
         return current
+    if saved.get('strict_identity') and current.get('scope_identity_conflict'):
+        raise RuntimeError('Worker scope identity conflict; refusing to signal another invocation')
     if not saved.get('invocation_id') or not saved.get('control_group'):
         logging.warning('Cannot signal an unbound worker scope')
         return current
@@ -99,6 +123,8 @@ class RequestGate:
     def __init__(self, policy, *, run_id=None, parent_pid=None):
         self.directory = Path(policy).resolve().parent
         self.expected = batch.read(policy)['identity']
+        self.fifo = batch.read(self.expected['manifest']).get('profile') == batch.FIFO_PROFILE
+        self.system_hold = Path(self.expected['manifest']).parent / 'SYSTEM_HOLD.json'
         self.hold = self.directory / 'HOLD'
         self.parent_pid = parent_pid
         self.scope = None
@@ -122,6 +148,8 @@ class RequestGate:
         raise RunCancelled(reason)
 
     def check_stop(self):
+        if self.fifo and self.system_hold.exists():
+            self.stop('systemic_hold')
         if self.scope is not None:
             try:
                 changes = check_worker_cgroup(self.scope)
@@ -142,6 +170,8 @@ class RequestGate:
         if self.entry and run_stopped(self.entry, after_attempt=self.prior_attempt):
             raise RunCancelled('run_evidence_fault')
         if self.parent_pid is not None and os.getppid() != self.parent_pid:
+            if self.fifo:
+                self.stop('supervisor_cancelled')
             if not getattr(self, '_parent_warning', False):
                 logging.warning('Worker parent changed or exited; continuing as requested')
                 self._parent_warning = True
@@ -154,6 +184,15 @@ class RequestGate:
         self.check_stop()
 
     def response(self, response):
+        if self.fifo and response.status_code >= 400:
+            import httpx
+            from saas_bench.model_usage import is_network_error
+            response.read()
+            error = httpx.HTTPStatusError('Model HTTP refusal', request=response.request, response=response)
+            if not is_network_error(error):
+                system_hold(self.system_hold, 'permanent_model_refusal',
+                    run_id=(self.entry or {}).get('run_id'), http_status=response.status_code,
+                    detail=response.text[:4000])
         if response.status_code != 429:
             return
         response.read()
@@ -200,9 +239,17 @@ def _worker(policy, run_id, *, resume, parent_pid, week, force_resume, warnings)
         gate.scope = verify_worker_scope(json.loads(os.environ.pop('CEOBENCH_WORKER_SCOPE_POLICY', 'null')))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         write_json(scope_receipt, dict(verified=False, error_type=type(exc).__name__, error=str(exc)))
+        if gate.fifo:
+            raise
         logging.warning('Worker scope validation failed: %s; continuing', exc)
     else:
         write_json(scope_receipt, dict(verified=True, **gate.scope))
+    if gate.fifo:
+        claim_path = Path(gate.expected['manifest']).parent / 'fifo-launches' / (run_id + '-' + launch_id + '.json')
+        claim = batch.read(claim_path)
+        if (claim.get('closed') is not False or claim.get('unit') != gate.scope['unit'] or
+                claim.get('controller_pid') != parent_pid or parent_pid != os.getppid()):
+            raise ValueError('FIFO worker does not belong to the active controller launch')
     manifest = gate.manifest()
     entry = batch.selected(manifest, run_id)
     from saas_bench.runtime_temp import prepare_tmpdir
@@ -234,9 +281,14 @@ def _worker(policy, run_id, *, resume, parent_pid, week, force_resume, warnings)
 
 def supervise(policy, *, resume=False, force_resume=False, memory_high=16 * 1024**3, memory_max=20 * 1024**3,
               memory_swap_max=0, week=None, run_id=None, startup_warnings=()):
-    with AttemptWarnings(startup_warnings) as warnings:
-        return _supervise(policy, resume=resume, force_resume=force_resume, memory_high=memory_high,
-            memory_max=memory_max, memory_swap_max=memory_swap_max, week=week, run_id=run_id, warnings=warnings)
+    manifest_path = Path(batch.read(policy)['identity']['manifest'])
+    fifo = batch.read(manifest_path).get('profile') == batch.FIFO_PROFILE
+    with (manifest_path.parent / 'fifo-controller.lock').open('a') if fifo else nullcontext() as ownership:
+        if fifo:
+            fcntl.flock(ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with AttemptWarnings(startup_warnings) as warnings:
+            return _supervise(policy, resume=resume, force_resume=force_resume, memory_high=memory_high,
+                memory_max=memory_max, memory_swap_max=memory_swap_max, week=week, run_id=run_id, warnings=warnings)
 
 
 def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_swap_max, week, run_id, warnings):
@@ -248,6 +300,12 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
     policy = Path(policy).resolve()
     gate = RequestGate(policy)
     manifest = gate.manifest()
+    fifo = manifest.get('profile') == batch.FIFO_PROFILE
+    if fifo:
+        from saas_bench.team_round5 import check_launch
+        check_launch(policy, driver_path=Path(__file__).with_name('team_driver.py'))
+        if resume and (run_id is None or (week is None and requested_checkpoint(batch.selected(manifest, run_id)) is None)):
+            raise ValueError('FIFO recovery requires a selected run and explicit checkpoint or week')
     if run_id is not None:
         manifest = dict(manifest, runs=[batch.selected(manifest, run_id)])
     source_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
@@ -261,6 +319,19 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
               for group in ('git', 'pf')}
     events_path = directory / 'controller-events.jsonl'
     terminal, children, streams = {}, [], []
+    storage_faults = []
+    claims = Path(gate.expected['manifest']).parent / 'fifo-launches'
+    claimed_ids = set()
+    if fifo:
+        claims.mkdir(exist_ok=True)
+        for claim_path in claims.glob('*.json'):
+            try:
+                claim = batch.read(claim_path)
+                claimed_ids.add(claim['run_id'])
+                if claim.get('closed') is not True:
+                    raise ValueError('Previous launch has no confirmed closure')
+            except (OSError, ValueError, AttributeError, KeyError, TypeError) as exc:
+                system_hold(gate.system_hold, 'unclosed_previous_launch', claim=str(claim_path), detail=str(exc))
     units_path = directory / 'controller-units.json'
     history_errors = []
     previous_units_unavailable = None
@@ -304,13 +375,21 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
     last_poll = 0
 
     def event(kind, **fields):
-        with events_path.open('a') as stream:
-            stream.write(json.dumps(dict(fields, time=datetime.now(timezone.utc).isoformat(), event=kind)) + '\n')
-            stream.flush()
-            os.fsync(stream.fileno())
+        try:
+            with events_path.open('a') as stream:
+                stream.write(json.dumps(dict(fields, time=datetime.now(timezone.utc).isoformat(), event=kind)) + '\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            if not fifo:
+                raise
+            storage_faults.append(str(exc))
+            print('Controller event persistence failed: ' + str(exc), file=sys.stderr)
 
     for error in history_errors:
         event('controller_history_warning', **error)
+    if fifo and history_errors:
+        system_hold(gate.system_hold, 'controller_history_unavailable', errors=history_errors)
 
     def alarm(entry, reason, **details):
         record = dict(run_id=entry['run_id'], group=entry['group'], reason=reason,
@@ -326,11 +405,27 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             logging.warning('Worker scope observation unavailable for %s: %s', slot['entry']['run_id'], exc)
             observed = dict(slot['unit'], scope_empty=slot['child'].returncode is not None,
                 scope_observation_unknown=True, cleanup_error=str(exc))
+        if fifo:
+            observed['strict_identity'] = True
+            if (observed.get('scope_identity_conflict') or observed.get('scope_observation_unknown') or
+                    slot['child'].returncode is not None and
+                    not (observed.get('invocation_id') and observed.get('control_group'))):
+                observed['scope_observation_unknown'] = True
+                try:
+                    system_hold(gate.system_hold, 'worker_scope_unconfirmed', run_id=slot['entry']['run_id'], unit=observed)
+                except OSError as exc:
+                    storage_faults.append(str(exc))
         slot['unit'] = observed
         run_id = slot['entry']['run_id']
         if units.get(run_id) != observed:
             units[run_id] = observed
-            write_json(units_path, units)
+            try:
+                write_json(units_path, units)
+            except OSError as exc:
+                if not fifo:
+                    raise
+                storage_faults.append(str(exc))
+                print('Controller scope persistence failed: ' + str(exc), file=sys.stderr)
         return observed
 
     def close_previous(entry):
@@ -360,6 +455,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if fifo:
+                    raise RuntimeError('Previous worker scope closure is unconfirmed')
                 logging.warning('Previous worker scope remains unconfirmed after %s seconds for %s; continuing in a new isolated attempt',
                     previous_scope_wait, entry['run_id'])
                 event('previous_scope_unconfirmed', run_id=entry['run_id'], unit=observed,
@@ -414,11 +511,14 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             launch_reason='checkpoint_recovery' if history else 'previous_group_run_terminal' if predecessor else 'initial_group_slot',
             predecessor_run_id=predecessor, source_commit=source_commit,
             frozen_source_commit=manifest.get('source_commit'))
+        claim = claims / (entry['run_id'] + '-' + launch_id + '.json') if fifo else None
+        if claim:
+            write_json(claim, dict(run_id=entry['run_id'], unit=unit, closed=False, policy=str(policy), controller_pid=os.getpid()))
         child = subprocess.Popen(command, cwd=root, env=env, stdout=stream,
                                  stderr=subprocess.STDOUT, start_new_session=True)
-        slot = dict(entry=entry, child=child, ready=ready, unit=dict(unit=unit),
+        slot = dict(entry=entry, child=child, ready=ready, unit=dict(unit=unit, strict_identity=fifo),
                     closed=False, stopping_at=None, signaled=False,
-                    prior_attempt=history[-1].name if history else '')
+                    prior_attempt=history[-1].name if history else '', claim=claim)
         children.append(slot)
         event('worker_launched', run_id=entry['run_id'], pid=child.pid, mode=mode,
             launch_ordinal=launch_ordinal, unit=unit, memory_high=memory_high,
@@ -433,7 +533,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             record = latest(entry) or {}
             notice['checkpoint'] = record.get('checkpoint') or record.get('source_checkpoint')
             notice['detail'] = record.get('hold_detail') or reason
-            if record and history[-1].name != prior_attempt:
+            if record and history[-1].name != prior_attempt and not fifo:
                 record.update(status='paused', hold=True, hold_detail=record.get('hold_detail') or reason)
                 write_json(history[-1] / 'attempt.json', record)
                 write_json(history[-1] / 'HOLD', notice)
@@ -448,19 +548,32 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
 
     def next_entry(group, predecessor=None):
         while queues[group]:
+            if fifo and (gate.system_hold.exists() or storage_faults):
+                return None
             entry = queues[group].pop(0)
             saved = latest(entry)
             history = batch.attempts(entry)
             prior_attempt = history[-1].name if history else ''
             try:
                 explicit = week is not None or requested_checkpoint(entry, week=week) is not None
+                if fifo and history and saved is None:
+                    raise ValueError('Attempt metadata is unreadable; preserving the run')
                 if not explicit and saved and saved.get('status') == 'finished':
+                    if fifo:
+                        from saas_bench.team_round5 import terminal_checkpoint
+                        terminal_checkpoint(entry, saved)
                     logging.warning('Skipping finished group %s; select a checkpoint or --week explicitly to re-enter it', entry['run_id'])
                     terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
                                                     attempt=saved.get('attempt'))
                     continue
+                if fifo and (history or entry['run_id'] in claimed_ids) and not (resume and explicit):
+                    hold_group(entry, reason='Existing attempt preserved; select a checkpoint to resume',
+                        prior_attempt=prior_attempt)
+                    continue
                 return launch(entry, predecessor)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                if fifo:
+                    system_hold(gate.system_hold, 'scheduler_state_unavailable', run_id=entry['run_id'], detail=str(exc))
                 return hold_group(entry, reason=type(exc).__name__ + ': ' + str(exc), prior_attempt=prior_attempt)
         return None
 
@@ -468,7 +581,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
         observed = observe(slot)
         child = slot['child']
         residual = child.poll() is not None and not observed.get('scope_empty')
-        if observed.get('scope_empty'):
+        if observed.get('scope_empty') and (not fifo or not observed.get('scope_observation_unknown')):
             return True
         if not (requested or residual):
             return False
@@ -497,7 +610,8 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=10)
-        return observe(slot).get('scope_empty', False)
+        observed = observe(slot)
+        return observed.get('scope_empty', False) and (not fifo or not observed.get('scope_observation_unknown'))
 
     def telemetry():
         nonlocal last_poll, sampler_active, sampler_receipt
@@ -516,7 +630,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             last_poll = time.monotonic()
 
     with (directory / 'controller.lock').open('a') as lock:
-        with advisory():
+        with nullcontext() if fifo else advisory():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         def request_stop(*_):
             nonlocal stop_requested
@@ -532,11 +646,14 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
             for group in queues:
                 if stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop):
                     break
-                active[group] = next_entry(group)
+                for index in range(2 if fifo else 1):
+                    active[group, index] = next_entry(group)
             while any(slot is not None for slot in active.values()):
                 telemetry()
-                stopping = stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop)
-                for group, slot in list(active.items()):
+                systemic = fifo and (gate.system_hold.exists() or bool(storage_faults))
+                stopping = systemic or stop_requested or (gate.stop_stamp() is not None and gate.stop_stamp() != gate.prior_stop)
+                for key, slot in list(active.items()):
+                    group = key[0]
                     if slot is None:
                         continue
                     child, entry = slot['child'], slot['entry']
@@ -550,16 +667,23 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                             cleanup_pending = batch.read(marker).get('status') == 'pending'
                     closed = cleanup(slot, requested=stopping or own_stop or cleanup_pending)
                     if slot['closed']:
-                        active[group] = None
+                        if fifo:
+                            system_hold(gate.system_hold, 'resources_not_closed', run_id=entry['run_id'])
+                        active[key] = None
                         continue
                     if child.poll() is None or not closed:
                         continue
                     child.wait()
                     slot['closed'] = True
+                    if fifo:
+                        write_json(slot['claim'], dict(run_id=entry['run_id'], unit=slot['unit'], closed=True, policy=str(policy)))
                     saved = latest(entry) or {}
                     event('worker_reaped', run_id=entry['run_id'], exit_code=child.returncode,
                         status=saved.get('status'), day=saved.get('day'), unit=slot['unit'])
-                    if stopping or own_stop or saved.get('runtime_failure') in ('requested_pause', 'supervisor_cancelled'):
+                    if systemic:
+                        hold_group(entry, reason='systemic_hold', unit=slot['unit'], prior_attempt=slot['prior_attempt'])
+                        active[key] = None
+                    elif stopping or own_stop or saved.get('runtime_failure') in ('requested_pause', 'supervisor_cancelled'):
                         clean = (saved.get('status') in ('paused', 'finished') and child.returncode in (0, 2) and
                             slot['unit'].get('result') != 'oom-kill' and not slot['unit'].get('cleanup_error'))
                         terminal[entry['run_id']] = dict(disposition='paused' if clean else 'failed',
@@ -567,16 +691,39 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                             reason=saved.get('runtime_failure') or 'requested_stop',
                             unit=slot['unit'], attempt=saved.get('attempt'), children_reaped=True)
                         event('group_operator_stopped', run_id=entry['run_id'], proof=terminal[entry['run_id']])
-                        active[group] = None
+                        active[key] = None
                     elif saved.get('status') == 'finished' and child.returncode == 0 and slot['unit'].get('result') != 'oom-kill':
+                        if fifo:
+                            from saas_bench.team_round5 import terminal_checkpoint
+                            try:
+                                proof = terminal_checkpoint(entry, saved)
+                            except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                                system_hold(gate.system_hold, 'terminal_checkpoint_invalid', run_id=entry['run_id'], detail=str(exc))
+                                hold_group(entry, reason=str(exc), unit=slot['unit'], prior_attempt=slot['prior_attempt'])
+                                active[key] = None
+                                continue
                         terminal[entry['run_id']] = dict(disposition='terminal', status='finished',
-                            unit=slot['unit'], attempt=saved.get('attempt'))
+                            unit=slot['unit'], attempt=saved.get('attempt'), **(dict(completion=proof) if fifo else {}))
                         event('group_run_terminal', run_id=entry['run_id'], proof=terminal[entry['run_id']])
-                        active[group] = next_entry(group, predecessor=entry['run_id'])
+                        active[key] = next_entry(group, predecessor=entry['run_id'])
                     else:
-                        active[group] = hold_group(entry, reason=str(saved.get('runtime_failure') or
+                        hold_group(entry, reason=str(saved.get('runtime_failure') or
                             saved.get('reason') or 'worker_exit:' + str(child.returncode)), unit=slot['unit'],
                             prior_attempt=slot['prior_attempt'])
+                        if fifo:
+                            storage_error = saved.get('checkpoint_error_errno') or saved.get('error_errno')
+                            sqlite_error = saved.get('checkpoint_error_sqlite_code') or saved.get('error_sqlite_code') or 0
+                            shared_storage_fault = (storage_error in (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS) or
+                                sqlite_error & 0xff in (sqlite3.SQLITE_FULL, sqlite3.SQLITE_IOERR, sqlite3.SQLITE_READONLY,
+                                    sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CANTOPEN))
+                            isolated = not shared_storage_fault and ((saved.get('runtime_failure') in (
+                                'model_attempt_limit', 'business_operation_unknown', 'business_operation_pending',
+                                'world_operation_failed', 'checkpoint_save_failed') and
+                                saved.get('resource_cleanup', {}).get('status') == 'closed') or slot['unit'].get('result') == 'oom-kill')
+                            if not isolated:
+                                system_hold(gate.system_hold, 'unsafe_worker_failure', run_id=entry['run_id'],
+                                    runtime_failure=saved.get('runtime_failure'), detail=saved.get('hold_detail'))
+                        active[key] = next_entry(group, predecessor=entry['run_id']) if fifo else None
                     write_json(directory / 'controller-terminal.json', terminal)
                 time.sleep(1)
             return [latest(entry) for entry in manifest['runs']]
@@ -612,9 +759,12 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                 not slot['unit'].get('scope_observation_unknown') for slot in children)
             held_groups = {entry['group'] for entry in manifest['runs']
                 if terminal.get(entry['run_id'], {}).get('disposition') == 'hold'}
-            write_json(directory / 'controller-exit.json', dict(hold=bool(held_groups),
-                failed=not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
+            if storage_faults:
+                system_hold(gate.system_hold, 'controller_persistence_failed', errors=storage_faults)
+            write_json(directory / 'controller-exit.json', dict(hold=bool(held_groups) or fifo and gate.system_hold.exists(),
+                failed=bool(storage_faults) or not children_reaped or any(record.get('disposition') in ('alarm', 'failed')
                     for record in terminal.values()) or not operator_stopped and
+                    not (fifo and gate.system_hold.exists()) and
                     any((latest(entry) or {}).get('status') != 'finished' and entry['group'] not in held_groups
                         for entry in manifest['runs']),
                 children_reaped=children_reaped, operator_stopped=operator_stopped,
@@ -624,7 +774,7 @@ def _supervise(policy, *, resume, force_resume, memory_high, memory_max, memory_
                     not unit.get('scope_observation_unknown') for unit in previous_units.values()),
                 units_path=str(units_path), events_path=str(events_path), history_read_errors=history_errors,
                 batch_id=manifest['batch_id'], runs=[entry['run_id'] for entry in manifest['runs']],
-                auto_resume=False))
+                auto_resume=False, systemic_hold=str(gate.system_hold) if fifo and gate.system_hold.exists() else None))
 
 
 def exit_code(record):

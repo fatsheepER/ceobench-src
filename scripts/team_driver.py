@@ -5,6 +5,7 @@ Exit codes: 0 completed or operator-stopped, 3 manual HOLD, 2 supervision/resour
 """
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -59,11 +60,12 @@ def _main(argv, warnings):
         manifest = dict(manifest, runs=[batch.selected(manifest, args.run_id)])
     if args.check:
         contract = {}
-        if manifest.get('profile') == batch.ROUND_FIVE_PROFILE:
+        if manifest.get('profile') in batch.ROUND_FIVE_SEEDS:
             from saas_bench.team_round5 import check_launch
             contract = dict(contract_check=check_launch(args.policy, driver_path=__file__))
         print(json.dumps(dict(status='validated', batch_id=manifest['batch_id'],
             scheduling='group_independent', profile=manifest.get('profile'),
+            scheduler=manifest.get('scheduling'),
             runs=[row['run_id'] for row in manifest['runs']], assignments=manifest['runs'],
             memory_high=args.memory_high, memory_max=args.memory_max,
             runtime_limits=runtime_environment(args),
@@ -71,11 +73,18 @@ def _main(argv, warnings):
             tokenizer=manifest.get('tokenizer'), source_commit=manifest.get('source_commit'),
             model_requests=0, business_operations=0, credential_read=False, new_attempts=0, **contract)))
         return 0
+    strict = manifest.get('profile') == batch.FIFO_PROFILE
+    if strict:
+        from saas_bench.team_round5 import check_launch
+        check_launch(args.policy, driver_path=__file__)
+        if args.resume and (args.run_id is None or (args.week is None and
+                controller.requested_checkpoint(batch.selected(manifest, args.run_id)) is None)):
+            parser.error('FIFO recovery requires --resume --run-id and an explicit checkpoint or --week')
     directory = args.policy.resolve().parent
     outcome = 2
     with (directory / 'driver.lock').open('a') as lock:
         from saas_bench.run_warnings import advisory
-        with advisory():
+        with nullcontext() if strict else advisory():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             options = dict(resume=args.resume, memory_high=args.memory_high,

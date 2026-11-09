@@ -36,7 +36,7 @@ from .shocks import ShockManager
 from .simulation import Simulator
 from .tools import AgentTools
 from .team_models import ROUND_FOUR_PROFILES, apply_model_configs, round_four_models, validate_models, validate_profile_models
-from .team_round5 import PROFILE as ROUND_FIVE_PROFILE
+from .team_round5 import PROFILE as ROUND_FIVE_PROFILE, PROFILE_SEEDS as ROUND_FIVE_SEEDS, FIFO_PROFILE
 from .team_checkpoint import CheckpointDataError, retention_lock
 from .run_lifecycle import BusinessOutcomeUnknown
 from .run_warnings import AttemptWarnings, advisory, optional_hash
@@ -74,14 +74,15 @@ BATCH_PROFILES = {
     'r2-paired-pilot': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r3-d70': BatchProfile('formal', (2,), 1, ('git', 'pf'), 70),
     'r5-d56': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
+    FIFO_PROFILE: BatchProfile('formal', (4,), 1, ('git', 'pf'), 56),
     'r4-d56': BatchProfile('formal', (2,), 1, ('git', 'pf'), 56),
     'r4-flash-max-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
     'r4-sol-high-pf': BatchProfile('formal', (1,), 1, ('pf',), 56),
 }
 ROUND_TWO_PROFILES = ('r2-git-exploration', 'r2-paired-pilot')
 ROUND_THREE_PROFILE = 'r3-d70'
-EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES, ROUND_FIVE_PROFILE)
-EXPLICIT_MODEL_PROFILES = (*ROUND_FOUR_PROFILES, ROUND_FIVE_PROFILE)
+EXPERIMENT_PROFILES = (*ROUND_TWO_PROFILES, ROUND_THREE_PROFILE, *ROUND_FOUR_PROFILES, *ROUND_FIVE_SEEDS)
+EXPLICIT_MODEL_PROFILES = (*ROUND_FOUR_PROFILES, *ROUND_FIVE_SEEDS)
 FIXED_PROFILES = (ROUND_THREE_PROFILE, *EXPLICIT_MODEL_PROFILES)
 ROUND_THREE_SEEDS = (1048, 1049)
 
@@ -396,7 +397,8 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if len(seeds) not in layout.seed_counts:
         raise ValueError(f'{profile or category} requires seed count in {layout.seed_counts}')
     if profile in FIXED_PROFILES:
-        expected_seeds = (1048,) if profile in ROUND_FOUR_PROFILES[1:] else ROUND_THREE_SEEDS
+        expected_seeds = ROUND_FIVE_SEEDS.get(profile,
+            (1048,) if profile in ROUND_FOUR_PROFILES[1:] else ROUND_THREE_SEEDS)
         if sorted(seeds) != list(expected_seeds):
             raise ValueError(f'{profile} requires sealed D0 seeds {expected_seeds}')
         selection_rule = 'Reuse sealed D0 seeds ' + ', '.join(map(str, expected_seeds)) + ' in ascending group queues'
@@ -439,7 +441,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
                                       for group in layout.groups}
         for entry in runs:
             entry['capabilities'] = parameters['capabilities'][entry['group']]
-    if profile == ROUND_FIVE_PROFILE:
+    if profile in ROUND_FIVE_SEEDS:
         from .team_round5 import workspace_contract, retention_contract
         parameters['workspace_contracts'] = {group: workspace_contract(group) for group in layout.groups}
         parameters['checkpoint_retention'] = retention_contract()
@@ -457,7 +459,7 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
             entry['comparison_role'] = 'exploration' if profile in ROUND_FOUR_PROFILES[1:] else 'paired'
     controllers = (*CONTROLLER_SCRIPTS, 'scripts/team_driver.py') if scheduling == 'group_independent' else CONTROLLER_SCRIPTS
     if profile in EXPLICIT_MODEL_PROFILES:
-        launcher = 'scripts/round5_main.py' if profile == ROUND_FIVE_PROFILE else 'scripts/round4.py'
+        launcher = 'scripts/round5_main.py' if profile in ROUND_FIVE_SEEDS else 'scripts/round4.py'
         controllers = (*controllers, launcher)
         from importlib.metadata import version
         parameters['openai_sdk_version'] = version('openai')
@@ -479,6 +481,9 @@ def freeze_batch(destination, d0_sources, prices, *, price_source, category='for
     if scheduling == 'group_independent':
         manifest['scheduling'] = dict(mode=scheduling, queues={group:
             [entry['run_id'] for entry in runs if entry['group'] == group] for group in ('git', 'pf')})
+        if profile in ROUND_FIVE_SEEDS:
+            from .team_round5 import scheduling_contract
+            manifest['scheduling'] = scheduling_contract(profile, runs)
     counter = token_counter or load_counter(model_configs['agent']['provider'] if model_configs else 'opencode',
                                           model_configs['agent']['model'] if model_configs else MODEL)
     manifest['tokenizer'] = counter.metadata if counter else None
@@ -535,7 +540,7 @@ def validate_manifest(path):
                 logging.warning('Third-round model parameters or capabilities mismatch')
             if any(row.get('capabilities') != expected_capabilities.get(row['group']) for row in manifest['runs']):
                 logging.warning('Third-round run capabilities mismatch')
-        if profile == ROUND_FIVE_PROFILE:
+        if profile in ROUND_FIVE_SEEDS:
             from .team_round5 import validate_contract
             validate_contract(manifest)
         if profile in ROUND_FOUR_PROFILES:
@@ -607,6 +612,9 @@ def scheduling_policy(manifest):
         return 'paired'
     expected = dict(mode='group_independent', queues={group:
         [entry['run_id'] for entry in manifest['runs'] if entry['group'] == group] for group in ('git', 'pf')})
+    if manifest.get('profile') in ROUND_FIVE_SEEDS:
+        from .team_round5 import scheduling_contract
+        expected = scheduling_contract(manifest['profile'], manifest['runs'])
     if policy != expected:
         logging.warning('Frozen scheduling queues differ from the assigned run order')
     return policy['mode']
@@ -620,12 +628,14 @@ def selected(manifest, run_id):
 
 
 @contextmanager
-def run_lock(output):
+def run_lock(output, *, strict=False):
     output.mkdir(parents=True, exist_ok=True)
     with (output / '.launch.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if strict:
+                raise RuntimeError('Run is already active; duplicate launch refused')
             logging.warning('Run is already active; continuing as requested')
         yield
 
@@ -959,6 +969,9 @@ def save_checkpoint(team, directory, record, boundary):
         raise
     except Exception as exc:
         record['checkpoint_error'] = str(exc)
+        record['checkpoint_error_type'] = type(exc).__name__
+        record['checkpoint_error_errno'] = getattr(exc, 'errno', None)
+        record['checkpoint_error_sqlite_code'] = getattr(exc, 'sqlite_errorcode', None)
         raise CheckpointPublicationError(f'Checkpoint {boundary} publication failed: {exc}') from exc
 
 
@@ -1019,7 +1032,14 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
         logging.warning('Team execution has replay, oracle or read-only environment overrides')
     entry = selected(manifest, run_id)
     output = Path(entry['output_dir'])
-    with run_lock(output):
+    if manifest.get('profile') == FIFO_PROFILE and live and not (
+            getattr(request_guard, 'fifo', False) and getattr(request_guard, 'scope', None)):
+        raise ValueError('FIFO execution requires the supervised team_driver entry point')
+    with run_lock(output, strict=manifest.get('profile') == FIFO_PROFILE):
+        if manifest.get('profile') == FIFO_PROFILE and attempts(entry):
+            from .team_recovery import requested_checkpoint
+            if not resume or (week is None and requested_checkpoint(entry) is None):
+                raise ValueError('FIFO run history is preserved; recovery requires an explicit checkpoint or --week')
         directory, record, source = register_attempt(path, manifest, entry, resume=resume, week=week)
         record['force_resume'] = force_resume
         warnings.bind(record, directory)
@@ -1117,6 +1137,8 @@ def _prepare(path, run_id, *, resume, week, live, client_factory, simulator_fact
             return record
         except BaseException as exc:
             record.update(status='failed', error_type=type(exc).__name__, error=str(exc),
+                error_errno=getattr(exc, 'errno', None),
+                error_sqlite_code=getattr(exc, 'sqlite_errorcode', None),
                 finished_at=datetime.now(timezone.utc).isoformat())
             write_json(directory / 'attempt.json', record)
             raise
@@ -1238,7 +1260,7 @@ def summarize(path, resource_paths=None):
         row.update(wall_time(history))
         usage, waste = run_usage(entry, manifest['pricing'])
         row.update(usage=usage, waste=waste, pending=usage['pending'])
-        if manifest.get('profile') == ROUND_FIVE_PROFILE:
+        if manifest.get('profile') in ROUND_FIVE_SEEDS:
             from .team_round5 import retained_d28
             row['d28_retention'] = retained_d28(entry)
         rows.append(row)

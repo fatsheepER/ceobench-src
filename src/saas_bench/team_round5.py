@@ -1,4 +1,6 @@
 """Frozen shared-workspace contracts and offline launch checks for the D56 pair."""
+import json
+from contextlib import closing
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,7 +12,56 @@ from .run_warnings import AttemptWarnings
 
 
 PROFILE = 'r5-d56'
+FIFO_PROFILE = 'r5-s41-44-d56'
+PROFILE_SEEDS = {PROFILE: (1048, 1049), FIFO_PROFILE: (41, 42, 43, 44)}
 LAUNCHER = 'scripts/round5_main.py'
+
+
+def scheduling_contract(profile, runs):
+    contract = dict(mode='group_independent', queues={group:
+        [r['run_id'] for r in runs if r['group'] == group] for group in ('git', 'pf')})
+    if profile == FIFO_PROFILE:
+        contract.update(slots={'git': 2, 'pf': 2}, max_workers=4,
+            isolated_hold='continue_fifo', systemic_hold='stop_all', restart='never_replay')
+    return contract
+
+
+def terminal_checkpoint(entry, record):
+    from .team_checkpoint import validate_snapshot, validate_runtime_data
+    if (record.get('status') != 'finished' or
+            record.get('resource_cleanup', {}).get('status') != 'closed'):
+        raise ValueError('R5 terminal attempt is not finished and closed')
+    day, result = record.get('day'), record.get('result', {})
+    observation = (record.get('reason') == result.get('stop_reason') == 'observation_end' and
+        day == result.get('day') == entry['stop_after_day'] == 56 and result.get('status') == 'reached_stop_day')
+    bankruptcy = (record.get('reason') in ('bankrupt', 'natural_end') and
+        result.get('stop_reason') == record['reason'] and result.get('status') == 'natural_bankruptcy' and
+        type(day) is int and 0 <= day <= 56 and result.get('day') == day)
+    if (not (observation or bankruptcy) or record.get('runtime_failure') not in
+            ((None, 'natural_end') if bankruptcy else (None,))):
+        raise ValueError('R5 terminal is neither observation_end D56 nor natural bankruptcy')
+    snapshot = Path(record['checkpoint']).resolve()
+    attempt = Path(entry['output_dir']) / f'attempt-{record["attempt"]:03}'
+    if not snapshot.is_relative_to(attempt.resolve() / 'runtime/checkpoints'):
+        raise ValueError('R5 terminal checkpoint is outside its attempt')
+    with AttemptWarnings() as warnings:
+        snapshot, state = validate_snapshot(snapshot)
+        validate_runtime_data(snapshot, state)
+    if warnings.rows:
+        raise ValueError('R5 terminal checkpoint validation: ' + '; '.join(r['message'] for r in warnings.rows))
+    pointer = json.loads((attempt / 'runtime/checkpoint.json').read_text())
+    if (pointer != dict(snapshot=str(snapshot), sha256=file_hash(snapshot / 'checkpoint.json')) or
+            state['day'] != day or state['seed'] != entry['seed'] or
+            observation and state['stage'] != 'boundary' or state.get('failure') != record.get('runtime_failure') or
+            any(role['identity']['run_id'] != entry['run_id'] for role in state['roles'].values())):
+        raise ValueError('R5 terminal checkpoint day, identity, boundary or publication pointer differs')
+    from .db_protection import load_session_db
+    with closing(load_session_db(snapshot / 'world.nmdb')) as conn:
+        row = conn.execute("SELECT state_json FROM _rng_states WHERE name='all'").fetchone()
+        if not row or json.loads(row[0])['_sim_state']['current_day'] != day:
+            raise ValueError('R5 terminal checkpoint world day differs')
+    return dict(kind='observation_end' if observation else 'natural_bankruptcy',
+        day=day, checkpoint=str(snapshot), checkpoint_sha256=pointer['sha256'], recovery_eligible=True)
 
 
 def workspace_contract(group):
@@ -38,14 +89,16 @@ def validate_contract(manifest):
     from . import team_batch as batch
     from .team_models import validate_profile_models, round_four_models
     from .runtime_options import runtime_environment_snapshot
-    if manifest.get('profile') != PROFILE:
+    profile = manifest.get('profile')
+    if profile not in PROFILE_SEEDS:
         raise ValueError('Expected the fifth-round main profile')
     parameters = manifest['parameters']
-    if manifest['seeds'] != [1048, 1049] or [(r['seed'], r['group'], r['repeat']) for r in manifest['runs']] != [
-            (seed, group, 1) for seed in (1048, 1049) for group in ('git', 'pf')]:
-        raise ValueError('R5 requires exactly s1048/s1049 x Git/PF in fixed order')
-    validate_profile_models(PROFILE, parameters['model_configs'], manifest['pricing'])
-    if parameters['model_configs'] != round_four_models(PROFILE, manifest['pricing']):
+    seeds = PROFILE_SEEDS[profile]
+    if manifest['seeds'] != list(seeds) or [(r['seed'], r['group'], r['repeat']) for r in manifest['runs']] != [
+            (seed, group, 1) for seed in seeds for group in ('git', 'pf')]:
+        raise ValueError('R5 requires its fixed seeds x Git/PF in ascending order')
+    validate_profile_models(profile, parameters['model_configs'], manifest['pricing'])
+    if parameters['model_configs'] != round_four_models(profile, manifest['pricing']):
         raise ValueError('R5 model route or request contract differs')
     if parameters.get('runtime_limits') != runtime_environment_snapshot():
         raise ValueError('R5 runtime environment differs from the frozen limits')
@@ -63,8 +116,7 @@ def validate_contract(manifest):
         if (entry.get('workspace_contract') != workspace_contract(entry['group']) or
                 entry.get('capabilities') != capabilities[entry['group']] or entry['stop_after_day'] != 56):
             raise ValueError('R5 assignment workspace, capability or observation endpoint differs')
-    expected = dict(mode='group_independent', queues={group:
-        [r['run_id'] for r in manifest['runs'] if r['group'] == group] for group in ('git', 'pf')})
+    expected = scheduling_contract(profile, manifest['runs'])
     if manifest.get('scheduling') != expected:
         raise ValueError('R5 requires independent ascending group queues')
 
@@ -137,8 +189,11 @@ def check_launch(policy_path, *, driver_path):
                 batch.close_team(team)
     return dict(prompts_match=True, source_matches=True, runtime_configurations=configurations,
         model_requests=0, business_operations=0, credential_read=False, live_verified=False,
-        pending=['Final R5-2.1 unified release gate and post-gate check',
-                 'User approval of final prompt diff', 'Current provider availability, quota and budget confirmation'])
+        pending=(['Parent session CloudAgent and grokwatch verification before live launch',
+                  'Current provider availability, quota and budget confirmation']
+                 if manifest['profile'] == FIFO_PROFILE else
+                 ['Final R5-2.1 unified release gate and post-gate check',
+                  'User approval of final prompt diff', 'Current provider availability, quota and budget confirmation']))
 
 
 def retained_d28(entry):

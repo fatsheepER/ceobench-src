@@ -42,7 +42,7 @@ def round_four_models(profile, pricing):
             contract=dict(source='https://developers.openai.com/api/docs/models/gpt-6.1-sol',
                 verification='official_responses_contract', live_verified=False),
             store=False, include=['reasoning.encrypted_content'])
-    elif profile == 'r5-d56':
+    elif profile in ('r5-d56', 'r5-s41-44-d56'):
         for config in (agent, simulator):
             config['base_url'] = 'https://opencode.ai/inference/go/openai/v1/'
             config['contract'] = dict(source='https://opencode.ai/docs/console/go/',

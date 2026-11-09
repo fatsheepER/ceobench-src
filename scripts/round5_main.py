@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and check the four shared-workspace D56 runs without starting workers."""
+"""Prepare and check frozen shared-workspace D56 runs without starting workers."""
 import argparse
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ import sys
 
 from saas_bench import team_batch as batch
 from saas_bench.run_state import file_hash, write_json
-from saas_bench.team_round5 import LAUNCHER, PROFILE
+from saas_bench.team_round5 import LAUNCHER, PROFILE, PROFILE_SEEDS
 
 
 def main(argv=None):
@@ -20,6 +20,7 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--d0-source-manifest', type=Path)
     parser.add_argument('--pricing', type=Path)
+    parser.add_argument('--profile', choices=tuple(PROFILE_SEEDS), default=PROFILE)
     args = parser.parse_args(argv)
     root = args.output.resolve()
     if args.prepare:
@@ -27,13 +28,13 @@ def main(argv=None):
             parser.error('--prepare requires --d0-source-manifest and --pricing')
         source = batch.read(args.d0_source_manifest)
         prices = batch.load_pricing(args.pricing)
-        sources = {seed: Path(source['d0'][str(seed)]['path']) for seed in (1048, 1049)}
+        sources = {seed: Path(source['d0'][str(seed)]['path']) for seed in PROFILE_SEEDS[args.profile]}
         if root.exists():
             parser.error('Preparation output must be a new directory')
-        batch.freeze_batch(root / 'batch', sources, prices, price_source=prices['source'], profile=PROFILE)
+        batch.freeze_batch(root / 'batch', sources, prices, price_source=prices['source'], profile=args.profile)
         policy = batch.create_policy(root / 'batch/manifest.json', root / 'control')['policy']
         command = [sys.executable, str(batch.ROOT / 'scripts/team_driver.py'), '--policy', policy]
-        write_json(root / 'launch.json', dict(launcher=LAUNCHER, profile=PROFILE,
+        write_json(root / 'launch.json', dict(launcher=LAUNCHER, profile=args.profile,
             source_manifest=str(args.d0_source_manifest.resolve()),
             source_manifest_sha256=file_hash(args.d0_source_manifest),
             policy=policy, check=shlex.join(command + ['--check']),
@@ -41,7 +42,7 @@ def main(argv=None):
             resume=shlex.join(command + ['--live', '--resume', '--run-id', '<run-id>', '--week', '<week>']),
             model_requests=0, business_operations=0, live_started=False))
     launch = batch.read(root / 'launch.json')
-    if launch['launcher'] != LAUNCHER or launch['profile'] != PROFILE:
+    if launch['launcher'] != LAUNCHER or launch['profile'] not in PROFILE_SEEDS:
         raise ValueError('Unexpected fifth-round launcher identity')
     result = subprocess.run([sys.executable, str(batch.ROOT / 'scripts/team_driver.py'),
         '--policy', launch['policy'], '--check'], check=True, capture_output=True, text=True)
