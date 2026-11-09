@@ -371,9 +371,13 @@ class EvidenceResolver:
                 if version not in event['outputs']:
                     continue
                 for item in json.loads(self.content(version)[1]):
-                    if self.content(item['version_id'])[0]['layer'] not in PUBLIC_LAYERS:
+                    try:
+                        if self.content(item['version_id'], public=True)[0]['layer'] not in PUBLIC_LAYERS:
+                            continue
+                        source, _, content, kind = self.identity(item['version_id'])
+                    except PermissionError:
+                        # Author-only receipts are not public declaration sources.
                         continue
-                    source, _, content, kind = self.identity(item['version_id'])
                     scope['sources'].setdefault(source, []).append((item, content, kind))
         return scope
 

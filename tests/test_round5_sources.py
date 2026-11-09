@@ -13,6 +13,7 @@ from test_pf_relations import cli, details
 from test_preflight_team_checkpoint import fast_simulator
 from test_preflight_team_flow import ADVANCE, calls, final
 from test_relation_batch import batch, create
+from test_receipt_outputs import artifact
 from test_round5_workflows import make_draft
 from test_shared_workspace import shared_team
 
@@ -290,3 +291,70 @@ def test_publication_sources_preserve_exact_versions_across_aba(monkeypatch, exe
             assert 'one\ntwo\nthree' in saved and 'GROWTH' not in saved
         newest = cli(team, 'ops_finance', 'pf', 'show', 'shared:plans/aba.txt@v4', '--full')
         assert 'one\ntwo\nGROWTH' in newest
+
+
+@pytest.mark.parametrize('exit_code', [0, 1])
+def test_unrelated_private_receipts_do_not_block_public_escalate_or_continuation(exit_code):
+    turns, receipts = [], []
+    own_secret, peer_secret = 'UNRELATED-OPS-PRIVATE-OUTPUT', 'UNRELATED-GROWTH-PRIVATE-OUTPUT'
+
+    def respond(team, role, body):
+        if role == 'ceo':
+            return calls(('bash', dict(command=ADVANCE)))
+        if role == 'growth':
+            assert peer_secret not in json.dumps(body)
+            return final('ordinary growth advice')
+        assert peer_secret not in json.dumps(body)
+        turns.append(body)
+        if len(turns) == 1:
+            return calls(('bash', dict(command='printf ' + own_secret + '; exit ' + str(exit_code))))
+        output = body['messages'][-1]['content']
+        if len(turns) == 2:
+            assert own_secret in output
+            assert ('[exit code: 1]' in output) == bool(exit_code)
+            return calls(('bash', dict(command='pf log plans/report.txt && pf log plans/source.txt')))
+        if len(turns) == 3:
+            assert 'shared:plans/report.txt@v1' in output and 'shared:plans/source.txt@v1' in output
+            return calls(('escalate', dict(items=[
+                create('public', 'shared:plans/report.txt@v1', ['shared:plans/source.txt@v1']),
+                create('private-target', 'shared:.git/config@v1', ['shared:plans/source.txt@v1']),
+                create('private-source', 'shared:plans/report.txt@v1', ['shared:.git/config@v1']),
+                create('escape', 'shared:plans/report.txt@v1', ['../outside.txt@v1']),
+            ])))
+        receipt = json.loads(output)
+        receipts.append(receipt)
+        assert own_secret not in output and peer_secret not in output
+        if len(turns) == 4:
+            assert (receipt['saved'], receipt['rejected']) == (1, 3), receipt
+            assert receipt['items'][0]['status'] == 'saved', receipt
+            assert [item['error_location'] for item in receipt['items'][1:]] == [
+                'target', 'sources[0].ref', 'sources[0].ref']
+            return calls(('escalate', dict(items=[create('continued',
+                'shared:plans/report.txt@v1', ['shared:plans/source.txt@v1'])])))
+        assert len(turns) == 5 and receipt['saved'] == 1, receipt
+        return final('The public report uses the exact published source.')
+
+    with shared_team('pf', respond, workspace_protocol='snapshot-v1') as team:
+        team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
+        team._set_phase('analysis')
+        growth = team.roles['growth'].executor
+        growth.execute('write_file', dict(path='plans/source.txt', content='public source'))
+        private = growth.execute('bash', dict(command='printf ' + peer_secret + '; exit 1'))
+        assert peer_secret in private and growth._bash_facts['boundary_closed']
+        peer_version = growth.last_capture_event + ':tool_return'
+        ops = team.roles['ops_finance']
+        with pytest.raises(PermissionError):
+            ops.store.get_content(peer_version)
+        ops.executor.execute('write_file', dict(path='plans/report.txt', content='public report'))
+        outcome = team.run(stop_after_day=7)
+        assert outcome.reason == 'observation_end', team.failure
+        assert len(turns) == 5 and len(ops.registry.relations._load()['records']) == 2
+        with pytest.raises(PermissionError):
+            ops.store.get_content(peer_version)
+        assert peer_secret not in json.dumps(team.test_wire)
+        usage = [json.loads(line) for line in ops.usage.path.read_text().splitlines()]
+        sent = [row['body'] for row in usage if row['event'] == 'http_request']
+        assert sent == [row['body'] for row in team.test_wire if row['role'] == 'ops_finance']
+        assert [json.loads(request['messages'][-1]['content']) for request in sent[-2:]] == receipts
+        assert not team.server._operation_failed and ops.executor._bash_facts['boundary_closed']
+        artifact('private-receipt-escalate.json', dict(exit_code=exit_code, sent=sent, receipts=receipts))

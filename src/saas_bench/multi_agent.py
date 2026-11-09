@@ -572,7 +572,11 @@ class MultiAgentRuntime:
                     if (self.roles[role].executor.workspace_execution is not None
                             and not self.roles[role].executor.workspace_advance_only):
                         return dict(success=False, error='workspace_tool_pending', day=server.tools.current_day,
-                            message='Week not advanced. Finish this Bash and its file publication first. Then run only ./novamind-operation next-week with rationale and predictions in a separate Bash. Do not repeat successful business calls.')
+                            message=('Week not advanced. This Bash is not recognized as a standalone next-week command. '
+                                'Run only ./novamind-operation next-week with literal rationale and predictions in a '
+                                'separate Bash; an optional cd /workspace && prefix is supported. Keep file writes, '
+                                'other commands, pipes, redirections and shell expansions in separate Bash calls. '
+                                'Do not repeat successful business calls.'))
                     reminder = publication.check_finish(role, server.tools.current_day)
                     if reminder:
                         return dict(success=False, error='draft_confirmation_required', day=server.tools.current_day, message=reminder)

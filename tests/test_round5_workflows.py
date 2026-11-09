@@ -312,7 +312,9 @@ def test_mutating_workspace_persistence_failure_holds_and_does_not_continue(monk
         assert team.roles['growth'].store.fault
 
 
-def test_ceo_opening_does_not_finish_and_confirmed_draft_allows_advance():
+@pytest.mark.parametrize('command', [ADVANCE, 'cd /workspace && \\\n' +
+    ADVANCE.replace('"offline weekly rationale"', "'cash $1 stays literal'")], ids=['plain', 'literal-prefix'])
+def test_ceo_opening_does_not_finish_and_confirmed_draft_allows_advance(command):
     counts = {}
     def respond(team, role, body):
         counts[role] = counts.get(role, 0) + 1
@@ -321,7 +323,7 @@ def test_ceo_opening_does_not_finish_and_confirmed_draft_allows_advance():
             assert 'CEO-PRIVATE' not in rendered and '--confirm-finish ' not in body['messages'][-1]['content']
             return final('ordinary advice')
         if counts[role] in (1, 3):
-            return calls(('bash', dict(command=ADVANCE)))
+            return calls(('bash', dict(command=command)))
         assert counts[role] == 2
         result = next(m['content'] for m in reversed(body['messages']) if m['role'] == 'tool')
         assert 'draft_confirmation_required' in result
@@ -552,3 +554,89 @@ def test_private_split_index_never_writes_shared_git_metadata():
         output = peer.execute('bash', dict(command="python -c \"from pathlib import Path; print([p.read_bytes() for p in Path('.git').glob('sharedindex.*')])\""))
         assert 'SECRET-' not in output, output
         assert not (publication.public / 'plans/private-index').exists()
+
+
+_LITERAL_ADVANCES = [
+    'cd /workspace && ' + ADVANCE,
+    ADVANCE.replace('next-week', 'next-\\\nweek').replace(' 1000000', ' \\\n 1000000', 1),
+    ADVANCE.replace('"offline weekly rationale"', "'cash $1 stays literal'"),
+    ADVANCE.replace('"offline weekly rationale"', '"cash $ / week"'),
+    ADVANCE.replace('"offline weekly rationale"', r'"cash \$1 stays literal"'),
+    ADVANCE.replace('"offline weekly rationale"', "'literal ; && > $(printf unused)'"),
+    '\ncd "/workspace" && \\\n' + ADVANCE.replace('"offline weekly rationale"', "'cash $'\"/week\"") + '\n',
+]
+
+
+@pytest.mark.parametrize('command', _LITERAL_ADVANCES,
+    ids=['cd', 'continuation', 'single-dollar', 'double-literal-dollar', 'escaped-dollar', 'quoted-operators', 'combined'])
+def test_literal_standalone_advance_recovers_after_mixed_write(command):
+    turns, receipts = [], []
+
+    def respond(team, role, body):
+        if role != 'ceo':
+            return final('ordinary advice')
+        turns.append(body)
+        if len(turns) == 1:
+            return calls(('bash', dict(command='printf changed > plans/new.txt; ' + command)))
+        output = body['messages'][-1]['content']
+        receipts.append(output)
+        assert team.server.tools.current_day == 0
+        if len(turns) == 2:
+            assert 'workspace_tool_pending' in output, output
+            assert 'standalone next-week command' in output, output
+            row = team.workspace_publication.draft_rows('ceo')[0]
+            return calls(('bash', dict(command='pf workspace resolve ' +
+                team.workspace_publication.draft_ref(row) + ' --against ' + team.workspace_publication.head())))
+        assert len(turns) == 3, output
+        assert '[PF workspace published]' in output, output
+        return calls(('bash', dict(command=command)))
+
+    with shared_team('pf', respond, workspace_protocol='snapshot-v1') as team:
+        team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
+        outcome = team.run(stop_after_day=7)
+        assert outcome.reason == 'observation_end', team.failure
+        assert len(turns) == 3 and team.server.tools.current_day == 7
+        worker = team.roles['ceo'].executor
+        assert worker._bash_facts['boundary_closed'] and not team.server._operation_failed
+        assert (team.roles['ceo'].workspace / 'plans/new.txt').read_text() == 'changed'
+        assert not team.workspace_publication.draft_rows('ceo')
+        usage = [json.loads(line) for line in team.roles['ceo'].usage.path.read_text().splitlines()]
+        sent = [row['body'] for row in usage if row['event'] == 'http_request']
+        assert sent == [row['body'] for row in team.test_wire if row['role'] == 'ceo']
+        assert all(any(message.get('content') == receipt for message in request['messages'])
+                   for receipt, request in zip(receipts, turns[1:]))
+        artifact('literal-advance.json', dict(command=command, sent=sent, receipts=receipts))
+
+
+@pytest.mark.parametrize('command', [
+    ADVANCE + '; printf mixed > plans/mixed.txt',
+    ADVANCE + '\nprintf mixed > plans/mixed.txt',
+    ADVANCE + ' &> plans/mixed.txt',
+    ADVANCE.replace('"offline weekly rationale"', '"cash $(printf mixed > plans/mixed.txt)"'),
+    ADVANCE.replace('"offline weekly rationale"', '"cash `printf mixed > plans/mixed.txt`"'),
+    ADVANCE.replace('"offline weekly rationale"', '"cash $\\\n(printf mixed > plans/mixed.txt)"'),
+], ids=['suffix', 'newline', 'redirection', 'substitution', 'backtick', 'continued-substitution'])
+def test_shell_side_effects_cannot_be_classified_as_standalone_advance(command):
+    from test_receipt_outputs import model_receives
+
+    with shared_team('pf', workspace_protocol='snapshot-v1') as team:
+        team.server.simulator = fast_simulator(team.server.conn, team.server.tools.config, team.server.tools.rng)
+        team._set_phase('ceo')
+        worker = team.roles['ceo'].executor
+        output = worker.execute('bash', dict(command=command))
+        assert team.server.tools.current_day == 0, output
+        assert worker._bash_facts['boundary_closed'] and not team.server._operation_failed
+        drafts = team.workspace_publication.draft_rows('ceo')
+        if drafts:
+            ref = team.workspace_publication.draft_ref(drafts[0])
+            _, candidate = team.workspace_publication.draft('ceo', ref)
+            content = team.workspace_publication.get('blobs', candidate['files']['plans/mixed.txt']['blob'])
+        else:
+            content = (team.roles['ceo'].workspace / 'plans/mixed.txt').read_bytes()
+        assert 'workspace_tool_pending' in output or b'workspace_tool_pending' in content
+        assert model_receives(team.roles['ceo'].store, team.roles['ceo'].workspace, output) == output
+        if drafts:
+            worker.execute('bash', dict(command='pf workspace discard ' + ref))
+        advanced = worker.execute('bash', dict(command=ADVANCE))
+        assert team.server.tools.current_day == 7, advanced
+        assert worker._bash_facts['boundary_closed'] and not team.server._operation_failed

@@ -60,6 +60,7 @@
 - 第五轮 A01/A17 的 shared-v1 共享目录、职责权限、namespace 文件来源、Git 并发和三类保存、宿主撞名、私有观察缺口与角色记忆恢复，从 `tests/test_shared_workspace.py`、`tests/test_shared_identity.py` 定位；旧布局默认保留，checkpoint 不跨布局转换。
 - 第五轮 A02/A03/A04/A05/A06/A09/A10/A11/A18 的 PF 稳定执行快照、独立比较基底、多文件原子发布、候选私有性、重复收尾及真实进程持久化故障，从 `tests/test_pf_edit_base.py`、`tests/test_pf_publication.py`、`tests/test_pf_publication_recovery.py` 定位；checkpoint 全链路留待 R5-1.4。
 - 第五轮 A07/A08/A12–A16/A22 的版本确认、精确修订与权限差异、同 Bash 草稿处理后再编辑、作者周初提醒与周末显式确认、CEO 独立推进、三 provider 真实 ModelUsage、注册源码与当前公共快照、API 成功后零重放、私有 Git 对象隔离与持久化故障，从 `tests/test_round5_workflows.py` 定位。
+- PF 独立周推进的 shell 引号、字面 `$`、续行、`cd /workspace &&`、混合写入拦截及草稿确认，从 `tests/test_round5_workflows.py` 定位；无关私有失败回执不得阻断公开 `escalate`、实际私有/越界目标仍拒绝及后续 ModelUsage 继续，从 `tests/test_round5_sources.py` 定位。
 - 第五轮 A18–A20 发布静止点、必要权威与对象闭包、真实 driver 发布阶段杀进程/断连、controller 发布锁等待 STOP、含草稿/确认/脚本源码的历史选点恢复、已成功 API/脚本零重放、缺失发布权威零模型请求 HOLD，从 `tests/test_round5_checkpoint.py`、`tests/round5_checkpoint_fixture.py` 和 `tests/test_checkpoint_driver.py` 定位。
 - 第五轮 A21 精确发布事件、跨调用比较基底、同内容回退来源、当前/历史/依赖与旧 namespace、私有候选事件及历史元数据隔离、真实 ModelUsage 作者来源绑定，从 `tests/test_round5_sources.py` 定位；私有原文与公共读取同请求的发送/记录继续从 `tests/test_round5_checkpoint.py` 定位。
 - 第五轮 A01/A07/A22/A23 的共同主文件空模板、两组三角色首次/恢复/问答 ModelUsage、普通消息原样投递与文件内预测、+7/+28 到期现金摘要、问答及交接检查点的摘要去重、D56 零请求/脚本，从 `tests/test_round5_prompts.py` 定位；PF 快照中的 HTTP/SDK/CLI/Bash 子进程职责权限从 `tests/test_shared_identity.py` 定位。

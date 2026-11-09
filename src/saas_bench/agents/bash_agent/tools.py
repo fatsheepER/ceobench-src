@@ -527,17 +527,75 @@ class BashAgentToolExecutor:
                     self.observer.finish(self, observation)
 
     def standalone_advance(self, command):
-        import shlex
-        if any(c in command for c in '$`\n'):
+        """Recognize literal CLI arguments without evaluating shell expansions."""
+        tokens, word, quote = [], None, None
+        position = 0
+        while position < len(command):
+            char = command[position]
+            position += 1
+            if char == '\\' and quote != "'":
+                if position == len(command):
+                    return False
+                escaped = command[position]
+                position += 1
+                if escaped == '\n':
+                    continue
+                if quote == '"' and escaped not in '\\"$`':
+                    word = (word or '') + '\\'
+                word = (word or '') + escaped
+                continue
+            if quote and char == quote:
+                quote = None
+                continue
+            if quote == "'":
+                word += char
+                continue
+            if not quote and char in "'\"":
+                quote = char
+                word = word or ''
+                continue
+            if char == '$':
+                following = position
+                while command.startswith('\\\n', following):
+                    following += 2
+                if following < len(command) and (
+                        command[following] in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_*@#?$!-{(['
+                        or not quote and command[following] in "'\""):
+                    return False
+            if char == '`' or char == '\x00':
+                return False
+            if not quote and char in ' \t\n;&|<>()':
+                if word is not None:
+                    tokens.append(('word', word))
+                    word = None
+                if char in ' \t':
+                    continue
+                if char == '&' and command[position:position + 1] == '&':
+                    position += 1
+                    tokens.append(('operator', '&&'))
+                elif char == '\n':
+                    tokens.append(('operator', '\n'))
+                else:
+                    return False
+            else:
+                if not quote and (char in '*?[]{}~' or char == '#' and word is None):
+                    return False
+                word = (word or '') + char
+        if quote:
             return False
-        try:
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
-            lexer.whitespace_split = True
-            words = list(lexer)
-        except ValueError:
-            return False
-        return (len(words) == 15 and words[0] in ('./novamind-operation', '/workspace/novamind-operation')
-                and words[1] == 'next-week' and not any(all(c in ';&|<>()' for c in word) for word in words))
+        if word is not None:
+            tokens.append(('word', word))
+        while tokens and tokens[0] == ('operator', '\n'):
+            tokens.pop(0)
+        while tokens and tokens[-1] == ('operator', '\n'):
+            tokens.pop()
+        if tokens[:3] == [('word', 'cd'), ('word', '/workspace'), ('operator', '&&')]:
+            tokens = tokens[3:]
+            while tokens and tokens[0] == ('operator', '\n'):
+                tokens.pop(0)
+        return (len(tokens) == 15 and all(kind == 'word' for kind, _ in tokens)
+                and tokens[0][1] in ('./novamind-operation', '/workspace/novamind-operation')
+                and tokens[1][1] == 'next-week')
 
     def _execute(self, tool_name, args, *, model_request_event=None, model_context_id=None, tool_call_id=None):
         disabled = None
