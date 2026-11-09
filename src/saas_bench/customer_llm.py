@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from .config import BenchmarkConfig, CUSTOMER_GROUPS, ChurnReason
-from .model_usage import InvalidModelResponse, ModelUsage, usage_values
+from .model_usage import InvalidModelResponse, ModelUsage, plain, usage_values
 from .run_lifecycle import RunCancelled
 from .runtime_options import runtime_value
 from .database import (
@@ -242,7 +242,20 @@ class CustomerSimulator:
                     kwargs['extra_body'] = {"thinking": {"type": "disabled"}}
                 if provider in ('opencode', 'opendesign'):
                     kwargs['reasoning_effort'] = 'none'
-                invoke = lambda: self.client.chat.completions.create(**kwargs)
+                def invoke():
+                    response = self.client.chat.completions.create(**kwargs)
+                    if provider == 'opendesign':
+                        raw = plain(response)
+                        choices = raw.get('choices') if isinstance(raw, dict) else None
+                        choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else {}
+                        message = choice.get('message') if isinstance(choice, dict) else None
+                        if (not isinstance(message, dict) or choice.get('finish_reason') != 'stop'
+                                or message.get('tool_calls') or message.get('function_call') or message.get('refusal')
+                                or not isinstance(message.get('content'), str) or not message['content'].strip()):
+                            raise InvalidModelResponse(
+                                'OpenDesign simulator requires one nonempty text choice ending in stop without tools or refusal',
+                                api='chat', response=raw, phase='completion_status')
+                    return response
             else:
                 api = 'responses'
                 kwargs = dict(model=model, reasoning={"effort": reasoning_effort or "low"},
