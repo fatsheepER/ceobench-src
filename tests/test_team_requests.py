@@ -778,15 +778,15 @@ def test_inprocess_model_reply_keeps_first_logical_request_identity(monkeypatch)
         return calls(('bash', dict(command=ADVANCE)))
     with make_team('git', respond, 'request-inprocess') as team:
         stream = module._stream_chat_completion
-        def local(client, request, check=lambda: None):
+        def local(client, request, check=lambda: None, *, require_success=False):
             if client is team.roles['growth'].agent.client:
                 check()
                 return ChatCompletion.model_validate(completion(final('INPROCESS-ANSWER')).json())
-            return stream(client, request, check)
+            return stream(client, request, check, require_success=require_success)
         monkeypatch.setattr(module, '_stream_chat_completion', local)
         result = team.run(stop_after_day=7)
         save_evidence(team, 'inprocess-reply')
-        assert result.reason == 'observation_end', team.failure
+        assert result.reason == 'observation_end', (team.failure, getattr(team, 'failure_detail', None))
         question = next(m for m in team.messages if m.kind == 'question')
         usage = [json.loads(line) for line in team.roles['growth'].usage.path.read_text().splitlines()]
         received = next(row for row in usage if row['event'] == 'request' and 'INPROCESS-QUESTION' in json.dumps(row))
